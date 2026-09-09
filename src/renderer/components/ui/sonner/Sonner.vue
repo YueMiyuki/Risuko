@@ -47,3 +47,24 @@ const props = defineProps<ToasterProps>();
     </template>
   </Sonner>
 </template>
+
+<style>
+[data-sonner-toast].error-reference-toast[data-styled="true"] {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	align-items: center;
+}
+
+[data-sonner-toast].error-reference-toast[data-styled="true"] [data-content] {
+	grid-column: 2;
+	grid-row: 1;
+	min-width: 0;
+}
+
+[data-sonner-toast].error-reference-toast[data-styled="true"] [data-action] {
+	grid-column: 2;
+	grid-row: 2;
+	margin: 8px 0 0;
+	justify-self: start;
+}
+</style>

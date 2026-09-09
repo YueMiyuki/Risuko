@@ -390,6 +390,7 @@ impl TorrentEngine {
             list_only: false,
             create_subfolder,
             initial_peers,
+            initial_tracker_peers: Vec::new(),
             p2p_proxy: task_p2p_proxy,
             p2p_proxy_is_task_override: task_p2p_proxy_is_override,
         };

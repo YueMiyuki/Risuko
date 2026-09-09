@@ -1,5 +1,7 @@
 //! `.torrent` metainfo parsing (BEP-3) Produces [`TorrentMeta`] with the raw `info` dict bytes preserved so the info-hash can be recomputed. [`ValidatedTorrentMetaV1Info`] wraps a parsed info dict with an enumerator over per-file details, matching the API shape that `engine::torrent` consumes from librqbit
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use super::super::bencode::{decode_dict_field_raw, Value};
 use super::hash::{sha1, sha256, Id20, Id32};
 
@@ -77,25 +79,20 @@ impl TorrentInfoHashes {
 #[derive(Debug, Clone)]
 pub struct TorrentMeta {
     pub info: ValidatedTorrentMetaV1Info,
-    /// Primary announce URL, if any
     pub announce: Option<String>,
-    /// `announce-list` tiers (BEP-12)
     pub announce_list: Vec<Vec<String>>,
+    pub url_list: Vec<String>,
+    pub bootstrap_nodes: Vec<(Id20, SocketAddr)>,
+    pub bootstrap_hosts: Vec<(Id20, String, u16)>,
     pub comment: Option<String>,
     pub created_by: Option<String>,
     pub creation_date: Option<i64>,
     pub encoding: Option<String>,
-    /// Info-hash computed over the raw bytes of the `info` dict. For hybrid torrents this is the v1 (SHA-1) hash. Used by BEP-3 handshakes, trackers, MSE/PE SKEY and the v1 DHT
     pub info_hash: Id20,
-    /// Parsed v2 (BEP 52) `info` view, when present (hybrid torrents)
     pub info_v2: Option<ValidatedTorrentMetaV2Info>,
-    /// SHA-256 info-hash from BEP 52, when present
     pub info_hash_v2: Option<Id32>,
-    /// Which BEP versions this torrent declares
     pub meta_version: MetaVersion,
-    /// `piece layers` dictionary from BEP 52: file pieces-root -> concatenated SHA-256 layer hashes (32 bytes each, one per piece-sized chunk) Empty when the torrent has no v2 dict, or when no file is large enough to require explicit layer hashes (single-piece files)
     pub piece_layers: std::collections::BTreeMap<Id32, Vec<u8>>,
-    /// Raw bytes of the `info` dict, exactly as they appeared in the source `.torrent` (or as fetched via BEP-9 ut_metadata). Required for serving ut_metadata to other peers — the SHA-1 / SHA-256 of these bytes is the canonical info-hash, so any re-encoding would break verification on the receiver. Stored once per torrent
     pub info_bytes: Vec<u8>,
 }
 
@@ -246,6 +243,8 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
                 .collect::<Vec<Vec<String>>>()
         })
         .unwrap_or_default();
+    let url_list = parse_url_list(&value);
+    let (bootstrap_nodes, bootstrap_hosts) = parse_bootstrap_nodes(&value);
     let comment = get_str(&value, b"comment");
     let created_by = get_str(&value, b"created by");
     let encoding = get_str(&value, b"encoding");
@@ -295,6 +294,9 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
             info,
             announce,
             announce_list,
+            url_list,
+            bootstrap_nodes,
+            bootstrap_hosts,
             comment,
             created_by,
             creation_date,
@@ -309,10 +311,11 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
     }
 
     let info_hash = sha1(info_raw);
-    let info = validate_info(&info_value)?;
+    let mut info = validate_info(&info_value)?;
 
     let (info_v2, info_hash_v2) = if has_v2 {
         let v2 = validate_info_v2(&info_value)?;
+        info.private |= v2.private;
         let h = sha256(info_raw);
         (Some(v2), Some(h))
     } else {
@@ -329,6 +332,9 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
         info,
         announce,
         announce_list,
+        url_list,
+        bootstrap_nodes,
+        bootstrap_hosts,
         comment,
         created_by,
         creation_date,
@@ -340,6 +346,128 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
         piece_layers,
         info_bytes: info_raw.to_vec(),
     })
+}
+
+fn parse_url_list(value: &Value) -> Vec<String> {
+    let mut candidates = Vec::new();
+    match value.get(b"url-list") {
+        Some(Value::Bytes(raw)) => candidates.push(raw.as_slice()),
+        Some(Value::List(items)) => {
+            for item in items {
+                if let Value::Bytes(raw) = item {
+                    candidates.push(raw.as_slice());
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut out = Vec::new();
+    for raw in candidates {
+        let Ok(url) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        let Ok(parsed) = url::Url::parse(url.trim()) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || url.trim().is_empty()
+        {
+            continue;
+        }
+        let normalized = parsed.to_string();
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, String, u16)>) {
+    let mut out = Vec::new();
+    let mut hosts = Vec::new();
+    for (key, width, v6) in [
+        (b"nodes".as_slice(), 26usize, false),
+        (b"nodes6".as_slice(), 38usize, true),
+    ] {
+        let Some(nodes) = value.get(key) else {
+            continue;
+        };
+        if let Some(raw) = nodes.as_bytes() {
+            for chunk in raw.chunks_exact(width) {
+                let Ok(id) = Id20::from_slice(&chunk[..20]) else {
+                    continue;
+                };
+                let addr = if v6 {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&chunk[20..36]);
+                    let ip = Ipv6Addr::from(bytes);
+                    let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+                    if ip.is_unspecified() || port == 0 {
+                        continue;
+                    }
+                    SocketAddr::new(ip.into(), port)
+                } else {
+                    let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
+                    let port = u16::from_be_bytes([chunk[24], chunk[25]]);
+                    if ip.is_unspecified() || port == 0 {
+                        continue;
+                    }
+                    SocketAddr::new(ip.into(), port)
+                };
+                if !out.iter().any(|(_, existing)| *existing == addr) {
+                    out.push((id, addr));
+                }
+            }
+            continue;
+        }
+
+        let Some(entries) = nodes.as_list() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(pair) = entry.as_list() else {
+                continue;
+            };
+            let Some(host) = pair.first().and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(port) = pair
+                .get(1)
+                .and_then(Value::as_int)
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+            else {
+                continue;
+            };
+            let host = host.trim();
+            if host.is_empty() || host.contains('\0') {
+                continue;
+            }
+            let id = {
+                use sha1::{Digest, Sha1};
+                let mut digest = Sha1::new();
+                digest.update(host.as_bytes());
+                digest.update(port.to_be_bytes());
+                Id20::from_slice(&digest.finalize()[..20]).expect("sha1 is 20 bytes")
+            };
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if ip.is_unspecified() || (v6 && !ip.is_ipv6()) {
+                    continue;
+                }
+                let addr = SocketAddr::new(ip, port);
+                if !out.iter().any(|(_, existing)| *existing == addr) {
+                    out.push((id, addr));
+                }
+            } else if !hosts
+                .iter()
+                .any(|(_, existing, existing_port)| existing == host && *existing_port == port)
+            {
+                hosts.push((id, host.to_string(), port));
+            }
+        }
+    }
+    (out, hosts)
 }
 
 fn get_str(value: &Value, key: &[u8]) -> Option<String> {
@@ -930,5 +1058,58 @@ mod tests {
             v2: None,
         };
         assert_eq!(h.announce_infohashes(), vec![v1]);
+    }
+
+    #[test]
+    fn parse_bep5_list_bootstrap_nodes() {
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(1)),
+            (b"name".to_vec(), Value::Bytes(b"x".to_vec())),
+            (b"piece length".to_vec(), Value::Int(1)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
+        ]);
+        let nodes = Value::List(vec![
+            Value::List(vec![Value::Bytes(b"127.0.0.1".to_vec()), Value::Int(6881)]),
+            Value::List(vec![
+                Value::Bytes(b"2001:db8::1".to_vec()),
+                Value::Int(6882),
+            ]),
+            Value::List(vec![
+                Value::Bytes(b"router.example.org".to_vec()),
+                Value::Int(6883),
+            ]),
+        ]);
+        let top = Value::Dict(vec![(b"info".to_vec(), info), (b"nodes".to_vec(), nodes)]);
+        let bytes = super::super::super::bencode::encode_to_vec(&top);
+        let meta = parse_torrent(&bytes).unwrap();
+        assert_eq!(meta.bootstrap_nodes.len(), 2);
+        assert_eq!(meta.bootstrap_hosts.len(), 1);
+        let v4_id = {
+            let mut data = b"127.0.0.1".to_vec();
+            data.extend_from_slice(&6881u16.to_be_bytes());
+            sha1(&data)
+        };
+        let v6_id = {
+            let mut data = b"2001:db8::1".to_vec();
+            data.extend_from_slice(&6882u16.to_be_bytes());
+            sha1(&data)
+        };
+        assert!(meta
+            .bootstrap_nodes
+            .iter()
+            .any(|(id, addr)| { *id == v4_id && *addr == "127.0.0.1:6881".parse().unwrap() }));
+        assert!(meta
+            .bootstrap_nodes
+            .iter()
+            .any(|(id, addr)| { *id == v6_id && *addr == "[2001:db8::1]:6882".parse().unwrap() }));
+        let host_id = {
+            let mut data = b"router.example.org".to_vec();
+            data.extend_from_slice(&6883u16.to_be_bytes());
+            sha1(&data)
+        };
+        assert_eq!(
+            meta.bootstrap_hosts,
+            vec![(host_id, "router.example.org".to_string(), 6883)]
+        );
     }
 }

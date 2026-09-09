@@ -1,5 +1,3 @@
-//! BitTorrent trackers: types and orchestration used by `torrent::` to discover peers via HTTP (BEP-3 / BEP-23 compact) and UDP (BEP-15) trackers
-
 pub mod http;
 pub mod udp;
 
@@ -13,6 +11,7 @@ use super::core::Id20;
 pub struct AnnounceRequest {
     pub info_hash: Id20,
     pub peer_id: Id20,
+    pub key: u32,
     pub port: u16,
     pub uploaded: u64,
     pub downloaded: u64,
@@ -46,6 +45,13 @@ pub struct AnnounceResponse {
     pub peers: Vec<SocketAddr>,
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrapeResponse {
+    pub complete: u32,
+    pub downloaded: u32,
+    pub incomplete: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,4 +98,45 @@ pub async fn announce_with_proxy(
     } else {
         Err(TrackerError::UnsupportedScheme(url.to_string()))
     }
+}
+
+pub async fn announce_with_proxy_and_source(
+    url: &str,
+    req: &AnnounceRequest,
+    timeout: Duration,
+    proxy: Option<&risuko_http::ProxyConnector>,
+    source: Option<SocketAddr>,
+) -> Result<AnnounceResponse, TrackerError> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        tokio::time::timeout(
+            timeout,
+            http::announce_with_proxy_and_source(url, req, proxy, source),
+        )
+        .await
+        .map_err(|_| TrackerError::Timeout)?
+    } else if url.starts_with("udp://") {
+        tokio::time::timeout(
+            timeout,
+            udp::announce_with_proxy_and_source(url, req, proxy, source),
+        )
+        .await
+        .map_err(|_| TrackerError::Timeout)?
+    } else {
+        Err(TrackerError::UnsupportedScheme(url.to_string()))
+    }
+}
+
+pub async fn scrape_udp(
+    url: &str,
+    info_hashes: &[Id20],
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    udp::scrape(url, info_hashes).await
+}
+
+pub async fn scrape_udp_with_proxy(
+    url: &str,
+    info_hashes: &[Id20],
+    proxy: Option<&risuko_http::ProxyConnector>,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    udp::scrape_with_proxy(url, info_hashes, proxy).await
 }

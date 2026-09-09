@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
+use rand::RngExt;
+use sha1::{Digest, Sha1};
 
 use super::blocklist::BlockList;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -19,7 +21,9 @@ use tokio::task::AbortHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::core::{supports_v2_wire, Id20, Lengths, MerkleProofTable, PieceVerifier, TorrentMeta};
-use super::peer::{connect_with_utp_fallback, PeerCommand, PeerEvent, SpawnPeer};
+use super::peer::{
+    connect_prefer_utp, connect_with_utp_fallback, PeerCommand, PeerEvent, SpawnPeer,
+};
 use super::piece::{ChunkTracker, PieceTracker};
 use super::storage::{FileSet, FilesystemStorage};
 use super::tracker::{AnnounceEvent, AnnounceRequest};
@@ -75,6 +79,12 @@ const OUR_UT_PEX_ID: u8 = 4;
 const OUR_UT_HOLEPUNCH_ID: u8 = 5;
 const MAX_PEX_SOURCE_ENTRIES: usize = 4096;
 const META_PIECE_SIZE: usize = 16 * 1024;
+const MAX_FAST_PIECES: usize = 10;
+const MAX_SUGGESTED_PIECES: usize = 64;
+const WEBSEED_MAX_WORKERS: usize = 4;
+const WEBSEED_MAX_PIECES_PER_JOB: usize = 8;
+const WEBSEED_MAX_RANGE_BYTES: u64 = super::webseed::DEFAULT_MAX_RANGE_BYTES;
+const WEBSEED_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct TorrentInit {
     pub meta: TorrentMeta,
@@ -92,12 +102,72 @@ pub struct TorrentInit {
     pub dht: Option<Arc<super::dht::Dht>>,
     pub p2p_proxy: Option<risuko_http::ProxyConnector>,
     pub p2p_proxy_is_task_override: bool,
+    pub tracker_source_addr: Option<SocketAddr>,
     pub blocklist: Arc<RwLock<BlockList>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSource {
+    Manual,
+    Tracker,
+    Dht,
+    Lsd,
+    Pex,
+    Holepunch,
+    WebSeed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerCandidate {
+    pub addr: SocketAddr,
+    pub source: PeerSource,
+}
+
+#[derive(Clone, Default)]
+struct GenerationToken {
+    current: Arc<AtomicU64>,
+}
+
+impl GenerationToken {
+    fn new() -> Self {
+        Self {
+            current: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    fn bump(&self) -> u64 {
+        self.current
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.current() == generation
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerEnvelope {
+    generation: u64,
+    candidate: PeerCandidate,
+}
+
+fn peer_source_allowed(
+    private_torrent: bool,
+    source: PeerSource,
+    addr: SocketAddr,
+    tracker_authorized: &HashSet<SocketAddr>,
+) -> bool {
+    !private_torrent || source == PeerSource::Tracker || tracker_authorized.contains(&addr)
 }
 
 #[derive(Debug)]
 pub enum TorrentCommand {
-    AddPeer(SocketAddr),
+    AddPeer(PeerCandidate),
     AddInboundPeer {
         addr: SocketAddr,
         cmd_tx: mpsc::Sender<PeerCommand>,
@@ -195,11 +265,17 @@ pub async fn spawn(
     let metadata_swap = ArcSwapOption::new(Some(meta_arc));
     let ext_handshake_builder: crate::peer::ExtHandshakeBuilder = {
         let metadata_size = init.meta.info_bytes.len() as u64;
+        let private_torrent = init.meta.info.private;
         std::sync::Arc::new(move |peer_ip: std::net::IpAddr| {
-            let hs =
+            let mut hs =
                 ExtHandshake::new_outgoing(OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Some(metadata_size))
-                    .with_holepunch(OUR_UT_HOLEPUNCH_ID)
-                    .with_yourip(peer_ip);
+                    .with_yourip(peer_ip)
+                    .with_port(listen_port);
+            if private_torrent {
+                hs.supported.remove(b"ut_pex".as_slice());
+            } else {
+                hs = hs.with_holepunch(OUR_UT_HOLEPUNCH_ID);
+            }
             MessageEncoder::encode(&Message::Extended {
                 ext_id: EXT_HANDSHAKE_ID,
                 payload: hs.encode(),
@@ -270,7 +346,20 @@ struct Peer {
     pex_sent: HashSet<SocketAddr>,
     outbound: bool,
     supports_fast: bool,
+    initial_availability: Option<InitialAvailability>,
+    suggested_pieces: HashSet<u32>,
+    remote_allowed_fast: HashSet<u32>,
+    sent_allowed_fast: HashSet<u32>,
+    responded_requests: HashSet<(u32, u32, u32)>,
+    canceled_requests: HashSet<(u32, u32, u32)>,
     io_abort: Option<AbortHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialAvailability {
+    Bitfield,
+    HaveAll,
+    HaveNone,
 }
 
 impl Peer {
@@ -321,6 +410,12 @@ impl Peer {
             pex_sent: HashSet::new(),
             outbound,
             supports_fast,
+            initial_availability: None,
+            suggested_pieces: HashSet::new(),
+            remote_allowed_fast: HashSet::new(),
+            sent_allowed_fast: HashSet::new(),
+            responded_requests: HashSet::new(),
+            canceled_requests: HashSet::new(),
             io_abort: None,
         }
     }
@@ -332,6 +427,31 @@ struct VerifyResult {
     piece_index: u32,
     write_failed: bool,
     verify_ok: bool,
+}
+
+struct WebSeedBatchResult {
+    generation: u64,
+    pieces: Vec<VerifyResult>,
+}
+
+#[derive(Clone)]
+struct WebSeedContext {
+    client: risuko_http::Client,
+    bases: Arc<Vec<String>>,
+    disabled: Arc<Mutex<HashSet<usize>>>,
+    etags: Arc<Mutex<HashMap<(usize, usize), String>>>,
+    info: Arc<super::core::ValidatedTorrentMetaV1Info>,
+    layout: FileSet,
+    storage: Arc<FilesystemStorage>,
+    verifier: PieceVerifier,
+    lengths: Lengths,
+    generation: GenerationToken,
+}
+
+impl WebSeedContext {
+    fn has_available_mirror(&self) -> bool {
+        self.disabled.lock().len() < self.bases.len()
+    }
 }
 
 struct PieceAssembly {
@@ -361,7 +481,12 @@ async fn torrent_loop(
     let utp = init.utp.clone();
     let outbound_utp = utp.clone();
     let upload_limiter = init.upload_limiter.clone();
-    let mut dht = init.dht.clone();
+    let private_torrent = init.meta.info.private;
+    let mut dht = if private_torrent {
+        None
+    } else {
+        init.dht.clone()
+    };
     let mut p2p_proxy = init.p2p_proxy.clone();
     let blocklist = init.blocklist.clone();
     let supports_v2 = supports_v2_wire(&init.meta);
@@ -444,17 +569,27 @@ async fn torrent_loop(
     } else {
         vec![info_hash]
     };
-    let (peer_src_tx, mut peer_addr_rx) = mpsc::channel::<SocketAddr>(256);
-    let mut tracker_urls = collect_trackers(&init.meta);
+    let generation = GenerationToken::new();
+    let (peer_src_tx, mut peer_addr_rx) = mpsc::channel::<PeerEnvelope>(256);
+    let mut tracker_tiers = collect_tracker_tiers(&init.meta);
+    let mut tracker_urls = flatten_tracker_tiers(&tracker_tiers);
     let tracker_info_hashes = announce_hashes.clone();
-    let mut tracker_tasks = spawn_tracker_pollers(
+    let tracker_key = rand::rng().random::<u32>();
+    let tracker_state = Arc::new(Mutex::new(TrackerLifecycle::default()));
+    let (tracker_tier_tx, mut tracker_tier_rx) = mpsc::channel::<()>(4);
+    let mut tracker_tasks = spawn_tracker_tier_pollers(
         peer_src_tx.clone(),
-        tracker_urls.clone(),
+        tracker_tiers.clone(),
         tracker_info_hashes.clone(),
         our_peer_id,
+        tracker_key,
         listen_port,
         Arc::clone(&stats),
         p2p_proxy.clone(),
+        Arc::clone(&tracker_state),
+        private_torrent.then_some(tracker_tier_tx.clone()),
+        init.tracker_source_addr,
+        generation.clone(),
     );
 
     let (peer_event_tx, mut peer_event_rx) = mpsc::channel::<(u32, PeerEvent)>(8192);
@@ -462,6 +597,7 @@ async fn torrent_loop(
     let mut peers: HashMap<u32, Peer> = HashMap::new();
     let mut next_pid: u32 = 1;
     let mut known_addrs: HashSet<SocketAddr> = HashSet::new();
+    let mut tracker_authorized: HashSet<SocketAddr> = HashSet::new();
     // BEP-55
     let mut pex_source: HashMap<SocketAddr, u32> = HashMap::new();
     let mut holepunch_attempted: HashSet<SocketAddr> = HashSet::new();
@@ -487,10 +623,43 @@ async fn torrent_loop(
     let mut bytes_this_tick = (0u64, 0u64);
     let upload_tick: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let mut write_tasks: tokio::task::JoinSet<VerifyResult> = tokio::task::JoinSet::new();
+    let mut webseed_tasks: tokio::task::JoinSet<WebSeedBatchResult> = tokio::task::JoinSet::new();
+    let mut webseed_inflight: HashSet<u32> = HashSet::new();
+    let mut webseed_ctx = if !private_torrent && !init.meta.url_list.is_empty() {
+        match build_webseed_client(p2p_proxy.as_ref()) {
+            Ok(client) => Some(WebSeedContext {
+                client,
+                bases: Arc::new(init.meta.url_list.clone()),
+                disabled: Arc::new(Mutex::new(HashSet::new())),
+                etags: Arc::new(Mutex::new(HashMap::new())),
+                info: Arc::clone(&info),
+                layout: storage.layout().clone(),
+                storage: Arc::clone(&storage),
+                verifier: verifier.clone(),
+                lengths,
+                generation: generation.clone(),
+            }),
+            Err(e) => {
+                tracing::warn!("torrent {info_hash}: unable to initialize WebSeed client: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut outbound_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut outbound_aborts: HashMap<u32, AbortHandle> = HashMap::new();
     let mut dht_poll_handle: Option<tokio::task::JoinHandle<()>> = dht.clone().map(|initial_dht| {
-        spawn_dht_poller(initial_dht, info_hash, listen_port, peer_src_tx.clone())
+        initial_dht.set_private(info_hash, private_torrent);
+        initial_dht.add_bootstrap_nodes(init.meta.bootstrap_nodes.clone());
+        initial_dht.add_bootstrap_hosts(init.meta.bootstrap_hosts.clone());
+        spawn_dht_poller(
+            initial_dht,
+            info_hash,
+            listen_port,
+            peer_src_tx.clone(),
+            generation.clone(),
+        )
     });
 
     let stop_ack = 'torrent: loop {
@@ -498,10 +667,17 @@ async fn torrent_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else {
                     tracing::debug!("torrent {torrent_id} command channel closed; shutting down");
+                    generation.bump();
                     break 'torrent None;
                 };
                 match cmd {
-                TorrentCommand::AddPeer(addr) => {
+                TorrentCommand::AddPeer(PeerCandidate { addr, source }) => {
+                    if source == PeerSource::Tracker {
+                        tracker_authorized.insert(addr);
+                    }
+                    if !peer_source_allowed(private_torrent, source, addr, &tracker_authorized) {
+                        continue;
+                    }
                     if enqueue_peer_candidate(
                         addr,
                         useful_peers.contains_key(&addr),
@@ -520,6 +696,7 @@ async fn torrent_loop(
                             &mut pending_dials,
                             &mut known_addrs,
                             &useful_peers,
+                            &holepunch_attempted,
                             &mut next_pid,
                             peers.len(),
                             max_peers,
@@ -530,6 +707,7 @@ async fn torrent_loop(
                             &peer_event_tx,
                             encryption,
                             advertise_v2,
+                            !private_torrent,
                             &ext_handshake_builder,
                             &outbound_utp,
                             &p2p_proxy,
@@ -540,7 +718,14 @@ async fn torrent_loop(
                     }
                 }
                 TorrentCommand::AddInboundPeer { addr, cmd_tx, event_rx, reserved, peer_id, io_abort } => {
-                    if blocklist.read().contains(addr.ip()) {
+                    if blocklist.read().contains(addr.ip())
+                        || !peer_source_allowed(
+                            private_torrent,
+                            PeerSource::Manual,
+                            addr,
+                            &tracker_authorized,
+                        )
+                    {
                         io_abort.abort();
                         let _ = cmd_tx.try_send(PeerCommand::Disconnect);
                     } else if !paused
@@ -564,6 +749,7 @@ async fn torrent_loop(
                             reserved,
                             Some(peer_id),
                             io_abort,
+                            info_hash,
                         )
                         .await;
                     } else {
@@ -582,7 +768,13 @@ async fn torrent_loop(
                     }
                 }
                 TorrentCommand::Pause(ack) => {
+                    generation.bump();
                     paused = true;
+                    tracker_tasks.shutdown(false).await;
+                    if let Some(handle) = dht_poll_handle.take() {
+                        handle.abort();
+                    }
+                    while peer_addr_rx.try_recv().is_ok() {}
                     let mut paused_candidates = pause_teardown_live_peers(
                         &mut peers,
                         &mut useful_peers,
@@ -596,6 +788,12 @@ async fn torrent_loop(
                     paused_candidates.extend(pending_dials.drain().map(|(_, addr)| addr));
                     outbound_tasks.shutdown().await;
                     outbound_aborts.clear();
+                    webseed_tasks.shutdown().await;
+                    for idx in webseed_inflight.drain() {
+                        if let Ok(vpi) = lengths.validate_piece(idx) {
+                            piece_tracker.clear_in_flight(vpi);
+                        }
+                    }
                     for (_, cmd_tx, registry_addr, io_abort) in
                         peer_registry::drain_scope(torrent_id, &registry_scope)
                     {
@@ -656,15 +854,31 @@ async fn torrent_loop(
                 TorrentCommand::Unpause(ack) => {
                     paused = false;
                     if tracker_tasks.is_empty() {
-                        tracker_tasks = spawn_tracker_pollers(
+                        tracker_tasks = spawn_tracker_tier_pollers(
                             peer_src_tx.clone(),
-                            tracker_urls.clone(),
+                            tracker_tiers.clone(),
                             tracker_info_hashes.clone(),
                             our_peer_id,
+                            tracker_key,
                             listen_port,
                             Arc::clone(&stats),
                             p2p_proxy.clone(),
+                            Arc::clone(&tracker_state),
+                            private_torrent.then_some(tracker_tier_tx.clone()),
+                            init.tracker_source_addr,
+                            generation.clone(),
                         );
+                    }
+                    if dht_poll_handle.is_none() {
+                        if let Some(dht) = dht.clone() {
+                            dht_poll_handle = Some(spawn_dht_poller(
+                                dht,
+                                info_hash,
+                                listen_port,
+                                peer_src_tx.clone(),
+                                generation.clone(),
+                            ));
+                        }
                     }
                     // Resume immediately rather than waiting up to one tick
                     drain_peer_backlog(
@@ -675,6 +889,7 @@ async fn torrent_loop(
                         &mut pending_dials,
                         &mut known_addrs,
                         &useful_peers,
+                        &holepunch_attempted,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -685,6 +900,7 @@ async fn torrent_loop(
                         &peer_event_tx,
                         encryption,
                         advertise_v2,
+                        !private_torrent,
                             &ext_handshake_builder,
                             &outbound_utp,
                             &p2p_proxy,
@@ -695,19 +911,52 @@ async fn torrent_loop(
                     let _ = ack.send(());
                 }
                 TorrentCommand::ReconfigureP2p { proxy, replace_proxy, dht: next_dht, ack } => {
+                    generation.bump();
                     if replace_proxy {
                         p2p_proxy = proxy;
+                    }
+                    webseed_tasks.shutdown().await;
+                    for idx in webseed_inflight.drain() {
+                        if let Ok(vpi) = lengths.validate_piece(idx) {
+                            piece_tracker.clear_in_flight(vpi);
+                        }
+                    }
+                    if replace_proxy {
+                        webseed_ctx = if !private_torrent && !init.meta.url_list.is_empty() {
+                            build_webseed_client(p2p_proxy.as_ref()).ok().map(|client| WebSeedContext {
+                                client,
+                                bases: Arc::new(init.meta.url_list.clone()),
+                                disabled: Arc::new(Mutex::new(HashSet::new())),
+                                etags: Arc::new(Mutex::new(HashMap::new())),
+                                info: Arc::clone(&info),
+                                layout: storage.layout().clone(),
+                                storage: Arc::clone(&storage),
+                                verifier: verifier.clone(),
+                                lengths,
+                                generation: generation.clone(),
+                            })
+                        } else {
+                            None
+                        };
                     }
                     if let Some(handle) = dht_poll_handle.take() {
                         handle.abort();
                     }
-                    dht = next_dht;
+                    while peer_addr_rx.try_recv().is_ok() {}
+                    if private_torrent {
+                        if let Some(next_dht) = next_dht.as_ref() {
+                            next_dht.set_private(info_hash, true);
+                        }
+                    }
+                    dht = if private_torrent { None } else { next_dht };
                     if let Some(next_dht) = dht.clone() {
+                        next_dht.set_private(info_hash, private_torrent);
                         dht_poll_handle = Some(spawn_dht_poller(
                             next_dht,
                             info_hash,
                             listen_port,
                             peer_src_tx.clone(),
+                            generation.clone(),
                         ));
                     }
                     if replace_proxy {
@@ -725,26 +974,50 @@ async fn torrent_loop(
                         tracker_urls.push(url.clone());
                     }
                     if !new_urls.is_empty() {
+                        generation.bump();
+                        webseed_tasks.shutdown().await;
+                        for idx in webseed_inflight.drain() {
+                            if let Ok(vpi) = lengths.validate_piece(idx) {
+                                piece_tracker.clear_in_flight(vpi);
+                            }
+                        }
+                        tracker_tiers.push(new_urls.clone());
+                        tracker_state.lock().append_tier(&new_urls);
                         if tracker_tasks.is_empty() {
-                            tracker_tasks = spawn_tracker_pollers(
-                                peer_src_tx.clone(),
-                                tracker_urls.clone(),
-                                tracker_info_hashes.clone(),
-                                our_peer_id,
-                                listen_port,
-                                Arc::clone(&stats),
-                                p2p_proxy.clone(),
-                            );
+                            if !paused {
+                                tracker_tasks = spawn_tracker_tier_pollers(
+                                    peer_src_tx.clone(),
+                                    tracker_tiers.clone(),
+                                    tracker_info_hashes.clone(),
+                                    our_peer_id,
+                                    tracker_key,
+                                    listen_port,
+                                    Arc::clone(&stats),
+                                    p2p_proxy.clone(),
+                                    Arc::clone(&tracker_state),
+                                    private_torrent.then_some(tracker_tier_tx.clone()),
+                                    init.tracker_source_addr,
+                                    generation.clone(),
+                                );
+                            }
                         } else {
-                            tracker_tasks.spawn_additional(
-                                peer_src_tx.clone(),
-                                new_urls,
-                                tracker_info_hashes.clone(),
-                                our_peer_id,
-                                listen_port,
-                                Arc::clone(&stats),
-                                p2p_proxy.clone(),
-                            );
+                            tracker_tasks.shutdown(false).await;
+                            if !paused {
+                                tracker_tasks = spawn_tracker_tier_pollers(
+                                    peer_src_tx.clone(),
+                                    tracker_tiers.clone(),
+                                    tracker_info_hashes.clone(),
+                                    our_peer_id,
+                                    tracker_key,
+                                    listen_port,
+                                    Arc::clone(&stats),
+                                    p2p_proxy.clone(),
+                                    Arc::clone(&tracker_state),
+                                    private_torrent.then_some(tracker_tier_tx.clone()),
+                                    init.tracker_source_addr,
+                                    generation.clone(),
+                                );
+                            }
                         }
                     }
                     let _ = ack.send(added);
@@ -773,10 +1046,23 @@ async fn torrent_loop(
                     choke_dirty = true;
                     let _ = ack.send((disconnected, removed));
                 }
-                TorrentCommand::Stop(ack) => break 'torrent Some(ack),
+                TorrentCommand::Stop(ack) => {
+                    generation.bump();
+                    break 'torrent Some(ack)
+                },
                 }
             },
-            Some(addr) = peer_addr_rx.recv() => {
+            Some(envelope) = peer_addr_rx.recv() => {
+                if !generation.is_current(envelope.generation) {
+                    continue;
+                }
+                let PeerCandidate { addr, source } = envelope.candidate;
+                if source == PeerSource::Tracker {
+                    tracker_authorized.insert(addr);
+                }
+                if !peer_source_allowed(private_torrent, source, addr, &tracker_authorized) {
+                    continue;
+                }
                 if enqueue_peer_candidate(
                     addr,
                     useful_peers.contains_key(&addr),
@@ -795,6 +1081,7 @@ async fn torrent_loop(
                         &mut pending_dials,
                         &mut known_addrs,
                         &useful_peers,
+                        &holepunch_attempted,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -805,6 +1092,7 @@ async fn torrent_loop(
                         &peer_event_tx,
                         encryption,
                         advertise_v2,
+                        !private_torrent,
                             &ext_handshake_builder,
                             &outbound_utp,
                             &p2p_proxy,
@@ -814,9 +1102,27 @@ async fn torrent_loop(
                         );
                 }
             }
+            Some(()) = tracker_tier_rx.recv(), if private_torrent => {
+                generation.bump();
+                tracker_authorized.clear();
+                while peer_addr_rx.try_recv().is_ok() {}
+                priority_backlog.clear();
+                peer_backlog.clear();
+                dial_retries.clear();
+                useful_redials.clear();
+                for (pid, addr) in pending_dials.drain() {
+                    if let Some(abort) = outbound_aborts.remove(&pid) {
+                        abort.abort();
+                    }
+                    known_addrs.remove(&addr);
+                }
+                for peer in peers.values() {
+                    let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                }
+            }
             Some((pid, ev)) = peer_event_rx.recv() => {
                 let kick = process_peer_event(
-                    torrent_id, pid, ev, &registry_scope, paused, &mut peers, &mut piece_tracker, &mut chunk_tracker,
+                    torrent_id, info_hash, init.meta.info.private, pid, ev, &registry_scope, paused, &mut peers, &mut piece_tracker, &mut chunk_tracker,
                     &mut piece_assemblies,
                     &lengths, &storage, &stats, &mut bytes_this_tick,
                     &upload_tick,
@@ -831,6 +1137,7 @@ async fn torrent_loop(
                     &mut useful_peers,
                     &mut pex_source, &mut holepunch_attempted,
                     &peer_src_tx,
+                    &generation,
                     &verifier,
                     &info_bytes,
                     hash_tables.as_deref().map(|v| &**v),
@@ -841,9 +1148,34 @@ async fn torrent_loop(
                     &upload_limiter,
                     dht.as_ref(),
                     &blocklist,
+                    &tracker_authorized,
                 ).await;
                 if kick && !paused {
                     drive_peer(pid, &mut peers, &mut piece_tracker, &mut chunk_tracker).await;
+                }
+            }
+            result = webseed_tasks.join_next(), if !webseed_tasks.is_empty() => {
+                match result {
+                    Some(Ok(batch)) => {
+                        if !generation.is_current(batch.generation) {
+                            continue;
+                        }
+                        for vr in batch.pieces {
+                            webseed_inflight.remove(&vr.piece_index);
+                            process_verify_result(
+                                vr, &lengths, &mut piece_tracker,
+                                &mut chunk_tracker, &mut peers, &storage, &stats,
+                                &mut piece_assemblies,
+                            ).await;
+                        }
+                        if !paused {
+                            drive_requests(&mut peers, &mut piece_tracker, &mut chunk_tracker).await;
+                        }
+                    }
+                    Some(Err(e)) if !e.is_cancelled() => {
+                        tracing::warn!("WebSeed worker failed: {e}");
+                    }
+                    Some(Err(_)) | None => {}
                 }
             }
             result = write_tasks.join_next(), if !write_tasks.is_empty() => {
@@ -879,6 +1211,7 @@ async fn torrent_loop(
                         &mut pending_dials,
                         &mut known_addrs,
                         &useful_peers,
+                        &holepunch_attempted,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -889,6 +1222,7 @@ async fn torrent_loop(
                         &peer_event_tx,
                         encryption,
                         advertise_v2,
+                        !private_torrent,
                             &ext_handshake_builder,
                             &outbound_utp,
                             &p2p_proxy,
@@ -1020,13 +1354,9 @@ async fn torrent_loop(
                         last_window_reset = now;
                     }
                 }
-                if now.duration_since(last_pex) >= PEX_INTERVAL {
+                if !private_torrent && now.duration_since(last_pex) >= PEX_INTERVAL {
                     last_pex = now;
-                    let current: HashSet<SocketAddr> = peers
-                        .values()
-                        .filter(|p| p.outbound)
-                        .map(|p| p.addr)
-                        .collect();
+                    let current: HashSet<SocketAddr> = peers.values().map(|p| p.addr).collect();
                     for p in peers.values_mut() {
                         let Some(pex_id) = p.their_ut_pex_id else {
                             continue;
@@ -1041,6 +1371,7 @@ async fn torrent_loop(
                             .pex_sent
                             .iter()
                             .filter(|a| !current.contains(a))
+                            .take(MAX_PEX_ADDED_PER_MSG)
                             .copied()
                             .collect();
                         if added.is_empty() && dropped.is_empty() {
@@ -1161,6 +1492,7 @@ async fn torrent_loop(
                         &mut pending_dials,
                         &mut known_addrs,
                         &useful_peers,
+                        &holepunch_attempted,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -1171,14 +1503,23 @@ async fn torrent_loop(
                         &peer_event_tx,
                         encryption,
                         advertise_v2,
+                        !private_torrent,
                             &ext_handshake_builder,
                             &outbound_utp,
                             &p2p_proxy,
                             &mut outbound_tasks,
                             &mut outbound_aborts,
                             &blocklist,
-                        );
+                    );
                     drive_requests(&mut peers, &mut piece_tracker, &mut chunk_tracker).await;
+                    if let Some(ctx) = webseed_ctx.as_ref() {
+                        schedule_webseed_workers(
+                            &mut webseed_tasks,
+                            &mut webseed_inflight,
+                            &mut piece_tracker,
+                            ctx,
+                        );
+                    }
                 }
             }
         }
@@ -1201,6 +1542,8 @@ async fn torrent_loop(
     }
 
     outbound_tasks.shutdown().await;
+    webseed_tasks.shutdown().await;
+    webseed_inflight.clear();
     for (_, cmd_tx, _, io_abort) in peer_registry::drain_scope(torrent_id, &registry_scope) {
         abort_peer_io(io_abort.as_ref(), &cmd_tx);
     }
@@ -1256,14 +1599,26 @@ fn spawn_dht_poller(
     dht: Arc<super::dht::Dht>,
     info_hash: Id20,
     listen_port: u16,
-    peer_tx: mpsc::Sender<SocketAddr>,
+    peer_tx: mpsc::Sender<PeerEnvelope>,
+    generation: GenerationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let mut peers =
                 dht.get_peers_stream(info_hash, Duration::from_secs(60), Some(listen_port));
             while let Some(addr) = peers.recv().await {
-                if peer_tx.send(addr).await.is_err() {
+                let candidate_generation = generation.current();
+                if peer_tx
+                    .send(PeerEnvelope {
+                        generation: candidate_generation,
+                        candidate: PeerCandidate {
+                            addr,
+                            source: PeerSource::Dht,
+                        },
+                    })
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1371,8 +1726,10 @@ async fn run_outbound_peer(
     event_tx: mpsc::Sender<(u32, PeerEvent)>,
     encryption: crate::peer::EncryptionPolicy,
     advertise_v2: bool,
+    advertise_dht: bool,
     ext_handshake_builder: Option<crate::peer::ExtHandshakeBuilder>,
     utp: Option<Arc<UtpSocket>>,
+    prefer_utp: bool,
     known_useful: bool,
     proxy: Option<risuko_http::ProxyConnector>,
 ) {
@@ -1389,13 +1746,18 @@ async fn run_outbound_peer(
         read_timeout: Duration::from_secs(120),
         encryption,
         advertise_v2,
+        advertise_dht,
         ext_handshake_builder,
         proxy,
     };
     if known_useful {
         tracing::debug!("redialing useful peer {addr} TCP-first with µTP fallback");
     }
-    let connect_result = connect_with_utp_fallback(spawn, utp).await;
+    let connect_result = if prefer_utp {
+        connect_prefer_utp(spawn, utp).await
+    } else {
+        connect_with_utp_fallback(spawn, utp).await
+    };
     match connect_result {
         Ok((handle, mut rx)) => {
             peer_registry::put(
@@ -1431,6 +1793,113 @@ fn fast_bit(reserved: &[u8; 8]) -> bool {
     reserved[b] & m != 0
 }
 
+fn dht_bit(reserved: &[u8; 8]) -> bool {
+    let (b, m) = super::wire::handshake::reserved::DHT;
+    reserved[b] & m != 0
+}
+
+fn allowed_fast_set(info_hash: &Id20, addr: SocketAddr, total_pieces: u32) -> Vec<u32> {
+    if total_pieces == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(MAX_FAST_PIECES.min(total_pieces as usize));
+    let mut seed = Vec::with_capacity(36);
+    match addr {
+        SocketAddr::V4(v4) => {
+            let octets = v4.ip().octets();
+            seed.extend_from_slice(&[octets[0], octets[1], octets[2], 0]);
+        }
+        SocketAddr::V6(v6) => seed.extend_from_slice(&v6.ip().octets()),
+    }
+    seed.extend_from_slice(info_hash.as_bytes());
+    while out.len() < MAX_FAST_PIECES.min(total_pieces as usize) {
+        let mut h = Sha1::new();
+        h.update(&seed);
+        seed = h.finalize().to_vec();
+        for chunk in seed.chunks_exact(4) {
+            let index = u32::from_be_bytes(chunk.try_into().expect("sha1 chunk")) % total_pieces;
+            if !out.contains(&index) {
+                out.push(index);
+                if out.len() == MAX_FAST_PIECES.min(total_pieces as usize) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn initial_availability_message(
+    bitfield: &[u8],
+    total_pieces: u32,
+    supports_fast: bool,
+) -> Option<Message> {
+    if !supports_fast {
+        return should_send_initial_bitfield(bitfield)
+            .then(|| Message::Bitfield(Bytes::copy_from_slice(bitfield)));
+    }
+
+    let has_any = bitfield.iter().any(|byte| *byte != 0);
+    if !has_any {
+        return Some(Message::HaveNone);
+    }
+    let has_all = (0..total_pieces as usize).all(|index| {
+        bitfield
+            .get(index / 8)
+            .is_some_and(|byte| byte & (1 << (7 - (index % 8))) != 0)
+    });
+    if has_all {
+        Some(Message::HaveAll)
+    } else {
+        Some(Message::Bitfield(Bytes::copy_from_slice(bitfield)))
+    }
+}
+
+async fn send_initial_availability(
+    cmd_tx: &mpsc::Sender<PeerCommand>,
+    bitfield: &[u8],
+    total_pieces: u32,
+    supports_fast: bool,
+) {
+    if let Some(message) = initial_availability_message(bitfield, total_pieces, supports_fast) {
+        let _ = cmd_tx.send(PeerCommand::Send(message)).await;
+    }
+}
+
+fn accept_initial_availability(peer: &mut Peer, availability: InitialAvailability) -> bool {
+    if peer.initial_availability.is_some() {
+        return false;
+    }
+    peer.initial_availability = Some(availability);
+    true
+}
+
+async fn send_allowed_fast(peer: &mut Peer, info_hash: &Id20, total_pieces: u32) {
+    if !peer.supports_fast {
+        return;
+    }
+    for index in allowed_fast_set(info_hash, peer.addr, total_pieces) {
+        peer.sent_allowed_fast.insert(index);
+        let _ = peer
+            .cmd_tx
+            .send(PeerCommand::Send(Message::AllowedFast(index)))
+            .await;
+    }
+}
+
+async fn send_fast_reject(peer: &Peer, index: u32, begin: u32, length: u32) {
+    if peer.supports_fast {
+        let _ = peer
+            .cmd_tx
+            .send(PeerCommand::Send(Message::RejectRequest {
+                index,
+                begin,
+                length,
+            }))
+            .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn adopt_inbound_peer(
     pid: u32,
@@ -1446,6 +1915,7 @@ async fn adopt_inbound_peer(
     reserved: [u8; 8],
     peer_id: Option<Id20>,
     io_abort: AbortHandle,
+    info_hash: Id20,
 ) {
     let supports_fast = fast_bit(&reserved);
     let mut peer = Peer::connected(
@@ -1461,10 +1931,9 @@ async fn adopt_inbound_peer(
     peer.io_abort = Some(io_abort);
     peers.insert(pid, peer);
     let bf = piece_tracker.bitfield();
-    if should_send_initial_bitfield(&bf) {
-        let _ = cmd_tx
-            .send(PeerCommand::Send(Message::Bitfield(Bytes::from(bf))))
-            .await;
+    send_initial_availability(&cmd_tx, &bf, lengths.total_pieces(), supports_fast).await;
+    if let Some(peer) = peers.get_mut(&pid) {
+        send_allowed_fast(peer, &info_hash, lengths.total_pieces()).await;
     }
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
@@ -1478,6 +1947,8 @@ async fn adopt_inbound_peer(
 #[allow(clippy::too_many_arguments)]
 async fn process_peer_event(
     torrent_id: usize,
+    info_hash: Id20,
+    private_torrent: bool,
     pid: u32,
     ev: PeerEvent,
     registry_scope: &Arc<()>,
@@ -1504,7 +1975,8 @@ async fn process_peer_event(
     pex_source: &mut HashMap<SocketAddr, u32>,
     // BEP-55: targets we've already asked a relay to rendezvous
     holepunch_attempted: &mut HashSet<SocketAddr>,
-    peer_src_tx: &mpsc::Sender<SocketAddr>,
+    peer_src_tx: &mpsc::Sender<PeerEnvelope>,
+    generation: &GenerationToken,
     verifier: &PieceVerifier,
     info_bytes: &Arc<Vec<u8>>,
     hash_tables: Option<&[MerkleProofTable]>,
@@ -1515,6 +1987,7 @@ async fn process_peer_event(
     upload_limiter: &Option<Arc<crate::limiter::UploadLimiter>>,
     dht: Option<&Arc<crate::dht::Dht>>,
     blocklist: &RwLock<BlockList>,
+    tracker_authorized: &HashSet<SocketAddr>,
 ) -> bool {
     if paused {
         match ev {
@@ -1546,7 +2019,9 @@ async fn process_peer_event(
                 {
                     let addr = pending_dials.remove(&pid).unwrap_or(registry_addr);
 
-                    if blocklist.read().contains(addr.ip()) {
+                    if blocklist.read().contains(addr.ip())
+                        || (private_torrent && !tracker_authorized.contains(&addr))
+                    {
                         reject_handshook_peer(
                             pid,
                             &cmd_tx,
@@ -1612,14 +2087,24 @@ async fn process_peer_event(
                     );
                     peer.io_abort = io_abort;
                     peers.insert(pid, peer);
-                    // Extended handshake (when peer supports BEP-10) is already on the wire — the connection layer wrote it synchronously before the Handshook event was emitted
                     let bf = piece_tracker.bitfield();
-                    if should_send_initial_bitfield(&bf) {
-                        let _ = cmd_tx
-                            .send(PeerCommand::Send(Message::Bitfield(Bytes::from(bf))))
-                            .await;
+                    send_initial_availability(&cmd_tx, &bf, lengths.total_pieces(), supports_fast)
+                        .await;
+                    if let Some(peer) = peers.get_mut(&pid) {
+                        send_allowed_fast(peer, &info_hash, lengths.total_pieces()).await;
+                        if !private_torrent {
+                            if let Some(port) =
+                                dht.and_then(|node| node.local_port_for(peer.addr.is_ipv6()))
+                            {
+                                if dht_bit(&reserved) {
+                                    let _ = peer
+                                        .cmd_tx
+                                        .send(PeerCommand::Send(Message::Port(port)))
+                                        .await;
+                                }
+                            }
+                        }
                     }
-                    // Choked until the tit-for-tat eval grants a slot
                 }
             }
         }
@@ -1680,17 +2165,39 @@ async fn process_peer_event(
                     kick = true;
                 }
                 Message::Bitfield(bytes) => {
+                    if peer.supports_fast
+                        && !accept_initial_availability(peer, InitialAvailability::Bitfield)
+                    {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
                     piece_tracker.replace_peer_bitfield(&mut peer.bitfield, &bytes);
                     send_interested_if_useful(peer, piece_tracker).await;
                     kick = true;
                 }
                 Message::HaveAll => {
+                    if !peer.supports_fast {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
+                    if !accept_initial_availability(peer, InitialAvailability::HaveAll) {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
                     let all = vec![0xff; peer.bitfield.len()];
                     piece_tracker.replace_peer_bitfield(&mut peer.bitfield, &all);
                     send_interested_if_useful(peer, piece_tracker).await;
                     kick = true;
                 }
                 Message::HaveNone => {
+                    if !peer.supports_fast {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
+                    if !accept_initial_availability(peer, InitialAvailability::HaveNone) {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
                     piece_tracker.replace_peer_bitfield(&mut peer.bitfield, &[]);
                 }
                 Message::RejectRequest {
@@ -1698,6 +2205,10 @@ async fn process_peer_event(
                     begin,
                     length,
                 } => {
+                    if !peer.supports_fast {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
                     if let Some(req_idx) = peer
                         .outstanding
                         .iter()
@@ -1722,6 +2233,34 @@ async fn process_peer_event(
                         } else if !peer.snubbing {
                             kick = true;
                         }
+                    } else {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
+                }
+                Message::SuggestPiece(index) => {
+                    if !peer.supports_fast {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
+                    if lengths.validate_piece(index).is_ok()
+                        && !piece_tracker.has_local(lengths.validate_piece(index).unwrap())
+                        && peer.suggested_pieces.len() < MAX_SUGGESTED_PIECES
+                    {
+                        peer.suggested_pieces.insert(index);
+                        kick = true;
+                    }
+                }
+                Message::AllowedFast(index) => {
+                    if !peer.supports_fast {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
+                        return false;
+                    }
+                    if lengths.validate_piece(index).is_ok()
+                        && peer.remote_allowed_fast.len() < MAX_SUGGESTED_PIECES
+                    {
+                        peer.remote_allowed_fast.insert(index);
+                        kick = true;
                     }
                 }
                 Message::Request {
@@ -1729,26 +2268,31 @@ async fn process_peer_event(
                     begin,
                     length,
                 } => {
-                    let Ok(vpi) = lengths.validate_piece(index) else {
-                        return false;
-                    };
-                    if !piece_tracker.has_local(vpi) || peer.am_choking {
-                        if peer.supports_fast {
-                            let _ =
-                                peer.cmd_tx
-                                    .try_send(PeerCommand::Send(Message::RejectRequest {
-                                        index,
-                                        begin,
-                                        length,
-                                    }));
-                        }
+                    let request_key = (index, begin, length);
+                    if peer.responded_requests.contains(&request_key) {
                         return false;
                     }
-                    if length > 1024 * 1024 {
+                    if peer.responded_requests.len() >= 4096 {
+                        peer.responded_requests.clear();
+                    }
+                    peer.responded_requests.insert(request_key);
+                    let Ok(vpi) = lengths.validate_piece(index) else {
+                        send_fast_reject(peer, index, begin, length).await;
+                        return false;
+                    };
+                    let fast_allowed =
+                        peer.supports_fast && peer.sent_allowed_fast.contains(&index);
+                    if !piece_tracker.has_local(vpi) || (peer.am_choking && !fast_allowed) {
+                        send_fast_reject(peer, index, begin, length).await;
+                        return false;
+                    }
+                    if length == 0 || length > 1024 * 1024 {
+                        send_fast_reject(peer, index, begin, length).await;
                         return false;
                     }
                     let piece_len = lengths.piece_length_of(vpi) as u64;
                     if (begin as u64).saturating_add(length as u64) > piece_len {
+                        send_fast_reject(peer, index, begin, length).await;
                         return false;
                     }
                     let offset = lengths.piece_offset(vpi) + begin as u64;
@@ -1761,12 +2305,22 @@ async fn process_peer_event(
                     let peer_uploaded_total = Arc::clone(&peer.uploaded_total);
                     let upload_len = length as u64;
                     let limiter = upload_limiter.clone();
+                    let supports_fast = peer.supports_fast;
                     tokio::spawn(async move {
                         if let Some(l) = &limiter {
                             l.acquire(upload_len).await;
                         }
                         let mut buf = vec![0u8; length as usize];
                         if storage.read_at(offset, &mut buf).await.is_err() {
+                            if supports_fast {
+                                let _ = cmd_tx
+                                    .send(PeerCommand::Send(Message::RejectRequest {
+                                        index,
+                                        begin,
+                                        length,
+                                    }))
+                                    .await;
+                            }
                             return;
                         }
                         if cmd_tx
@@ -1789,6 +2343,7 @@ async fn process_peer_event(
                 }
                 Message::Piece { index, begin, data } => {
                     let Ok(vpi) = lengths.validate_piece(index) else {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
                         return false;
                     };
                     // Only accept pieces that match an outstanding request; reject unsolicited or mismatched frames
@@ -1796,11 +2351,18 @@ async fn process_peer_event(
                         p == index && b == begin && l as usize == data.len()
                     });
                     let Some(req_idx) = requested else {
+                        let late_key =
+                            (index, begin, u32::try_from(data.len()).unwrap_or(u32::MAX));
+                        if peer.canceled_requests.remove(&late_key) {
+                            return false;
+                        }
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
                         return false;
                     };
                     // Reject if data extends past the piece boundary
                     let piece_len = lengths.piece_length_of(vpi);
                     if (begin as u64).saturating_add(data.len() as u64) > piece_len as u64 {
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Disconnect);
                         return false;
                     }
                     peer.outstanding.swap_remove(req_idx);
@@ -1978,19 +2540,36 @@ async fn process_peer_event(
                         }
                     } else if ext_id == OUR_UT_METADATA_ID {
                         serve_ut_metadata(peer, &payload, info_bytes);
-                    } else if ext_id == OUR_UT_PEX_ID {
-                        // A connected peer (often a seeder) gossips other swarm members
-                        if let Some((v4, v6)) = super::wire::extended::parse_ut_pex(&payload) {
-                            for addr in v4.into_iter().chain(v6) {
+                    } else if ext_id == OUR_UT_PEX_ID && !private_torrent {
+                        if let Some(update) = super::wire::extended::parse_ut_pex_full(&payload) {
+                            for addr in update.dropped {
+                                pex_source.remove(&addr);
+                                priority_backlog.retain(|queued| *queued != addr);
+                                peer_backlog.retain(|queued| *queued != addr);
+                                dial_retries.retain(|(queued, _)| *queued != addr);
+                                useful_redials.retain(|(queued, _)| *queued != addr);
+                                if !peers.values().any(|peer| peer.addr == addr)
+                                    && !pending_dials.values().any(|queued| *queued == addr)
+                                {
+                                    known_addrs.remove(&addr);
+                                }
+                            }
+                            for (addr, _flags) in update.added {
                                 if pex_source.len() < MAX_PEX_SOURCE_ENTRIES
                                     || pex_source.contains_key(&addr)
                                 {
                                     pex_source.insert(addr, pid);
                                 }
-                                let _ = peer_src_tx.try_send(addr);
+                                let _ = peer_src_tx.try_send(PeerEnvelope {
+                                    generation: generation.current(),
+                                    candidate: PeerCandidate {
+                                        addr,
+                                        source: PeerSource::Pex,
+                                    },
+                                });
                             }
                         }
-                    } else if ext_id == OUR_UT_HOLEPUNCH_ID {
+                    } else if ext_id == OUR_UT_HOLEPUNCH_ID && !private_torrent {
                         // BEP-55 hole punching
                         let from_addr = peer.addr;
                         let from_hp_id = peer.their_ut_holepunch_id;
@@ -2008,14 +2587,17 @@ async fn process_peer_event(
                                 dial_retries,
                                 useful_redials,
                                 known_addrs,
+                                holepunch_attempted,
                                 blocklist,
                             );
                         }
                     }
                 }
                 Message::Port(port) => {
-                    if let (Some(dht), true) = (dht, port != 0) {
-                        dht.add_node(SocketAddr::new(peer.addr.ip(), port));
+                    if !private_torrent {
+                        if let (Some(dht), true) = (dht, port != 0) {
+                            dht.add_node(SocketAddr::new(peer.addr.ip(), port));
+                        }
                     }
                 }
                 _ => {}
@@ -2034,16 +2616,20 @@ async fn process_peer_event(
             if let Some(a) = addr {
                 tracing::debug!("peer {a} disconnected: {reason}");
                 pex_source.retain(|_, relay| *relay != pid);
-                if was_pending_dial {
+                if was_pending_dial && !private_torrent {
                     try_initiate_holepunch(a, pex_source, holepunch_attempted, peers);
                 }
 
-                if useful_bytes > 0 {
+                if useful_bytes > 0 && (!private_torrent || tracker_authorized.contains(&a)) {
                     useful_peers.insert(a, useful_window.clamp(pipeline_floor, pipeline_cap));
                 }
                 let known_useful = useful_bytes > 0 || useful_peers.contains_key(&a);
-                schedule_peer_retry(a, known_useful, dial_retries, useful_redials);
-                if known_useful {
+                if !private_torrent || tracker_authorized.contains(&a) {
+                    schedule_peer_retry(a, known_useful, dial_retries, useful_redials);
+                } else {
+                    known_addrs.remove(&a);
+                }
+                if known_useful && (!private_torrent || tracker_authorized.contains(&a)) {
                     tracing::debug!(
                         "scheduled useful peer {a} redial in {}s (delivered {useful_bytes} bytes)",
                         USEFUL_PEER_REDIAL_DELAY.as_secs()
@@ -2126,6 +2712,301 @@ async fn process_verify_result(
     }
 }
 
+fn build_webseed_client(
+    proxy: Option<&risuko_http::ProxyConnector>,
+) -> Result<risuko_http::Client, String> {
+    let mut builder = risuko_http::Client::builder()
+        .timeout(WEBSEED_TIMEOUT)
+        .connect_timeout(Duration::from_secs(8))
+        .redirect(risuko_http::Policy::limited(3))
+        .pool_max_idle_per_host(WEBSEED_MAX_WORKERS)
+        .gzip(false)
+        .brotli(false)
+        .deflate(false);
+    if let Some(proxy) = proxy {
+        if let Some(route) = proxy.proxy() {
+            builder = builder.proxy(route.clone());
+        }
+        if let Some(bypass) = proxy.no_proxy() {
+            builder = builder.no_proxy(bypass.clone());
+        }
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+fn webseed_piece_spans(layout: &FileSet, offset: u64, len: u64) -> Vec<(usize, u64, u64)> {
+    layout
+        .spans_for(offset, len)
+        .map(|span| (span.file_index, span.file_offset, span.len))
+        .collect()
+}
+
+fn webseed_failed_batch(generation: u64, piece_indices: &[u32]) -> WebSeedBatchResult {
+    WebSeedBatchResult {
+        generation,
+        pieces: piece_indices
+            .iter()
+            .copied()
+            .map(|piece_index| VerifyResult {
+                piece_index,
+                write_failed: false,
+                verify_ok: false,
+            })
+            .collect(),
+    }
+}
+
+async fn fetch_webseed_batch(ctx: WebSeedContext, piece_indices: Vec<u32>) -> WebSeedBatchResult {
+    let generation = ctx.generation.current();
+    let Some(&first_index) = piece_indices.first() else {
+        return WebSeedBatchResult {
+            generation,
+            pieces: Vec::new(),
+        };
+    };
+    let Some(&last_index) = piece_indices.last() else {
+        return WebSeedBatchResult {
+            generation,
+            pieces: Vec::new(),
+        };
+    };
+    let Ok(first) = ctx.lengths.validate_piece(first_index) else {
+        return webseed_failed_batch(generation, &piece_indices);
+    };
+    let Ok(last) = ctx.lengths.validate_piece(last_index) else {
+        return webseed_failed_batch(generation, &piece_indices);
+    };
+    if piece_indices
+        .windows(2)
+        .any(|pair| pair[1] != pair[0].saturating_add(1))
+    {
+        return webseed_failed_batch(generation, &piece_indices);
+    }
+
+    let offset = ctx.lengths.piece_offset(first);
+    let batch_len = ctx
+        .lengths
+        .piece_offset(last)
+        .saturating_add(ctx.lengths.piece_length_of(last) as u64)
+        .saturating_sub(offset);
+    let spans = webseed_piece_spans(&ctx.layout, offset, batch_len);
+    if spans.is_empty() {
+        return webseed_failed_batch(generation, &piece_indices);
+    }
+    for mirror_idx in 0..ctx.bases.len() {
+        if ctx.disabled.lock().contains(&mirror_idx) {
+            continue;
+        }
+        let mut batch = vec![0u8; batch_len as usize];
+        let mut cursor = 0usize;
+        let mut mirror_ok = true;
+        for (file_idx, file_offset, span_len) in &spans {
+            let file = &ctx.layout.files()[*file_idx];
+            let url = match super::webseed::build_file_url(
+                &ctx.bases[mirror_idx],
+                &ctx.info.name,
+                &ctx.info.files[*file_idx].path,
+                ctx.info.single_file_mode,
+            ) {
+                Ok(url) => url,
+                Err(_) => {
+                    ctx.disabled.lock().insert(mirror_idx);
+                    mirror_ok = false;
+                    break;
+                }
+            };
+            let mut span_cursor = 0u64;
+            while span_cursor < *span_len {
+                let request_len = (*span_len - span_cursor).min(WEBSEED_MAX_RANGE_BYTES);
+                let Some(start) = file_offset.checked_add(span_cursor) else {
+                    ctx.disabled.lock().insert(mirror_idx);
+                    mirror_ok = false;
+                    break;
+                };
+                let requested = match super::webseed::validate_range(
+                    start,
+                    start + request_len - 1,
+                    file.length,
+                    WEBSEED_MAX_RANGE_BYTES,
+                ) {
+                    Ok(requested) => requested,
+                    Err(_) => {
+                        ctx.disabled.lock().insert(mirror_idx);
+                        mirror_ok = false;
+                        break;
+                    }
+                };
+                let mut fetched = None;
+                for attempt in 0..3u32 {
+                    match super::webseed::fetch_range_response(
+                        &ctx.client,
+                        &url,
+                        requested,
+                        WEBSEED_MAX_RANGE_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let representation_changed = {
+                                let mut etags = ctx.etags.lock();
+                                let etag_key = (mirror_idx, *file_idx);
+                                match response.etag {
+                                    Some(etag) => {
+                                        if etags
+                                            .get(&etag_key)
+                                            .is_some_and(|previous| previous != &etag)
+                                        {
+                                            true
+                                        } else {
+                                            etags.entry(etag_key).or_insert(etag);
+                                            false
+                                        }
+                                    }
+                                    None => etags.contains_key(&etag_key),
+                                }
+                            };
+                            if representation_changed {
+                                ctx.disabled.lock().insert(mirror_idx);
+                                mirror_ok = false;
+                                break;
+                            }
+                            fetched = Some(response.body);
+                            break;
+                        }
+                        Err(super::webseed::WebSeedError::UnexpectedStatus(status))
+                            if super::webseed::is_retryable_status(status) && attempt < 2 =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64))
+                                .await;
+                        }
+                        Err(super::webseed::WebSeedError::Http(_)) if attempt < 2 => {
+                            tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64))
+                                .await;
+                        }
+                        Err(super::webseed::WebSeedError::UnexpectedStatus(status))
+                            if super::webseed::is_permanent_status(status) =>
+                        {
+                            ctx.disabled.lock().insert(mirror_idx);
+                            mirror_ok = false;
+                            break;
+                        }
+                        Err(super::webseed::WebSeedError::Http(_)) => {
+                            mirror_ok = false;
+                            break;
+                        }
+                        Err(_) => {
+                            ctx.disabled.lock().insert(mirror_idx);
+                            mirror_ok = false;
+                            break;
+                        }
+                    }
+                }
+                let Some(bytes) = fetched else {
+                    break;
+                };
+                let end_cursor = cursor.saturating_add(bytes.len());
+                if end_cursor > batch.len() || bytes.len() as u64 != request_len {
+                    ctx.disabled.lock().insert(mirror_idx);
+                    mirror_ok = false;
+                    break;
+                }
+                batch[cursor..end_cursor].copy_from_slice(&bytes);
+                cursor = end_cursor;
+                span_cursor += request_len;
+            }
+            if !mirror_ok || span_cursor != *span_len {
+                break;
+            }
+        }
+        if !mirror_ok || cursor != batch.len() {
+            continue;
+        }
+
+        let mut pieces = Vec::with_capacity(piece_indices.len());
+        let mut piece_cursor = 0usize;
+        for piece_index in &piece_indices {
+            let Ok(vpi) = ctx.lengths.validate_piece(*piece_index) else {
+                return webseed_failed_batch(generation, &piece_indices);
+            };
+            let piece_len = ctx.lengths.piece_length_of(vpi) as usize;
+            let end = piece_cursor.saturating_add(piece_len);
+            let Some(piece) = batch.get(piece_cursor..end) else {
+                return webseed_failed_batch(generation, &piece_indices);
+            };
+            if ctx.verifier.verify(*piece_index, piece).is_err() {
+                ctx.disabled.lock().insert(mirror_idx);
+                mirror_ok = false;
+                break;
+            }
+            let write_failed = ctx
+                .storage
+                .write_at_owned(ctx.lengths.piece_offset(vpi), Bytes::copy_from_slice(piece))
+                .await
+                .is_err();
+            pieces.push(VerifyResult {
+                piece_index: *piece_index,
+                write_failed,
+                verify_ok: !write_failed,
+            });
+            piece_cursor = end;
+        }
+        if mirror_ok && piece_cursor == batch.len() {
+            return WebSeedBatchResult { generation, pieces };
+        }
+    }
+    webseed_failed_batch(generation, &piece_indices)
+}
+
+fn schedule_webseed_workers(
+    tasks: &mut tokio::task::JoinSet<WebSeedBatchResult>,
+    inflight: &mut HashSet<u32>,
+    piece_tracker: &mut PieceTracker,
+    ctx: &WebSeedContext,
+) {
+    if tasks.len() >= WEBSEED_MAX_WORKERS || !ctx.has_available_mirror() {
+        return;
+    }
+    let mut candidates: Vec<u32> = piece_tracker
+        .choose_missing_pieces()
+        .into_iter()
+        .map(|piece| piece.get())
+        .collect();
+    candidates.sort_unstable();
+    candidates.retain(|piece| !inflight.contains(piece));
+    for batch in contiguous_webseed_batches(&candidates, WEBSEED_MAX_PIECES_PER_JOB) {
+        if tasks.len() >= WEBSEED_MAX_WORKERS {
+            break;
+        }
+        for piece_index in &batch {
+            let Ok(vpi) = ctx.lengths.validate_piece(*piece_index) else {
+                continue;
+            };
+            inflight.insert(*piece_index);
+            piece_tracker.mark_in_flight(vpi);
+        }
+        let worker_ctx = ctx.clone();
+        tasks.spawn(async move { fetch_webseed_batch(worker_ctx, batch).await });
+    }
+}
+
+fn contiguous_webseed_batches(candidates: &[u32], max_pieces: usize) -> Vec<Vec<u32>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    for &piece in candidates {
+        let adjacent = batch
+            .last()
+            .is_some_and(|previous: &u32| piece == previous.saturating_add(1));
+        if !batch.is_empty() && (!adjacent || batch.len() == max_pieces.max(1)) {
+            batches.push(std::mem::take(&mut batch));
+        }
+        batch.push(piece);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
 /// Clear the endgame flag once the working set grows back above the activation threshold; endgame is otherwise a one-way ratchet (set when `pending_chunks() <= 64`, never cleared) that would keep pieces re-queued via `reset_piece` after a hash/write failure off the cheap sequential-scan path in `next_chunk` and force every peer through the `choose_piece_excluding` fallback for the rest of the download
 fn maybe_clear_endgame(chunk_tracker: &mut ChunkTracker) {
     if chunk_tracker.endgame() && chunk_tracker.pending_chunks() > 64 {
@@ -2147,6 +3028,7 @@ fn handle_holepunch(
     dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
     useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
     known_addrs: &mut HashSet<SocketAddr>,
+    holepunch_targets: &mut HashSet<SocketAddr>,
     blocklist: &RwLock<BlockList>,
 ) {
     match hp.msg_type {
@@ -2159,7 +3041,7 @@ fn handle_holepunch(
                 .map(|peer| peer.addr)
                 .chain(pending_dials.values().copied())
                 .collect::<HashSet<_>>();
-            promote_holepunch_candidate(
+            if promote_holepunch_candidate(
                 hp.addr,
                 &active_addrs,
                 priority_backlog,
@@ -2167,9 +3049,15 @@ fn handle_holepunch(
                 dial_retries,
                 useful_redials,
                 known_addrs,
-            );
+            ) {
+                holepunch_targets.insert(hp.addr);
+            }
         }
         holepunch_type::RENDEZVOUS => {
+            // A peer that did not advertise the extension
+            let Some(from_hp_id) = from_hp_id else {
+                return;
+            };
             // We are the relay
             enum Relay {
                 Connect(mpsc::Sender<PeerCommand>, u8),
@@ -2177,13 +3065,15 @@ fn handle_holepunch(
             }
             let action = if hp.addr == from_addr {
                 Relay::Err(holepunch_err::NO_SELF)
+            } else if !super::magnet::is_dialable_peer_addr(hp.addr) {
+                Relay::Err(holepunch_err::NO_SUCH_PEER)
             } else {
                 match peers.values().find(|p| p.addr == hp.addr) {
                     Some(t) => match t.their_ut_holepunch_id {
                         Some(thp) => Relay::Connect(t.cmd_tx.clone(), thp),
                         None => Relay::Err(holepunch_err::NO_SUPPORT),
                     },
-                    None => Relay::Err(holepunch_err::NO_SUCH_PEER),
+                    None => Relay::Err(holepunch_err::NOT_CONNECTED),
                 }
             };
             match action {
@@ -2194,20 +3084,16 @@ fn handle_holepunch(
                         payload: build_holepunch(holepunch_type::CONNECT, from_addr, 0),
                     }));
                     // and tell the initiator to connect to the target
-                    if let Some(fid) = from_hp_id {
-                        let _ = from_cmd.try_send(PeerCommand::Send(Message::Extended {
-                            ext_id: fid,
-                            payload: build_holepunch(holepunch_type::CONNECT, hp.addr, 0),
-                        }));
-                    }
+                    let _ = from_cmd.try_send(PeerCommand::Send(Message::Extended {
+                        ext_id: from_hp_id,
+                        payload: build_holepunch(holepunch_type::CONNECT, hp.addr, 0),
+                    }));
                 }
                 Relay::Err(code) => {
-                    if let Some(fid) = from_hp_id {
-                        let _ = from_cmd.try_send(PeerCommand::Send(Message::Extended {
-                            ext_id: fid,
-                            payload: build_holepunch(holepunch_type::ERROR, hp.addr, code),
-                        }));
-                    }
+                    let _ = from_cmd.try_send(PeerCommand::Send(Message::Extended {
+                        ext_id: from_hp_id,
+                        payload: build_holepunch(holepunch_type::ERROR, hp.addr, code),
+                    }));
                 }
             }
         }
@@ -2426,6 +3312,7 @@ fn drain_peer_backlog(
     pending_dials: &mut HashMap<u32, SocketAddr>,
     known_addrs: &mut HashSet<SocketAddr>,
     useful_peers: &HashMap<SocketAddr, usize>,
+    holepunch_targets: &HashSet<SocketAddr>,
     next_pid: &mut u32,
     live_peers: usize,
     max_peers: usize,
@@ -2436,6 +3323,7 @@ fn drain_peer_backlog(
     peer_event_tx: &mpsc::Sender<(u32, PeerEvent)>,
     encryption: crate::peer::EncryptionPolicy,
     advertise_v2: bool,
+    advertise_dht: bool,
     ext_handshake_builder: &crate::peer::ExtHandshakeBuilder,
     utp: &Option<Arc<UtpSocket>>,
     proxy: &Option<risuko_http::ProxyConnector>,
@@ -2472,6 +3360,7 @@ fn drain_peer_backlog(
         *next_pid += 1;
         pending_dials.insert(pid, addr);
         let known_useful = useful_peers.contains_key(&addr);
+        let prefer_utp = holepunch_targets.contains(&addr);
         let abort = outbound_tasks.spawn(run_outbound_peer(
             torrent_id,
             pid,
@@ -2482,8 +3371,10 @@ fn drain_peer_backlog(
             peer_event_tx.clone(),
             encryption,
             advertise_v2,
+            advertise_dht,
             Some(ext_handshake_builder.clone()),
             utp.clone(),
+            prefer_utp,
             known_useful,
             proxy.clone(),
         ));
@@ -2604,7 +3495,9 @@ async fn broadcast_have(peers: &mut HashMap<u32, Peer>, piece_index: u32) {
 }
 
 fn request_peer_eligible(peer: &Peer) -> bool {
-    !peer.peer_choking && peer.am_interested && !peer.snubbing
+    (!peer.peer_choking || !peer.remote_allowed_fast.is_empty())
+        && peer.am_interested
+        && !peer.snubbing
 }
 
 fn effective_request_limit(adaptive_limit: usize, active_request_peers: usize) -> usize {
@@ -2798,6 +3691,7 @@ fn cancel_outstanding(
         };
         // Drop our local record first so a duplicate Piece response is rejected as unsolicited even if the peer ignores Cancel
         other.outstanding.swap_remove(slot);
+        remember_canceled_request(other, (index, begin, length));
         let _ = other.cmd_tx.try_send(PeerCommand::Send(Message::Cancel {
             index,
             begin,
@@ -2814,6 +3708,7 @@ fn cancel_piece_outstanding(peers: &mut HashMap<u32, Peer>, piece_index: u32) {
             let (p, begin, length) = other.outstanding[i];
             if p == piece_index {
                 other.outstanding.swap_remove(i);
+                remember_canceled_request(other, (p, begin, length));
                 let _ = other.cmd_tx.try_send(PeerCommand::Send(Message::Cancel {
                     index: piece_index,
                     begin,
@@ -2824,6 +3719,14 @@ fn cancel_piece_outstanding(peers: &mut HashMap<u32, Peer>, piece_index: u32) {
             }
         }
     }
+}
+
+fn remember_canceled_request(peer: &mut Peer, request: (u32, u32, u32)) {
+    const MAX_CANCELED_REQUESTS: usize = 4096;
+    if peer.canceled_requests.len() >= MAX_CANCELED_REQUESTS {
+        peer.canceled_requests.clear();
+    }
+    peer.canceled_requests.insert(request);
 }
 
 /// Pipeline requests for a single peer up to its adaptive `max_outstanding`; called both on the tick and inline after events that can unblock a peer (Unchoke, Bitfield, Have, Piece), since without the inline calls throughput is capped at `max_outstanding * CHUNK_SIZE / tick_interval`
@@ -2849,7 +3752,9 @@ async fn drive_peer(
     let mut request_slots = remaining_request_budget;
 
     let mut exhausted: HashSet<u32> = HashSet::new();
-    let requestable_pieces = piece_tracker.choose_requestable_pieces(&peer.bitfield, pid);
+    let mut requestable_pieces = piece_tracker.choose_requestable_pieces(&peer.bitfield, pid);
+    requestable_pieces
+        .sort_by_key(|piece| (!peer.suggested_pieces.contains(&piece.get()), piece.get()));
     let mut requestable_idx = 0usize;
     let mut endgame_pieces: Option<Vec<super::core::ValidPieceIndex>> = None;
     let mut endgame_idx = 0usize;
@@ -2862,7 +3767,10 @@ async fn drive_peer(
                 loop {
                     if let Some(piece) = requestable_pieces.get(requestable_idx).copied() {
                         requestable_idx += 1;
-                        if !exhausted.contains(&piece.get()) {
+                        if !exhausted.contains(&piece.get())
+                            && (!peer.peer_choking
+                                || peer.remote_allowed_fast.contains(&piece.get()))
+                        {
                             selected = Some(piece);
                             break;
                         }
@@ -2878,7 +3786,10 @@ async fn drive_peer(
                         });
                         if let Some(piece) = pieces.get(endgame_idx).copied() {
                             endgame_idx += 1;
-                            if !exhausted.contains(&piece.get()) {
+                            if !exhausted.contains(&piece.get())
+                                && (!peer.peer_choking
+                                    || peer.remote_allowed_fast.contains(&piece.get()))
+                            {
                                 selected = Some(piece);
                                 break;
                             }
@@ -3289,28 +4200,44 @@ where
     out
 }
 
-fn collect_trackers(meta: &TorrentMeta) -> Vec<String> {
-    let mut v = Vec::new();
-    let mut push = |raw: &str| {
-        for part in raw
-            .split([',', '\n', '\r'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if !v.iter().any(|x| x == part) {
-                v.push(part.to_string());
-            }
-        }
+fn collect_tracker_tiers(meta: &TorrentMeta) -> Vec<Vec<String>> {
+    let source = if !meta.announce_list.is_empty() {
+        meta.announce_list.clone()
+    } else {
+        meta.announce
+            .as_deref()
+            .map(|raw| {
+                raw.split([',', '\n', '\r'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .collect()
     };
-    if let Some(a) = &meta.announce {
-        push(a);
-    }
-    for tier in &meta.announce_list {
-        for url in tier {
-            push(url);
-        }
-    }
-    v
+
+    let mut seen = HashSet::new();
+    source
+        .into_iter()
+        .map(|tier| {
+            let mut urls = tier
+                .into_iter()
+                .filter(|url| seen.insert(url.clone()))
+                .collect::<Vec<_>>();
+            let mut rng = rand::rng();
+            for i in (1..urls.len()).rev() {
+                let j = (rand::RngExt::random::<u64>(&mut rng) as usize) % (i + 1);
+                urls.swap(i, j);
+            }
+            urls
+        })
+        .filter(|tier: &Vec<String>| !tier.is_empty())
+        .collect()
+}
+
+fn flatten_tracker_tiers(tiers: &[Vec<String>]) -> Vec<String> {
+    tiers.iter().flatten().cloned().collect()
 }
 
 struct TrackerPollers {
@@ -3321,34 +4248,6 @@ struct TrackerPollers {
 impl TrackerPollers {
     fn is_empty(&self) -> bool {
         self.tasks.is_empty()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_additional(
-        &mut self,
-        tx: mpsc::Sender<SocketAddr>,
-        trackers: Vec<String>,
-        info_hashes: Vec<Id20>,
-        peer_id: Id20,
-        port: u16,
-        stats: Arc<Mutex<TorrentStats>>,
-        proxy: Option<risuko_http::ProxyConnector>,
-    ) {
-        let shutdown_rx = self.shutdown_tx.subscribe();
-        for url in trackers {
-            for info_hash in &info_hashes {
-                self.tasks.spawn(run_tracker_poller(
-                    tx.clone(),
-                    url.clone(),
-                    *info_hash,
-                    peer_id,
-                    port,
-                    Arc::clone(&stats),
-                    shutdown_rx.clone(),
-                    proxy.clone(),
-                ));
-            }
-        }
     }
 
     async fn shutdown(&mut self, announce_stopped: bool) {
@@ -3397,6 +4296,7 @@ fn tracker_retry_delay(consecutive_failures: u32) -> Duration {
     Duration::from_secs(BACKOFF_SECS[idx.min(BACKOFF_SECS.len() - 1)])
 }
 
+#[cfg(test)]
 fn tracker_event_for_attempt(
     pending: AnnounceEvent,
     finished: bool,
@@ -3409,6 +4309,7 @@ fn tracker_event_for_attempt(
     }
 }
 
+#[cfg(test)]
 fn tracker_event_after_success(sent: AnnounceEvent, sent_completed: &mut bool) -> AnnounceEvent {
     if matches!(sent, AnnounceEvent::Completed) {
         *sent_completed = true;
@@ -3419,6 +4320,7 @@ fn tracker_event_after_success(sent: AnnounceEvent, sent_completed: &mut bool) -
 fn tracker_request(
     info_hash: Id20,
     peer_id: Id20,
+    key: u32,
     port: u16,
     stats: &Arc<Mutex<TorrentStats>>,
     event: AnnounceEvent,
@@ -3435,6 +4337,7 @@ fn tracker_request(
     AnnounceRequest {
         info_hash,
         peer_id,
+        key,
         port,
         uploaded,
         downloaded,
@@ -3444,97 +4347,278 @@ fn tracker_request(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_tracker_poller(
-    tx: mpsc::Sender<SocketAddr>,
+#[derive(Clone)]
+struct TrackerUrlState {
     url: String,
+    next_at: Instant,
+    failures: u32,
+    started_sent: bool,
+    completed_sent: bool,
+}
+
+#[derive(Clone)]
+struct TrackerRunState {
+    tiers: Vec<Vec<TrackerUrlState>>,
+    active_tier: usize,
+    active_url: usize,
+    last_successful_tier: Option<usize>,
+}
+
+#[derive(Default)]
+struct TrackerLifecycle {
+    by_info_hash: HashMap<Id20, TrackerRunState>,
+}
+
+impl TrackerLifecycle {
+    fn run_state(&mut self, info_hash: Id20, tiers: &[Vec<String>]) -> &mut TrackerRunState {
+        self.by_info_hash.entry(info_hash).or_insert_with(|| {
+            let now = Instant::now();
+            TrackerRunState {
+                tiers: tiers
+                    .iter()
+                    .map(|tier| {
+                        tier.iter()
+                            .cloned()
+                            .map(|url| TrackerUrlState {
+                                url,
+                                next_at: now,
+                                failures: 0,
+                                started_sent: false,
+                                completed_sent: false,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                active_tier: 0,
+                active_url: 0,
+                last_successful_tier: None,
+            }
+        })
+    }
+
+    fn append_tier(&mut self, urls: &[String]) {
+        if urls.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for state in self.by_info_hash.values_mut() {
+            state.tiers.push(
+                urls.iter()
+                    .cloned()
+                    .map(|url| TrackerUrlState {
+                        url,
+                        next_at: now,
+                        failures: 0,
+                        started_sent: false,
+                        completed_sent: false,
+                    })
+                    .collect(),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tracker_tier_poller(
+    tx: mpsc::Sender<PeerEnvelope>,
+    tiers: Vec<Vec<String>>,
     info_hash: Id20,
     peer_id: Id20,
+    key: u32,
     port: u16,
     stats: Arc<Mutex<TorrentStats>>,
     mut shutdown: watch::Receiver<Option<bool>>,
     proxy: Option<risuko_http::ProxyConnector>,
+    lifecycle: Arc<Mutex<TrackerLifecycle>>,
+    tier_change_tx: Option<mpsc::Sender<()>>,
+    tracker_source_addr: Option<SocketAddr>,
+    generation: GenerationToken,
 ) {
-    let mut pending_event = AnnounceEvent::Started;
-    let mut sent_completed = false;
-    let mut consecutive_failures = 0u32;
+    if tiers.is_empty() {
+        return;
+    }
 
     'poll: loop {
         if shutdown.borrow().is_some() {
             break;
         }
-        let finished = stats.lock().finished;
-        pending_event = tracker_event_for_attempt(pending_event, finished, sent_completed);
-        let event = pending_event;
-        let req = tracker_request(info_hash, peer_id, port, &stats, event, 200);
+        let selected = {
+            let mut lifecycle = lifecycle.lock();
+            let state = lifecycle.run_state(info_hash, &tiers);
+            if state.tiers.is_empty() {
+                break;
+            }
+            if state.active_tier >= state.tiers.len() {
+                state.active_tier = 0;
+                state.active_url = 0;
+            }
+            if state.tiers[state.active_tier].is_empty() {
+                state.active_tier = (state.active_tier + 1) % state.tiers.len();
+                state.active_url = 0;
+            }
+            let (index, selected) = state.tiers[state.active_tier]
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.next_at)
+                .expect("non-empty tracker tier");
+            state.active_url = index;
+            selected.clone()
+        };
+        let wait = selected.next_at.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'poll,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            continue;
+        }
 
+        let finished = stats.lock().finished;
+        let event = if !selected.started_sent {
+            AnnounceEvent::Started
+        } else if finished && !selected.completed_sent {
+            AnnounceEvent::Completed
+        } else {
+            AnnounceEvent::None
+        };
+        let req = tracker_request(info_hash, peer_id, key, port, &stats, event, 200);
+        let request_generation = generation.current();
         let result = tokio::select! {
             biased;
             _ = shutdown.changed() => break 'poll,
-            result = super::tracker::announce_with_proxy(&url, &req, TRACKER_ANNOUNCE_TIMEOUT, proxy.as_ref()) => result,
+            result = super::tracker::announce_with_proxy_and_source(
+                &selected.url,
+                &req,
+                TRACKER_ANNOUNCE_TIMEOUT,
+                proxy.as_ref(),
+                tracker_source_addr,
+            ) => result,
         };
-
-        let delay = match result {
+        match result {
             Ok(resp) => {
-                tracing::info!(
-                    target: "diag",
-                    "tracker ANNOUNCE ok url={url} event={event:?} peers={} interval_s={}",
-                    resp.peers.len(),
-                    resp.interval.as_secs()
-                );
-                consecutive_failures = 0;
-                pending_event = tracker_event_after_success(event, &mut sent_completed);
+                tracing::info!(target: "diag", "tracker ANNOUNCE ok url={} event={event:?} peers={} interval_s={}", selected.url, resp.peers.len(), resp.interval.as_secs());
+                let changed_tier = {
+                    let mut lifecycle = lifecycle.lock();
+                    let state = lifecycle.run_state(info_hash, &tiers);
+                    let selected_tier = state.active_tier;
+                    let tier = &mut state.tiers[state.active_tier];
+                    if let Some(index) = tier.iter().position(|entry| entry.url == selected.url) {
+                        let mut updated = tier.remove(index);
+                        updated.failures = 0;
+                        if event == AnnounceEvent::Started {
+                            updated.started_sent = true;
+                        } else if event == AnnounceEvent::Completed {
+                            updated.completed_sent = true;
+                        }
+                        updated.next_at = Instant::now() + clamp_tracker_interval(resp.interval);
+                        tier.insert(0, updated);
+                        state.active_url = 0;
+                    }
+                    state
+                        .last_successful_tier
+                        .replace(selected_tier)
+                        .is_some_and(|previous| previous != selected_tier)
+                };
+                if changed_tier {
+                    if let Some(tx) = &tier_change_tx {
+                        let _ = tx.try_send(());
+                    }
+                }
                 for addr in resp.peers {
                     let sent = tokio::select! {
                         biased;
                         _ = shutdown.changed() => break 'poll,
-                        sent = tx.send(addr) => sent,
+                        sent = tx.send(PeerEnvelope {
+                            generation: request_generation,
+                            candidate: PeerCandidate { addr, source: PeerSource::Tracker },
+                        }) => sent,
                     };
                     if sent.is_err() {
                         break 'poll;
                     }
                 }
-                clamp_tracker_interval(resp.interval)
             }
             Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                let delay = tracker_retry_delay(consecutive_failures);
-                tracing::info!(
-                    target: "diag",
-                    "tracker ANNOUNCE fail url={url} event={event:?} retry_s={} err={e}",
-                    delay.as_secs()
-                );
-                delay
+                let changed_tier = {
+                    let mut lifecycle = lifecycle.lock();
+                    let state = lifecycle.run_state(info_hash, &tiers);
+                    let tier_index = state.active_tier;
+                    let previous_tier = tier_index;
+                    if let Some(index) = state.tiers[tier_index]
+                        .iter()
+                        .position(|entry| entry.url == selected.url)
+                    {
+                        let entry = &mut state.tiers[tier_index][index];
+                        entry.failures = entry.failures.saturating_add(1);
+                        let delay = tracker_retry_delay(entry.failures);
+                        entry.next_at = Instant::now() + delay;
+                        tracing::info!(target: "diag", "tracker ANNOUNCE fail url={} event={event:?} retry_s={} err={e}", selected.url, delay.as_secs());
+                        state.active_url = index;
+                        let tier_failed = state.tiers[tier_index]
+                            .iter()
+                            .all(|entry| entry.failures > 0);
+                        if tier_failed {
+                            state.active_tier = (state.active_tier + 1) % state.tiers.len();
+                            state.active_url = 0;
+                            let now = Instant::now();
+                            for entry in &mut state.tiers[state.active_tier] {
+                                entry.failures = 0;
+                                entry.next_at = now;
+                            }
+                        }
+                    }
+                    state.active_tier != previous_tier
+                };
+                if changed_tier {
+                    if let Some(tx) = &tier_change_tx {
+                        let _ = tx.try_send(());
+                    }
+                }
             }
-        };
-
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep(delay) => {}
         }
     }
 
     if !(*shutdown.borrow()).unwrap_or(true) {
         return;
     }
-
-    let stopped = tracker_request(info_hash, peer_id, port, &stats, AnnounceEvent::Stopped, 0);
-    match super::tracker::announce_with_proxy(
-        &url,
-        &stopped,
-        TRACKER_STOPPED_TIMEOUT,
-        proxy.as_ref(),
-    )
-    .await
-    {
-        Ok(_) => tracing::debug!("tracker STOPPED ok url={url}"),
-        Err(e) => tracing::debug!("tracker STOPPED failed url={url}: {e}"),
+    let started = lifecycle
+        .lock()
+        .run_state(info_hash, &tiers)
+        .tiers
+        .iter()
+        .flatten()
+        .filter(|state| state.started_sent)
+        .cloned()
+        .collect::<Vec<_>>();
+    for state in started {
+        let stopped = tracker_request(
+            info_hash,
+            peer_id,
+            key,
+            port,
+            &stats,
+            AnnounceEvent::Stopped,
+            0,
+        );
+        match super::tracker::announce_with_proxy_and_source(
+            &state.url,
+            &stopped,
+            TRACKER_STOPPED_TIMEOUT,
+            proxy.as_ref(),
+            tracker_source_addr,
+        )
+        .await
+        {
+            Ok(_) => tracing::debug!("tracker STOPPED ok url={}", state.url),
+            Err(e) => tracing::debug!("tracker STOPPED failed url={}: {e}", state.url),
+        }
     }
 }
 
+#[cfg(test)]
 fn spawn_tracker_pollers(
-    tx: mpsc::Sender<SocketAddr>,
+    tx: mpsc::Sender<PeerEnvelope>,
     trackers: Vec<String>,
     info_hashes: Vec<Id20>,
     peer_id: Id20,
@@ -3542,19 +4626,64 @@ fn spawn_tracker_pollers(
     stats: Arc<Mutex<TorrentStats>>,
     proxy: Option<risuko_http::ProxyConnector>,
 ) -> TrackerPollers {
+    let tiers = if trackers.is_empty() {
+        Vec::new()
+    } else {
+        vec![trackers]
+    };
+    let key = info_hashes
+        .first()
+        .map(|h| u32::from_be_bytes(h.0[..4].try_into().unwrap()))
+        .unwrap_or_default();
+    spawn_tracker_tier_pollers(
+        tx,
+        tiers,
+        info_hashes,
+        peer_id,
+        key,
+        port,
+        stats,
+        proxy,
+        Arc::new(Mutex::new(TrackerLifecycle::default())),
+        None,
+        None,
+        GenerationToken::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tracker_tier_pollers(
+    tx: mpsc::Sender<PeerEnvelope>,
+    tiers: Vec<Vec<String>>,
+    info_hashes: Vec<Id20>,
+    peer_id: Id20,
+    key: u32,
+    port: u16,
+    stats: Arc<Mutex<TorrentStats>>,
+    proxy: Option<risuko_http::ProxyConnector>,
+    lifecycle: Arc<Mutex<TrackerLifecycle>>,
+    tier_change_tx: Option<mpsc::Sender<()>>,
+    tracker_source_addr: Option<SocketAddr>,
+    generation: GenerationToken,
+) -> TrackerPollers {
     let (shutdown_tx, shutdown_rx) = watch::channel(None);
     let mut tasks = tokio::task::JoinSet::new();
-    for url in trackers {
-        for info_hash in &info_hashes {
-            tasks.spawn(run_tracker_poller(
+    for info_hash in info_hashes {
+        if !tiers.is_empty() {
+            tasks.spawn(run_tracker_tier_poller(
                 tx.clone(),
-                url.clone(),
-                *info_hash,
+                tiers.clone(),
+                info_hash,
                 peer_id,
+                key,
                 port,
                 Arc::clone(&stats),
                 shutdown_rx.clone(),
                 proxy.clone(),
+                Arc::clone(&lifecycle),
+                tier_change_tx.clone(),
+                tracker_source_addr,
+                generation.clone(),
             ));
         }
     }
@@ -3874,6 +5003,7 @@ mod tests {
         let mut dial_retries = VecDeque::new();
         let mut useful_redials = VecDeque::new();
         let mut known_addrs = HashSet::new();
+        let mut holepunch_targets = HashSet::new();
 
         handle_holepunch(
             HolepunchMsg {
@@ -3891,6 +5021,7 @@ mod tests {
             &mut dial_retries,
             &mut useful_redials,
             &mut known_addrs,
+            &mut holepunch_targets,
             &RwLock::new(list),
         );
 
@@ -3899,6 +5030,44 @@ mod tests {
         assert!(dial_retries.is_empty());
         assert!(useful_redials.is_empty());
         assert!(known_addrs.is_empty());
+        assert!(holepunch_targets.is_empty());
+    }
+
+    #[test]
+    fn holepunch_connect_marks_target_for_utp_first_dial() {
+        let target = test_peer(14_003);
+        let (from_cmd, _rx) = mpsc::channel(1);
+        let peers = HashMap::new();
+        let pending_dials = HashMap::new();
+        let mut priority_backlog = VecDeque::new();
+        let mut peer_backlog = VecDeque::new();
+        let mut dial_retries = VecDeque::new();
+        let mut useful_redials = VecDeque::new();
+        let mut known_addrs = HashSet::new();
+        let mut holepunch_targets = HashSet::new();
+
+        handle_holepunch(
+            HolepunchMsg {
+                msg_type: holepunch_type::CONNECT,
+                addr: target,
+                err_code: 0,
+            },
+            test_peer(14_004),
+            None,
+            &from_cmd,
+            &peers,
+            &pending_dials,
+            &mut priority_backlog,
+            &mut peer_backlog,
+            &mut dial_retries,
+            &mut useful_redials,
+            &mut known_addrs,
+            &mut holepunch_targets,
+            &RwLock::new(BlockList::default()),
+        );
+
+        assert_eq!(priority_backlog, VecDeque::from([target]));
+        assert!(holepunch_targets.contains(&target));
     }
 
     #[test]
@@ -4528,6 +5697,37 @@ mod tests {
     }
 
     #[test]
+    fn fast_initial_availability_covers_empty_full_and_partial_swarms() {
+        assert!(matches!(
+            initial_availability_message(&[0], 4, true),
+            Some(Message::HaveNone)
+        ));
+        assert!(matches!(
+            initial_availability_message(&[0b1111_0000], 4, true),
+            Some(Message::HaveAll)
+        ));
+        assert!(matches!(
+            initial_availability_message(&[0b1010_0000], 4, true),
+            Some(Message::Bitfield(_))
+        ));
+        assert!(initial_availability_message(&[0], 4, false).is_none());
+    }
+
+    #[test]
+    fn fast_peer_rejects_duplicate_initial_availability() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut peer = Peer::connected(test_peer(52_001), cmd_tx, 1, 1, 1, true, true, None);
+        assert!(accept_initial_availability(
+            &mut peer,
+            InitialAvailability::Bitfield
+        ));
+        assert!(!accept_initial_availability(
+            &mut peer,
+            InitialAvailability::HaveAll
+        ));
+    }
+
+    #[test]
     fn build_hash_response_rejects_unknown_root() {
         let (tables, _root) = make_v2_tables(4, 64 * 1024);
         let bogus = [0xAAu8; 32];
@@ -4636,6 +5836,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn allowed_fast_set_is_stable_bounded_and_in_range() {
+        let hash = Id20::new([7; 20]);
+        let addr = "192.0.2.1:6881".parse().unwrap();
+        let first = allowed_fast_set(&hash, addr, 17);
+        assert_eq!(first, allowed_fast_set(&hash, addr, 17));
+        assert!(first.len() <= MAX_FAST_PIECES);
+        assert!(first.iter().all(|index| *index < 17));
+        assert!(first.iter().collect::<HashSet<_>>().len() == first.len());
+    }
+
+    #[test]
+    fn lifecycle_generation_invalidates_stale_worker_results() {
+        let token = GenerationToken::new();
+        let first = token.current();
+        assert!(token.is_current(first));
+        let second = token.bump();
+        assert!(!token.is_current(first));
+        assert!(token.is_current(second));
+    }
+
+    #[test]
+    fn tracker_lifecycle_preserves_events_and_promoted_url_across_restart() {
+        let hash = Id20::new([9; 20]);
+        let tiers = vec![vec![
+            "https://one.example/announce".to_string(),
+            "https://two.example/announce".to_string(),
+        ]];
+        let mut lifecycle = TrackerLifecycle::default();
+        {
+            let state = lifecycle.run_state(hash, &tiers);
+            state.active_url = 1;
+            state.tiers[0][1].started_sent = true;
+            let promoted = state.tiers[0].remove(1);
+            state.tiers[0].insert(0, promoted);
+            state.active_url = 0;
+        }
+        let restored = lifecycle.run_state(hash, &tiers);
+        assert_eq!(restored.tiers[0][0].url, "https://two.example/announce");
+        assert!(restored.tiers[0][0].started_sent);
+        lifecycle.append_tier(&["https://new.example/announce".to_string()]);
+        assert_eq!(lifecycle.run_state(hash, &tiers).tiers.len(), 2);
+    }
+
     #[tokio::test]
     async fn add_trackers_after_shutdown_uses_a_fresh_poller_set() {
         let (tx, _rx) = mpsc::channel(8);
@@ -4664,6 +5908,110 @@ mod tests {
             pollers.shutdown_tx.borrow().is_none(),
             "recreated pollers must not inherit the previous shutdown latch"
         );
+    }
+
+    #[test]
+    fn webseed_scheduler_groups_bounded_contiguous_piece_jobs() {
+        let jobs = contiguous_webseed_batches(&[0, 1, 2, 3, 5, 6, 9], 3);
+        assert_eq!(jobs, vec![vec![0, 1, 2], vec![3], vec![5, 6], vec![9]]);
+    }
+
+    #[test]
+    fn webseed_batch_maps_one_contiguous_range_across_files() {
+        let info = ValidatedTorrentMetaV1Info {
+            name: "bundle".into(),
+            piece_length: 4,
+            pieces: vec![0; 60],
+            private: false,
+            files: vec![
+                TorrentMetaInfo {
+                    path: vec!["first.bin".into()],
+                    length: 5,
+                },
+                TorrentMetaInfo {
+                    path: vec!["second.bin".into()],
+                    length: 7,
+                },
+            ],
+            single_file_mode: false,
+        };
+        let layout = FileSet::from_meta(&info, Path::new("/tmp/risuko-webseed-test"));
+        assert_eq!(
+            webseed_piece_spans(&layout, 0, 12),
+            vec![(0, 0, 5), (1, 0, 7)]
+        );
+    }
+
+    #[tokio::test]
+    async fn webseed_batch_fetches_adjacent_pieces_in_one_http_range() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = b"abcdefghijkl";
+        let mut piece_hashes = Vec::new();
+        for piece in payload.chunks(4) {
+            piece_hashes.extend_from_slice(crate::core::hash::sha1(piece).as_bytes());
+        }
+        let info = Arc::new(ValidatedTorrentMetaV1Info {
+            name: "payload.bin".into(),
+            piece_length: 4,
+            pieces: piece_hashes.clone(),
+            private: false,
+            files: vec![TorrentMetaInfo {
+                path: vec!["payload.bin".into()],
+                length: payload.len() as u64,
+            }],
+            single_file_mode: true,
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /payload.bin HTTP/1.1\r\n"));
+            assert!(request.contains("range: bytes=0-11\r\n"), "{request:?}");
+            socket
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 12\r\nContent-Range: bytes 0-11/12\r\nETag: \"batch-v1\"\r\nConnection: close\r\n\r\nabcdefghijkl",
+                )
+                .await
+                .unwrap();
+        });
+
+        let lengths = Lengths::new(payload.len() as u64, 4).unwrap();
+        let ctx = WebSeedContext {
+            client: build_webseed_client(None).unwrap(),
+            bases: Arc::new(vec![format!("http://{addr}/")]),
+            disabled: Arc::new(Mutex::new(HashSet::new())),
+            etags: Arc::new(Mutex::new(HashMap::new())),
+            layout: storage.layout().clone(),
+            info,
+            storage: Arc::clone(&storage),
+            verifier: PieceVerifier::V1Sha1 {
+                pieces: Arc::new(piece_hashes),
+            },
+            lengths,
+            generation: GenerationToken::new(),
+        };
+
+        let result = fetch_webseed_batch(ctx, vec![0, 1, 2]).await;
+        assert_eq!(result.pieces.len(), 3);
+        assert!(result
+            .pieces
+            .iter()
+            .all(|piece| piece.verify_ok && !piece.write_failed));
+        server.await.unwrap();
+        let mut stored = [0u8; 12];
+        storage.read_at(0, &mut stored).await.unwrap();
+        assert_eq!(&stored, payload);
     }
 
     #[tokio::test]
@@ -4717,5 +6065,45 @@ mod tests {
             !piece_tracker.has_local(v1),
             "piece that spans the missing file must stay outstanding"
         );
+    }
+
+    #[test]
+    fn private_peer_policy_allows_tracker_only() {
+        let tracker = test_peer(15_001);
+        let dht = test_peer(15_002);
+        let auth = HashSet::new();
+        assert!(peer_source_allowed(
+            true,
+            PeerSource::Tracker,
+            tracker,
+            &auth
+        ));
+        assert!(!peer_source_allowed(true, PeerSource::Dht, dht, &auth));
+        assert!(!peer_source_allowed(true, PeerSource::Manual, dht, &auth));
+    }
+
+    #[test]
+    fn private_peer_policy_allows_reconnect_to_authorized_endpoint() {
+        let addr = test_peer(15_003);
+        let auth = HashSet::from([addr]);
+        assert!(peer_source_allowed(true, PeerSource::Pex, addr, &auth));
+        assert!(peer_source_allowed(true, PeerSource::Manual, addr, &auth));
+    }
+
+    #[test]
+    fn public_peer_policy_accepts_all_sources() {
+        let addr = test_peer(15_004);
+        let auth = HashSet::new();
+        for source in [
+            PeerSource::Manual,
+            PeerSource::Tracker,
+            PeerSource::Dht,
+            PeerSource::Lsd,
+            PeerSource::Pex,
+            PeerSource::Holepunch,
+            PeerSource::WebSeed,
+        ] {
+            assert!(peer_source_allowed(false, source, addr, &auth));
+        }
     }
 }

@@ -1,7 +1,8 @@
 //! Minimal BEP-5 DHT
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +46,196 @@ const ALPHA: usize = 3;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_ROUND_QUERIES: usize = 50;
 const KRPC_DECODE_LIMITS: DecodeLimits = DecodeLimits::new(2048, 16, 1024);
+const PEER_STORE_TTL: Duration = Duration::from_secs(30 * 60);
+const TOKEN_ROTATION: Duration = Duration::from_secs(5 * 60);
+const MAX_STORED_PEERS: usize = 2048;
+const ROUTING_STALE: Duration = Duration::from_secs(15 * 60);
+const MAX_PERSISTED_ROUTES: usize = 4096;
+const ROUTING_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const MAX_KRPC_RESPONSE_BYTES: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct StoredPeer {
+    addr: SocketAddr,
+    seen: Instant,
+}
+
+#[derive(Debug)]
+struct TokenState {
+    current: [u8; 16],
+    previous: [u8; 16],
+    rotated: Instant,
+}
+
+impl TokenState {
+    fn new() -> Self {
+        let mut current = [0u8; 16];
+        rand::rng().fill(&mut current);
+        Self {
+            current,
+            previous: current,
+            rotated: Instant::now(),
+        }
+    }
+
+    fn rotate_if_needed(&mut self) {
+        if self.rotated.elapsed() < TOKEN_ROTATION {
+            return;
+        }
+        self.previous = self.current;
+        rand::rng().fill(&mut self.current);
+        self.rotated = Instant::now();
+    }
+
+    fn token_for(&mut self, addr: SocketAddr) -> Vec<u8> {
+        self.rotate_if_needed();
+        token_for_secret(&self.current, addr)
+    }
+
+    fn valid(&mut self, addr: SocketAddr, token: &[u8]) -> bool {
+        self.rotate_if_needed();
+        token == token_for_secret(&self.current, addr).as_slice()
+            || token == token_for_secret(&self.previous, addr).as_slice()
+    }
+}
+
+#[derive(Debug)]
+struct InboundDhtState {
+    our_id: Id20,
+    routing: Arc<Mutex<RoutingTable>>,
+    routing6: Arc<Mutex<RoutingTable>>,
+    peers: Mutex<HashMap<Id20, Vec<StoredPeer>>>,
+    tokens: Mutex<TokenState>,
+    private_hashes: Mutex<HashSet<Id20>>,
+}
+
+impl InboundDhtState {
+    #[cfg(test)]
+    fn new(our_id: Id20, routing: Arc<Mutex<RoutingTable>>) -> Self {
+        Self::with_routing6(
+            our_id,
+            routing,
+            Arc::new(Mutex::new(RoutingTable::new(our_id))),
+        )
+    }
+
+    fn with_routing6(
+        our_id: Id20,
+        routing: Arc<Mutex<RoutingTable>>,
+        routing6: Arc<Mutex<RoutingTable>>,
+    ) -> Self {
+        Self {
+            our_id,
+            routing,
+            routing6,
+            peers: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(TokenState::new()),
+            private_hashes: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn token(&self, addr: SocketAddr) -> Vec<u8> {
+        self.tokens.lock().token_for(addr)
+    }
+
+    fn valid_token(&self, addr: SocketAddr, token: &[u8]) -> bool {
+        self.tokens.lock().valid(addr, token)
+    }
+
+    fn get_peers(&self, hash: Id20, family: Option<bool>) -> Vec<SocketAddr> {
+        let now = Instant::now();
+        let mut peers = self.peers.lock();
+        let Some(entries) = peers.get_mut(&hash) else {
+            return Vec::new();
+        };
+        entries.retain(|peer| now.duration_since(peer.seen) <= PEER_STORE_TTL);
+        let result = entries
+            .iter()
+            .filter(|peer| {
+                matches!(
+                    (family, peer.addr),
+                    (Some(true), SocketAddr::V6(_)) | (Some(false), SocketAddr::V4(_)) | (None, _)
+                )
+            })
+            .map(|peer| peer.addr)
+            .collect();
+        let empty = entries.is_empty();
+        if empty {
+            peers.remove(&hash);
+        }
+        result
+    }
+
+    fn add_peer(&self, hash: Id20, addr: SocketAddr) {
+        if self.private_hashes.lock().contains(&hash) {
+            return;
+        }
+        let mut peers = self.peers.lock();
+        let entries = peers.entry(hash).or_default();
+        if let Some(existing) = entries.iter_mut().find(|peer| peer.addr == addr) {
+            existing.seen = Instant::now();
+            return;
+        }
+        entries.push(StoredPeer {
+            addr,
+            seen: Instant::now(),
+        });
+        while peers.values().map(Vec::len).sum::<usize>() > MAX_STORED_PEERS {
+            let oldest = peers
+                .iter()
+                .flat_map(|(hash, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(idx, peer)| (*hash, idx, peer.seen))
+                })
+                .min_by_key(|(_, _, seen)| *seen);
+            if let Some((hash, idx, _)) = oldest {
+                if let Some(entries) = peers.get_mut(&hash) {
+                    entries.remove(idx);
+                    if entries.is_empty() {
+                        peers.remove(&hash);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn set_private(&self, hash: Id20, private: bool) {
+        let mut hashes = self.private_hashes.lock();
+        if private {
+            hashes.insert(hash);
+            self.peers.lock().remove(&hash);
+        } else {
+            hashes.remove(&hash);
+        }
+    }
+
+    fn is_private(&self, hash: &Id20) -> bool {
+        self.private_hashes.lock().contains(hash)
+    }
+
+    fn add_routing(&self, id: Id20, addr: SocketAddr) {
+        if !valid_routing_addr(addr) {
+            return;
+        }
+        if addr.is_ipv6() {
+            self.routing6.lock().add(id, addr);
+        } else {
+            self.routing.lock().add(id, addr);
+        }
+    }
+
+    fn closest_nodes(&self, target: &Id20, n: usize) -> Vec<(Id20, SocketAddr)> {
+        let mut nodes = self.routing.lock().closest_nodes(target, n);
+        nodes.extend(self.routing6.lock().closest_nodes(target, n));
+        nodes.sort_by_key(|(id, _)| id.distance(target));
+        nodes.truncate(n);
+        nodes
+    }
+}
 
 /// Process-wide DHT ownership and route state
 #[derive(Default)]
@@ -111,9 +302,14 @@ pub struct Dht {
     our_id: Id20,
     pending: Arc<Mutex<PendingMap>>,
     routing: Arc<Mutex<RoutingTable>>,
+    routing6: Arc<Mutex<RoutingTable>>,
+    bootstrap_hosts: Mutex<Vec<DhtTarget>>,
+    server: Arc<InboundDhtState>,
     reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reader6_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lookup_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    refresh_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    routing_state_path: Option<PathBuf>,
     shutdown: AtomicBool,
 }
 
@@ -196,12 +392,16 @@ impl std::fmt::Debug for Dht {
 
 impl Drop for Dht {
     fn drop(&mut self) {
+        self.persist_configured_routing_state();
         self.shutdown.store(true, Ordering::Release);
         self.abort_lookups();
         if let Some(h) = self.reader_handle.lock().take() {
             h.abort();
         }
         if let Some(h) = self.reader6_handle.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.refresh_handle.lock().take() {
             h.abort();
         }
     }
@@ -222,6 +422,7 @@ impl Dht {
     }
 
     pub async fn shutdown(&self) {
+        self.persist_configured_routing_state();
         self.shutdown.store(true, Ordering::Release);
         self.abort_lookups();
         if let Some(handle) = self.reader_handle.lock().take() {
@@ -230,10 +431,13 @@ impl Dht {
         if let Some(handle) = self.reader6_handle.lock().take() {
             handle.abort();
         }
+        if let Some(handle) = self.refresh_handle.lock().take() {
+            handle.abort();
+        }
     }
 }
 
-type PendingMap = std::collections::HashMap<u16, PendingEntry>;
+type PendingMap = std::collections::HashMap<Vec<u8>, PendingEntry>;
 
 #[derive(Clone)]
 struct PendingToken(Arc<()>);
@@ -258,7 +462,7 @@ struct PendingEntry {
 /// Removes its transaction id from `pending` on drop, keeping aborted lookup tasks from leaving orphaned pending entries
 struct PendingGuard {
     pending: Arc<Mutex<PendingMap>>,
-    txn: u16,
+    txn: Vec<u8>,
     token: PendingToken,
 }
 
@@ -422,8 +626,13 @@ impl Dht {
             guard.last_error = None;
             snapshot
         };
+        let preserved_routes = previous
+            .as_ref()
+            .map(|dht| dht.routing_snapshot())
+            .unwrap_or_default();
         let next = match Dht::spawn_with_proxy(proxy).await {
             Ok(dht) => {
+                dht.add_bootstrap_nodes(preserved_routes);
                 let warm = dht.clone();
                 tokio::spawn(async move { warm.bootstrap().await });
                 Some(dht)
@@ -477,9 +686,14 @@ impl Dht {
             guard.last_error = None;
             (previous, previous_proxy_requested)
         };
+        let preserved_routes = previous
+            .as_ref()
+            .map(|dht| dht.routing_snapshot())
+            .unwrap_or_default();
 
         let next = match Dht::spawn_with_proxy(proxy).await {
             Ok(dht) => {
+                dht.add_bootstrap_nodes(preserved_routes);
                 let warm = dht.clone();
                 tokio::spawn(async move { warm.bootstrap().await });
                 Some(dht)
@@ -518,6 +732,17 @@ impl Dht {
     pub async fn spawn_with_proxy(
         proxy: Option<risuko_http::ProxyConnector>,
     ) -> std::io::Result<Arc<Self>> {
+        Self::spawn_with_proxy_and_routing_state(proxy, None).await
+    }
+    pub async fn spawn_with_routing_state(
+        state_path: impl Into<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::spawn_with_proxy_and_routing_state(None, Some(state_path.into())).await
+    }
+    pub async fn spawn_with_proxy_and_routing_state(
+        proxy: Option<risuko_http::ProxyConnector>,
+        routing_state_path: Option<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
         let proxy_datagram = match proxy {
             Some(connector) => {
                 let has_explicit_bypass = connector
@@ -551,16 +776,37 @@ impl Dht {
         let our_id = random_id();
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(Default::default()));
 
+        let routing = Arc::new(Mutex::new(RoutingTable::new(our_id)));
+        let routing6 = Arc::new(Mutex::new(RoutingTable::new(our_id)));
+        if let Some(path) = routing_state_path.as_deref() {
+            for (id, addr) in load_routing_state_file(path)? {
+                if addr.is_ipv6() {
+                    routing6.lock().add(id, addr);
+                } else {
+                    routing.lock().add(id, addr);
+                }
+            }
+        }
+        let server = Arc::new(InboundDhtState::with_routing6(
+            our_id,
+            routing.clone(),
+            routing6.clone(),
+        ));
         let this = Arc::new(Self {
             sock: sock.clone(),
             sock6: sock6.clone(),
             proxy_datagram: proxy_datagram.clone(),
             our_id,
             pending: pending.clone(),
-            routing: Arc::new(Mutex::new(RoutingTable::new(our_id))),
+            routing,
+            routing6,
+            bootstrap_hosts: Mutex::new(Vec::new()),
+            server: server.clone(),
             reader_handle: Mutex::new(None),
             reader6_handle: Mutex::new(None),
             lookup_handles: Mutex::new(Vec::new()),
+            refresh_handle: Mutex::new(None),
+            routing_state_path,
             shutdown: AtomicBool::new(false),
         });
 
@@ -569,8 +815,14 @@ impl Dht {
         let reader_handle = if let Some(datagram) = proxy_datagram.clone() {
             tokio::spawn(async move { proxy_reader_loop(datagram, pending_reader).await })
         } else {
+            let server_reader = server.clone();
             tokio::spawn(async move {
-                reader_loop(reader_sock.expect("direct DHT socket"), pending_reader).await
+                reader_loop(
+                    reader_sock.expect("direct DHT socket"),
+                    pending_reader,
+                    server_reader,
+                )
+                .await
             })
         };
         *this.reader_handle.lock() = Some(reader_handle);
@@ -578,10 +830,33 @@ impl Dht {
         if proxy_datagram.is_none() {
             if let Some(s6) = sock6 {
                 let pending6 = pending.clone();
-                let reader6_handle = tokio::spawn(async move { reader_loop(s6, pending6).await });
+                let server6 = server.clone();
+                let reader6_handle =
+                    tokio::spawn(async move { reader_loop(s6, pending6, server6).await });
                 *this.reader6_handle.lock() = Some(reader6_handle);
             }
         }
+
+        let weak = Arc::downgrade(&this);
+        let refresh_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ROUTING_REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(dht) = weak.upgrade() else {
+                    return;
+                };
+                if dht.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                let stale = dht.refresh_routing(K);
+                for (id, addr) in stale {
+                    let _ = dht.ping_node(addr, id).await;
+                }
+            }
+        });
+        *this.refresh_handle.lock() = Some(refresh_handle);
 
         tracing::debug!(
             "DHT started: id={}, bootstrap={} nodes, ipv6={}",
@@ -600,6 +875,9 @@ impl Dht {
         announce_port: Option<u16>,
     ) -> mpsc::UnboundedReceiver<SocketAddr> {
         let (tx, rx) = mpsc::unbounded_channel::<SocketAddr>();
+        if self.server.is_private(&info_hash) {
+            return rx;
+        }
         let this = self.clone();
         let handle = tokio::spawn(async move {
             let _ = tokio::time::timeout(
@@ -625,13 +903,12 @@ impl Dht {
         announce_port: Option<u16>,
     ) {
         let mut targets: Vec<DhtTarget> = self
-            .routing
-            .lock()
-            .closest(&info_hash, K * 2)
+            .closest_routing(&info_hash, K * 2)
             .into_iter()
             .map(DhtTarget::Addr)
             .collect();
         targets.extend(bootstrap_targets());
+        targets.extend(self.bootstrap_hosts.lock().iter().cloned());
         if targets.is_empty() {
             tracing::debug!("dht: no bootstrap nodes available");
             return;
@@ -684,7 +961,7 @@ impl Dht {
             shortlist.insert(node_id.distance(&info_hash), from.clone());
             if responder_id.is_some() {
                 if let DhtTarget::Addr(from) = &from {
-                    self.routing.lock().add(node_id, *from);
+                    self.add_routing(node_id, *from);
                 }
             }
             if let Some(tok) = token {
@@ -703,7 +980,7 @@ impl Dht {
                     e.insert(DhtTarget::Addr(*naddr));
                     progressed = true;
                 }
-                self.routing.lock().add(*nid, *naddr);
+                self.add_routing(*nid, *naddr);
             }
 
             // Trim to K * 2 to keep memory bounded
@@ -753,13 +1030,8 @@ impl Dht {
         // BEP-5 announce_peer: publish ourselves on the closest token-bearing nodes so other clients doing get_peers for this info-hash discover us and can open inbound connections; fire-and-forget, we don't need the ack
         if let Some(port) = announce_port {
             for (_d, (addr, token)) in announce_targets.into_iter().take(K) {
-                let pkt = build_announce_peer(
-                    rand::rng().random(),
-                    &self.our_id,
-                    &info_hash,
-                    port,
-                    &token,
-                );
+                let txn = random_transaction_id();
+                let pkt = build_announce_peer(&txn, &self.our_id, &info_hash, port, &token);
                 let _ = self.send_target(&pkt, &addr).await;
             }
         }
@@ -788,7 +1060,7 @@ impl Dht {
             target => (target, None),
         };
         let (txn, rx, _guard) = self.register_transaction(target.clone(), resolved_addrs);
-        let packet = build_get_peers(txn, &self.our_id, &info_hash);
+        let packet = build_get_peers_bytes(&txn, &self.our_id, &info_hash);
         // `_guard` removes `txn` from `pending`
         let send_res = self.send_target(&packet, &target).await;
         if send_res.is_err() {
@@ -804,20 +1076,48 @@ impl Dht {
             .map(|(rid, peers, nodes, token)| (resp.from, rid, peers, nodes, token))
     }
 
+    async fn ping_node(self: &Arc<Self>, target: SocketAddr, expected_id: Id20) -> bool {
+        if self.proxy_datagram.is_some() {
+            return false;
+        }
+        let target_kind = DhtTarget::Addr(target);
+        let (txn, rx, _guard) = self.register_transaction(target_kind.clone(), Some(vec![target]));
+        let packet = build_ping_bytes(&txn, &self.our_id);
+        if self.send_target(&packet, &target_kind).await.is_err() {
+            return false;
+        }
+        let Ok(Ok(response)) = tokio::time::timeout(QUERY_TIMEOUT, rx).await else {
+            return false;
+        };
+        let id = response
+            .body
+            .get(b"r")
+            .and_then(|value| value.get(b"id"))
+            .and_then(Value::as_bytes)
+            .and_then(|bytes| Id20::from_slice(bytes).ok());
+        match id {
+            Some(id) if id == expected_id => {
+                self.add_routing(id, target);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn register_transaction(
         &self,
         target: DhtTarget,
         resolved_addrs: Option<Vec<SocketAddr>>,
-    ) -> (u16, oneshot::Receiver<KrpcResponse>, PendingGuard) {
+    ) -> (Vec<u8>, oneshot::Receiver<KrpcResponse>, PendingGuard) {
         let (tx, rx) = oneshot::channel();
         let mut map = self.pending.lock();
-        let mut txn: u16 = rand::rng().random();
+        let mut txn = random_transaction_id().to_vec();
         while map.contains_key(&txn) {
-            txn = txn.wrapping_add(1);
+            txn = random_transaction_id().to_vec();
         }
         let token = PendingToken::new();
         map.insert(
-            txn,
+            txn.clone(),
             PendingEntry {
                 tx,
                 target,
@@ -827,7 +1127,7 @@ impl Dht {
         );
         let guard = PendingGuard {
             pending: self.pending.clone(),
-            txn,
+            txn: txn.clone(),
             token,
         };
         (txn, rx, guard)
@@ -835,12 +1135,119 @@ impl Dht {
 
     /// Number of unique nodes currently held in the Kademlia routing table; a coarse health signal for DHT bootstrap progress
     pub fn routing_table_len(&self) -> usize {
-        self.routing.lock().len()
+        self.routing.lock().len() + self.routing6.lock().len()
+    }
+
+    fn add_routing(&self, id: Id20, addr: SocketAddr) {
+        if !valid_routing_addr(addr) {
+            return;
+        }
+        if addr.is_ipv6() {
+            self.routing6.lock().add(id, addr);
+        } else {
+            self.routing.lock().add(id, addr);
+        }
+    }
+
+    fn closest_routing(&self, target: &Id20, n: usize) -> Vec<SocketAddr> {
+        let mut nodes = self.routing.lock().closest_nodes(target, n);
+        nodes.extend(self.routing6.lock().closest_nodes(target, n));
+        nodes.sort_by_key(|(id, _)| id.distance(target));
+        nodes.truncate(n);
+        nodes.into_iter().map(|(_, addr)| addr).collect()
+    }
+
+    pub fn routing_snapshot(&self) -> Vec<(Id20, SocketAddr)> {
+        let mut routes = self.routing.lock().snapshot();
+        routes.extend(self.routing6.lock().snapshot());
+        routes
+    }
+
+    pub fn save_routing_state(&self, path: impl AsRef<Path>) -> std::io::Result<usize> {
+        save_routing_state_file(path.as_ref(), &self.routing_snapshot())
+    }
+
+    pub fn load_routing_state(&self, path: impl AsRef<Path>) -> std::io::Result<usize> {
+        let contacts = load_routing_state_file(path.as_ref())?;
+        let count = contacts.len();
+        self.add_bootstrap_nodes(contacts);
+        Ok(count)
+    }
+
+    fn persist_configured_routing_state(&self) {
+        if let Some(path) = self.routing_state_path.as_deref() {
+            if let Err(error) = self.save_routing_state(path) {
+                tracing::warn!(path = %path.display(), "failed to persist DHT routing state: {error}");
+            }
+        }
+    }
+
+    pub fn refresh_routing(&self, limit: usize) -> Vec<(Id20, SocketAddr)> {
+        let now = Instant::now();
+        let mut routes = self.routing.lock().refresh_stale(now, limit);
+        if routes.len() < limit {
+            routes.extend(
+                self.routing6
+                    .lock()
+                    .refresh_stale(now, limit - routes.len()),
+            );
+        }
+        routes
+    }
+
+    pub fn local_port(&self) -> Option<u16> {
+        self.sock
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
+            .map(|addr| addr.port())
+    }
+
+    pub fn local_port_for(&self, ipv6: bool) -> Option<u16> {
+        let socket = if ipv6 {
+            self.sock6.as_ref()
+        } else {
+            self.sock.as_ref()
+        }?;
+        socket.local_addr().ok().map(|addr| addr.port())
+    }
+
+    pub fn peer_store_len(&self) -> usize {
+        self.server.peers.lock().values().map(Vec::len).sum()
+    }
+
+    pub fn set_private(&self, info_hash: Id20, private: bool) {
+        self.server.set_private(info_hash, private);
+    }
+    
+    pub fn add_bootstrap_nodes<I>(&self, nodes: I)
+    where
+        I: IntoIterator<Item = (Id20, SocketAddr)>,
+    {
+        for (id, addr) in nodes {
+            self.add_routing(id, addr);
+        }
+    }
+    
+    pub fn add_bootstrap_hosts<I>(&self, hosts: I)
+    where
+        I: IntoIterator<Item = (Id20, String, u16)>,
+    {
+        let mut targets = self.bootstrap_hosts.lock();
+        for (_id, host, port) in hosts {
+            if host.is_empty() || port == 0 {
+                continue;
+            }
+            let target = DhtTarget::Host(host, port);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets.truncate(MAX_ROUND_QUERIES);
     }
 
     /// BEP-5 PORT support
     pub fn add_node(&self, addr: SocketAddr) {
-        self.routing.lock().add(pseudo_id(addr), addr);
+        self.add_routing(pseudo_id(addr), addr);
     }
 
     /// Warm the routing table by iteratively looking up our own id (bootstrap nodes respond with contacts closest to us, which populates a fresh table), returning once the lookup converges or `budget` elapses
@@ -852,102 +1259,306 @@ impl Dht {
     }
 }
 
-// Kademlia routing table (BEP 5 §"Routing Table"): 160 buckets indexed by the highest differing bit between `our_id` and a node's id (XOR distance), each holding at most K=8 nodes with LRU eviction on `last_seen`; nodes are inserted passively from KRPC responses (responder plus returned contacts) with no active liveness pings, so staleness is bounded by new traffic replacing old entries
+fn valid_routing_addr(addr: SocketAddr) -> bool {
+    addr.port() != 0
+        && !addr.ip().is_unspecified()
+        && !addr.ip().is_multicast()
+        && !matches!(addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+}
+
+fn load_routing_state_file(path: &Path) -> std::io::Result<Vec<(Id20, SocketAddr)>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut contacts = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text
+        .lines()
+        .skip_while(|line| *line == "risuko-dht-routing-v1")
+    {
+        if contacts.len() >= MAX_PERSISTED_ROUTES {
+            break;
+        }
+        let Some((id_hex, addr_text)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(id_bytes) = hex::decode(id_hex) else {
+            continue;
+        };
+        let Ok(id) = Id20::from_slice(&id_bytes) else {
+            continue;
+        };
+        let Ok(addr) = addr_text.parse::<SocketAddr>() else {
+            continue;
+        };
+        if valid_routing_addr(addr) && seen.insert((id, addr)) {
+            contacts.push((id, addr));
+        }
+    }
+    Ok(contacts)
+}
+
+fn save_routing_state_file(path: &Path, contacts: &[(Id20, SocketAddr)]) -> std::io::Result<usize> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut data = String::from("risuko-dht-routing-v1\n");
+    let mut written = 0usize;
+    let mut seen = HashSet::new();
+    for (id, addr) in contacts {
+        if written >= MAX_PERSISTED_ROUTES {
+            break;
+        }
+        if valid_routing_addr(*addr) && seen.insert((*id, *addr)) {
+            data.push_str(&id.to_hex());
+            data.push('\t');
+            data.push_str(&addr.to_string());
+            data.push('\n');
+            written += 1;
+        }
+    }
+    let temporary = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&temporary)?;
+        use std::io::Write;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)?;
+    Ok(written)
+}
+
 
 const BUCKET_SIZE: usize = K;
-const NUM_BUCKETS: usize = 160;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingLiveness {
+    Good,
+    Questionable,
+    Bad,
+}
 
 #[derive(Debug, Clone)]
 struct RoutingNode {
     id: Id20,
     addr: SocketAddr,
     last_seen: Instant,
+    liveness: RoutingLiveness,
 }
 
+#[derive(Debug)]
+struct RoutingBucket {
+    prefix: [u8; 20],
+    prefix_len: u8,
+    nodes: Vec<RoutingNode>,
+}
+
+impl RoutingBucket {
+    fn root() -> Self {
+        Self {
+            prefix: [0; 20],
+            prefix_len: 0,
+            nodes: Vec::with_capacity(BUCKET_SIZE),
+        }
+    }
+
+    fn bit(bytes: &[u8; 20], index: u8) -> u8 {
+        (bytes[index as usize / 8] >> (7 - (index % 8))) & 1
+    }
+
+    fn matches(&self, distance: &Id20) -> bool {
+        let bytes = distance.as_bytes();
+        (0..self.prefix_len).all(|bit| Self::bit(bytes, bit) == Self::bit(&self.prefix, bit))
+    }
+
+    fn contains_ours(&self) -> bool {
+        (0..self.prefix_len).all(|bit| Self::bit(&self.prefix, bit) == 0)
+    }
+
+    fn child(&self, bit: u8) -> Self {
+        let mut prefix = self.prefix;
+        let byte = self.prefix_len as usize / 8;
+        let shift = 7 - (self.prefix_len % 8);
+        if bit == 0 {
+            prefix[byte] &= !(1 << shift);
+        } else {
+            prefix[byte] |= 1 << shift;
+        }
+        Self {
+            prefix,
+            prefix_len: self.prefix_len + 1,
+            nodes: Vec::with_capacity(BUCKET_SIZE),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct RoutingTable {
     our_id: Id20,
-    buckets: Vec<Vec<RoutingNode>>,
+    buckets: Vec<RoutingBucket>,
 }
 
 impl RoutingTable {
     fn new(our_id: Id20) -> Self {
-        let buckets = (0..NUM_BUCKETS)
-            .map(|_| Vec::with_capacity(BUCKET_SIZE))
-            .collect();
-        Self { our_id, buckets }
+        Self {
+            our_id,
+            buckets: vec![RoutingBucket::root()],
+        }
     }
 
     fn len(&self) -> usize {
-        self.buckets.iter().map(|b| b.len()).sum()
+        self.buckets.iter().map(|b| b.nodes.len()).sum()
     }
 
-    fn bucket_index(&self, id: &Id20) -> Option<usize> {
-        // Position of the highest set bit in XOR(our_id, id); identical ids (distance 0) belong to no bucket and are skipped
-        let xord = self.our_id.distance(id);
-        let bytes = xord.as_bytes();
-        for (byte_pos, byte) in bytes.iter().enumerate() {
-            if *byte != 0 {
-                let leading = byte.leading_zeros() as usize;
-                let bit_pos = byte_pos * 8 + leading;
-                // bit_pos 0 == highest bit set → most-distant bucket → index 0; bit_pos 159 == lowest bit set → closest bucket → index 159
-                return Some(bit_pos);
+    fn bucket_index(&self, distance: &Id20) -> Option<usize> {
+        self.buckets
+            .iter()
+            .position(|bucket| bucket.matches(distance))
+    }
+
+    fn split_bucket(&mut self, index: usize) {
+        let bucket = self.buckets.remove(index);
+        debug_assert!(bucket.prefix_len < 160);
+        let mut zero = bucket.child(0);
+        let mut one = bucket.child(1);
+        for node in bucket.nodes {
+            let distance = self.our_id.distance(&node.id);
+            if RoutingBucket::bit(distance.as_bytes(), bucket.prefix_len) == 0 {
+                zero.nodes.push(node);
+            } else {
+                one.nodes.push(node);
             }
         }
-        None
+        self.buckets.insert(index, one);
+        self.buckets.insert(index, zero);
     }
 
     fn add(&mut self, id: Id20, addr: SocketAddr) {
-        let Some(idx) = self.bucket_index(&id) else {
+        let distance = self.our_id.distance(&id);
+        if distance == Id20([0; 20]) {
             return;
-        };
+        }
         let now = Instant::now();
-        let bucket = &mut self.buckets[idx];
-        // Refresh existing entry if seen
-        if let Some(existing) = bucket.iter_mut().find(|n| n.id == id) {
-            existing.addr = addr;
-            existing.last_seen = now;
-            return;
-        }
-        if bucket.len() < BUCKET_SIZE {
-            bucket.push(RoutingNode {
-                id,
-                addr,
-                last_seen: now,
-            });
-            return;
-        }
-        // Evict the stalest entry; BEP 5 wants a ping-then-evict dance, but this passive variant trades a little routing optimality for simplicity and zero extra wire traffic
-        if let Some(stalest_idx) = bucket
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, n)| n.last_seen)
-            .map(|(i, _)| i)
-        {
-            bucket[stalest_idx] = RoutingNode {
-                id,
-                addr,
-                last_seen: now,
+        loop {
+            let Some(idx) = self.bucket_index(&distance) else {
+                return;
             };
+            let bucket = &mut self.buckets[idx];
+            if let Some(existing) = bucket.nodes.iter_mut().find(|n| n.id == id) {
+                existing.addr = addr;
+                existing.last_seen = now;
+                existing.liveness = RoutingLiveness::Good;
+                return;
+            }
+            if bucket.nodes.len() < BUCKET_SIZE {
+                bucket.nodes.push(RoutingNode {
+                    id,
+                    addr,
+                    last_seen: now,
+                    liveness: RoutingLiveness::Good,
+                });
+                return;
+            }
+            if bucket.contains_ours() && bucket.prefix_len < 160 {
+                self.split_bucket(idx);
+                continue;
+            }
+            if let Some(replace_idx) = bucket
+                .nodes
+                .iter()
+                .position(|node| node.liveness == RoutingLiveness::Bad)
+            {
+                bucket.nodes[replace_idx] = RoutingNode {
+                    id,
+                    addr,
+                    last_seen: now,
+                    liveness: RoutingLiveness::Good,
+                };
+            } else if let Some(stalest) = bucket.nodes.iter_mut().min_by_key(|node| node.last_seen)
+            {
+                stalest.liveness = RoutingLiveness::Questionable;
+            }
+            return;
         }
     }
 
-    /// The `n` nodes whose ids are closest (by XOR) to `target`; used to seed an iterative lookup from the warm routing table instead of the cold public bootstrap servers
-    fn closest(&self, target: &Id20, n: usize) -> Vec<SocketAddr> {
-        let mut all: Vec<(Id20, SocketAddr)> = self
+    fn refresh_stale(&mut self, now: Instant, limit: usize) -> Vec<(Id20, SocketAddr)> {
+        let mut out = Vec::new();
+        for bucket in &mut self.buckets {
+            for node in &mut bucket.nodes {
+                if out.len() >= limit {
+                    return out;
+                }
+                if now.duration_since(node.last_seen) >= ROUTING_STALE {
+                    node.liveness = match node.liveness {
+                        RoutingLiveness::Good => RoutingLiveness::Questionable,
+                        RoutingLiveness::Questionable => RoutingLiveness::Bad,
+                        RoutingLiveness::Bad => RoutingLiveness::Bad,
+                    };
+                    out.push((node.id, node.addr));
+                }
+            }
+        }
+        out
+    }
+
+    fn snapshot(&self) -> Vec<(Id20, SocketAddr)> {
+        self.buckets
+            .iter()
+            .flat_map(|bucket| bucket.nodes.iter())
+            .map(|node| (node.id, node.addr))
+            .collect()
+    }
+
+    fn closest_nodes(&self, target: &Id20, n: usize) -> Vec<(Id20, SocketAddr)> {
+        let mut all: Vec<(Id20, Id20, SocketAddr)> = self
             .buckets
             .iter()
-            .flatten()
-            .map(|node| (node.id.distance(target), node.addr))
+            .flat_map(|bucket| bucket.nodes.iter())
+            .map(|node| (node.id.distance(target), node.id, node.addr))
             .collect();
-        all.sort_by_key(|&(dist, _)| dist);
-        all.into_iter().take(n).map(|(_, addr)| addr).collect()
+        all.sort_by_key(|(dist, _, _)| *dist);
+        all.into_iter()
+            .take(n)
+            .map(|(_, id, addr)| (id, addr))
+            .collect()
     }
+}
+
+pub fn parse_compact_nodes(bytes: &[u8], v6: bool) -> Vec<(Id20, SocketAddr)> {
+    let width = if v6 { 38 } else { 26 };
+    bytes
+        .chunks_exact(width)
+        .filter_map(|chunk| {
+            let id = Id20::from_slice(&chunk[..20]).ok()?;
+            let addr = if v6 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&chunk[20..36]);
+                let ip = Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+                SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0))
+            } else {
+                let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
+                let port = u16::from_be_bytes([chunk[24], chunk[25]]);
+                SocketAddr::V4(SocketAddrV4::new(ip, port))
+            };
+            valid_dht_endpoint(addr).then_some((id, addr))
+        })
+        .collect()
 }
 
 fn random_id() -> Id20 {
     let mut b = [0u8; 20];
     rand::rng().fill(&mut b[..]);
     Id20::from_slice(&b).expect("20 bytes")
+}
+
+fn random_transaction_id() -> [u8; 8] {
+    let mut txn = [0u8; 8];
+    rand::rng().fill(&mut txn);
+    txn
 }
 
 fn pseudo_id(addr: SocketAddr) -> Id20 {
@@ -982,7 +1593,7 @@ fn pseudo_id_target(target: &DhtTarget) -> Id20 {
 
 /// Build a BEP-5 `announce_peer` query; the `token` must be one we received from this node's prior `get_peers` response, otherwise it rejects us
 fn build_announce_peer(
-    txn: u16,
+    txn: &[u8],
     our_id: &Id20,
     info_hash: &Id20,
     port: u16,
@@ -999,17 +1610,34 @@ fn build_announce_peer(
         (b"port".to_vec(), Value::Int(port as i64)),
         (b"token".to_vec(), Value::Bytes(token.to_vec())),
     ]);
-    let tid = txn.to_be_bytes().to_vec();
     let msg = Value::Dict(vec![
         (b"a".to_vec(), args),
         (b"q".to_vec(), Value::Bytes(b"announce_peer".to_vec())),
-        (b"t".to_vec(), Value::Bytes(tid)),
+        (b"t".to_vec(), Value::Bytes(txn.to_vec())),
         (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
     ]);
     encode_to_vec(&msg)
 }
 
+#[cfg(test)]
 fn build_get_peers(txn: u16, our_id: &Id20, info_hash: &Id20) -> Vec<u8> {
+    build_get_peers_bytes(&txn.to_be_bytes(), our_id, info_hash)
+}
+
+fn build_ping_bytes(txn: &[u8], our_id: &Id20) -> Vec<u8> {
+    let args = Value::Dict(vec![(
+        b"id".to_vec(),
+        Value::Bytes(our_id.as_bytes().to_vec()),
+    )]);
+    encode_to_vec(&Value::Dict(vec![
+        (b"a".to_vec(), args),
+        (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
+        (b"t".to_vec(), Value::Bytes(txn.to_vec())),
+        (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+    ]))
+}
+
+fn build_get_peers_bytes(txn: &[u8], our_id: &Id20, info_hash: &Id20) -> Vec<u8> {
     let args = Value::Dict(vec![
         (b"id".to_vec(), Value::Bytes(our_id.as_bytes().to_vec())),
         (
@@ -1025,11 +1653,10 @@ fn build_get_peers(txn: u16, our_id: &Id20, info_hash: &Id20) -> Vec<u8> {
             ]),
         ),
     ]);
-    let tid = txn.to_be_bytes().to_vec();
     let msg = Value::Dict(vec![
         (b"a".to_vec(), args),
         (b"q".to_vec(), Value::Bytes(b"get_peers".to_vec())),
-        (b"t".to_vec(), Value::Bytes(tid)),
+        (b"t".to_vec(), Value::Bytes(txn.to_vec())),
         (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
     ]);
     encode_to_vec(&msg)
@@ -1050,14 +1677,20 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
                     6 => {
                         let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
                         let port = u16::from_be_bytes([b[4], b[5]]);
-                        peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+                        let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+                        if valid_dht_endpoint(addr) {
+                            peers.push(addr);
+                        }
                     }
                     18 => {
                         let mut o = [0u8; 16];
                         o.copy_from_slice(&b[..16]);
                         let ip = Ipv6Addr::from(o);
                         let port = u16::from_be_bytes([b[16], b[17]]);
-                        peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
+                        let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
+                        if valid_dht_endpoint(addr) {
+                            peers.push(addr);
+                        }
                     }
                     _ => {}
                 }
@@ -1070,7 +1703,10 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
             let id = Id20::from_slice(&chunk[..20]).ok()?;
             let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
             let port = u16::from_be_bytes([chunk[24], chunk[25]]);
-            nodes.push((id, SocketAddr::V4(SocketAddrV4::new(ip, port))));
+            let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+            if valid_dht_endpoint(addr) {
+                nodes.push((id, addr));
+            }
         }
     }
     if let Some(n6) = r_val.get(b"nodes6").and_then(|v| v.as_bytes()) {
@@ -1084,7 +1720,10 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
             o.copy_from_slice(&chunk[20..36]);
             let ip = Ipv6Addr::from(o);
             let port = u16::from_be_bytes([chunk[36], chunk[37]]);
-            nodes.push((id, SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0))));
+            let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
+            if valid_dht_endpoint(addr) {
+                nodes.push((id, addr));
+            }
         }
     }
     let token = r_val
@@ -1094,7 +1733,275 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
     Some((responder_id, peers, nodes, token))
 }
 
-async fn reader_loop(sock: Arc<UdpSocket>, pending: Arc<Mutex<PendingMap>>) {
+fn valid_dht_endpoint(addr: SocketAddr) -> bool {
+    addr.port() != 0
+        && !addr.ip().is_unspecified()
+        && !addr.ip().is_multicast()
+        && !matches!(addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+}
+
+fn token_for_secret(secret: &[u8; 16], addr: SocketAddr) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let mut digest = Sha1::new();
+    digest.update(secret);
+    match addr {
+        SocketAddr::V4(a) => digest.update(a.ip().octets()),
+        SocketAddr::V6(a) => digest.update(a.ip().octets()),
+    }
+    digest.finalize()[..8].to_vec()
+}
+
+fn compact_peer(addr: SocketAddr) -> Vec<u8> {
+    let mut out = Vec::with_capacity(match addr {
+        SocketAddr::V4(_) => 6,
+        SocketAddr::V6(_) => 18,
+    });
+    match addr {
+        SocketAddr::V4(a) => out.extend_from_slice(&a.ip().octets()),
+        SocketAddr::V6(a) => out.extend_from_slice(&a.ip().octets()),
+    }
+    out.extend_from_slice(&addr.port().to_be_bytes());
+    out
+}
+
+fn compact_nodes(nodes: impl IntoIterator<Item = (Id20, SocketAddr)>, v6: bool) -> Vec<u8> {
+    let width = if v6 { 38 } else { 26 };
+    let mut out = Vec::new();
+    for (id, addr) in nodes {
+        if v6 != addr.is_ipv6() {
+            continue;
+        }
+        out.reserve(width);
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&compact_peer(addr));
+    }
+    out
+}
+
+fn parse_want(args: &Value, from: SocketAddr) -> (bool, bool) {
+    let Some(want) = args.get(b"want").and_then(Value::as_list) else {
+        return (from.is_ipv4(), from.is_ipv6());
+    };
+    let mut n4 = false;
+    let mut n6 = false;
+    for item in want {
+        match item.as_bytes() {
+            Some(b"n4") => n4 = true,
+            Some(b"n6") => n6 = true,
+            _ => {}
+        }
+    }
+    (n4, n6)
+}
+
+fn krpc_error(tid: &[u8], code: i64, message: &'static [u8]) -> Vec<u8> {
+    encode_to_vec(&Value::Dict(vec![
+        (
+            b"e".to_vec(),
+            Value::List(vec![Value::Int(code), Value::Bytes(message.to_vec())]),
+        ),
+        (b"t".to_vec(), Value::Bytes(tid.to_vec())),
+        (b"y".to_vec(), Value::Bytes(b"e".to_vec())),
+    ]))
+}
+
+#[allow(clippy::ptr_arg)]
+fn bounded_response_bytes(response: &mut Vec<(Vec<u8>, Value)>) -> Vec<u8> {
+    loop {
+        let encoded = encode_to_vec(&Value::Dict(response.clone()));
+        if encoded.len() <= MAX_KRPC_RESPONSE_BYTES {
+            return encoded;
+        }
+        let mut trimmed = false;
+        if let Some((_, Value::Dict(body))) = response.iter_mut().find(|(key, _)| key == b"r") {
+            for key in [
+                b"values".as_slice(),
+                b"nodes6".as_slice(),
+                b"nodes".as_slice(),
+            ] {
+                let Some(index) = body.iter().position(|(field, _)| field == key) else {
+                    continue;
+                };
+                match &mut body[index].1 {
+                    Value::List(values) if values.len() > 1 => {
+                        values.pop();
+                    }
+                    _ => {
+                        body.remove(index);
+                    }
+                }
+                trimmed = true;
+                break;
+            }
+        }
+        if !trimmed {
+            return encoded;
+        }
+    }
+}
+
+fn build_query_response(
+    msg: &Value,
+    from: SocketAddr,
+    server: &InboundDhtState,
+) -> Option<Vec<u8>> {
+    let tid = msg.get(b"t").and_then(Value::as_bytes)?;
+    if tid.is_empty() || tid.len() > 32 {
+        return None;
+    }
+    let Some(query) = msg.get(b"q").and_then(Value::as_bytes) else {
+        return Some(krpc_error(tid, 203, b"missing query"));
+    };
+    let Some(args) = msg.get(b"a").and_then(Value::as_dict) else {
+        return Some(krpc_error(tid, 203, b"missing arguments"));
+    };
+    let args = Value::Dict(args.to_vec());
+    let remote_id = args
+        .get(b"id")
+        .and_then(Value::as_bytes)
+        .and_then(|bytes| Id20::from_slice(bytes).ok());
+    let Some(remote_id) = remote_id else {
+        return Some(krpc_error(tid, 203, b"invalid id"));
+    };
+    if matches!(query, b"get_peers" | b"announce_peer") {
+        if let Some(hash) = args
+            .get(b"info_hash")
+            .and_then(Value::as_bytes)
+            .and_then(|bytes| Id20::from_slice(bytes).ok())
+        {
+            if server.is_private(&hash) {
+                return Some(krpc_error(tid, 203, b"private torrent"));
+            }
+        }
+    }
+    server.add_routing(remote_id, from);
+
+    let mut response = vec![
+        (
+            b"r".to_vec(),
+            Value::Dict(vec![(
+                b"id".to_vec(),
+                Value::Bytes(server.our_id.as_bytes().to_vec()),
+            )]),
+        ),
+        (b"t".to_vec(), Value::Bytes(tid.to_vec())),
+        (b"y".to_vec(), Value::Bytes(b"r".to_vec())),
+    ];
+    match query {
+        b"ping" => {}
+        b"find_node" => {
+            let target = args
+                .get(b"target")
+                .and_then(Value::as_bytes)
+                .and_then(|bytes| Id20::from_slice(bytes).ok());
+            let Some(target) = target else {
+                return Some(krpc_error(tid, 203, b"invalid target"));
+            };
+            let (want4, want6) = parse_want(&args, from);
+            let nodes = server.closest_nodes(&target, K * 2);
+            let mut body = vec![(
+                b"id".to_vec(),
+                Value::Bytes(server.our_id.as_bytes().to_vec()),
+            )];
+            if want4 {
+                body.push((
+                    b"nodes".to_vec(),
+                    Value::Bytes(compact_nodes(nodes.iter().copied(), false)),
+                ));
+            }
+            if want6 {
+                body.push((
+                    b"nodes6".to_vec(),
+                    Value::Bytes(compact_nodes(nodes.iter().copied(), true)),
+                ));
+            }
+            response[0] = (b"r".to_vec(), Value::Dict(body));
+        }
+        b"get_peers" => {
+            let hash = args
+                .get(b"info_hash")
+                .and_then(Value::as_bytes)
+                .and_then(|bytes| Id20::from_slice(bytes).ok());
+            let Some(hash) = hash else {
+                return Some(krpc_error(tid, 203, b"invalid info_hash"));
+            };
+            let (want4, want6) = parse_want(&args, from);
+            let peers = server.get_peers(hash, Some(from.is_ipv6()));
+            let nodes = server.closest_nodes(&hash, K * 2);
+            let mut body = vec![
+                (
+                    b"id".to_vec(),
+                    Value::Bytes(server.our_id.as_bytes().to_vec()),
+                ),
+                (b"token".to_vec(), Value::Bytes(server.token(from))),
+            ];
+            let values: Vec<Value> = peers
+                .into_iter()
+                .map(|addr| Value::Bytes(compact_peer(addr)))
+                .collect();
+            if !values.is_empty() {
+                body.push((b"values".to_vec(), Value::List(values)));
+            }
+            if want4 {
+                body.push((
+                    b"nodes".to_vec(),
+                    Value::Bytes(compact_nodes(nodes.iter().copied(), false)),
+                ));
+            }
+            if want6 {
+                body.push((
+                    b"nodes6".to_vec(),
+                    Value::Bytes(compact_nodes(nodes.iter().copied(), true)),
+                ));
+            }
+            response[0] = (b"r".to_vec(), Value::Dict(body));
+        }
+        b"announce_peer" => {
+            let hash = args
+                .get(b"info_hash")
+                .and_then(Value::as_bytes)
+                .and_then(|bytes| Id20::from_slice(bytes).ok());
+            let token = args.get(b"token").and_then(Value::as_bytes);
+            let Some(hash) = hash else {
+                return Some(krpc_error(tid, 203, b"invalid info_hash"));
+            };
+            let Some(token) = token else {
+                return Some(krpc_error(tid, 203, b"missing token"));
+            };
+            if !server.valid_token(from, token) {
+                return Some(krpc_error(tid, 203, b"invalid token"));
+            }
+            let implied = args
+                .get(b"implied_port")
+                .and_then(Value::as_int)
+                .unwrap_or(0);
+            if implied != 0 && implied != 1 {
+                return Some(krpc_error(tid, 203, b"invalid implied_port"));
+            }
+            let implied = implied == 1;
+            let port = if implied {
+                from.port()
+            } else {
+                args.get(b"port")
+                    .and_then(Value::as_int)
+                    .and_then(|p| u16::try_from(p).ok())
+                    .unwrap_or(0)
+            };
+            if port == 0 {
+                return Some(krpc_error(tid, 203, b"invalid port"));
+            }
+            server.add_peer(hash, SocketAddr::new(from.ip(), port));
+        }
+        _ => return Some(krpc_error(tid, 204, b"method unknown")),
+    }
+    Some(bounded_response_bytes(&mut response))
+}
+
+async fn reader_loop(
+    sock: Arc<UdpSocket>,
+    pending: Arc<Mutex<PendingMap>>,
+    server: Arc<InboundDhtState>,
+) {
     let mut buf = vec![0u8; 2048];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
@@ -1102,21 +2009,28 @@ async fn reader_loop(sock: Arc<UdpSocket>, pending: Arc<Mutex<PendingMap>>) {
             Err(_) => return,
         };
         let Ok(msg) = decode_all_external(&buf[..n], KRPC_DECODE_LIMITS) else {
+            if let Some(tid) = recover_transaction_id(&buf[..n]) {
+                let reply = krpc_error(&tid, 203, b"invalid bencode");
+                let _ = sock.send_to(&reply, from).await;
+            }
             continue;
         };
         let Some(ty) = msg.get(b"y").and_then(|v| v.as_bytes()) else {
             continue;
         };
+        if ty == b"q" {
+            if let Some(reply) = build_query_response(&msg, from, &server) {
+                let _ = sock.send_to(&reply, from).await;
+            }
+            continue;
+        }
         if ty != b"r" && ty != b"e" {
             continue;
         }
         let Some(tid) = msg.get(b"t").and_then(|v| v.as_bytes()) else {
             continue;
         };
-        let txn = match tid.len() {
-            2 => u16::from_be_bytes([tid[0], tid[1]]),
-            _ => continue,
-        };
+        let txn = tid.to_vec();
         let mut guard = pending.lock();
         if let Some(entry) = guard.get(&txn) {
             let matches = entry
@@ -1136,6 +2050,26 @@ async fn reader_loop(sock: Arc<UdpSocket>, pending: Arc<Mutex<PendingMap>>) {
             // Mismatch: ignore the packet, leave entry for the real responder
         }
     }
+}
+
+fn recover_transaction_id(packet: &[u8]) -> Option<Vec<u8>> {
+    let marker = b"1:t";
+    let start = packet.windows(marker.len()).position(|w| w == marker)? + marker.len();
+    let mut colon = start;
+    while colon < packet.len() && packet[colon].is_ascii_digit() {
+        colon += 1;
+    }
+    if colon == start || colon >= packet.len() || packet[colon] != b':' {
+        return None;
+    }
+    let len = std::str::from_utf8(&packet[start..colon])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    if len == 0 || len > 32 || colon + 1 + len > packet.len() {
+        return None;
+    }
+    Some(packet[colon + 1..colon + 1 + len].to_vec())
 }
 
 async fn proxy_reader_loop(sock: Arc<ProxyDatagram>, pending: Arc<Mutex<PendingMap>>) {
@@ -1164,10 +2098,7 @@ async fn proxy_reader_loop(sock: Arc<ProxyDatagram>, pending: Arc<Mutex<PendingM
         let Some(tid) = msg.get(b"t").and_then(|v| v.as_bytes()) else {
             continue;
         };
-        let txn = match tid.len() {
-            2 => u16::from_be_bytes([tid[0], tid[1]]),
-            _ => continue,
-        };
+        let txn = tid.to_vec();
         let expected = pending.lock().get(&txn).map(|entry| entry.target.clone());
         let matches = match (&expected, &source) {
             (Some(DhtTarget::Addr(target)), ProxyDatagramSource::Host(..)) => {
@@ -1196,6 +2127,7 @@ async fn proxy_reader_loop(sock: Arc<ProxyDatagram>, pending: Arc<Mutex<PendingM
 mod tests {
     use super::*;
     use crate::bencode::decode_all;
+    use std::io::Write;
 
     // Shared-DHT tests mutate process-wide state
     static SHARED_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
@@ -1286,6 +2218,20 @@ mod tests {
     }
 
     #[test]
+    fn routing_endpoint_validation_rejects_non_routable_addresses() {
+        for raw in [
+            "0.0.0.0:6881",
+            "255.255.255.255:6881",
+            "224.0.0.1:6881",
+            "127.0.0.1:0",
+        ] {
+            let addr: SocketAddr = raw.parse().unwrap();
+            assert!(!valid_routing_addr(addr), "accepted {raw}");
+        }
+        assert!(valid_routing_addr("192.0.2.1:6881".parse().unwrap()));
+    }
+
+    #[test]
     fn routing_table_caps_bucket_at_k() {
         let me = Id20::from_slice(&[0u8; 20]).unwrap();
         let mut rt = RoutingTable::new(me);
@@ -1300,6 +2246,90 @@ mod tests {
             );
         }
         assert_eq!(rt.len(), BUCKET_SIZE);
+    }
+
+    #[test]
+    fn routing_refresh_marks_stale_contacts_before_evicting_them() {
+        let me = Id20::from_slice(&[0u8; 20]).unwrap();
+        let mut rt = RoutingTable::new(me);
+        let mut id = [0u8; 20];
+        id[0] = 0x80;
+        id[19] = 1;
+        rt.add(
+            Id20::from_slice(&id).unwrap(),
+            "127.0.0.1:6881".parse().unwrap(),
+        );
+        rt.buckets[0].nodes[0].last_seen = Instant::now() - ROUTING_STALE;
+
+        let first = rt.refresh_stale(Instant::now(), 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            rt.buckets[0].nodes[0].liveness,
+            RoutingLiveness::Questionable
+        );
+
+        let second = rt.refresh_stale(Instant::now(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(rt.buckets[0].nodes[0].liveness, RoutingLiveness::Bad);
+        assert_eq!(rt.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn malformed_packet_transaction_recovery_is_bounded() {
+        assert_eq!(
+            recover_transaction_id(b"d1:t2:ab1:y1:q"),
+            Some(b"ab".to_vec())
+        );
+        assert_eq!(recover_transaction_id(b"d1:t0:1:y1:q"), None);
+        assert_eq!(
+            recover_transaction_id(b"d1:t33:0123456789012345678901234567890121:y1:q"),
+            None
+        );
+        assert_eq!(recover_transaction_id(b"d1:tnope"), None);
+    }
+
+    #[test]
+    fn routing_state_file_round_trips_and_ignores_invalid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/dht-routing.state");
+        let first = Id20::from_slice(&[1u8; 20]).unwrap();
+        let second = Id20::from_slice(&[2u8; 20]).unwrap();
+        let contacts = vec![
+            (first, "127.0.0.1:6881".parse().unwrap()),
+            (second, "[::1]:6881".parse().unwrap()),
+        ];
+        assert_eq!(save_routing_state_file(&path, &contacts).unwrap(), 2);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"not-a-contact\n0011\t0.0.0.0:1\n")
+            .unwrap();
+
+        assert_eq!(load_routing_state_file(&path).unwrap(), contacts);
+    }
+
+    #[tokio::test]
+    async fn configured_routing_state_loads_and_saves_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dht-routing.state");
+        let first = Id20::from_slice(&[1u8; 20]).unwrap();
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        save_routing_state_file(&path, &[(first, addr)]).unwrap();
+
+        let dht = Dht::spawn_with_routing_state(path.clone()).await.unwrap();
+        assert_eq!(dht.routing_table_len(), 1);
+        let second = Id20::from_slice(&[2u8; 20]).unwrap();
+        dht.add_bootstrap_nodes([(second, "[::1]:6881".parse().unwrap())]);
+        dht.shutdown().await;
+        let restored = load_routing_state_file(&path).unwrap();
+        assert!(restored.contains(&(first, addr)));
+        assert!(restored.iter().any(|(id, _)| *id == second));
+    }
+
+    #[test]
+    fn outbound_transaction_ids_are_opaque_eight_byte_values() {
+        assert_eq!(random_transaction_id().len(), 8);
     }
 
     #[test]
@@ -1328,7 +2358,7 @@ mod tests {
     fn announce_peer_packet_is_bencoded_krpc_query() {
         let our_id = Id20::from_slice(&[0u8; 20]).unwrap();
         let info_hash = Id20::from_slice(&[1u8; 20]).unwrap();
-        let packet = build_announce_peer(0xCAFE, &our_id, &info_hash, 6881, b"tok");
+        let packet = build_announce_peer(b"opaque-tx", &our_id, &info_hash, 6881, b"tok");
         let decoded = decode_all(&packet).unwrap();
         assert_eq!(
             decoded.get(b"q").and_then(|v| v.as_bytes()),
@@ -1337,6 +2367,10 @@ mod tests {
         assert_eq!(
             decoded.get(b"y").and_then(|v| v.as_bytes()),
             Some(b"q" as &[u8])
+        );
+        assert_eq!(
+            decoded.get(b"t").and_then(|v| v.as_bytes()),
+            Some(b"opaque-tx" as &[u8])
         );
         let a = Value::Dict(decoded.get(b"a").unwrap().as_dict().unwrap().to_vec());
         assert_eq!(a.get(b"port").and_then(|v| v.as_int()), Some(6881));
@@ -1438,7 +2472,7 @@ mod tests {
     #[test]
     fn pending_guard_drop_does_not_remove_reused_transaction() {
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(Default::default()));
-        let txn = 0x1234;
+        let txn = 0x1234u16.to_be_bytes().to_vec();
         let target: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let (old_tx, _old_rx) = oneshot::channel();
         let (new_tx, _new_rx) = oneshot::channel();
@@ -1446,7 +2480,7 @@ mod tests {
         let new_token = PendingToken::new();
 
         pending.lock().insert(
-            txn,
+            txn.clone(),
             PendingEntry {
                 tx: old_tx,
                 target: DhtTarget::Addr(target),
@@ -1456,12 +2490,12 @@ mod tests {
         );
         let guard = PendingGuard {
             pending: pending.clone(),
-            txn,
+            txn: txn.clone(),
             token: old_token,
         };
         pending.lock().remove(&txn);
         pending.lock().insert(
-            txn,
+            txn.clone(),
             PendingEntry {
                 tx: new_tx,
                 target: DhtTarget::Addr(target),
@@ -1473,5 +2507,340 @@ mod tests {
         drop(guard);
 
         assert!(pending.lock().contains_key(&txn));
+    }
+
+    #[test]
+    fn inbound_ping_and_unknown_query() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let ping = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![(
+                    b"id".to_vec(),
+                    Value::Bytes(remote.as_bytes().to_vec()),
+                )]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"abc".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = build_query_response(&ping, "127.0.0.1:6000".parse().unwrap(), &state).unwrap();
+        let reply = decode_all(&reply).unwrap();
+        assert_eq!(
+            reply.get(b"t").and_then(Value::as_bytes),
+            Some(b"abc" as &[u8])
+        );
+        assert_eq!(
+            reply.get(b"y").and_then(Value::as_bytes),
+            Some(b"r" as &[u8])
+        );
+        assert_eq!(state.routing.lock().len(), 1);
+
+        let mut unknown = ping.clone();
+        if let Value::Dict(items) = &mut unknown {
+            if let Some((_, value)) = items.iter_mut().find(|(key, _)| key == b"q") {
+                *value = Value::Bytes(b"no_such_method".to_vec());
+            }
+        }
+        let reply = decode_all(
+            &build_query_response(&unknown, "127.0.0.1:6000".parse().unwrap(), &state).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply.get(b"y").and_then(Value::as_bytes),
+            Some(b"e" as &[u8])
+        );
+        assert_eq!(
+            reply
+                .get(b"e")
+                .and_then(Value::as_list)
+                .and_then(|e| e.first())
+                .and_then(Value::as_int),
+            Some(204)
+        );
+    }
+
+    #[test]
+    fn inbound_get_peers_token_and_announce() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        let from: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let get = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                    (
+                        b"info_hash".to_vec(),
+                        Value::Bytes(hash.as_bytes().to_vec()),
+                    ),
+                ]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"get_peers".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"g1".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let body = decode_all(&build_query_response(&get, from, &state).unwrap()).unwrap();
+        let token = body
+            .get(b"r")
+            .and_then(|r| r.get(b"token"))
+            .and_then(Value::as_bytes)
+            .unwrap()
+            .to_vec();
+        let announce = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                    (
+                        b"info_hash".to_vec(),
+                        Value::Bytes(hash.as_bytes().to_vec()),
+                    ),
+                    (b"port".to_vec(), Value::Int(6881)),
+                    (b"token".to_vec(), Value::Bytes(token)),
+                ]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"announce_peer".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"a1".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = decode_all(&build_query_response(&announce, from, &state).unwrap()).unwrap();
+        assert_eq!(
+            reply.get(b"y").and_then(Value::as_bytes),
+            Some(b"r" as &[u8])
+        );
+        assert_eq!(
+            state.get_peers(hash, None),
+            vec!["127.0.0.1:6881".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn inbound_get_peers_values_follow_transport_not_want() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        state.add_peer(hash, "192.0.2.1:6881".parse().unwrap());
+        state.add_peer(hash, "[2001:db8::1]:6881".parse().unwrap());
+
+        // `want` asks for IPv6 routing nodes, but the KRPC packet itself was
+        // sent over IPv4. BEP-32 requires 6-byte IPv4 peer values here.
+        let request = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                    (
+                        b"info_hash".to_vec(),
+                        Value::Bytes(hash.as_bytes().to_vec()),
+                    ),
+                    (
+                        b"want".to_vec(),
+                        Value::List(vec![Value::Bytes(b"n6".to_vec())]),
+                    ),
+                ]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"get_peers".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"g6".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = decode_all(
+            &build_query_response(&request, "127.0.0.1:6000".parse().unwrap(), &state).unwrap(),
+        )
+        .unwrap();
+        let response = reply.get(b"r").unwrap();
+        let values = response.get(b"values").and_then(Value::as_list).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].as_bytes().unwrap().len(), 6);
+        assert!(response.get(b"nodes6").is_some());
+        assert!(response.get(b"nodes").is_none());
+    }
+
+    #[test]
+    fn inbound_get_peers_response_stays_within_udp_budget() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        for port in 1..2000u16 {
+            state.add_peer(
+                hash,
+                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), port),
+            );
+        }
+        let request = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                    (
+                        b"info_hash".to_vec(),
+                        Value::Bytes(hash.as_bytes().to_vec()),
+                    ),
+                    (
+                        b"want".to_vec(),
+                        Value::List(vec![Value::Bytes(b"n4".to_vec())]),
+                    ),
+                ]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"get_peers".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"aa".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let encoded =
+            build_query_response(&request, "127.0.0.1:6881".parse().unwrap(), &state).unwrap();
+        assert!(encoded.len() <= MAX_KRPC_RESPONSE_BYTES);
+        assert!(decode_all(&encoded).unwrap().get(b"r").is_some());
+    }
+
+    #[test]
+    fn private_hashes_are_not_stored() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        state.set_private(hash, true);
+        state.add_peer(hash, "127.0.0.1:6881".parse().unwrap());
+        assert!(state.get_peers(hash, None).is_empty());
+    }
+
+    #[test]
+    fn unknown_get_peers_does_not_create_empty_store_bucket() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+
+        assert!(state.get_peers(hash, None).is_empty());
+        assert!(state.peers.lock().is_empty());
+    }
+
+    #[test]
+    fn private_hashes_receive_no_dht_service_or_route_learning() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        let from: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        state.set_private(hash, true);
+
+        for (query, tid) in [
+            (b"get_peers".as_slice(), b"g1".as_slice()),
+            (b"announce_peer".as_slice(), b"a1".as_slice()),
+        ] {
+            let request = Value::Dict(vec![
+                (
+                    b"a".to_vec(),
+                    Value::Dict(vec![
+                        (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                        (
+                            b"info_hash".to_vec(),
+                            Value::Bytes(hash.as_bytes().to_vec()),
+                        ),
+                        (b"port".to_vec(), Value::Int(6881)),
+                        (b"token".to_vec(), Value::Bytes(b"not-issued".to_vec())),
+                    ]),
+                ),
+                (b"q".to_vec(), Value::Bytes(query.to_vec())),
+                (b"t".to_vec(), Value::Bytes(tid.to_vec())),
+                (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+            ]);
+            let reply = decode_all(&build_query_response(&request, from, &state).unwrap()).unwrap();
+            assert_eq!(
+                reply.get(b"y").and_then(Value::as_bytes),
+                Some(b"e" as &[u8])
+            );
+            assert!(reply.get(b"r").is_none());
+        }
+        assert_eq!(state.routing.lock().len(), 0);
+        assert!(state.peers.lock().is_empty());
+    }
+
+    #[test]
+    fn announce_peer_rejects_invalid_implied_port_value() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let remote = Id20::from_slice(&[7u8; 20]).unwrap();
+        let hash = Id20::from_slice(&[3u8; 20]).unwrap();
+        let from: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let token = state.token(from);
+        let request = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![
+                    (b"id".to_vec(), Value::Bytes(remote.as_bytes().to_vec())),
+                    (b"implied_port".to_vec(), Value::Int(2)),
+                    (
+                        b"info_hash".to_vec(),
+                        Value::Bytes(hash.as_bytes().to_vec()),
+                    ),
+                    (b"port".to_vec(), Value::Int(6881)),
+                    (b"token".to_vec(), Value::Bytes(token)),
+                ]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"announce_peer".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"bad".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = decode_all(&build_query_response(&request, from, &state).unwrap()).unwrap();
+        assert_eq!(
+            reply.get(b"y").and_then(Value::as_bytes),
+            Some(b"e" as &[u8])
+        );
+        assert!(state.get_peers(hash, None).is_empty());
+    }
+
+    #[test]
+    fn compact_node_parser_rejects_bad_tail_and_zero_port() {
+        let id = [1u8; 20];
+        let mut bytes = id.to_vec();
+        bytes.extend_from_slice(&[1, 2, 3, 4, 0x1a, 0xe1]);
+        bytes.extend_from_slice(&[0xff]);
+        assert_eq!(parse_compact_nodes(&bytes, false).len(), 1);
+        bytes[24] = 0;
+        bytes[25] = 0;
+        assert!(parse_compact_nodes(&bytes[..26], false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_runtime_answers_ping() {
+        let dht = Dht::spawn().await.expect("bind DHT sockets");
+        let port = dht.local_port().expect("IPv4 DHT port");
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = Id20::from_slice(&[4u8; 20]).unwrap();
+        let request = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![(
+                    b"id".to_vec(),
+                    Value::Bytes(remote.as_bytes().to_vec()),
+                )]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
+            (b"t".to_vec(), Value::Bytes(b"zz".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        client
+            .send_to(&encode_to_vec(&request), (Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = decode_all(&buf[..n]).unwrap();
+        assert_eq!(
+            response.get(b"y").and_then(Value::as_bytes),
+            Some(b"r" as &[u8])
+        );
+        assert_eq!(
+            response.get(b"t").and_then(Value::as_bytes),
+            Some(b"zz" as &[u8])
+        );
+        dht.shutdown().await;
     }
 }

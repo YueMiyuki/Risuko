@@ -38,6 +38,7 @@ pub(crate) struct Connector {
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
     pub(crate) tcp_keepalive: Option<Duration>,
+    pub(crate) local_addr: Option<SocketAddr>,
 }
 
 impl Connector {
@@ -88,6 +89,7 @@ impl ProxyConnector {
                 connect_timeout: None,
                 tcp_nodelay: true,
                 tcp_keepalive: None,
+                local_addr: None,
             },
             udp_inner: None,
         }
@@ -1357,7 +1359,17 @@ impl Connector {
         if ordered.is_empty() {
             return Err(Error::Connect(format!("no addresses for {host}")));
         }
-        let connecting = self.happy_eyeballs(host, ordered);
+        let local_addr = self.local_addr;
+        let ordered: Vec<_> = ordered
+            .into_iter()
+            .filter(|target| local_addr.is_none_or(|source| source.is_ipv4() == target.is_ipv4()))
+            .collect();
+        if ordered.is_empty() {
+            return Err(Error::Connect(format!(
+                "no addresses for {host} match the configured local address"
+            )));
+        }
+        let connecting = self.happy_eyeballs(host, ordered, local_addr);
         match self.connect_timeout {
             Some(timeout) => tokio::time::timeout(timeout, connecting)
                 .await
@@ -1367,7 +1379,12 @@ impl Connector {
     }
 
     /// Staggered-parallel connect: each address starts `ATTEMPT_DELAY` after the previous, first to connect wins, rest dropped
-    async fn happy_eyeballs(&self, host: &str, addrs: Vec<SocketAddr>) -> Result<TcpStream, Error> {
+    async fn happy_eyeballs(
+        &self,
+        host: &str,
+        addrs: Vec<SocketAddr>,
+        local_addr: Option<SocketAddr>,
+    ) -> Result<TcpStream, Error> {
         /// Connection Attempt Delay
         const ATTEMPT_DELAY: Duration = Duration::from_millis(300);
 
@@ -1378,7 +1395,7 @@ impl Connector {
 
         // Prime the first attempt
         if let Some(addr) = remaining.next() {
-            in_flight.push(connect_one(addr, timeout));
+            in_flight.push(connect_one(addr, timeout, local_addr));
         }
 
         let stagger = tokio::time::sleep(ATTEMPT_DELAY);
@@ -1403,7 +1420,7 @@ impl Connector {
                             // That attempt failed
                             if in_flight.is_empty() {
                                 if let Some(addr) = remaining.next() {
-                                    in_flight.push(connect_one(addr, timeout));
+                                    in_flight.push(connect_one(addr, timeout, local_addr));
                                 } else {
                                     break;
                                 }
@@ -1412,7 +1429,7 @@ impl Connector {
                         None => {
                             // No attempts in flight and the stream drained
                             if let Some(addr) = remaining.next() {
-                                in_flight.push(connect_one(addr, timeout));
+                                in_flight.push(connect_one(addr, timeout, local_addr));
                             } else {
                                 break;
                             }
@@ -1422,7 +1439,7 @@ impl Connector {
                 _ = &mut stagger => {
                     // Stagger elapsed without a winner
                     if let Some(addr) = remaining.next() {
-                        in_flight.push(connect_one(addr, timeout));
+                        in_flight.push(connect_one(addr, timeout, local_addr));
                     } else if in_flight.is_empty() {
                         break;
                     }
@@ -1464,7 +1481,7 @@ impl Connector {
                     .ok_or_else(|| Error::Url("proxy missing host".into()))?
                     .to_string();
                 let pport = proxy.url().port().unwrap_or(80);
-                let stream = self.direct(&phost, pport).await?;
+                let stream = self.direct_proxy_connection(&phost, pport).await?;
                 if is_https {
                     http_connect(stream, host, port, proxy, self.connect_timeout).await
                 } else {
@@ -1484,7 +1501,7 @@ impl Connector {
                 let user = percent_decode_str(user_raw);
                 let pass = percent_decode_str(pass_raw);
                 let auth = (!user.is_empty()).then_some((user.as_str(), pass.as_str()));
-                let proxy_stream = self.direct(&phost, pport).await?;
+                let proxy_stream = self.direct_proxy_connection(&phost, pport).await?;
                 self.tune(&proxy_stream)?;
                 let stream = match self.connect_timeout {
                     Some(d) => tokio::time::timeout(
@@ -1517,6 +1534,14 @@ impl Connector {
                 Ok(BoxedIo::new(stream))
             }
         }
+    }
+
+    /// Proxy control connections intentionally do not inherit a direct
+    /// destination source address. A proxy chooses the tracker-facing source.
+    async fn direct_proxy_connection(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
+        let mut connector = self.clone();
+        connector.local_addr = None;
+        connector.direct(host, port).await
     }
 }
 
@@ -1611,8 +1636,21 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 async fn connect_one(
     addr: SocketAddr,
     timeout: Option<Duration>,
+    local_addr: Option<SocketAddr>,
 ) -> Result<(TcpStream, SocketAddr), io::Error> {
-    let fut = TcpStream::connect(addr);
+    let fut = async move {
+        if let Some(local_addr) = local_addr {
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket.bind(local_addr)?;
+            socket.connect(addr).await
+        } else {
+            TcpStream::connect(addr).await
+        }
+    };
     let stream = match timeout {
         Some(d) => tokio::time::timeout(d, fut)
             .await
@@ -1844,6 +1882,7 @@ mod tests {
             connect_timeout: Some(Duration::from_secs(2)),
             tcp_nodelay: true,
             tcp_keepalive: None,
+            local_addr: None,
         }
     }
 
@@ -1874,7 +1913,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let c = test_connector();
-        let stream = c.happy_eyeballs("localhost", vec![addr]).await.unwrap();
+        let stream = c
+            .happy_eyeballs("localhost", vec![addr], None)
+            .await
+            .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), addr);
     }
 
@@ -1885,7 +1927,7 @@ mod tests {
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let c = test_connector();
         let stream = c
-            .happy_eyeballs("localhost", vec![dead, live])
+            .happy_eyeballs("localhost", vec![dead, live], None)
             .await
             .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), live);
@@ -1896,7 +1938,9 @@ mod tests {
         let dead1: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let dead2: SocketAddr = "127.0.0.1:2".parse().unwrap();
         let c = test_connector();
-        let res = c.happy_eyeballs("localhost", vec![dead1, dead2]).await;
+        let res = c
+            .happy_eyeballs("localhost", vec![dead1, dead2], None)
+            .await;
         assert!(res.is_err());
     }
 

@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -375,6 +376,7 @@ pub struct ClientBuilder {
     cookie_jar: Option<SharedJar>,
     resolver: Option<SharedResolver>,
     extra_root_certs: Vec<Vec<u8>>,
+    local_addr: Option<SocketAddr>,
 }
 
 impl ClientBuilder {
@@ -398,6 +400,7 @@ impl ClientBuilder {
             cookie_jar: None,
             resolver: None,
             extra_root_certs: Vec::new(),
+            local_addr: None,
         }
     }
 
@@ -492,6 +495,17 @@ impl ClientBuilder {
         self
     }
 
+    pub fn local_address(mut self, address: IpAddr) -> Self {
+        self.local_addr = Some(SocketAddr::new(address, 0));
+        self
+    }
+
+    pub fn local_socket_address(mut self, mut address: SocketAddr) -> Self {
+        address.set_port(0);
+        self.local_addr = Some(address);
+        self
+    }
+
     pub fn add_root_certificate(mut self, der: impl Into<Vec<u8>>) -> Self {
         self.extra_root_certs.push(der.into());
         self
@@ -519,6 +533,7 @@ impl ClientBuilder {
             connect_timeout: self.connect_timeout,
             tcp_nodelay: self.tcp_nodelay,
             tcp_keepalive: self.tcp_keepalive,
+            local_addr: self.local_addr,
         };
 
         let mut hyper_builder = HyperClient::builder(TokioExecutor::new());
@@ -709,6 +724,88 @@ mod tests {
         assert_eq!(
             client
                 .get("http://example.test/file?part=1")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_client_binds_configured_local_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, peer) = listener.accept().await.unwrap();
+            assert_eq!(
+                peer.ip(),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            );
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client = Client::builder()
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(format!("http://{address}/announce"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_connection_does_not_inherit_direct_source_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, peer) = listener.accept().await.unwrap();
+            assert!(peer.is_ipv4());
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client = Client::builder()
+            .proxy(Proxy::all(format!("http://{address}")).unwrap())
+            // A v6 source cannot connect to this v4 proxy. The request must
+            // still succeed because only direct destination routes are bound.
+            .local_address(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get("http://tracker.example/announce")
                 .send()
                 .await
                 .unwrap()

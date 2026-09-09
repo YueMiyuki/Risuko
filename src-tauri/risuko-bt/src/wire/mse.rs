@@ -85,7 +85,6 @@ impl DhKeys {
     }
 }
 
-/// Compute `SHA1(parts...)` and return its 20-byte digest
 pub fn sha1_many(parts: &[&[u8]]) -> [u8; 20] {
     let mut h = Sha1::new();
     for p in parts {
@@ -97,7 +96,6 @@ pub fn sha1_many(parts: &[&[u8]]) -> [u8; 20] {
     r
 }
 
-/// XOR two 20-byte arrays
 pub fn xor20(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
     let mut out = [0u8; 20];
     for i in 0..20 {
@@ -106,20 +104,16 @@ pub fn xor20(a: &[u8; 20], b: &[u8; 20]) -> [u8; 20] {
     out
 }
 
-/// HASH('req1', S) — 20 bytes
 pub fn req1(s: &[u8; DH_LEN]) -> [u8; 20] {
     sha1_many(&[b"req1", s])
 }
-/// HASH('req2', SKEY) — 20 bytes
 pub fn req2(skey: &[u8; 20]) -> [u8; 20] {
     sha1_many(&[b"req2", skey])
 }
-/// HASH('req3', S) — 20 bytes
 pub fn req3(s: &[u8; DH_LEN]) -> [u8; 20] {
     sha1_many(&[b"req3", s])
 }
 
-/// RC4 key derivation per BEP 8: `HASH('keyA' | 'keyB', S, SKEY)` — 20 bytes
 pub fn rc4_key(tag: &[u8; 4], s: &[u8; DH_LEN], skey: &[u8; 20]) -> [u8; 20] {
     sha1_many(&[tag, s, skey])
 }

@@ -16,6 +16,7 @@ pub mod torrent;
 pub mod tracker;
 pub mod upnp;
 pub mod utp;
+pub mod webseed;
 pub mod wire;
 
 pub use api::TorrentIdOrHash;
@@ -29,4 +30,4 @@ pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, ListenerOptions, Session,
     SessionOptions, UpnpStatus,
 };
-pub use torrent::{ManagedTorrent, PeerSnapshot, TorrentStats};
+pub use torrent::{ManagedTorrent, PeerCandidate, PeerSnapshot, PeerSource, TorrentStats};

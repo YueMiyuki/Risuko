@@ -67,6 +67,7 @@ pub struct SpawnPeer {
     pub read_timeout: Duration,
     pub encryption: EncryptionPolicy,
     pub advertise_v2: bool,
+    pub advertise_dht: bool,
     pub ext_handshake_builder: Option<ExtHandshakeBuilder>,
     pub proxy: Option<risuko_http::ProxyConnector>,
 }
@@ -75,6 +76,7 @@ pub struct SpawnPeer {
 pub struct KnownInfoHash {
     pub info_hash: Id20,
     pub advertise_v2: bool,
+    pub advertise_dht: bool,
     pub ext_handshake_builder: Option<ExtHandshakeBuilder>,
 }
 
@@ -83,6 +85,7 @@ impl From<Id20> for KnownInfoHash {
         Self {
             info_hash,
             advertise_v2: true,
+            advertise_dht: true,
             ext_handshake_builder: None,
         }
     }
@@ -331,7 +334,13 @@ where
             "unknown info hash",
         ));
     };
-    let our_hs = Handshake::new_with_v2(remote_hs.info_hash, our_peer_id, known.advertise_v2);
+    let our_hs = Handshake::new_with_features(
+        remote_hs.info_hash,
+        our_peer_id,
+        known.advertise_v2,
+        known.advertise_dht,
+        true,
+    );
     writer.write_all(&our_hs.to_bytes()).await?;
     write_ext_handshake_if_supported(
         &mut writer,
@@ -432,7 +441,13 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let our_hs = Handshake::new_with_v2(spawn.info_hash, spawn.our_peer_id, spawn.advertise_v2);
+    let our_hs = Handshake::new_with_features(
+        spawn.info_hash,
+        spawn.our_peer_id,
+        spawn.advertise_v2,
+        spawn.advertise_dht,
+        true,
+    );
     writer.write_all(&our_hs.to_bytes()).await?;
 
     let mut buf = [0u8; HANDSHAKE_LEN];
@@ -495,7 +510,6 @@ async fn read_until(
     Ok(())
 }
 
-/// Perform the BEP-8 MSE handshake as initiator (A), then send the BEP-3 handshake over the now-encrypted stream
 async fn connect_mse(
     stream: risuko_http::BoxedIo,
     addr: SocketAddr,
@@ -538,8 +552,14 @@ async fn connect_mse(
         crypto_provide |= mse::crypto::PLAINTEXT;
     }
     // Send IA = our BT handshake immediately so the responder can begin on its very first reply packet — saves a round trip
-    let our_hs_bytes =
-        Handshake::new_with_v2(spawn.info_hash, spawn.our_peer_id, spawn.advertise_v2).to_bytes();
+    let our_hs_bytes = Handshake::new_with_features(
+        spawn.info_hash,
+        spawn.our_peer_id,
+        spawn.advertise_v2,
+        spawn.advertise_dht,
+        true,
+    )
+    .to_bytes();
     let mut payload = mse::build_initiator_payload(crypto_provide, &pad_c, &our_hs_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
     enc_out.apply_keystream(&mut payload);
@@ -900,7 +920,14 @@ async fn accept_mse(
     };
 
     // Send our BT handshake, encrypted if RC4 selected
-    let our_hs = Handshake::new_with_v2(skey, our_peer_id, known_info.advertise_v2).to_bytes();
+    let our_hs = Handshake::new_with_features(
+        skey,
+        our_peer_id,
+        known_info.advertise_v2,
+        known_info.advertise_dht,
+        true,
+    )
+    .to_bytes();
     if crypto_select == mse::crypto::RC4 {
         let mut encoded = our_hs.to_vec();
         enc_out.apply_keystream(&mut encoded);
@@ -1298,6 +1325,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             encryption: EncryptionPolicy::PlaintextOnly,
             advertise_v2: true,
+            advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
         })
@@ -1428,11 +1456,53 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             encryption: EncryptionPolicy::PlaintextOnly,
             advertise_v2: true,
+            advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
         })
         .await;
         assert!(res.is_err() || accept_fut.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn private_spawn_does_not_advertise_dht() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = Id20([0x41; 20]);
+        let local_peer_id = Id20([0x42; 20]);
+        let remote_peer_id = Id20([0x43; 20]);
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; HANDSHAKE_LEN];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let request = Handshake::parse(&bytes).unwrap();
+            let (byte, mask) = crate::wire::handshake::reserved::DHT;
+            assert_eq!(request.reserved[byte] & mask, 0);
+            let response = Handshake::new_with_v2(info_hash, remote_peer_id, false);
+            stream.write_all(&response.to_bytes()).await.unwrap();
+        });
+
+        let (handle, mut events) = connect(SpawnPeer {
+            addr,
+            info_hash,
+            our_peer_id: local_peer_id,
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            encryption: EncryptionPolicy::PlaintextOnly,
+            advertise_v2: false,
+            advertise_dht: false,
+            ext_handshake_builder: None,
+            proxy: None,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(PeerEvent::Handshook { .. })
+        ));
+        handle.tx.send(PeerCommand::Disconnect).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1464,6 +1534,7 @@ mod tests {
             read_timeout: Duration::from_secs(10),
             encryption: EncryptionPolicy::RequireEncryption,
             advertise_v2: true,
+            advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
         })
@@ -1543,6 +1614,7 @@ mod tests {
                 read_timeout: Duration::from_secs(10),
                 encryption: EncryptionPolicy::RequireEncryption,
                 advertise_v2: true,
+                advertise_dht: true,
                 ext_handshake_builder: None,
                 proxy: None,
             },
@@ -1615,6 +1687,7 @@ mod tests {
                     read_timeout: Duration::from_secs(5),
                     encryption: EncryptionPolicy::PlaintextOnly,
                     advertise_v2: false,
+                    advertise_dht: true,
                     ext_handshake_builder: None,
                     proxy: None,
                 },
@@ -1682,6 +1755,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             encryption: EncryptionPolicy::PlaintextOnly,
             advertise_v2: false,
+            advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
         };
@@ -1721,6 +1795,7 @@ mod tests {
             let known = vec![KnownInfoHash {
                 info_hash,
                 advertise_v2: false,
+                advertise_dht: true,
                 ext_handshake_builder: None,
             }];
             let (handle, mut rx) =
@@ -1758,6 +1833,7 @@ mod tests {
                     read_timeout: Duration::from_secs(5),
                     encryption: EncryptionPolicy::PlaintextOnly,
                     advertise_v2: false,
+                    advertise_dht: true,
                     ext_handshake_builder: None,
                     proxy: None,
                 },

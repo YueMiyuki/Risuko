@@ -7012,6 +7012,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "env_logger",
+ "futures-util",
  "hex",
  "httparse",
  "network-interface",

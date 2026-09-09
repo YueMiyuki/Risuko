@@ -24,7 +24,7 @@ env:
 jobs:
   bump:
     name: Bump Formula/risuko-cli.rb and Casks/risuko-app.rb
-    runs-on: [self-hosted, linux-x64]
+    runs-on: ubuntu-latest
     # Only run for successful tag releases (workflow_run) or manual dispatch.
     if: >
       github.event_name == 'workflow_dispatch' ||

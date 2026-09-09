@@ -360,8 +360,6 @@ impl EngineOptions {
             .filter(|&v| v != 0)
             .map(std::time::Duration::from_secs)
     }
-
-    /// BEP-8 Message Stream Encryption policy ("plaintext", "prefer", "require"), defaulting to `prefer` (MSE first, plaintext fallback)
     pub fn bt_encryption_policy(&self) -> &'static str {
         match self.get_str("bt-encryption-policy").unwrap_or("prefer") {
             "plaintext" => "plaintext",

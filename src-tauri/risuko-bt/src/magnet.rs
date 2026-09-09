@@ -41,6 +41,7 @@ pub struct Resolved {
     pub trackers: Vec<String>,
     pub piece_layers: BTreeMap<Id32, Vec<u8>>,
     pub peers: Vec<SocketAddr>,
+    pub tracker_peers: Vec<SocketAddr>,
 }
 
 const DEFAULT_LISTEN_PORT: u16 = 6881;
@@ -216,14 +217,22 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     let deadline = Instant::now() + budget;
     let started = Instant::now();
 
-    // Peer addresses discovered by trackers stream through this channel; unbounded because trackers return bursty batches but we drain greedily
-    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<SocketAddr>();
+    #[derive(Clone, Copy)]
+    enum PeerSource {
+        Tracker,
+        Dht,
+        Manual,
+    }
+
+    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<(SocketAddr, PeerSource)>();
+    let tracker_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Fire off all tracker announces in parallel; each feeds peer_tx with its own bounded timeout, so a slow tracker never gates the others
     let mut tracker_set: JoinSet<()> = JoinSet::new();
     for url in trackers.clone() {
         let req = req.clone();
         let tx = peer_tx.clone();
+        let tracker_peers = tracker_peers.clone();
         let per_tracker = budget.min(TRACKER_TIMEOUT);
         let tracker_proxy = proxy.clone();
         tracker_set.spawn(async move {
@@ -238,7 +247,10 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                 Ok(r) => {
                     tracing::debug!("tracker {url} returned {} peers", r.peers.len());
                     for p in r.peers {
-                        let _ = tx.send(p);
+                        if is_dialable_peer_addr(p) {
+                            tracker_peers.lock().insert(p);
+                        }
+                        let _ = tx.send((p, PeerSource::Tracker));
                     }
                 }
                 Err(e) => tracing::debug!("tracker {url} failed: {e}"),
@@ -254,7 +266,7 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
             let mut dht_rx = dht.get_peers_stream(info_hash, dht_budget, None);
             Some(tokio::spawn(async move {
                 while let Some(p) = dht_rx.recv().await {
-                    if tx.send(p).is_err() {
+                    if tx.send((p, PeerSource::Dht)).is_err() {
                         break;
                     }
                 }
@@ -267,7 +279,7 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     };
     // Caller-supplied peers go in first so the driver can begin contacting them immediately, without waiting for any tracker / DHT round-trip
     for p in extra_peers {
-        let _ = peer_tx.send(*p);
+        let _ = peer_tx.send((*p, PeerSource::Manual));
     }
     drop(peer_tx);
 
@@ -287,7 +299,7 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     let (dial_tx, mut dial_rx) = mpsc::unbounded_channel::<SocketAddr>();
     let fan_discovered = discovered.clone();
     let fan_in = tokio::spawn(async move {
-        while let Some(addr) = peer_rx.recv().await {
+        while let Some((addr, _source)) = peer_rx.recv().await {
             if !is_dialable_peer_addr(addr) {
                 continue;
             }
@@ -433,6 +445,7 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                 trackers,
                 piece_layers,
                 peers,
+                tracker_peers: tracker_peers.lock().iter().copied().collect(),
             })
         }
         None => {
@@ -452,6 +465,7 @@ fn metadata_announce_request(info_hash: Id20, peer_id: Id20, listen_port: u16) -
     AnnounceRequest {
         info_hash,
         peer_id,
+        key: u32::from_be_bytes(info_hash.0[..4].try_into().unwrap()),
         port: listen_port,
         uploaded: 0,
         downloaded: 0,
@@ -556,6 +570,7 @@ async fn try_fetch_from_peer(
             read_timeout: PEER_READ_TIMEOUT,
             encryption,
             advertise_v2,
+            advertise_dht: true,
             ext_handshake_builder: Some(ext_handshake_builder),
             proxy,
         },

@@ -18,32 +18,23 @@ pub const EXT_NAME_UT_METADATA: &[u8] = b"ut_metadata";
 pub const EXT_NAME_UT_PEX: &[u8] = b"ut_pex";
 pub const EXT_NAME_UT_HOLEPUNCH: &[u8] = b"ut_holepunch";
 
-/// ut_metadata message types (BEP-9)
 pub mod ut_metadata_type {
     pub const REQUEST: i64 = 0;
     pub const DATA: i64 = 1;
     pub const REJECT: i64 = 2;
 }
 
-/// ut_holepunch (BEP-55) message types; fixed binary layout (NOT bencoded): `msg_type(1) addr_type(1) ip(4|16) port(2) [err_code(4) for Error]`
 pub mod holepunch_type {
-    /// Initiator -> relay: "help me reach this endpoint"
     pub const RENDEZVOUS: u8 = 0;
-    /// Relay -> both ends: "connect to this endpoint now" (simultaneous open)
     pub const CONNECT: u8 = 1;
-    /// Relay -> initiator: rendezvous failed
     pub const ERROR: u8 = 2;
 }
 
-/// ut_holepunch (BEP-55) error codes carried by `holepunch_type::ERROR`
+
 pub mod holepunch_err {
-    /// The relay is not connected to the requested target
     pub const NO_SUCH_PEER: u32 = 1;
-    /// The relay is connected to the target but in a state that can't relay
     pub const NOT_CONNECTED: u32 = 2;
-    /// The target does not advertise ut_holepunch
     pub const NO_SUPPORT: u32 = 3;
-    /// The target endpoint is the relay itself
     pub const NO_SELF: u32 = 4;
 }
 
@@ -54,6 +45,9 @@ pub struct ExtHandshake {
     pub client: Option<String>,
     pub yourip: Option<IpAddr>,
     pub reqq: Option<u32>,
+    pub port: Option<u16>,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
 }
 
 impl ExtHandshake {
@@ -72,6 +66,9 @@ impl ExtHandshake {
             )),
             yourip: None,
             reqq: None,
+            port: None,
+            ipv4: None,
+            ipv6: None,
         }
     }
 
@@ -84,6 +81,21 @@ impl ExtHandshake {
     pub fn with_holepunch(mut self, ut_holepunch_id: u8) -> Self {
         self.supported
             .insert(EXT_NAME_UT_HOLEPUNCH.to_vec(), ut_holepunch_id);
+        self
+    }
+
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    pub fn with_ipv4(mut self, addr: Ipv4Addr) -> Self {
+        self.ipv4 = Some(addr);
+        self
+    }
+
+    pub fn with_ipv6(mut self, addr: Ipv6Addr) -> Self {
+        self.ipv6 = Some(addr);
         self
     }
 
@@ -108,6 +120,15 @@ impl ExtHandshake {
                 IpAddr::V6(v6) => v6.octets().to_vec(),
             };
             dict.push((b"yourip".to_vec(), Value::Bytes(bytes)));
+        }
+        if let Some(port) = self.port {
+            dict.push((b"p".to_vec(), Value::Int(port as i64)));
+        }
+        if let Some(ip) = &self.ipv4 {
+            dict.push((b"ipv4".to_vec(), Value::Bytes(ip.octets().to_vec())));
+        }
+        if let Some(ip) = &self.ipv6 {
+            dict.push((b"ipv6".to_vec(), Value::Bytes(ip.octets().to_vec())));
         }
         Bytes::from(encode_to_vec(&Value::Dict(dict)))
     }
@@ -157,12 +178,32 @@ impl ExtHandshake {
             .find(|(k, _)| k == b"reqq")
             .and_then(|(_, v)| v.as_int())
             .and_then(|n| if n > 0 { Some(n as u32) } else { None });
+        let port = dict
+            .iter()
+            .find(|(k, _)| k == b"p")
+            .and_then(|(_, v)| v.as_int())
+            .and_then(|n| u16::try_from(n).ok());
+        let ipv4 = dict
+            .iter()
+            .find(|(k, _)| k == b"ipv4")
+            .and_then(|(_, v)| v.as_bytes())
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(Ipv4Addr::from);
+        let ipv6 = dict
+            .iter()
+            .find(|(k, _)| k == b"ipv6")
+            .and_then(|(_, v)| v.as_bytes())
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .map(Ipv6Addr::from);
         Some(Self {
             supported,
             metadata_size,
             client,
             yourip,
             reqq,
+            port,
+            ipv4,
+            ipv6,
         })
     }
 
@@ -245,36 +286,116 @@ pub fn parse_ut_metadata(payload: Bytes) -> Option<UtMetadataMsg> {
     })
 }
 
-/// Decode a compact ut_pex payload, returning (ipv4 peers, ipv6 peers) where each peer is an (IP, port) pair
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UtPex {
+    pub added: Vec<(SocketAddr, u8)>,
+    pub dropped: Vec<SocketAddr>,
+}
+
+fn valid_pex_endpoint(addr: SocketAddr) -> bool {
+    addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
+}
+
+fn parse_compact_pex(bytes: &[u8], v6: bool) -> Vec<SocketAddr> {
+    let width = if v6 { 18 } else { 6 };
+    bytes
+        .chunks_exact(width)
+        .filter_map(|chunk| {
+            let addr = if v6 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&chunk[..16]);
+                SocketAddr::from((
+                    std::net::Ipv6Addr::from(octets),
+                    u16::from_be_bytes([chunk[16], chunk[17]]),
+                ))
+            } else {
+                SocketAddr::from((
+                    std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                    u16::from_be_bytes([chunk[4], chunk[5]]),
+                ))
+            };
+            valid_pex_endpoint(addr).then_some(addr)
+        })
+        .collect()
+}
+
+fn parse_compact_pex_flagged(
+    bytes: &[u8],
+    flags: &[u8],
+    v6: bool,
+    remaining: usize,
+) -> Vec<(SocketAddr, u8)> {
+    let width = if v6 { 18 } else { 6 };
+    bytes
+        .chunks_exact(width)
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            let addr = if v6 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&chunk[..16]);
+                SocketAddr::from((
+                    std::net::Ipv6Addr::from(octets),
+                    u16::from_be_bytes([chunk[16], chunk[17]]),
+                ))
+            } else {
+                SocketAddr::from((
+                    std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                    u16::from_be_bytes([chunk[4], chunk[5]]),
+                ))
+            };
+            valid_pex_endpoint(addr).then_some((addr, flags.get(index).copied().unwrap_or(0)))
+        })
+        .take(remaining)
+        .collect()
+}
+
+pub fn parse_ut_pex_full(payload: &[u8]) -> Option<UtPex> {
+    let value = decode_all_external(payload, EXTENSION_DECODE_LIMITS).ok()?;
+    let dict = value.as_dict()?;
+    let bytes = |key: &[u8]| {
+        dict.iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .and_then(|(_, v)| v.as_bytes())
+            .unwrap_or_default()
+    };
+    let flags = |key: &[u8]| {
+        dict.iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .and_then(|(_, v)| v.as_bytes())
+            .unwrap_or_default()
+    };
+    let mut added = Vec::new();
+    added.extend(parse_compact_pex_flagged(
+        bytes(b"added"),
+        flags(b"added.f"),
+        false,
+        50,
+    ));
+    if added.len() < 50 {
+        added.extend(parse_compact_pex_flagged(
+            bytes(b"added6"),
+            flags(b"added6.f"),
+            true,
+            50 - added.len(),
+        ));
+    }
+    let mut dropped = parse_compact_pex(bytes(b"dropped"), false);
+    dropped.extend(parse_compact_pex(bytes(b"dropped6"), true));
+    dropped.truncate(50);
+    Some(UtPex { added, dropped })
+}
+
 pub fn parse_ut_pex(
     payload: &[u8],
 ) -> Option<(Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>)> {
-    let value = decode_all_external(payload, EXTENSION_DECODE_LIMITS).ok()?;
-    let dict = value.as_dict()?;
+    let pex = parse_ut_pex_full(payload)?;
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
-    if let Some(added) = dict
-        .iter()
-        .find(|(k, _)| k == b"added")
-        .and_then(|(_, v)| v.as_bytes())
-    {
-        for chunk in added.chunks_exact(6) {
-            let ip = std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            v4.push(std::net::SocketAddr::from((ip, port)));
-        }
-    }
-    if let Some(added6) = dict
-        .iter()
-        .find(|(k, _)| k == b"added6")
-        .and_then(|(_, v)| v.as_bytes())
-    {
-        for chunk in added6.chunks_exact(18) {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&chunk[..16]);
-            let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-            v6.push(std::net::SocketAddr::from((ip, port)));
+    for (addr, _) in pex.added {
+        if addr.is_ipv4() {
+            v4.push(addr);
+        } else {
+            v6.push(addr);
         }
     }
     Some((v4, v6))
@@ -298,8 +419,20 @@ pub fn build_ut_pex(added: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
         }
         (v4, v6)
     }
-    let (added4, added6) = split(added);
-    let (dropped4, dropped6) = split(dropped);
+    let added: Vec<_> = added
+        .iter()
+        .copied()
+        .filter(|addr| valid_pex_endpoint(*addr))
+        .take(50)
+        .collect();
+    let dropped: Vec<_> = dropped
+        .iter()
+        .copied()
+        .filter(|addr| valid_pex_endpoint(*addr))
+        .take(50)
+        .collect();
+    let (added4, added6) = split(&added);
+    let (dropped4, dropped6) = split(&dropped);
     let dict = vec![
         (b"added".to_vec(), Value::Bytes(added4.clone())),
         (
@@ -320,15 +453,11 @@ pub fn build_ut_pex(added: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
 /// A decoded BEP-55 ut_holepunch message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HolepunchMsg {
-    /// One of [`holepunch_type`]
     pub msg_type: u8,
-    /// The endpoint the message refers to (rendezvous target / connect peer)
     pub addr: SocketAddr,
-    /// One of [`holepunch_err`]; meaningful only for `holepunch_type::ERROR`
     pub err_code: u32,
 }
 
-/// Encode a BEP-55 ut_holepunch message; `err_code` is only emitted for `holepunch_type::ERROR`
 pub fn build_holepunch(msg_type: u8, addr: SocketAddr, err_code: u32) -> Bytes {
     let mut buf = Vec::with_capacity(24);
     buf.push(msg_type);
@@ -343,9 +472,14 @@ pub fn build_holepunch(msg_type: u8, addr: SocketAddr, err_code: u32) -> Bytes {
         }
     }
     buf.extend_from_slice(&addr.port().to_be_bytes());
-    if msg_type == holepunch_type::ERROR {
-        buf.extend_from_slice(&err_code.to_be_bytes());
-    }
+    buf.extend_from_slice(
+        &(if msg_type == holepunch_type::ERROR {
+            err_code
+        } else {
+            0
+        })
+        .to_be_bytes(),
+    );
     Bytes::from(buf)
 }
 
@@ -374,13 +508,13 @@ pub fn parse_holepunch(payload: &[u8]) -> Option<HolepunchMsg> {
         _ => return None,
     };
     let port = u16::from_be_bytes([payload[port_off], payload[port_off + 1]]);
-    let mut err_code = 0u32;
-    if msg_type == holepunch_type::ERROR {
-        let eo = port_off + 2;
-        if payload.len() < eo + 4 {
-            return None;
-        }
-        err_code = u32::from_be_bytes(payload[eo..eo + 4].try_into().ok()?);
+    let eo = port_off + 2;
+    if payload.len() != eo + 4 {
+        return None;
+    }
+    let err_code = u32::from_be_bytes(payload[eo..eo + 4].try_into().ok()?);
+    if msg_type != holepunch_type::ERROR && err_code != 0 {
+        return None;
     }
     Some(HolepunchMsg {
         msg_type,
@@ -402,6 +536,20 @@ mod tests {
         let (v4, v6) = parse_ut_pex(&payload).unwrap();
         assert_eq!(v4, vec![v4a]);
         assert_eq!(v6, vec![v6a]);
+    }
+
+    #[test]
+    fn ut_pex_full_retains_flags_and_dropped_contacts() {
+        let mut added = vec![1, 2, 3, 4, 0x1a, 0xe1];
+        let dropped = vec![5, 6, 7, 8, 0x1a, 0xe2];
+        let payload = encode_to_vec(&Value::Dict(vec![
+            (b"added".to_vec(), Value::Bytes(std::mem::take(&mut added))),
+            (b"added.f".to_vec(), Value::Bytes(vec![0x02])),
+            (b"dropped".to_vec(), Value::Bytes(dropped)),
+        ]));
+        let parsed = parse_ut_pex_full(&payload).unwrap();
+        assert_eq!(parsed.added, vec![("1.2.3.4:6881".parse().unwrap(), 0x02)]);
+        assert_eq!(parsed.dropped, vec!["5.6.7.8:6882".parse().unwrap()]);
     }
 
     #[test]
@@ -477,6 +625,18 @@ mod tests {
     }
 
     #[test]
+    fn advertised_addresses_and_port_round_trip() {
+        let out = ExtHandshake::new_outgoing(3, 4, None)
+            .with_port(51413)
+            .with_ipv4("198.51.100.7".parse().unwrap())
+            .with_ipv6("2001:db8::7".parse().unwrap());
+        let parsed = ExtHandshake::decode(&out.encode()).unwrap();
+        assert_eq!(parsed.port, Some(51413));
+        assert_eq!(parsed.ipv4, Some("198.51.100.7".parse().unwrap()));
+        assert_eq!(parsed.ipv6, Some("2001:db8::7".parse().unwrap()));
+    }
+
+    #[test]
     fn holepunch_advertised_in_handshake() {
         let out = ExtHandshake::new_outgoing(3, 4, None).with_holepunch(5);
         let bytes = out.encode();
@@ -498,8 +658,7 @@ mod tests {
     fn holepunch_connect_v4_round_trip() {
         let addr: SocketAddr = "203.0.113.7:51413".parse().unwrap();
         let bytes = build_holepunch(holepunch_type::CONNECT, addr, 0);
-        // type(1) + addr_type(1) + ipv4(4) + port(2), no err_code for non-error
-        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes.len(), 12);
         let parsed = parse_holepunch(&bytes).unwrap();
         assert_eq!(parsed.msg_type, holepunch_type::CONNECT);
         assert_eq!(parsed.addr, addr);
@@ -510,8 +669,7 @@ mod tests {
     fn holepunch_rendezvous_v6_round_trip() {
         let addr: SocketAddr = "[2001:db8::dead:beef]:6881".parse().unwrap();
         let bytes = build_holepunch(holepunch_type::RENDEZVOUS, addr, 0);
-        // type(1) + addr_type(1) + ipv6(16) + port(2)
-        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes.len(), 24);
         let parsed = parse_holepunch(&bytes).unwrap();
         assert_eq!(parsed.msg_type, holepunch_type::RENDEZVOUS);
         assert_eq!(parsed.addr, addr);
@@ -532,7 +690,6 @@ mod tests {
     fn holepunch_rejects_truncated_and_unknown_family() {
         assert!(parse_holepunch(&[]).is_none());
         assert!(parse_holepunch(&[holepunch_type::CONNECT]).is_none());
-        // addr_type 0 (v4) but missing port bytes
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 0, 1, 2, 3, 4]).is_none());
         // unknown address family
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 9, 1, 2, 3, 4, 0, 0]).is_none());
