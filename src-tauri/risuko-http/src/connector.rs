@@ -39,6 +39,7 @@ pub(crate) struct Connector {
     pub(crate) tcp_nodelay: bool,
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) local_addr: Option<SocketAddr>,
+    pub(crate) direct_address_filter: Option<Arc<dyn Fn(IpAddr) -> bool + Send + Sync>>,
 }
 
 impl Connector {
@@ -90,6 +91,7 @@ impl ProxyConnector {
                 tcp_nodelay: true,
                 tcp_keepalive: None,
                 local_addr: None,
+                direct_address_filter: None,
             },
             udp_inner: None,
         }
@@ -1301,6 +1303,10 @@ impl Connector {
         });
         let is_https = scheme == "https";
 
+        if self.direct_address_filter.is_some() {
+            self.validate_destination(&host).await?;
+        }
+
         let bypass = self
             .no_proxy
             .as_deref()
@@ -1351,8 +1357,27 @@ impl Connector {
         Ok(addrs.collect())
     }
 
+    async fn validate_destination(&self, host: &str) -> Result<(), Error> {
+        let addrs = self.resolve_addrs(host).await?;
+        let allowed = self.direct_address_filter.as_ref().expect("filter checked");
+        if addrs.is_empty() || addrs.iter().any(|addr| !allowed(addr.ip())) {
+            return Err(Error::Connect(format!(
+                "destination {host} resolved to a blocked address"
+            )));
+        }
+        Ok(())
+    }
+
     async fn direct(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let addrs = self.resolve_addrs(host).await?;
+        let addrs = addrs
+            .into_iter()
+            .filter(|addr| {
+                self.direct_address_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter(addr.ip()))
+            })
+            .collect::<Vec<_>>();
         // RFC 8305 (Happy Eyeballs v2)
         let ordered =
             interleave_by_family(addrs.into_iter().map(|a| SocketAddr::new(a.ip(), port)));
@@ -1541,6 +1566,7 @@ impl Connector {
     async fn direct_proxy_connection(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let mut connector = self.clone();
         connector.local_addr = None;
+        connector.direct_address_filter = None;
         connector.direct(host, port).await
     }
 }
@@ -1883,6 +1909,7 @@ mod tests {
             tcp_nodelay: true,
             tcp_keepalive: None,
             local_addr: None,
+            direct_address_filter: None,
         }
     }
 

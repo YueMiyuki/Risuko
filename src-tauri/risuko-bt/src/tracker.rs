@@ -72,6 +72,13 @@ pub enum TrackerError {
     Url(String),
 }
 
+pub(crate) fn is_valid_endpoint(endpoint: SocketAddr) -> bool {
+    !endpoint.ip().is_unspecified()
+        && !endpoint.ip().is_multicast()
+        && !matches!(endpoint, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+        && endpoint.port() != 0
+}
+
 /// Dispatch a single announce to a tracker URL; returns the parsed response
 pub async fn announce(
     url: &str,
@@ -129,14 +136,34 @@ pub async fn announce_with_proxy_and_source(
 pub async fn scrape_udp(
     url: &str,
     info_hashes: &[Id20],
+    timeout: Duration,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    udp::scrape(url, info_hashes).await
+    tokio::time::timeout(timeout, udp::scrape(url, info_hashes, None))
+        .await
+        .map_err(|_| TrackerError::Timeout)?
 }
 
 pub async fn scrape_udp_with_proxy(
     url: &str,
     info_hashes: &[Id20],
+    timeout: Duration,
     proxy: Option<&risuko_http::ProxyConnector>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    udp::scrape_with_proxy(url, info_hashes, proxy).await
+    tokio::time::timeout(
+        timeout,
+        udp::scrape_with_proxy(url, info_hashes, proxy, None),
+    )
+    .await
+    .map_err(|_| TrackerError::Timeout)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_endpoint;
+
+    #[test]
+    fn rejects_broadcast_peer_endpoints() {
+        assert!(!is_valid_endpoint("255.255.255.255:6881".parse().unwrap()));
+        assert!(is_valid_endpoint("192.0.2.1:6881".parse().unwrap()));
+    }
 }

@@ -2715,11 +2715,14 @@ async fn process_verify_result(
 fn build_webseed_client(
     proxy: Option<&risuko_http::ProxyConnector>,
 ) -> Result<risuko_http::Client, String> {
-    let mut builder = risuko_http::Client::builder()
+    let builder = risuko_http::Client::builder()
         .timeout(WEBSEED_TIMEOUT)
         .connect_timeout(Duration::from_secs(8))
         .redirect(risuko_http::Policy::limited(3))
-        .pool_max_idle_per_host(WEBSEED_MAX_WORKERS)
+        .pool_max_idle_per_host(WEBSEED_MAX_WORKERS);
+    #[cfg(not(test))]
+    let builder = builder.direct_address_filter(super::webseed::is_allowed_destination);
+    let mut builder = builder
         .gzip(false)
         .brotli(false)
         .deflate(false);
@@ -2967,7 +2970,7 @@ fn schedule_webseed_workers(
         return;
     }
     let mut candidates: Vec<u32> = piece_tracker
-        .choose_missing_pieces()
+        .choose_missing_pieces_by_index()
         .into_iter()
         .map(|piece| piece.get())
         .collect();

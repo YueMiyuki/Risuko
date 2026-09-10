@@ -1,6 +1,6 @@
 //! UDP tracker (BEP-15): client sends `Connect` (magic) to get a 64-bit `connection_id`, then `Announce` quoting it to get peers + interval + seeders/leechers; retransmits shortened to 3 tries to fit our async budget
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -10,7 +10,7 @@ use tokio::net::{lookup_host, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::{AnnounceRequest, AnnounceResponse, ScrapeResponse, TrackerError};
+use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, ScrapeResponse, TrackerError};
 
 /// Big-endian read/write helpers over byte slices, replacing `byteorder`; each maps 1:1 to `std` be-bytes and slices are sized exactly by the caller so `try_into` never fails
 mod be {
@@ -49,8 +49,14 @@ struct CachedConnection {
     created: std::time::Instant,
 }
 
-static CONNECTION_CACHE: LazyLock<Mutex<std::collections::HashMap<SocketAddr, CachedConnection>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct ConnectionCacheKey {
+    target: SocketAddr,
+    source: SocketAddr,
+}
+
+static CONNECTION_CACHE: LazyLock<Mutex<HashMap<ConnectionCacheKey, CachedConnection>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     announce_with_proxy(url, req, None).await
@@ -127,10 +133,11 @@ const MAX_SCRAPE_HASHES_PER_REQUEST: usize = 74;
 pub async fn scrape(
     url: &str,
     info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
     let mut results = Vec::with_capacity(info_hashes.len());
     for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
-        results.extend(scrape_direct_batch(url, batch).await?);
+        results.extend(scrape_direct_batch(url, batch, source).await?);
     }
     Ok(results)
 }
@@ -138,6 +145,7 @@ pub async fn scrape(
 async fn scrape_direct_batch(
     url: &str,
     info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
     if info_hashes.is_empty() {
         return Ok(Vec::new());
@@ -148,14 +156,21 @@ async fn scrape_direct_batch(
         ));
     }
     let (host, port) = parse_udp_url(url)?;
-    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?);
+    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
+        .into_iter()
+        .filter(|target| {
+            source.is_none_or(|source| {
+                source.ip().is_unspecified() || source.is_ipv4() == target.is_ipv4()
+            })
+        })
+        .collect::<Vec<_>>();
     if targets.is_empty() {
         return Err(TrackerError::Url(format!("no DNS result for {host}")));
     }
 
     let mut last_error = None;
     for target in targets {
-        match scrape_direct_endpoint(target, info_hashes).await {
+        match scrape_direct_endpoint(target, info_hashes, source).await {
             Ok(response) => return Ok(response),
             Err(error) => last_error = Some(error),
         }
@@ -166,15 +181,50 @@ async fn scrape_direct_batch(
 async fn scrape_direct_endpoint(
     target: SocketAddr,
     info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    let sock = UdpSocket::bind(if target.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    })
-    .await?;
+    let bind_addr = direct_bind_addr(target, source);
+    let cache_key = ConnectionCacheKey {
+        target,
+        source: bind_addr,
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(target).await?;
-    let conn_id = connect(&sock).await?;
+
+    let conn_id = match cached_connection(cache_key) {
+        Some(id) => id,
+        None => {
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            id
+        }
+    };
+    match scrape_inner(&sock, conn_id, info_hashes).await {
+        Ok(response) => Ok(response),
+        Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
+            invalidate_connection(cache_key);
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            match scrape_inner(&sock, id, info_hashes).await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    invalidate_connection(cache_key);
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            invalidate_connection(cache_key);
+            Err(error)
+        }
+    }
+}
+
+async fn scrape_inner(
+    sock: &UdpSocket,
+    conn_id: u64,
+    info_hashes: &[super::super::core::Id20],
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
     let txn = rand::rng().random::<u32>();
     let mut body = Vec::with_capacity(16 + info_hashes.len() * 20);
     body.extend_from_slice(&conn_id.to_be_bytes());
@@ -217,10 +267,24 @@ pub async fn scrape_with_proxy(
     url: &str,
     info_hashes: &[super::super::core::Id20],
     proxy: Option<&risuko_http::ProxyConnector>,
+    source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
     let Some(proxy) = proxy else {
-        return scrape(url, info_hashes).await;
+        return scrape(url, info_hashes, source).await;
     };
+    if !proxy.has_proxy() {
+        return scrape(url, info_hashes, source).await;
+    }
+    if source.is_some_and(|source| !source.ip().is_unspecified()) {
+        let (host, port) = parse_udp_url(url)?;
+        let bypasses_proxy = proxy
+            .udp_no_proxy()
+            .or_else(|| proxy.no_proxy())
+            .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
+        if bypasses_proxy {
+            return scrape(url, info_hashes, source).await;
+        }
+    }
     let mut results = Vec::with_capacity(info_hashes.len());
     for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
         results.extend(scrape_proxy_batch(url, batch, proxy).await?);
@@ -294,35 +358,33 @@ fn dedupe_endpoints(endpoints: impl IntoIterator<Item = SocketAddr>) -> Vec<Sock
         .collect()
 }
 
-fn is_valid_endpoint(endpoint: SocketAddr) -> bool {
-    !endpoint.ip().is_unspecified()
-        && !endpoint.ip().is_multicast()
-        && !matches!(endpoint, SocketAddr::V4(v4) if v4.ip().is_broadcast())
-        && endpoint.port() != 0
-}
-
 async fn announce_endpoint(
     target: SocketAddr,
     req: &AnnounceRequest,
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let sock = UdpSocket::bind(direct_bind_addr(target, source)).await?;
+    let bind_addr = direct_bind_addr(target, source);
+    let cache_key = ConnectionCacheKey {
+        target,
+        source: bind_addr,
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(target).await?;
 
-    let conn_id = cached_connection(target).unwrap_or(0);
-    let conn_id = if conn_id == 0 {
-        let id = connect(&sock).await?;
-        cache_connection(target, id);
-        id
-    } else {
-        conn_id
+    let conn_id = match cached_connection(cache_key) {
+        Some(id) => id,
+        None => {
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            id
+        }
     };
     match announce_inner(&sock, conn_id, req).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
-            invalidate_connection(target);
+            invalidate_connection(cache_key);
             let id = connect(&sock).await?;
-            cache_connection(target, id);
+            cache_connection(cache_key, id);
             announce_inner(&sock, id, req).await
         }
         Err(error) => Err(error),
@@ -333,7 +395,10 @@ fn direct_bind_addr(target: SocketAddr, source: Option<SocketAddr>) -> SocketAdd
     let compatible = source
         .filter(|source| !source.ip().is_unspecified() && source.is_ipv4() == target.is_ipv4());
     compatible
-        .map(|source| SocketAddr::new(source.ip(), 0))
+        .map(|mut source| {
+            source.set_port(0);
+            source
+        })
         .unwrap_or_else(|| {
             if target.is_ipv6() {
                 SocketAddr::from(([0u16; 8], 0))
@@ -343,17 +408,17 @@ fn direct_bind_addr(target: SocketAddr, source: Option<SocketAddr>) -> SocketAdd
         })
 }
 
-fn cached_connection(target: SocketAddr) -> Option<u64> {
+fn cached_connection(key: ConnectionCacheKey) -> Option<u64> {
     let mut cache = CONNECTION_CACHE.lock().ok()?;
     cache.retain(|_, item| item.created.elapsed() < CONNECTION_TTL);
-    cache.get(&target).map(|item| item.id)
+    cache.get(&key).map(|item| item.id)
 }
 
-fn cache_connection(target: SocketAddr, id: u64) {
+fn cache_connection(key: ConnectionCacheKey, id: u64) {
     if let Ok(mut cache) = CONNECTION_CACHE.lock() {
         cache.retain(|_, item| item.created.elapsed() < CONNECTION_TTL);
         cache.insert(
-            target,
+            key,
             CachedConnection {
                 id,
                 created: std::time::Instant::now(),
@@ -362,9 +427,9 @@ fn cache_connection(target: SocketAddr, id: u64) {
     }
 }
 
-fn invalidate_connection(target: SocketAddr) {
+fn invalidate_connection(key: ConnectionCacheKey) {
     if let Ok(mut cache) = CONNECTION_CACHE.lock() {
-        cache.remove(&target);
+        cache.remove(&key);
     }
 }
 
@@ -374,31 +439,12 @@ async fn announce_endpoint_proxy(
     port: u16,
     req: &AnnounceRequest,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let cache_key = host
-        .parse::<IpAddr>()
-        .ok()
-        .map(|address| SocketAddr::new(address, port));
-    let conn_id = cache_key.and_then(cached_connection).unwrap_or(0);
-    let conn_id = if conn_id == 0 {
-        let id = connect_socket(&sock, host, port).await?;
-        if let Some(cache_key) = cache_key {
-            cache_connection(cache_key, id);
-        }
-        id
-    } else {
-        conn_id
-    };
+    let conn_id = connect_socket(&sock, host, port).await?;
     let is_ipv6 = host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6());
     match announce_inner_socket(&sock, conn_id, host, port, req, is_ipv6).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
-            if let Some(cache_key) = cache_key {
-                invalidate_connection(cache_key);
-            }
             let id = connect_socket(&sock, host, port).await?;
-            if let Some(cache_key) = cache_key {
-                cache_connection(cache_key, id);
-            }
             announce_inner_socket(&sock, id, host, port, req, is_ipv6).await
         }
         Err(error) => Err(error),
@@ -745,6 +791,24 @@ mod tests {
             direct_bind_addr(v6_target, Some(v4_source)),
             "[::]:0".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn cached_connection_keeps_zero_and_isolates_source_routes() {
+        let target: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let first = ConnectionCacheKey {
+            target,
+            source: "192.0.2.7:0".parse().unwrap(),
+        };
+        let second = ConnectionCacheKey {
+            target,
+            source: "192.0.2.8:0".parse().unwrap(),
+        };
+
+        cache_connection(first, 0);
+        assert_eq!(cached_connection(first), Some(0));
+        assert_eq!(cached_connection(second), None);
+        invalidate_connection(first);
     }
 
     #[test]

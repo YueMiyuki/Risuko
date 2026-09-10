@@ -34,7 +34,7 @@ impl Handshake {
     pub fn new_with_v2(info_hash: Id20, peer_id: Id20, advertise_v2: bool) -> Self {
         Self::new_with_features(info_hash, peer_id, advertise_v2, true, true)
     }
-    
+
     pub fn new_with_features(
         info_hash: Id20,
         peer_id: Id20,

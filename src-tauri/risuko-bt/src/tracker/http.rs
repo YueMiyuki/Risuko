@@ -1,13 +1,14 @@
 //! HTTP / HTTPS tracker (BEP-3 + BEP-23 compact peer list)
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
 use super::super::bencode::{decode_all_external, DecodeLimits};
-use super::{AnnounceRequest, AnnounceResponse, TrackerError};
+use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, TrackerError};
 
 /// RFC 3986 unreserved + `-_.~` are safe in a URL without percent-encoding
 const TRACKER_RESPONSE_LIMITS: DecodeLimits = DecodeLimits::new(2 * 1024 * 1024, 64, 262_144);
@@ -28,6 +29,34 @@ fn client() -> &'static risuko_http::Client {
             .build()
             .expect("build risuko-http client")
     })
+}
+
+fn source_client(source: SocketAddr) -> Result<risuko_http::Client, TrackerError> {
+    static CLIENTS: OnceLock<Mutex<HashMap<SocketAddr, risuko_http::Client>>> = OnceLock::new();
+
+    let source = tracker_source_addr(source);
+    let mut clients = CLIENTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| TrackerError::Http("source client cache lock poisoned".into()))?;
+    if let Some(client) = clients.get(&source) {
+        return Ok(client.clone());
+    }
+
+    let client = risuko_http::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(4)
+        .local_socket_address(source)
+        .build()
+        .map_err(|e| TrackerError::Http(e.to_string()))?;
+    clients.insert(source, client.clone());
+    Ok(client)
+}
+
+fn tracker_source_addr(mut source: SocketAddr) -> SocketAddr {
+    source.set_port(0);
+    source
 }
 
 pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
@@ -65,20 +94,13 @@ pub async fn announce_with_proxy_and_source(
             builder = builder.no_proxy(bypass.clone());
         }
         if let Some(source) = source.filter(|source| !source.ip().is_unspecified()) {
-            builder = builder.local_socket_address(SocketAddr::new(source.ip(), 0));
+            builder = builder.local_socket_address(tracker_source_addr(source));
         }
         builder
             .build()
             .map_err(|e| TrackerError::Http(e.to_string()))?
     } else if let Some(source) = source.filter(|source| !source.ip().is_unspecified()) {
-        let source = SocketAddr::new(source.ip(), 0);
-        risuko_http::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(4)
-            .local_socket_address(source)
-            .build()
-            .map_err(|e| TrackerError::Http(e.to_string()))?
+        source_client(source)?
     } else {
         client().clone()
     };
@@ -138,13 +160,14 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
         .and_then(|n| u32::try_from(n).ok());
 
     let mut peers = Vec::new();
+    let mut seen = HashSet::new();
     // Compact IPv4 (BEP-23): 6 bytes per peer
     if let Some(raw) = value.get(b"peers").and_then(|v| v.as_bytes()) {
         for chunk in raw.chunks_exact(6) {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             let endpoint = SocketAddr::new(IpAddr::V4(ip), port);
-            if valid_peer_endpoint(endpoint) {
+            if is_valid_endpoint(endpoint) && seen.insert(endpoint) {
                 peers.push(endpoint);
             }
         }
@@ -158,7 +181,7 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
                     if let Ok(ip) = ip.parse::<IpAddr>() {
                         if let Ok(port) = u16::try_from(port) {
                             let endpoint = SocketAddr::new(ip, port);
-                            if valid_peer_endpoint(endpoint) {
+                            if is_valid_endpoint(endpoint) && seen.insert(endpoint) {
                                 peers.push(endpoint);
                             }
                         }
@@ -176,14 +199,11 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
             let ip = Ipv6Addr::from(octets);
             let port = u16::from_be_bytes([chunk[16], chunk[17]]);
             let endpoint = SocketAddr::new(IpAddr::V6(ip), port);
-            if valid_peer_endpoint(endpoint) {
+            if is_valid_endpoint(endpoint) && seen.insert(endpoint) {
                 peers.push(endpoint);
             }
         }
     }
-
-    peers.sort_unstable();
-    peers.dedup();
 
     Ok(AnnounceResponse {
         interval: Duration::from_secs(interval),
@@ -191,10 +211,6 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
         seeders,
         leechers,
     })
-}
-
-fn valid_peer_endpoint(endpoint: SocketAddr) -> bool {
-    !endpoint.ip().is_unspecified() && !endpoint.ip().is_multicast() && endpoint.port() != 0
 }
 
 #[cfg(test)]
@@ -248,6 +264,44 @@ mod tests {
         assert_eq!(r.interval, Duration::from_secs(60));
         assert_eq!(r.peers.len(), 2);
         assert_eq!(r.peers[0].port(), 6881);
+    }
+
+    #[test]
+    fn preserves_tracker_peer_order_while_deduplicating() {
+        let peers_bin: Vec<u8> = vec![
+            5, 6, 7, 8, 0x1a, 0xe2, // 5.6.7.8:6882
+            1, 2, 3, 4, 0x1a, 0xe1, // 1.2.3.4:6881
+            5, 6, 7, 8, 0x1a, 0xe2, // duplicate
+            255, 255, 255, 255, 0x1a, 0xe3, // broadcast
+        ];
+        let body = encode_to_vec(&Value::Dict(vec![
+            (b"interval".to_vec(), Value::Int(60)),
+            (b"peers".to_vec(), Value::Bytes(peers_bin)),
+        ]));
+
+        let response = parse_response(&body).unwrap();
+        assert_eq!(
+            response.peers,
+            vec![
+                "5.6.7.8:6882".parse().unwrap(),
+                "1.2.3.4:6881".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tracker_source_keeps_ipv6_scope_id() {
+        let source = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            43123,
+            0,
+            7,
+        ));
+
+        assert_eq!(
+            tracker_source_addr(source),
+            SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 7))
+        );
     }
 
     #[test]

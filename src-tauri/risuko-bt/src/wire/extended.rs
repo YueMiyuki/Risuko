@@ -30,7 +30,6 @@ pub mod holepunch_type {
     pub const ERROR: u8 = 2;
 }
 
-
 pub mod holepunch_err {
     pub const NO_SUCH_PEER: u32 = 1;
     pub const NOT_CONNECTED: u32 = 2;
@@ -509,13 +508,20 @@ pub fn parse_holepunch(payload: &[u8]) -> Option<HolepunchMsg> {
     };
     let port = u16::from_be_bytes([payload[port_off], payload[port_off + 1]]);
     let eo = port_off + 2;
-    if payload.len() != eo + 4 {
+    let err_code = if payload.len() == eo {
+        if msg_type == holepunch_type::ERROR {
+            return None;
+        }
+        0
+    } else if payload.len() == eo + 4 {
+        let err_code = u32::from_be_bytes(payload[eo..eo + 4].try_into().ok()?);
+        if msg_type != holepunch_type::ERROR && err_code != 0 {
+            return None;
+        }
+        err_code
+    } else {
         return None;
-    }
-    let err_code = u32::from_be_bytes(payload[eo..eo + 4].try_into().ok()?);
-    if msg_type != holepunch_type::ERROR && err_code != 0 {
-        return None;
-    }
+    };
     Some(HolepunchMsg {
         msg_type,
         addr: SocketAddr::new(ip, port),
@@ -693,5 +699,12 @@ mod tests {
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 0, 1, 2, 3, 4]).is_none());
         // unknown address family
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 9, 1, 2, 3, 4, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn holepunch_accepts_legacy_non_error_without_err_code() {
+        let mut bytes = build_holepunch(holepunch_type::CONNECT, "203.0.113.7:51413".parse().unwrap(), 0).to_vec();
+        bytes.truncate(bytes.len() - 4);
+        assert_eq!(parse_holepunch(&bytes).unwrap().err_code, 0);
     }
 }

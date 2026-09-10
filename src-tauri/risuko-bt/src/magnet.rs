@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use rand::RngExt;
 use sha1::{Digest, Sha1};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinSet;
@@ -416,6 +417,7 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     };
 
     tracker_set.abort_all();
+    while tracker_set.join_next().await.is_some() {}
     if let Some(h) = dht_handle {
         h.abort();
     }
@@ -465,7 +467,7 @@ fn metadata_announce_request(info_hash: Id20, peer_id: Id20, listen_port: u16) -
     AnnounceRequest {
         info_hash,
         peer_id,
-        key: u32::from_be_bytes(info_hash.0[..4].try_into().unwrap()),
+        key: rand::rng().random(),
         port: listen_port,
         uploaded: 0,
         downloaded: 0,

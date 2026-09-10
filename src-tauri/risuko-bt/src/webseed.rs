@@ -2,10 +2,31 @@
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use std::net::IpAddr;
 use url::Url;
 
 use crate::bencode::Value;
 pub const DEFAULT_MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+
+pub fn is_allowed_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unique_local()
+                && !ip.is_multicast()
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum WebSeedError {
@@ -49,7 +70,11 @@ pub struct RangeResponse {
 
 impl ByteRange {
     pub fn len(self) -> u64 {
-        self.end - self.start + 1
+        if self.is_empty() {
+            0
+        } else {
+            self.end - self.start + 1
+        }
     }
 
     pub fn is_empty(self) -> bool {
@@ -71,12 +96,13 @@ pub fn parse_url_list(value: &Value) -> Vec<String> {
             continue;
         };
         let raw = raw.trim();
-        let Ok(url) = Url::parse(raw) else {
+        let Ok(mut url) = Url::parse(raw) else {
             continue;
         };
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             continue;
         }
+        url.set_fragment(None);
         let normalized = url.to_string();
         if !out.iter().any(|existing| existing == &normalized) {
             out.push(normalized);
@@ -87,10 +113,11 @@ pub fn parse_url_list(value: &Value) -> Vec<String> {
 
 /// Validate and normalize one WebSeed base URL
 pub fn parse_base_url(raw: &str) -> Result<Url, WebSeedError> {
-    let url = Url::parse(raw.trim()).map_err(|e| WebSeedError::InvalidUrl(e.to_string()))?;
+    let mut url = Url::parse(raw.trim()).map_err(|e| WebSeedError::InvalidUrl(e.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(WebSeedError::UnsupportedScheme);
     }
+    url.set_fragment(None);
     Ok(url)
 }
 
@@ -262,6 +289,15 @@ pub async fn fetch_range_response(
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    if status != 206 {
+        validate_range_response(
+            status,
+            content_range.as_deref(),
+            0,
+            requested,
+            max_body,
+        )?;
+    }
     if let Some(length) = response.content_length() {
         if length > max_body {
             return Err(WebSeedError::BodyTooLarge {
@@ -311,6 +347,12 @@ mod tests {
         let scalar = Value::Bytes(b"https://mirror.example/file".to_vec());
         assert_eq!(parse_url_list(&scalar), vec!["https://mirror.example/file"]);
 
+        let with_fragment = Value::Bytes(b"https://mirror.example/file#piece".to_vec());
+        assert_eq!(
+            parse_url_list(&with_fragment),
+            vec!["https://mirror.example/file"]
+        );
+
         let list = Value::List(vec![
             Value::Bytes(b"https://mirror.example/".to_vec()),
             Value::Bytes(b"ftp://mirror.example/file".to_vec()),
@@ -318,6 +360,17 @@ mod tests {
             Value::Bytes(vec![0xff]),
         ]);
         assert_eq!(parse_url_list(&list), vec!["https://mirror.example/"]);
+    }
+
+    #[test]
+    fn rejects_internal_webseed_destinations() {
+        for raw in ["127.0.0.1", "10.0.0.1", "169.254.1.1", "::1", "fc00::1"] {
+            assert!(
+                !is_allowed_destination(raw.parse().unwrap()),
+                "accepted {raw}"
+            );
+        }
+        assert!(is_allowed_destination("192.0.2.1".parse().unwrap()));
     }
 
     #[test]
@@ -338,6 +391,15 @@ mod tests {
             direct.as_str(),
             "https://mirror.example/payload.bin?download=1"
         );
+
+        let fragment = build_file_url(
+            "https://mirror.example/payload.bin#download",
+            "payload.bin",
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(fragment.as_str(), "https://mirror.example/payload.bin");
 
         let multi = build_file_url("https://mirror.example/pub/", "root", &path, false).unwrap();
         assert_eq!(
@@ -391,6 +453,15 @@ mod tests {
 
     #[test]
     fn rejects_oversized_ranges_and_truncated_bodies() {
+        assert_eq!(
+            ByteRange {
+                start: 2,
+                end: 1,
+                total: 10,
+            }
+            .len(),
+            0
+        );
         assert!(matches!(
             validate_range(0, 100, 101, 100),
             Err(WebSeedError::BodyTooLarge { .. })

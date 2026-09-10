@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
@@ -17,6 +17,9 @@ use super::core::metainfo::{parse_torrent, FileDetails};
 use super::core::{generate_peer_id, Id20, Lengths};
 use super::peer::{KnownInfoHash, PeerCommand, PeerEvent, PeerHandle};
 use super::torrent::{spawn as spawn_torrent, ManagedTorrent, TorrentCommand, TorrentInit};
+
+static PRIVATE_TORRENT_OWNERS: LazyLock<Mutex<HashMap<Id20, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpnpStatus {
@@ -664,6 +667,15 @@ impl Session {
             inner.torrents.insert(id, handle.clone());
         }
         if info.private {
+            {
+                let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+                for hash in meta.announce_infohashes() {
+                    owners
+                        .entry(hash)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                }
+            }
             if let Some(dht) = self.dht.lock().clone() {
                 for hash in meta.announce_infohashes() {
                     dht.set_private(hash, true);
@@ -923,7 +935,20 @@ impl Session {
             if let Some(dht) = self.dht.lock().clone() {
                 if let Some(meta) = handle.metadata.load().as_ref() {
                     for hash in meta.announce_infohashes() {
-                        dht.set_private(hash, false);
+                        let should_clear = {
+                            let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+                            let count = owners.entry(hash).or_default();
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                owners.remove(&hash);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_clear {
+                            dht.set_private(hash, false);
+                        }
                     }
                 }
             }

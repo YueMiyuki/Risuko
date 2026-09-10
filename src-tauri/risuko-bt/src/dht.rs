@@ -222,9 +222,13 @@ impl InboundDhtState {
             return;
         }
         if addr.is_ipv6() {
-            self.routing6.lock().add(id, addr);
+            self.routing6
+                .lock()
+                .add_with_liveness(id, addr, RoutingLiveness::Questionable);
         } else {
-            self.routing.lock().add(id, addr);
+            self.routing
+                .lock()
+                .add_with_liveness(id, addr, RoutingLiveness::Questionable);
         }
     }
 
@@ -422,7 +426,20 @@ impl Dht {
     }
 
     pub async fn shutdown(&self) {
-        self.persist_configured_routing_state();
+        if let Some(path) = self.routing_state_path.clone() {
+            let routes = self.routing_snapshot();
+            let log_path = path.clone();
+            let result = tokio::task::spawn_blocking(move || save_routing_state_file(&path, &routes)).await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(path = %log_path.display(), "failed to persist DHT routing state: {error}");
+                }
+                Err(error) => {
+                    tracing::warn!(path = %log_path.display(), "DHT routing state persistence task failed: {error}");
+                }
+            }
+        }
         self.shutdown.store(true, Ordering::Release);
         self.abort_lookups();
         if let Some(handle) = self.reader_handle.lock().take() {
@@ -781,9 +798,13 @@ impl Dht {
         if let Some(path) = routing_state_path.as_deref() {
             for (id, addr) in load_routing_state_file(path)? {
                 if addr.is_ipv6() {
-                    routing6.lock().add(id, addr);
+                    routing6
+                        .lock()
+                        .add_with_liveness(id, addr, RoutingLiveness::Questionable);
                 } else {
-                    routing.lock().add(id, addr);
+                    routing
+                        .lock()
+                        .add_with_liveness(id, addr, RoutingLiveness::Questionable);
                 }
             }
         }
@@ -961,7 +982,7 @@ impl Dht {
             shortlist.insert(node_id.distance(&info_hash), from.clone());
             if responder_id.is_some() {
                 if let DhtTarget::Addr(from) = &from {
-                    self.add_routing(node_id, *from);
+                    self.add_routing_questionable(node_id, *from);
                 }
             }
             if let Some(tok) = token {
@@ -980,7 +1001,7 @@ impl Dht {
                     e.insert(DhtTarget::Addr(*naddr));
                     progressed = true;
                 }
-                self.add_routing(*nid, *naddr);
+                self.add_routing_questionable(*nid, *naddr);
             }
 
             // Trim to K * 2 to keep memory bounded
@@ -1149,6 +1170,21 @@ impl Dht {
         }
     }
 
+    fn add_routing_questionable(&self, id: Id20, addr: SocketAddr) {
+        if !valid_routing_addr(addr) {
+            return;
+        }
+        if addr.is_ipv6() {
+            self.routing6
+                .lock()
+                .add_with_liveness(id, addr, RoutingLiveness::Questionable);
+        } else {
+            self.routing
+                .lock()
+                .add_with_liveness(id, addr, RoutingLiveness::Questionable);
+        }
+    }
+
     fn closest_routing(&self, target: &Id20, n: usize) -> Vec<SocketAddr> {
         let mut nodes = self.routing.lock().closest_nodes(target, n);
         nodes.extend(self.routing6.lock().closest_nodes(target, n));
@@ -1218,16 +1254,16 @@ impl Dht {
     pub fn set_private(&self, info_hash: Id20, private: bool) {
         self.server.set_private(info_hash, private);
     }
-    
+
     pub fn add_bootstrap_nodes<I>(&self, nodes: I)
     where
         I: IntoIterator<Item = (Id20, SocketAddr)>,
     {
         for (id, addr) in nodes {
-            self.add_routing(id, addr);
+            self.add_routing_questionable(id, addr);
         }
     }
-    
+
     pub fn add_bootstrap_hosts<I>(&self, hosts: I)
     where
         I: IntoIterator<Item = (Id20, String, u16)>,
@@ -1247,7 +1283,7 @@ impl Dht {
 
     /// BEP-5 PORT support
     pub fn add_node(&self, addr: SocketAddr) {
-        self.add_routing(pseudo_id(addr), addr);
+        self.add_routing_questionable(pseudo_id(addr), addr);
     }
 
     /// Warm the routing table by iteratively looking up our own id (bootstrap nodes respond with contacts closest to us, which populates a fresh table), returning once the lookup converges or `budget` elapses
@@ -1301,7 +1337,7 @@ fn load_routing_state_file(path: &Path) -> std::io::Result<Vec<(Id20, SocketAddr
 }
 
 fn save_routing_state_file(path: &Path, contacts: &[(Id20, SocketAddr)]) -> std::io::Result<usize> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let mut data = String::from("risuko-dht-routing-v1\n");
@@ -1329,7 +1365,6 @@ fn save_routing_state_file(path: &Path, contacts: &[(Id20, SocketAddr)]) -> std:
     std::fs::rename(&temporary, path)?;
     Ok(written)
 }
-
 
 const BUCKET_SIZE: usize = K;
 
@@ -1436,6 +1471,10 @@ impl RoutingTable {
     }
 
     fn add(&mut self, id: Id20, addr: SocketAddr) {
+        self.add_with_liveness(id, addr, RoutingLiveness::Good);
+    }
+
+    fn add_with_liveness(&mut self, id: Id20, addr: SocketAddr, liveness: RoutingLiveness) {
         let distance = self.our_id.distance(&id);
         if distance == Id20([0; 20]) {
             return;
@@ -1449,7 +1488,11 @@ impl RoutingTable {
             if let Some(existing) = bucket.nodes.iter_mut().find(|n| n.id == id) {
                 existing.addr = addr;
                 existing.last_seen = now;
-                existing.liveness = RoutingLiveness::Good;
+                if liveness == RoutingLiveness::Good {
+                    existing.liveness = RoutingLiveness::Good;
+                } else if existing.liveness != RoutingLiveness::Good {
+                    existing.liveness = liveness;
+                }
                 return;
             }
             if bucket.nodes.len() < BUCKET_SIZE {
@@ -1457,7 +1500,7 @@ impl RoutingTable {
                     id,
                     addr,
                     last_seen: now,
-                    liveness: RoutingLiveness::Good,
+                    liveness,
                 });
                 return;
             }
@@ -1474,7 +1517,7 @@ impl RoutingTable {
                     id,
                     addr,
                     last_seen: now,
-                    liveness: RoutingLiveness::Good,
+                    liveness,
                 };
             } else if let Some(stalest) = bucket.nodes.iter_mut().min_by_key(|node| node.last_seen)
             {
@@ -1491,12 +1534,16 @@ impl RoutingTable {
                 if out.len() >= limit {
                     return out;
                 }
+                if node.liveness == RoutingLiveness::Bad {
+                    continue;
+                }
                 if now.duration_since(node.last_seen) >= ROUTING_STALE {
                     node.liveness = match node.liveness {
                         RoutingLiveness::Good => RoutingLiveness::Questionable,
                         RoutingLiveness::Questionable => RoutingLiveness::Bad,
                         RoutingLiveness::Bad => RoutingLiveness::Bad,
                     };
+                    node.last_seen = now;
                     out.push((node.id, node.addr));
                 }
             }
@@ -1807,6 +1854,28 @@ fn krpc_error(tid: &[u8], code: i64, message: &'static [u8]) -> Vec<u8> {
 
 #[allow(clippy::ptr_arg)]
 fn bounded_response_bytes(response: &mut Vec<(Vec<u8>, Value)>) -> Vec<u8> {
+    if let Some((_, Value::Dict(body))) = response.iter_mut().find(|(key, _)| key == b"r") {
+        let max_values = MAX_KRPC_RESPONSE_BYTES / 6;
+        for (key, width) in [
+            (b"values".as_slice(), 6usize),
+            (b"nodes".as_slice(), 26usize),
+            (b"nodes6".as_slice(), 38usize),
+        ] {
+            let Some(index) = body.iter().position(|(field, _)| field == key) else {
+                continue;
+            };
+            match &mut body[index].1 {
+                Value::List(values) if key == b"values" => values.truncate(max_values),
+                Value::Bytes(bytes) => {
+                    let max_bytes = (MAX_KRPC_RESPONSE_BYTES / width) * width;
+                    bytes.truncate(bytes.len().min(max_bytes) / width * width);
+                }
+                _ => {
+                    body.remove(index);
+                }
+            }
+        }
+    }
     loop {
         let encoded = encode_to_vec(&Value::Dict(response.clone()));
         if encoded.len() <= MAX_KRPC_RESPONSE_BYTES {
@@ -1823,8 +1892,18 @@ fn bounded_response_bytes(response: &mut Vec<(Vec<u8>, Value)>) -> Vec<u8> {
                     continue;
                 };
                 match &mut body[index].1 {
-                    Value::List(values) if values.len() > 1 => {
-                        values.pop();
+                    Value::List(values) if !values.is_empty() => {
+                        values.truncate(values.len() / 2);
+                        if values.is_empty() {
+                            body.remove(index);
+                        }
+                    }
+                    Value::Bytes(bytes) if !bytes.is_empty() => {
+                        let width = if key == b"nodes6" { 38 } else { 26 };
+                        bytes.truncate((bytes.len() / width / 2) * width);
+                        if bytes.is_empty() {
+                            body.remove(index);
+                        }
                     }
                     _ => {
                         body.remove(index);
@@ -2268,9 +2347,11 @@ mod tests {
             RoutingLiveness::Questionable
         );
 
+        rt.buckets[0].nodes[0].last_seen = Instant::now() - ROUTING_STALE;
         let second = rt.refresh_stale(Instant::now(), 1);
         assert_eq!(second.len(), 1);
         assert_eq!(rt.buckets[0].nodes[0].liveness, RoutingLiveness::Bad);
+        assert!(rt.refresh_stale(Instant::now(), 1).is_empty());
         assert_eq!(rt.snapshot().len(), 1);
     }
 

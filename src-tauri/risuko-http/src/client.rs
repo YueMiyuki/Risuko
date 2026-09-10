@@ -377,6 +377,7 @@ pub struct ClientBuilder {
     resolver: Option<SharedResolver>,
     extra_root_certs: Vec<Vec<u8>>,
     local_addr: Option<SocketAddr>,
+    direct_address_filter: Option<Arc<dyn Fn(IpAddr) -> bool + Send + Sync>>,
 }
 
 impl ClientBuilder {
@@ -401,6 +402,7 @@ impl ClientBuilder {
             resolver: None,
             extra_root_certs: Vec::new(),
             local_addr: None,
+            direct_address_filter: None,
         }
     }
 
@@ -500,9 +502,17 @@ impl ClientBuilder {
         self
     }
 
-    pub fn local_socket_address(mut self, mut address: SocketAddr) -> Self {
-        address.set_port(0);
+    pub fn local_socket_address(mut self, address: SocketAddr) -> Self {
         self.local_addr = Some(address);
+        self
+    }
+
+    /// Filter resolved addresses used for direct destination connections
+    pub fn direct_address_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(IpAddr) -> bool + Send + Sync + 'static,
+    {
+        self.direct_address_filter = Some(Arc::new(filter));
         self
     }
 
@@ -534,6 +544,7 @@ impl ClientBuilder {
             tcp_nodelay: self.tcp_nodelay,
             tcp_keepalive: self.tcp_keepalive,
             local_addr: self.local_addr,
+            direct_address_filter: self.direct_address_filter,
         };
 
         let mut hyper_builder = HyperClient::builder(TokioExecutor::new());
@@ -693,6 +704,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_address_filter_rejects_resolved_destination() {
+        let client = Client::builder()
+            .resolver_arc(Arc::new(RoutingResolver(HashMap::from([(
+                "blocked.example".to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+            )]))))
+            .direct_address_filter(|ip| !ip.is_loopback())
+            .build()
+            .unwrap();
+
+        let error = client.get("http://blocked.example/").send().await.unwrap_err();
+        assert!(error.to_string().contains("Connect"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
     async fn plain_http_proxy_uses_absolute_form_and_authentication() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -774,6 +800,14 @@ mod tests {
             "ok"
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn local_socket_address_preserves_the_configured_port() {
+        let address: SocketAddr = "127.0.0.1:43123".parse().unwrap();
+        let builder = Client::builder().local_socket_address(address);
+
+        assert_eq!(builder.local_addr, Some(address));
     }
 
     #[tokio::test]

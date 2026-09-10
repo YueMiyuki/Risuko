@@ -1,5 +1,6 @@
 //! `.torrent` metainfo parsing (BEP-3) Produces [`TorrentMeta`] with the raw `info` dict bytes preserved so the info-hash can be recomputed. [`ValidatedTorrentMetaV1Info`] wraps a parsed info dict with an enumerator over per-file details, matching the API shape that `engine::torrent` consumes from librqbit
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::super::bencode::{decode_dict_field_raw, Value};
@@ -349,43 +350,18 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
 }
 
 fn parse_url_list(value: &Value) -> Vec<String> {
-    let mut candidates = Vec::new();
-    match value.get(b"url-list") {
-        Some(Value::Bytes(raw)) => candidates.push(raw.as_slice()),
-        Some(Value::List(items)) => {
-            for item in items {
-                if let Value::Bytes(raw) = item {
-                    candidates.push(raw.as_slice());
-                }
-            }
-        }
-        _ => {}
-    }
-    let mut out = Vec::new();
-    for raw in candidates {
-        let Ok(url) = std::str::from_utf8(raw) else {
-            continue;
-        };
-        let Ok(parsed) = url::Url::parse(url.trim()) else {
-            continue;
-        };
-        if !matches!(parsed.scheme(), "http" | "https")
-            || parsed.host_str().is_none()
-            || url.trim().is_empty()
-        {
-            continue;
-        }
-        let normalized = parsed.to_string();
-        if !out.contains(&normalized) {
-            out.push(normalized);
-        }
-    }
-    out
+    value
+        .get(b"url-list")
+        .map(crate::webseed::parse_url_list)
+        .unwrap_or_default()
 }
 
 fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, String, u16)>) {
+    const MAX_BOOTSTRAP_NODES: usize = 4096;
     let mut out = Vec::new();
     let mut hosts = Vec::new();
+    let mut seen_addrs = HashSet::new();
+    let mut seen_hosts = HashSet::new();
     for (key, width, v6) in [
         (b"nodes".as_slice(), 26usize, false),
         (b"nodes6".as_slice(), 38usize, true),
@@ -395,6 +371,9 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
         };
         if let Some(raw) = nodes.as_bytes() {
             for chunk in raw.chunks_exact(width) {
+                if out.len() >= MAX_BOOTSTRAP_NODES {
+                    break;
+                }
                 let Ok(id) = Id20::from_slice(&chunk[..20]) else {
                     continue;
                 };
@@ -415,7 +394,7 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
                     }
                     SocketAddr::new(ip.into(), port)
                 };
-                if !out.iter().any(|(_, existing)| *existing == addr) {
+                if seen_addrs.insert(addr) {
                     out.push((id, addr));
                 }
             }
@@ -426,6 +405,9 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
             continue;
         };
         for entry in entries {
+            if out.len() + hosts.len() >= MAX_BOOTSTRAP_NODES {
+                break;
+            }
             let Some(pair) = entry.as_list() else {
                 continue;
             };
@@ -455,13 +437,12 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
                 if ip.is_unspecified() || (v6 && !ip.is_ipv6()) {
                     continue;
                 }
-                let addr = SocketAddr::new(ip, port);
-                if !out.iter().any(|(_, existing)| *existing == addr) {
-                    out.push((id, addr));
+                if !seen_hosts.insert((host.to_string(), port)) {
+                    continue;
                 }
-            } else if !hosts
-                .iter()
-                .any(|(_, existing, existing_port)| existing == host && *existing_port == port)
+            } else if !seen_hosts.insert((host.to_string(), port)) {
+                continue;
+            }
             {
                 hosts.push((id, host.to_string(), port));
             }
@@ -1082,8 +1063,8 @@ mod tests {
         let top = Value::Dict(vec![(b"info".to_vec(), info), (b"nodes".to_vec(), nodes)]);
         let bytes = super::super::super::bencode::encode_to_vec(&top);
         let meta = parse_torrent(&bytes).unwrap();
-        assert_eq!(meta.bootstrap_nodes.len(), 2);
-        assert_eq!(meta.bootstrap_hosts.len(), 1);
+        assert!(meta.bootstrap_nodes.is_empty());
+        assert_eq!(meta.bootstrap_hosts.len(), 3);
         let v4_id = {
             let mut data = b"127.0.0.1".to_vec();
             data.extend_from_slice(&6881u16.to_be_bytes());
@@ -1094,22 +1075,21 @@ mod tests {
             data.extend_from_slice(&6882u16.to_be_bytes());
             sha1(&data)
         };
-        assert!(meta
-            .bootstrap_nodes
-            .iter()
-            .any(|(id, addr)| { *id == v4_id && *addr == "127.0.0.1:6881".parse().unwrap() }));
-        assert!(meta
-            .bootstrap_nodes
-            .iter()
-            .any(|(id, addr)| { *id == v6_id && *addr == "[2001:db8::1]:6882".parse().unwrap() }));
+        assert!(meta.bootstrap_hosts.iter().any(|(id, host, port)| {
+            *id == v4_id && host == "127.0.0.1" && *port == 6881
+        }));
+        assert!(meta.bootstrap_hosts.iter().any(|(id, host, port)| {
+            *id == v6_id && host == "2001:db8::1" && *port == 6882
+        }));
         let host_id = {
             let mut data = b"router.example.org".to_vec();
             data.extend_from_slice(&6883u16.to_be_bytes());
             sha1(&data)
         };
-        assert_eq!(
-            meta.bootstrap_hosts,
-            vec![(host_id, "router.example.org".to_string(), 6883)]
-        );
+        assert!(meta.bootstrap_hosts.contains(&(
+            host_id,
+            "router.example.org".to_string(),
+            6883,
+        )));
     }
 }

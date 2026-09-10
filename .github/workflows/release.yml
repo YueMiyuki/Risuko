@@ -223,6 +223,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target == 'i686-pc-windows-msvc' && 'x86' || 'amd64' }}
+
       - name: Cache Rust (cargo registry + build artifacts)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
@@ -241,7 +247,18 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            xdg-utils
+            xdg-utils \
+            file
+          # linuxdeploy-plugin-gtk does `ln -s` without -f; flattened
+          # im-*.so names then abort with "File exists".
+          mkdir -p "$HOME/.cache/tauri"
+          plugin="$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
+          if [ ! -f "$plugin" ]; then
+            curl -fsSL -o "$plugin" \
+              https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+            chmod +x "$plugin"
+          fi
+          sed -i 's/ln $verbose -s /ln $verbose -sfn /' "$plugin"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
