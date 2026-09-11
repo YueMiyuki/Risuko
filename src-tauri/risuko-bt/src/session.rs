@@ -1003,9 +1003,6 @@ impl Session {
                 .torrents
                 .remove(&id)
                 .ok_or_else(|| "not found".to_string())?;
-            if inner.by_hash.get(&handle.info_hash) == Some(&id) {
-                inner.by_hash.remove(&handle.info_hash);
-            }
             handle
         };
         let private_hashes = handle
@@ -1052,12 +1049,20 @@ impl Session {
             None
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        handle
-            .cmd_tx()
-            .send(TorrentCommand::Stop(tx))
-            .await
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = handle.cmd_tx().send(TorrentCommand::Stop(tx)).await {
+            let mut inner = self.inner.lock();
+            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
+                inner.by_hash.remove(&handle.info_hash);
+            }
+            return Err(error.to_string());
+        }
         let _ = rx.await;
+        {
+            let mut inner = self.inner.lock();
+            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
+                inner.by_hash.remove(&handle.info_hash);
+            }
+        }
         let is_private = handle
             .metadata
             .load()

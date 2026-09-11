@@ -29,9 +29,11 @@ pub fn is_allowed_destination(ip: IpAddr) -> bool {
             if let Some(ipv4) = ip.to_ipv4() {
                 return is_allowed_destination(IpAddr::V4(ipv4));
             }
+            let segments = ip.segments();
             !ip.is_unicast_link_local()
                 && !ip.is_unique_local()
                 && !ip.is_multicast()
+                && (segments[0] & 0xffc0) != 0xfec0
         }
     }
 }
@@ -403,6 +405,7 @@ mod tests {
             "::ffff:100.64.0.1",
             "::100.64.0.1",
             "fc00::1",
+            "fec0::1",
         ] {
             assert!(
                 !is_allowed_destination(raw.parse().unwrap()),

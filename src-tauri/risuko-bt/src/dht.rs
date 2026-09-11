@@ -1797,7 +1797,7 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
                         let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
                         let port = u16::from_be_bytes([b[4], b[5]]);
                         let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-                        if valid_dht_endpoint(addr) {
+                        if public_dht_endpoint(addr) {
                             peers.push(addr);
                         }
                     }
@@ -1807,7 +1807,7 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
                         let ip = Ipv6Addr::from(o);
                         let port = u16::from_be_bytes([b[16], b[17]]);
                         let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
-                        if valid_dht_endpoint(addr) {
+                        if public_dht_endpoint(addr) {
                             peers.push(addr);
                         }
                     }
@@ -2622,9 +2622,10 @@ mod tests {
 
     #[test]
     fn parse_response_extracts_v6_peers_and_nodes6() {
-        // 18-byte compact v6 peer: ip=::1 port=6881
+        // 18-byte compact v6 peer: ip=2001:4860:4860::8888 port=6881
         let mut peer6: Vec<u8> = Vec::with_capacity(18);
-        peer6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let peer_ip6: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
+        peer6.extend_from_slice(&peer_ip6.octets());
         peer6.extend_from_slice(&6881u16.to_be_bytes());
         // 38-byte compact v6 node: id=0x33... ip=2001:db8::1 port=12345
         let mut node6 = vec![0x33u8; 20];
@@ -2646,7 +2647,7 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(
             peers[0],
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6881, 0, 0))
+            SocketAddr::V6(SocketAddrV6::new(peer_ip6, 6881, 0, 0))
         );
         assert_eq!(nodes.len(), 1);
         assert_eq!(
