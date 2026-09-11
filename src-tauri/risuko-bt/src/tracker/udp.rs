@@ -184,18 +184,28 @@ async fn scrape_direct_endpoint(
     source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
     let bind_addr = direct_bind_addr(target, source);
+    let cache_key = ConnectionCacheKey {
+        target,
+        source: bind_addr,
+    };
     let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(target).await?;
 
-    let conn_id = connect(&sock).await?;
+    let conn_id = match cached_connection(cache_key) {
+        Some(id) => id,
+        None => {
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            id
+        }
+    };
     match scrape_inner(&sock, conn_id, info_hashes).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
+            invalidate_connection(cache_key);
             let id = connect(&sock).await?;
-            match scrape_inner(&sock, id, info_hashes).await {
-                Ok(response) => Ok(response),
-                Err(error) => Err(error),
-            }
+            cache_connection(cache_key, id);
+            scrape_inner(&sock, id, info_hashes).await
         }
         Err(error) => Err(error),
     }

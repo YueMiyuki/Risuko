@@ -544,14 +544,31 @@ impl Dht {
                 "DHT runtime was reconfigured",
             ));
         }
+        let resolved = lookup_host((host, port)).await?.collect::<Vec<_>>();
+        let targets = resolved
+            .iter()
+            .copied()
+            .filter(|target| public_dht_endpoint(*target))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("no public addresses for {host}"),
+            ));
+        }
         if let Some(proxy) = &self.proxy_datagram {
+            if targets.len() != resolved.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("host {host} resolves to a non-public address"),
+                ));
+            }
             return proxy
                 .send_to_host(packet, host, port)
                 .await
                 .map_err(|error| std::io::Error::other(error.to_string()));
         }
 
-        let targets = lookup_host((host, port)).await?;
         let mut last_error = None;
         for target in targets {
             let result = match target {
@@ -1101,13 +1118,21 @@ impl Dht {
             return None;
         }
         let (target, resolved_addrs) = match target {
-            DhtTarget::Host(host, port) if self.proxy_datagram.is_none() => {
+            DhtTarget::Host(host, port) => {
+                // Resolve bootstrap names before sending any traffic and only
+                // retain publicly routable addresses. Using the validated
+                // numeric endpoint for proxy requests also prevents a proxy
+                // from resolving the same hostname to a private address.
                 let addresses = lookup_host((host.as_str(), port))
                     .await
                     .ok()?
-                    .filter(|address| match address {
-                        SocketAddr::V4(_) => self.sock.is_some(),
-                        SocketAddr::V6(_) => self.sock6.is_some(),
+                    .filter(|address| public_dht_endpoint(*address))
+                    .filter(|address| {
+                        self.proxy_datagram.is_some()
+                            || match address {
+                                SocketAddr::V4(_) => self.sock.is_some(),
+                                SocketAddr::V6(_) => self.sock6.is_some(),
+                            }
                     })
                     .collect::<Vec<_>>();
                 if addresses.is_empty() {
@@ -1832,23 +1857,59 @@ fn valid_dht_endpoint(addr: SocketAddr) -> bool {
         && !matches!(addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())
 }
 
-fn public_dht_endpoint(addr: SocketAddr) -> bool {
+pub(crate) fn public_dht_endpoint(addr: SocketAddr) -> bool {
     if !valid_dht_endpoint(addr) {
         return false;
     }
     match addr.ip() {
-        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_private() && !ip.is_link_local(),
+        IpAddr::V4(ip) => public_dht_ipv4(ip),
         IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            if segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff {
+            // IPv4-compatible and IPv4-mapped IPv6 addresses carry an IPv4
+            // endpoint, so apply the IPv4 policy before accepting the address.
+            if let Some(ipv4) = ip.to_ipv4() {
                 return public_dht_endpoint(SocketAddr::new(
-                    ip.to_ipv4().expect("mapped IPv4").into(),
+                    ipv4.into(),
                     addr.port(),
                 ));
             }
-            !ip.is_loopback() && !ip.is_unicast_link_local() && !ip.is_unique_local()
+            let segments = ip.segments();
+            // Documentation and benchmarking prefixes are not publicly
+            // routable DHT endpoints even though they are global unicast.
+            let documentation = segments[0] == 0x2001
+                && (segments[1] == 0x0db8 || segments[1] == 0x0002);
+            let orchid = segments[0] == 0x2001
+                && ((segments[1] & 0xfff0) == 0x0010
+                    || (segments[1] & 0xfff0) == 0x0020);
+            !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unique_local()
+                && !documentation
+                && !orchid
         }
     }
+}
+
+fn public_dht_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // Ipv4Addr::is_private does not include CGNAT, reserved, benchmarking,
+    // or several IANA special-purpose ranges.
+    octets[0] != 0
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_private()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+        && !ip.is_multicast()
+        && !ip.is_documentation()
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+        && !(octets[0] == 192
+            && ((octets[1] == 0 && octets[2] == 0)
+                || (octets[1] == 31 && octets[2] == 196)
+                || (octets[1] == 52 && octets[2] == 193)
+                || (octets[1] == 88 && octets[2] == 99)
+                || (octets[1] == 175 && octets[2] == 48)))
+        && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+        && octets[0] < 240
 }
 
 fn token_for_secret(secret: &[u8; 16], addr: SocketAddr) -> Vec<u8> {
@@ -2006,17 +2067,6 @@ fn build_query_response(
     let Some(remote_id) = remote_id else {
         return Some(krpc_error(tid, 203, b"invalid id"));
     };
-    if matches!(query, b"get_peers" | b"announce_peer") {
-        if let Some(hash) = args
-            .get(b"info_hash")
-            .and_then(Value::as_bytes)
-            .and_then(|bytes| Id20::from_slice(bytes).ok())
-        {
-            if server.is_private(&hash) {
-                return Some(krpc_error(tid, 203, b"private torrent"));
-            }
-        }
-    }
     server.add_routing(remote_id, from);
 
     let mut response = vec![
@@ -2864,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn private_hashes_receive_no_dht_service_or_route_learning() {
+    fn private_hashes_follow_normal_dht_response_without_storage() {
         let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
         let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
         let remote = Id20::from_slice(&[7u8; 20]).unwrap();
@@ -2872,6 +2922,7 @@ mod tests {
         let from: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         state.set_private(hash, true);
 
+        let token = state.token(from);
         for (query, tid) in [
             (b"get_peers".as_slice(), b"g1".as_slice()),
             (b"announce_peer".as_slice(), b"a1".as_slice()),
@@ -2886,7 +2937,7 @@ mod tests {
                             Value::Bytes(hash.as_bytes().to_vec()),
                         ),
                         (b"port".to_vec(), Value::Int(6881)),
-                        (b"token".to_vec(), Value::Bytes(b"not-issued".to_vec())),
+                        (b"token".to_vec(), Value::Bytes(token.clone())),
                     ]),
                 ),
                 (b"q".to_vec(), Value::Bytes(query.to_vec())),
@@ -2894,14 +2945,34 @@ mod tests {
                 (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
             ]);
             let reply = decode_all(&build_query_response(&request, from, &state).unwrap()).unwrap();
-            assert_eq!(
-                reply.get(b"y").and_then(Value::as_bytes),
-                Some(b"e" as &[u8])
-            );
-            assert!(reply.get(b"r").is_none());
+            assert_eq!(reply.get(b"y").and_then(Value::as_bytes), Some(b"r" as &[u8]));
+            assert!(reply.get(b"e").is_none());
         }
-        assert_eq!(state.routing.lock().len(), 0);
+        assert_eq!(state.routing.lock().len(), 1);
         assert!(state.peers.lock().is_empty());
+    }
+
+    #[test]
+    fn public_dht_endpoint_rejects_cgnat_and_special_use_ranges() {
+        for ip in [
+            "0.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "192.0.0.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.175.48.1",
+            "198.18.0.1",
+            "239.255.255.1",
+            "240.0.0.1",
+        ] {
+            assert!(
+                !public_dht_endpoint(SocketAddr::new(ip.parse().unwrap(), 6881)),
+                "special-use address {ip}"
+            );
+        }
+        assert!(public_dht_endpoint("8.8.8.8:6881".parse().unwrap()));
     }
 
     #[test]

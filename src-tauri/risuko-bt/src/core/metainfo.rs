@@ -1,7 +1,7 @@
 //! `.torrent` metainfo parsing (BEP-3) Produces [`TorrentMeta`] with the raw `info` dict bytes preserved so the info-hash can be recomputed. [`ValidatedTorrentMetaV1Info`] wraps a parsed info dict with an enumerator over per-file details, matching the API shape that `engine::torrent` consumes from librqbit
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::super::bencode::{decode_dict_field_raw, Value};
 use super::hash::{sha1, sha256, Id20, Id32};
@@ -382,14 +382,14 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
                     bytes.copy_from_slice(&chunk[20..36]);
                     let ip = Ipv6Addr::from(bytes);
                     let port = u16::from_be_bytes([chunk[36], chunk[37]]);
-                    if ip.is_unspecified() || port == 0 {
+                    if !crate::dht::public_dht_endpoint(SocketAddr::new(ip.into(), port)) {
                         continue;
                     }
                     SocketAddr::new(ip.into(), port)
                 } else {
                     let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
                     let port = u16::from_be_bytes([chunk[24], chunk[25]]);
-                    if ip.is_unspecified() || port == 0 {
+                    if !crate::dht::public_dht_endpoint(SocketAddr::new(ip.into(), port)) {
                         continue;
                     }
                     SocketAddr::new(ip.into(), port)
@@ -433,8 +433,10 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
                 digest.update(port.to_be_bytes());
                 Id20::from_slice(&digest.finalize()[..20]).expect("sha1 is 20 bytes")
             };
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                if ip.is_unspecified() || (v6 && !ip.is_ipv6()) {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if !crate::dht::public_dht_endpoint(SocketAddr::new(ip, port))
+                    || (v6 && !ip.is_ipv6())
+                {
                     continue;
                 }
                 if !seen_hosts.insert((host.to_string(), port)) {
@@ -1055,6 +1057,7 @@ mod tests {
                 Value::Bytes(b"2001:db8::1".to_vec()),
                 Value::Int(6882),
             ]),
+            Value::List(vec![Value::Bytes(b"8.8.8.8".to_vec()), Value::Int(6884)]),
             Value::List(vec![
                 Value::Bytes(b"router.example.org".to_vec()),
                 Value::Int(6883),
@@ -1064,32 +1067,23 @@ mod tests {
         let bytes = super::super::super::bencode::encode_to_vec(&top);
         let meta = parse_torrent(&bytes).unwrap();
         assert!(meta.bootstrap_nodes.is_empty());
-        assert_eq!(meta.bootstrap_hosts.len(), 3);
-        let v4_id = {
-            let mut data = b"127.0.0.1".to_vec();
-            data.extend_from_slice(&6881u16.to_be_bytes());
+        assert_eq!(meta.bootstrap_hosts.len(), 2);
+        let public_v4_id = {
+            let mut data = b"8.8.8.8".to_vec();
+            data.extend_from_slice(&6884u16.to_be_bytes());
             sha1(&data)
         };
-        let v6_id = {
-            let mut data = b"2001:db8::1".to_vec();
-            data.extend_from_slice(&6882u16.to_be_bytes());
-            sha1(&data)
-        };
-        assert!(meta.bootstrap_hosts.iter().any(|(id, host, port)| {
-            *id == v4_id && host == "127.0.0.1" && *port == 6881
-        }));
-        assert!(meta.bootstrap_hosts.iter().any(|(id, host, port)| {
-            *id == v6_id && host == "2001:db8::1" && *port == 6882
-        }));
+        assert!(meta
+            .bootstrap_hosts
+            .iter()
+            .any(|(id, host, port)| { *id == public_v4_id && host == "8.8.8.8" && *port == 6884 }));
         let host_id = {
             let mut data = b"router.example.org".to_vec();
             data.extend_from_slice(&6883u16.to_be_bytes());
             sha1(&data)
         };
-        assert!(meta.bootstrap_hosts.contains(&(
-            host_id,
-            "router.example.org".to_string(),
-            6883,
-        )));
+        assert!(meta
+            .bootstrap_hosts
+            .contains(&(host_id, "router.example.org".to_string(), 6883,)));
     }
 }

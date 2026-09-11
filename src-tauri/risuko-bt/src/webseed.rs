@@ -19,13 +19,13 @@ pub fn is_allowed_destination(ip: IpAddr) -> bool {
                 && !ip.is_broadcast()
         }
         IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            if segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff {
-                return is_allowed_destination(IpAddr::V4(ip.to_ipv4().expect("mapped IPv4")));
+            if ip.is_unspecified() || ip.is_loopback() {
+                return false;
             }
-            !ip.is_unspecified()
-                && !ip.is_loopback()
-                && !ip.is_unicast_link_local()
+            if let Some(ipv4) = ip.to_ipv4() {
+                return is_allowed_destination(IpAddr::V4(ipv4));
+            }
+            !ip.is_unicast_link_local()
                 && !ip.is_unique_local()
                 && !ip.is_multicast()
         }
@@ -373,6 +373,7 @@ mod tests {
             "10.0.0.1",
             "169.254.1.1",
             "::1",
+            "::127.0.0.1",
             "::ffff:127.0.0.1",
             "fc00::1",
         ] {
@@ -382,6 +383,7 @@ mod tests {
             );
         }
         assert!(is_allowed_destination("192.0.2.1".parse().unwrap()));
+        assert!(is_allowed_destination("::192.0.2.1".parse().unwrap()));
     }
 
     #[test]

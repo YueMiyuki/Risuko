@@ -18,8 +18,62 @@ use super::core::{generate_peer_id, Id20, Lengths};
 use super::peer::{KnownInfoHash, PeerCommand, PeerEvent, PeerHandle};
 use super::torrent::{spawn as spawn_torrent, ManagedTorrent, TorrentCommand, TorrentInit};
 
-static PRIVATE_TORRENT_OWNERS: LazyLock<Mutex<HashMap<Id20, usize>>> =
+#[derive(Default)]
+struct PrivateTorrentOwners {
+    count: usize,
+    dhts: Vec<Arc<super::dht::Dht>>,
+}
+
+static PRIVATE_TORRENT_OWNERS: LazyLock<Mutex<HashMap<Id20, PrivateTorrentOwners>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_private_dht(entry: &mut PrivateTorrentOwners, dht: Arc<super::dht::Dht>) {
+    if !entry.dhts.iter().any(|known| Arc::ptr_eq(known, &dht)) {
+        entry.dhts.push(dht);
+    }
+}
+
+fn claim_private_hashes(dht: Option<Arc<super::dht::Dht>>, hashes: impl IntoIterator<Item = Id20>) {
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let entry = owners.entry(hash).or_default();
+        entry.count += 1;
+        if let Some(dht) = dht.as_ref() {
+            remember_private_dht(entry, dht.clone());
+            dht.set_private(hash, true);
+        }
+    }
+}
+
+fn mark_private_hashes(dht: Option<Arc<super::dht::Dht>>, hashes: impl IntoIterator<Item = Id20>) {
+    let Some(dht) = dht else {
+        return;
+    };
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let Some(entry) = owners.get_mut(&hash) else {
+            continue;
+        };
+        remember_private_dht(entry, dht.clone());
+        dht.set_private(hash, true);
+    }
+}
+
+fn release_private_hashes(hashes: impl IntoIterator<Item = Id20>) {
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let Some(entry) = owners.get_mut(&hash) else {
+            continue;
+        };
+        entry.count = entry.count.saturating_sub(1);
+        if entry.count == 0 {
+            let entry = owners.remove(&hash).expect("private owner entry exists");
+            for dht in entry.dhts {
+                dht.set_private(hash, false);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpnpStatus {
@@ -135,7 +189,6 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let dht = self.dht.get_mut().clone();
         let private_hashes: Vec<Id20> = self
             .inner
             .get_mut()
@@ -145,26 +198,7 @@ impl Drop for Session {
             .filter(|meta| meta.info.private)
             .flat_map(|meta| meta.announce_infohashes())
             .collect();
-        for hash in private_hashes {
-            let should_clear = {
-                let mut owners = PRIVATE_TORRENT_OWNERS.lock();
-                let Some(count) = owners.get_mut(&hash) else {
-                    continue;
-                };
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    owners.remove(&hash);
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_clear {
-                if let Some(dht) = dht.as_ref() {
-                    dht.set_private(hash, false);
-                }
-            }
-        }
+        release_private_hashes(private_hashes);
         if let Some(h) = self.accept_handle.lock().take() {
             h.abort();
         }
@@ -702,20 +736,7 @@ impl Session {
             }
         };
         if info.private {
-            {
-                let mut owners = PRIVATE_TORRENT_OWNERS.lock();
-                for hash in meta.announce_infohashes() {
-                    owners
-                        .entry(hash)
-                        .and_modify(|count| *count += 1)
-                        .or_insert(1);
-                }
-            }
-            if let Some(dht) = self.dht.lock().clone() {
-                for hash in meta.announce_infohashes() {
-                    dht.set_private(hash, true);
-                }
-            }
+            claim_private_hashes(self.dht.lock().clone(), meta.announce_infohashes());
         }
         {
             let mut inner = self.inner.lock();
@@ -783,13 +804,11 @@ impl Session {
             utp.reconfigure_proxy(proxy.clone()).await;
         }
         *self.dht.lock() = dht.clone();
-        if let Some(next_dht) = dht.as_ref() {
+        if dht.is_some() {
             for handle in &handles {
                 if let Some(meta) = handle.metadata.load().as_ref() {
                     if meta.info.private {
-                        for hash in meta.announce_infohashes() {
-                            next_dht.set_private(hash, true);
-                        }
+                        mark_private_hashes(dht.clone(), meta.announce_infohashes());
                     }
                 }
             }
@@ -971,28 +990,8 @@ impl Session {
             .as_ref()
             .is_some_and(|meta| meta.info.private);
         if is_private {
-            let dht = self.dht.lock().clone();
             if let Some(meta) = handle.metadata.load().as_ref() {
-                for hash in meta.announce_infohashes() {
-                    let should_clear = {
-                        let mut owners = PRIVATE_TORRENT_OWNERS.lock();
-                        let Some(count) = owners.get_mut(&hash) else {
-                            continue;
-                        };
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            owners.remove(&hash);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if should_clear {
-                        if let Some(dht) = dht.as_ref() {
-                            dht.set_private(hash, false);
-                        }
-                    }
-                }
+                release_private_hashes(meta.announce_infohashes());
             }
         }
         if !is_private {
