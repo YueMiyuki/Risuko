@@ -225,7 +225,7 @@ jobs:
 
       - name: MSVC environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
         with:
           arch: ${{ matrix.target == 'i686-pc-windows-msvc' && 'x86' || 'amd64' }}
 
@@ -253,11 +253,20 @@ jobs:
           # im-*.so names then abort with "File exists".
           mkdir -p "$HOME/.cache/tauri"
           plugin="$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
-          if [ ! -f "$plugin" ]; then
-            curl -fsSL -o "$plugin" \
-              https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-            chmod +x "$plugin"
+          source_plugin="$HOME/.cache/tauri/linuxdeploy-plugin-gtk.upstream.sh"
+          plugin_url="https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/b5eb8d05b4c0ed40107fe2158c5d8527f94568ef/linuxdeploy-plugin-gtk.sh"
+          expected_sha256="cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a"
+          if [ ! -f "$source_plugin" ]; then
+            curl -fsSL -o "$source_plugin" \
+              "$plugin_url"
           fi
+          actual_sha256="$(sha256sum "$source_plugin" | awk '{print $1}')"
+          if [ "$actual_sha256" != "$expected_sha256" ]; then
+            echo "::error::linuxdeploy-plugin-gtk.sh checksum mismatch"
+            exit 1
+          fi
+          cp "$source_plugin" "$plugin"
+          chmod +x "$plugin"
           sed -i 's/ln $verbose -s /ln $verbose -sfn /' "$plugin"
 
       - name: Install dependencies

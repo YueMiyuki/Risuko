@@ -1,7 +1,7 @@
 //! Minimal BEP-5 DHT
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -871,6 +871,11 @@ impl Dht {
                 if dht.shutdown.load(Ordering::Acquire) {
                     return;
                 }
+                if dht.proxy_datagram.is_some() {
+                    // Proxied DHT sockets cannot issue the direct refresh pings
+                    // needed to validate liveness transitions.
+                    continue;
+                }
                 let stale = dht.refresh_routing(K);
                 for (id, addr) in stale {
                     let _ = dht.ping_node(addr, id).await;
@@ -923,6 +928,9 @@ impl Dht {
         peer_tx: mpsc::UnboundedSender<SocketAddr>,
         announce_port: Option<u16>,
     ) {
+        if self.server.is_private(&info_hash) {
+            return;
+        }
         let mut targets: Vec<DhtTarget> = self
             .closest_routing(&info_hash, K * 2)
             .into_iter()
@@ -947,6 +955,9 @@ impl Dht {
 
         let mut futs: JoinSet<Option<GetPeersReply>> = JoinSet::new();
         for target in targets {
+            if self.server.is_private(&info_hash) {
+                return;
+            }
             let this = self.clone();
             futs.spawn(async move { this.query_get_peers(target, info_hash).await });
         }
@@ -956,6 +967,9 @@ impl Dht {
         let mut rounds_without_progress = 0usize;
 
         loop {
+            if self.server.is_private(&info_hash) {
+                return;
+            }
             let Some(joined) = futs.join_next().await else {
                 break;
             };
@@ -979,22 +993,33 @@ impl Dht {
 
             // Record the responder as a live DHT node, preferring the id it reported in its KRPC response and falling back to a pseudo-id only if omitted; the real id keeps XOR distance accurate, which matters for lookup convergence
             let node_id = responder_id.unwrap_or_else(|| pseudo_id_target(&from));
-            shortlist.insert(node_id.distance(&info_hash), from.clone());
-            if responder_id.is_some() {
-                if let DhtTarget::Addr(from) = &from {
-                    self.add_routing_questionable(node_id, *from);
+            let responder_public = match &from {
+                DhtTarget::Addr(addr) => public_dht_endpoint(*addr),
+                DhtTarget::Host(_, _) => true,
+            };
+            if responder_public {
+                shortlist.insert(node_id.distance(&info_hash), from.clone());
+                if responder_id.is_some() {
+                    if let DhtTarget::Addr(from) = &from {
+                        self.add_routing(node_id, *from);
+                    }
                 }
             }
-            if let Some(tok) = token {
-                announce_targets.insert(node_id.distance(&info_hash), (from, tok));
-                while announce_targets.len() > K * 2 {
-                    announce_targets.pop_last();
+            if responder_public {
+                if let Some(tok) = token {
+                    announce_targets.insert(node_id.distance(&info_hash), (from, tok));
+                    while announce_targets.len() > K * 2 {
+                        announce_targets.pop_last();
+                    }
                 }
             }
 
             // Merge any learned nodes into the shortlist
             let mut progressed = false;
             for (nid, naddr) in &nodes {
+                if !public_dht_endpoint(*naddr) {
+                    continue;
+                }
                 total_nodes += 1;
                 let d = nid.distance(&info_hash);
                 if let std::collections::btree_map::Entry::Vacant(e) = shortlist.entry(d) {
@@ -1029,6 +1054,9 @@ impl Dht {
                 }
             }
             for target in to_dispatch {
+                if self.server.is_private(&info_hash) {
+                    return;
+                }
                 let this = self.clone();
                 futs.spawn(async move { this.query_get_peers(target, info_hash).await });
             }
@@ -1051,8 +1079,14 @@ impl Dht {
         // BEP-5 announce_peer: publish ourselves on the closest token-bearing nodes so other clients doing get_peers for this info-hash discover us and can open inbound connections; fire-and-forget, we don't need the ack
         if let Some(port) = announce_port {
             for (_d, (addr, token)) in announce_targets.into_iter().take(K) {
+                if self.server.is_private(&info_hash) {
+                    return;
+                }
                 let txn = random_transaction_id();
                 let pkt = build_announce_peer(&txn, &self.our_id, &info_hash, port, &token);
+                if self.server.is_private(&info_hash) {
+                    return;
+                }
                 let _ = self.send_target(&pkt, &addr).await;
             }
         }
@@ -1063,6 +1097,9 @@ impl Dht {
         target: DhtTarget,
         info_hash: Id20,
     ) -> Option<GetPeersReply> {
+        if self.server.is_private(&info_hash) {
+            return None;
+        }
         let (target, resolved_addrs) = match target {
             DhtTarget::Host(host, port) if self.proxy_datagram.is_none() => {
                 let addresses = lookup_host((host.as_str(), port))
@@ -1082,6 +1119,9 @@ impl Dht {
         };
         let (txn, rx, _guard) = self.register_transaction(target.clone(), resolved_addrs);
         let packet = build_get_peers_bytes(&txn, &self.our_id, &info_hash);
+        if self.server.is_private(&info_hash) {
+            return None;
+        }
         // `_guard` removes `txn` from `pending`
         let send_res = self.send_target(&packet, &target).await;
         if send_res.is_err() {
@@ -1486,6 +1526,9 @@ impl RoutingTable {
             };
             let bucket = &mut self.buckets[idx];
             if let Some(existing) = bucket.nodes.iter_mut().find(|n| n.id == id) {
+                if existing.liveness == RoutingLiveness::Good && liveness != RoutingLiveness::Good {
+                    return;
+                }
                 existing.addr = addr;
                 existing.last_seen = now;
                 if liveness == RoutingLiveness::Good {
@@ -1555,6 +1598,7 @@ impl RoutingTable {
         self.buckets
             .iter()
             .flat_map(|bucket| bucket.nodes.iter())
+            .filter(|node| node.liveness != RoutingLiveness::Bad)
             .map(|node| (node.id, node.addr))
             .collect()
     }
@@ -1564,6 +1608,7 @@ impl RoutingTable {
             .buckets
             .iter()
             .flat_map(|bucket| bucket.nodes.iter())
+            .filter(|node| node.liveness != RoutingLiveness::Bad)
             .map(|node| (node.id.distance(target), node.id, node.addr))
             .collect();
         all.sort_by_key(|(dist, _, _)| *dist);
@@ -1785,6 +1830,25 @@ fn valid_dht_endpoint(addr: SocketAddr) -> bool {
         && !addr.ip().is_unspecified()
         && !addr.ip().is_multicast()
         && !matches!(addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+}
+
+fn public_dht_endpoint(addr: SocketAddr) -> bool {
+    if !valid_dht_endpoint(addr) {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_private() && !ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff {
+                return public_dht_endpoint(SocketAddr::new(
+                    ip.to_ipv4().expect("mapped IPv4").into(),
+                    addr.port(),
+                ));
+            }
+            !ip.is_loopback() && !ip.is_unicast_link_local() && !ip.is_unique_local()
+        }
+    }
 }
 
 fn token_for_secret(secret: &[u8; 16], addr: SocketAddr) -> Vec<u8> {
@@ -2352,7 +2416,7 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(rt.buckets[0].nodes[0].liveness, RoutingLiveness::Bad);
         assert!(rt.refresh_stale(Instant::now(), 1).is_empty());
-        assert_eq!(rt.snapshot().len(), 1);
+        assert!(rt.snapshot().is_empty());
     }
 
     #[test]

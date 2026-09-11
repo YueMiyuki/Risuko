@@ -184,39 +184,20 @@ async fn scrape_direct_endpoint(
     source: Option<SocketAddr>,
 ) -> Result<Vec<ScrapeResponse>, TrackerError> {
     let bind_addr = direct_bind_addr(target, source);
-    let cache_key = ConnectionCacheKey {
-        target,
-        source: bind_addr,
-    };
     let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(target).await?;
 
-    let conn_id = match cached_connection(cache_key) {
-        Some(id) => id,
-        None => {
-            let id = connect(&sock).await?;
-            cache_connection(cache_key, id);
-            id
-        }
-    };
+    let conn_id = connect(&sock).await?;
     match scrape_inner(&sock, conn_id, info_hashes).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
-            invalidate_connection(cache_key);
             let id = connect(&sock).await?;
-            cache_connection(cache_key, id);
             match scrape_inner(&sock, id, info_hashes).await {
                 Ok(response) => Ok(response),
-                Err(error) => {
-                    invalidate_connection(cache_key);
-                    Err(error)
-                }
+                Err(error) => Err(error),
             }
         }
-        Err(error) => {
-            invalidate_connection(cache_key);
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -240,11 +221,14 @@ async fn scrape_inner(
             Ok(Ok(n)) if n >= 8 => {
                 let action = be::read_u32(&buf[..4]);
                 let rtxn = be::read_u32(&buf[4..8]);
+                if rtxn != txn {
+                    continue;
+                }
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
                 let expected = 8 + info_hashes.len() * 12;
-                if action != ACTION_SCRAPE || rtxn != txn || n != expected {
+                if action != ACTION_SCRAPE || n != expected {
                     continue;
                 }
                 let mut out = Vec::with_capacity(info_hashes.len());
@@ -328,11 +312,14 @@ async fn scrape_proxy_batch(
             Ok(Ok((n, _))) if n >= 8 => {
                 let action = be::read_u32(&buf[..4]);
                 let rtxn = be::read_u32(&buf[4..8]);
+                if rtxn != txn {
+                    continue;
+                }
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
                 let expected = 8 + info_hashes.len() * 12;
-                if action != ACTION_SCRAPE || rtxn != txn || n != expected {
+                if action != ACTION_SCRAPE || n != expected {
                     continue;
                 }
                 return Ok(buf[8..expected]

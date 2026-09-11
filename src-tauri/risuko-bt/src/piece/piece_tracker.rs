@@ -185,20 +185,6 @@ impl PieceTracker {
         pieces
     }
 
-    pub fn choose_missing_pieces_by_index(&self) -> Vec<ValidPieceIndex> {
-        let mut pieces = Vec::new();
-        for index in 0..self.lengths.total_pieces() {
-            let idx = index as usize;
-            if self.have_local[idx] || self.in_flight[idx] {
-                continue;
-            }
-            if let Ok(vpi) = self.lengths.validate_piece(index) {
-                pieces.push(vpi);
-            }
-        }
-        pieces
-    }
-
     /// Return useful pieces, including in-flight pieces for endgame duplication
     pub fn choose_pieces(&mut self, peer_bitfield: &[u8], hint: u32) -> Vec<ValidPieceIndex> {
         self.choose_many_impl(peer_bitfield, false, hint)

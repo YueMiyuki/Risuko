@@ -371,7 +371,7 @@ fn parse_bootstrap_nodes(value: &Value) -> (Vec<(Id20, SocketAddr)>, Vec<(Id20, 
         };
         if let Some(raw) = nodes.as_bytes() {
             for chunk in raw.chunks_exact(width) {
-                if out.len() >= MAX_BOOTSTRAP_NODES {
+                if out.len() + hosts.len() >= MAX_BOOTSTRAP_NODES {
                     break;
                 }
                 let Ok(id) = Id20::from_slice(&chunk[..20]) else {

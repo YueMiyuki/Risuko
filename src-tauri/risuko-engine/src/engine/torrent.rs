@@ -505,22 +505,9 @@ impl TorrentEngine {
         }
         let meta = bt::parse_torrent(&bytes)
             .map_err(|e| format!("Failed to parse resolved metadata: {e}"))?;
-        let tracker_set: std::collections::HashSet<_> =
-            tracker_peers.iter().copied().collect();
-        let initial_peers = if meta.info.private {
-            Vec::new()
-        } else {
-            peers
-                .into_iter()
-                .filter(|peer| !tracker_set.contains(peer))
-                .collect()
-        };
-        self.add_torrent_bytes_with_peer_sources(
-            &bytes,
-            options,
-            initial_peers,
-            tracker_peers,
-        )
+        let (initial_peers, tracker_peers) =
+            bt::split_initial_peer_sources(meta.info.private, peers, tracker_peers);
+        self.add_torrent_bytes_with_peer_sources(&bytes, options, initial_peers, tracker_peers)
             .await
     }
 

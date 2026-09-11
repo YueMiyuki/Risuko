@@ -77,6 +77,24 @@ impl Default for AddTorrentOptions {
     }
 }
 
+pub fn split_initial_peer_sources(
+    private_torrent: bool,
+    peers: Vec<SocketAddr>,
+    tracker_peers: Vec<SocketAddr>,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    if private_torrent {
+        return (Vec::new(), tracker_peers);
+    }
+    let tracker_set: std::collections::HashSet<_> = tracker_peers.iter().copied().collect();
+    (
+        peers
+            .into_iter()
+            .filter(|peer| !tracker_set.contains(peer))
+            .collect(),
+        tracker_peers,
+    )
+}
+
 pub enum AddTorrent {
     TorrentFileBytes(Bytes),
     Url(String),
@@ -117,6 +135,36 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        let dht = self.dht.get_mut().clone();
+        let private_hashes: Vec<Id20> = self
+            .inner
+            .get_mut()
+            .torrents
+            .values()
+            .filter_map(|handle| handle.metadata.load_full())
+            .filter(|meta| meta.info.private)
+            .flat_map(|meta| meta.announce_infohashes())
+            .collect();
+        for hash in private_hashes {
+            let should_clear = {
+                let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+                let Some(count) = owners.get_mut(&hash) else {
+                    continue;
+                };
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    owners.remove(&hash);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_clear {
+                if let Some(dht) = dht.as_ref() {
+                    dht.set_private(hash, false);
+                }
+            }
+        }
         if let Some(h) = self.accept_handle.lock().take() {
             h.abort();
         }
@@ -482,19 +530,10 @@ impl Session {
                     .map_err(|e| format!("parse synthesized torrent: {e}"))?;
                 let mut opts = opts;
                 let tracker_peers = resolved.tracker_peers;
-                opts.initial_tracker_peers
-                    .extend(tracker_peers.iter().copied());
-                if !meta.info.private {
-                    // Public torrents may use all resolver output
-                    let tracker_set: std::collections::HashSet<_> =
-                        tracker_peers.iter().copied().collect();
-                    opts.initial_peers.extend(
-                        resolved
-                            .peers
-                            .into_iter()
-                            .filter(|peer| !tracker_set.contains(peer)),
-                    );
-                }
+                let (initial_peers, tracker_peers) =
+                    split_initial_peer_sources(meta.info.private, resolved.peers, tracker_peers);
+                opts.initial_tracker_peers.extend(tracker_peers);
+                opts.initial_peers.extend(initial_peers);
                 self.add_from_meta(meta, opts).await
             }
         }
@@ -662,10 +701,6 @@ impl Session {
                 return Err(format!("spawn torrent: {e}"));
             }
         };
-        {
-            let mut inner = self.inner.lock();
-            inner.torrents.insert(id, handle.clone());
-        }
         if info.private {
             {
                 let mut owners = PRIVATE_TORRENT_OWNERS.lock();
@@ -681,6 +716,10 @@ impl Session {
                     dht.set_private(hash, true);
                 }
             }
+        }
+        {
+            let mut inner = self.inner.lock();
+            inner.torrents.insert(id, handle.clone());
         }
         if !opts.initial_peers.is_empty() || !opts.initial_tracker_peers.is_empty() {
             let cmd_tx = handle.cmd_tx();
@@ -932,21 +971,24 @@ impl Session {
             .as_ref()
             .is_some_and(|meta| meta.info.private);
         if is_private {
-            if let Some(dht) = self.dht.lock().clone() {
-                if let Some(meta) = handle.metadata.load().as_ref() {
-                    for hash in meta.announce_infohashes() {
-                        let should_clear = {
-                            let mut owners = PRIVATE_TORRENT_OWNERS.lock();
-                            let count = owners.entry(hash).or_default();
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                owners.remove(&hash);
-                                true
-                            } else {
-                                false
-                            }
+            let dht = self.dht.lock().clone();
+            if let Some(meta) = handle.metadata.load().as_ref() {
+                for hash in meta.announce_infohashes() {
+                    let should_clear = {
+                        let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+                        let Some(count) = owners.get_mut(&hash) else {
+                            continue;
                         };
-                        if should_clear {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            owners.remove(&hash);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_clear {
+                        if let Some(dht) = dht.as_ref() {
                             dht.set_private(hash, false);
                         }
                     }

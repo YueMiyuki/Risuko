@@ -2970,7 +2970,7 @@ fn schedule_webseed_workers(
         return;
     }
     let mut candidates: Vec<u32> = piece_tracker
-        .choose_missing_pieces_by_index()
+        .choose_missing_pieces()
         .into_iter()
         .map(|piece| piece.get())
         .collect();

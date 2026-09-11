@@ -1303,10 +1303,6 @@ impl Connector {
         });
         let is_https = scheme == "https";
 
-        if self.direct_address_filter.is_some() {
-            self.validate_destination(&host).await?;
-        }
-
         let bypass = self
             .no_proxy
             .as_deref()
@@ -1317,6 +1313,10 @@ impl Connector {
                 .proxy
                 .as_deref()
                 .is_some_and(|proxy| matches!(proxy.scheme(), ProxyScheme::Http));
+        let uses_proxy = self.proxy.is_some() && !bypass;
+        if !uses_proxy && self.direct_address_filter.is_some() {
+            self.validate_destination(&host).await?;
+        }
         let stream = match (self.proxy.as_deref(), bypass) {
             (Some(p), false) => self.via_proxy(p, &host, port, is_https).await?,
             (None, _) | (Some(_), true) => BoxedIo::new(self.direct(&host, port).await?),
@@ -1414,13 +1414,16 @@ impl Connector {
         const ATTEMPT_DELAY: Duration = Duration::from_millis(300);
 
         let timeout = self.connect_timeout;
+        let bind_lock = local_addr
+            .filter(|addr| addr.port() != 0)
+            .map(|_| Arc::new(Mutex::new(())));
         let mut in_flight = FuturesUnordered::new();
         let mut remaining = addrs.into_iter();
         let mut last: Option<io::Error> = None;
 
         // Prime the first attempt
         if let Some(addr) = remaining.next() {
-            in_flight.push(connect_one(addr, timeout, local_addr));
+            in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
         }
 
         let stagger = tokio::time::sleep(ATTEMPT_DELAY);
@@ -1445,7 +1448,7 @@ impl Connector {
                             // That attempt failed
                             if in_flight.is_empty() {
                                 if let Some(addr) = remaining.next() {
-                                    in_flight.push(connect_one(addr, timeout, local_addr));
+                                    in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
                                 } else {
                                     break;
                                 }
@@ -1454,7 +1457,7 @@ impl Connector {
                         None => {
                             // No attempts in flight and the stream drained
                             if let Some(addr) = remaining.next() {
-                                in_flight.push(connect_one(addr, timeout, local_addr));
+                                in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
                             } else {
                                 break;
                             }
@@ -1464,7 +1467,7 @@ impl Connector {
                 _ = &mut stagger => {
                     // Stagger elapsed without a winner
                     if let Some(addr) = remaining.next() {
-                        in_flight.push(connect_one(addr, timeout, local_addr));
+                        in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
                     } else if in_flight.is_empty() {
                         break;
                     }
@@ -1663,9 +1666,14 @@ async fn connect_one(
     addr: SocketAddr,
     timeout: Option<Duration>,
     local_addr: Option<SocketAddr>,
+    bind_lock: Option<Arc<Mutex<()>>>,
 ) -> Result<(TcpStream, SocketAddr), io::Error> {
     let fut = async move {
         if let Some(local_addr) = local_addr {
+            let _guard = match bind_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
             let socket = if addr.is_ipv4() {
                 tokio::net::TcpSocket::new_v4()?
             } else {

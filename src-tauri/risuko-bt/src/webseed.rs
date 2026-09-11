@@ -19,6 +19,10 @@ pub fn is_allowed_destination(ip: IpAddr) -> bool {
                 && !ip.is_broadcast()
         }
         IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff {
+                return is_allowed_destination(IpAddr::V4(ip.to_ipv4().expect("mapped IPv4")));
+            }
             !ip.is_unspecified()
                 && !ip.is_loopback()
                 && !ip.is_unicast_link_local()
@@ -364,7 +368,14 @@ mod tests {
 
     #[test]
     fn rejects_internal_webseed_destinations() {
-        for raw in ["127.0.0.1", "10.0.0.1", "169.254.1.1", "::1", "fc00::1"] {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+        ] {
             assert!(
                 !is_allowed_destination(raw.parse().unwrap()),
                 "accepted {raw}"

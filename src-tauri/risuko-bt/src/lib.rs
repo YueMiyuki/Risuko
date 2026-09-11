@@ -27,7 +27,7 @@ pub use core::metainfo::{
 pub use core::{generate_peer_id, Id20, Lengths, Magnet};
 pub use peer::EncryptionPolicy;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, ListenerOptions, Session,
-    SessionOptions, UpnpStatus,
+    split_initial_peer_sources, AddTorrent, AddTorrentOptions, AddTorrentResponse,
+    ListOnlyResponse, ListenerOptions, Session, SessionOptions, UpnpStatus,
 };
 pub use torrent::{ManagedTorrent, PeerCandidate, PeerSnapshot, PeerSource, TorrentStats};
