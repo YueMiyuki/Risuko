@@ -2,21 +2,25 @@
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use url::Url;
 
 use crate::bencode::Value;
 pub const DEFAULT_MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_URL_LIST_ENTRIES: usize = 64;
 
 pub fn is_allowed_destination(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
             !ip.is_unspecified()
                 && !ip.is_loopback()
                 && !ip.is_private()
                 && !ip.is_link_local()
                 && !ip.is_multicast()
                 && !ip.is_broadcast()
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
         }
         IpAddr::V6(ip) => {
             if ip.is_unspecified() || ip.is_loopback() {
@@ -95,7 +99,11 @@ pub fn parse_url_list(value: &Value) -> Vec<String> {
     };
 
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for item in values {
+        if out.len() >= MAX_URL_LIST_ENTRIES {
+            break;
+        }
         let Some(raw) = item.as_str() else {
             continue;
         };
@@ -108,7 +116,7 @@ pub fn parse_url_list(value: &Value) -> Vec<String> {
         }
         url.set_fragment(None);
         let normalized = url.to_string();
-        if !out.iter().any(|existing| existing == &normalized) {
+        if seen.insert(normalized.clone()) {
             out.push(normalized);
         }
     }
@@ -367,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn bounds_url_list_and_deduplicates_in_order() {
+        let mut values = vec![Value::Bytes(b"https://mirror.example/first".to_vec())];
+        values.extend((0..MAX_URL_LIST_ENTRIES + 4).map(|i| {
+            Value::Bytes(format!("https://mirror.example/{i}").into_bytes())
+        }));
+        values.push(Value::Bytes(b"https://mirror.example/first".to_vec()));
+        let urls = parse_url_list(&Value::List(values));
+        assert_eq!(urls.len(), MAX_URL_LIST_ENTRIES);
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://mirror.example/first")
+        );
+        assert_eq!(urls[1], "https://mirror.example/0");
+    }
+
+    #[test]
     fn rejects_internal_webseed_destinations() {
         for raw in [
             "127.0.0.1",
@@ -375,6 +399,9 @@ mod tests {
             "::1",
             "::127.0.0.1",
             "::ffff:127.0.0.1",
+            "100.64.0.1",
+            "::ffff:100.64.0.1",
+            "::100.64.0.1",
             "fc00::1",
         ] {
             assert!(

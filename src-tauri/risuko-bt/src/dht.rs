@@ -167,7 +167,8 @@ impl InboundDhtState {
     }
 
     fn add_peer(&self, hash: Id20, addr: SocketAddr) {
-        if self.private_hashes.lock().contains(&hash) {
+        let private_hashes = self.private_hashes.lock();
+        if private_hashes.contains(&hash) {
             return;
         }
         let mut peers = self.peers.lock();
@@ -201,6 +202,7 @@ impl InboundDhtState {
                 break;
             }
         }
+        drop(private_hashes);
     }
 
     fn set_private(&self, hash: Id20, private: bool) {
@@ -1880,11 +1882,14 @@ pub(crate) fn public_dht_endpoint(addr: SocketAddr) -> bool {
             let orchid = segments[0] == 0x2001
                 && ((segments[1] & 0xfff0) == 0x0010
                     || (segments[1] & 0xfff0) == 0x0020);
+            let discard_only =
+                segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0);
             !ip.is_loopback()
                 && !ip.is_unicast_link_local()
                 && !ip.is_unique_local()
                 && !documentation
                 && !orchid
+                && !discard_only
         }
     }
 }
@@ -2958,6 +2963,7 @@ mod tests {
             "0.0.0.1",
             "100.64.0.1",
             "100.127.255.254",
+            "100::1",
             "192.0.0.1",
             "192.31.196.1",
             "192.52.193.1",

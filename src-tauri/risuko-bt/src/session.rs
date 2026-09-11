@@ -21,15 +21,16 @@ use super::torrent::{spawn as spawn_torrent, ManagedTorrent, TorrentCommand, Tor
 #[derive(Default)]
 struct PrivateTorrentOwners {
     count: usize,
-    dhts: Vec<Arc<super::dht::Dht>>,
+    dhts: Vec<std::sync::Weak<super::dht::Dht>>,
 }
 
 static PRIVATE_TORRENT_OWNERS: LazyLock<Mutex<HashMap<Id20, PrivateTorrentOwners>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn remember_private_dht(entry: &mut PrivateTorrentOwners, dht: Arc<super::dht::Dht>) {
-    if !entry.dhts.iter().any(|known| Arc::ptr_eq(known, &dht)) {
-        entry.dhts.push(dht);
+    let weak = Arc::downgrade(&dht);
+    if !entry.dhts.iter().any(|known| known.ptr_eq(&weak)) {
+        entry.dhts.push(weak);
     }
 }
 
@@ -69,9 +70,60 @@ fn release_private_hashes(hashes: impl IntoIterator<Item = Id20>) {
         if entry.count == 0 {
             let entry = owners.remove(&hash).expect("private owner entry exists");
             for dht in entry.dhts {
-                dht.set_private(hash, false);
+                if let Some(dht) = dht.upgrade() {
+                    dht.set_private(hash, false);
+                }
             }
         }
+    }
+}
+
+struct PrivateHashClaimGuard {
+    hashes: Option<Vec<Id20>>,
+}
+
+impl PrivateHashClaimGuard {
+    fn claim(dht: Option<Arc<super::dht::Dht>>, hashes: Vec<Id20>) -> Self {
+        claim_private_hashes(dht, hashes.clone());
+        Self {
+            hashes: Some(hashes),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.hashes = None;
+    }
+}
+
+impl Drop for PrivateHashClaimGuard {
+    fn drop(&mut self) {
+        if let Some(hashes) = self.hashes.take() {
+            release_private_hashes(hashes);
+        }
+    }
+}
+
+struct PrivateHashReleaseGuard {
+    hashes: Option<Vec<Id20>>,
+}
+
+impl PrivateHashReleaseGuard {
+    fn new(hashes: Vec<Id20>) -> Self {
+        Self {
+            hashes: Some(hashes),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(hashes) = self.hashes.take() {
+            release_private_hashes(hashes);
+        }
+    }
+}
+
+impl Drop for PrivateHashReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -724,6 +776,9 @@ impl Session {
             tracker_source_addr: self.tracker_source_addr,
             blocklist: self.blocklist.clone(),
         };
+        let mut private_claim = info.private.then(|| {
+            PrivateHashClaimGuard::claim(self.dht.lock().clone(), meta.announce_infohashes())
+        });
         let handle = match spawn_torrent(id, init, self.peer_id, self.listen_port).await {
             Ok(h) => h,
             Err(e) => {
@@ -735,8 +790,8 @@ impl Session {
                 return Err(format!("spawn torrent: {e}"));
             }
         };
-        if info.private {
-            claim_private_hashes(self.dht.lock().clone(), meta.announce_infohashes());
+        if let Some(claim) = private_claim.as_mut() {
+            claim.disarm();
         }
         {
             let mut inner = self.inner.lock();
@@ -935,7 +990,31 @@ impl Session {
     }
 
     pub async fn delete(&self, which: TorrentIdOrHash, with_files: bool) -> Result<(), String> {
-        let handle = self.get(which).ok_or_else(|| "not found".to_string())?;
+        let handle = {
+            let mut inner = self.inner.lock();
+            let id = match which {
+                TorrentIdOrHash::Id(id) => id,
+                TorrentIdOrHash::Hash(hash) => *inner
+                    .by_hash
+                    .get(&hash)
+                    .ok_or_else(|| "not found".to_string())?,
+            };
+            let handle = inner
+                .torrents
+                .remove(&id)
+                .ok_or_else(|| "not found".to_string())?;
+            if inner.by_hash.get(&handle.info_hash) == Some(&id) {
+                inner.by_hash.remove(&handle.info_hash);
+            }
+            handle
+        };
+        let private_hashes = handle
+            .metadata
+            .load()
+            .as_ref()
+            .filter(|meta| meta.info.private)
+            .map(|meta| meta.announce_infohashes());
+        let mut private_release = private_hashes.map(PrivateHashReleaseGuard::new);
         // Capture file paths for optional deletion before stopping the torrent (the torrent loop owns storage and drops it on Stop)
         let file_paths: Option<Vec<(PathBuf, bool)>> = if with_files {
             let create_subfolder = handle.create_subfolder;
@@ -979,19 +1058,14 @@ impl Session {
             .await
             .map_err(|e| e.to_string())?;
         let _ = rx.await;
-        {
-            let mut inner = self.inner.lock();
-            inner.torrents.remove(&handle.id);
-            inner.by_hash.remove(&handle.info_hash);
-        }
         let is_private = handle
             .metadata
             .load()
             .as_ref()
             .is_some_and(|meta| meta.info.private);
         if is_private {
-            if let Some(meta) = handle.metadata.load().as_ref() {
-                release_private_hashes(meta.announce_infohashes());
+            if let Some(release) = private_release.as_mut() {
+                release.release();
             }
         }
         if !is_private {
