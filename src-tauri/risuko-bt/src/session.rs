@@ -1005,6 +1005,16 @@ impl Session {
                 .ok_or_else(|| "not found".to_string())?;
             handle
         };
+        let is_private = handle
+            .metadata
+            .load()
+            .as_ref()
+            .is_some_and(|meta| meta.info.private);
+        if !is_private {
+            if let Some(lsd) = self.lsd.lock().as_ref() {
+                lsd.remove_infohash(handle.info_hash);
+            }
+        }
         let private_hashes = handle
             .metadata
             .load()
@@ -1063,19 +1073,9 @@ impl Session {
                 inner.by_hash.remove(&handle.info_hash);
             }
         }
-        let is_private = handle
-            .metadata
-            .load()
-            .as_ref()
-            .is_some_and(|meta| meta.info.private);
         if is_private {
             if let Some(release) = private_release.as_mut() {
                 release.release();
-            }
-        }
-        if !is_private {
-            if let Some(lsd) = self.lsd.lock().as_ref() {
-                lsd.remove_infohash(handle.info_hash);
             }
         }
         if let Some(paths) = file_paths {
