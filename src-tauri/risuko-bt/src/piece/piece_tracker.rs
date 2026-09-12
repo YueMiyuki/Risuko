@@ -170,6 +170,21 @@ impl PieceTracker {
         self.choose_many_impl(peer_bitfield, true, hint)
     }
 
+    pub fn choose_missing_pieces(&self) -> Vec<ValidPieceIndex> {
+        let mut pieces = Vec::new();
+        for index in 0..self.lengths.total_pieces() {
+            let idx = index as usize;
+            if self.have_local[idx] || self.in_flight[idx] {
+                continue;
+            }
+            if let Ok(vpi) = self.lengths.validate_piece(index) {
+                pieces.push(vpi);
+            }
+        }
+        pieces.sort_by_key(|vpi| (self.availability[vpi.get_usize()], vpi.get()));
+        pieces
+    }
+
     /// Return useful pieces, including in-flight pieces for endgame duplication
     pub fn choose_pieces(&mut self, peer_bitfield: &[u8], hint: u32) -> Vec<ValidPieceIndex> {
         self.choose_many_impl(peer_bitfield, false, hint)
@@ -439,5 +454,20 @@ mod tests {
             .map(|p| p.get())
             .collect();
         assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn webseed_selection_includes_zero_availability_pieces() {
+        let mut t = PieceTracker::new(lengths(3));
+        t.add_peer_bitfield(&[0b1000_0000]);
+        t.mark_in_flight(t.lengths.validate_piece(1).unwrap());
+
+        let missing: Vec<u32> = t
+            .choose_missing_pieces()
+            .into_iter()
+            .map(|piece| piece.get())
+            .collect();
+
+        assert_eq!(missing, vec![2, 0]);
     }
 }

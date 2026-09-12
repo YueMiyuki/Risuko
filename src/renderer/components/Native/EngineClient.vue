@@ -608,6 +608,7 @@ export default {
 					if (host && appStore.cloudflareSkipHosts.includes(host)) {
 						toast.error(this.$t("task.download-error-message", { taskName }), {
 							duration: 5000,
+							class: "error-reference-toast",
 							action: errorReferenceUrl
 								? {
 										label: this.$t("task.open-error-code-reference"),
@@ -666,6 +667,7 @@ export default {
 					: "";
 				toast.error(`${message}${errorCodeSuffix}`, {
 					duration: isMissingYtDlp || usenetRepairFailure ? 9000 : 5000,
+					class: "error-reference-toast",
 					action: errorReferenceUrl
 						? {
 								label: this.$t("task.open-error-code-reference"),

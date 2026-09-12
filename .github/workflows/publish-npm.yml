@@ -16,13 +16,9 @@ permissions:
   id-token: write
 
 env:
+  CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Self-hosted disks persist cargo; skip GitHub Actions cache restore/upload.
-  # Compile cache lives beside CARGO_HOME, not inside `_work/<repo>/<repo>`.
-  CARGO_HOME: ${{ github.workspace }}/../../.cargo
-  CARGO_TARGET_DIR: ${{ github.workspace }}/../../.cargo-target
-  RUSTUP_HOME: ${{ github.workspace }}/../../.rustup
 
 jobs:
   build-cli:
@@ -33,23 +29,23 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: [self-hosted, darwin-x64]
+            os: macos-latest
             binary: risuko
             npm_dir: darwin-arm64
           - target: x86_64-apple-darwin
-            os: [self-hosted, darwin-x64]
+            os: macos-latest
             binary: risuko
             npm_dir: darwin-x64
           - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, linux-x64]
+            os: ubuntu-22.04
             binary: risuko
             npm_dir: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
-            os: [self-hosted, linux-arm64]
+            os: ubuntu-22.04-arm
             binary: risuko
             npm_dir: linux-arm64-gnu
           - target: x86_64-pc-windows-msvc
-            os: [self-hosted, win32-x64]
+            os: windows-latest
             binary: risuko.exe
             npm_dir: win32-x64-msvc
           - target: aarch64-pc-windows-msvc
@@ -59,8 +55,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,19 +62,20 @@ jobs:
 
       - name: MSVC environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
         with:
-          arch: amd64
+          arch: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: src-tauri -> target
+          key: cli-${{ matrix.target }}
 
       - name: Install Linux build deps
-        if: contains(matrix.target, 'linux')
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config file
-
-      - name: Install aarch64 Linux cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: bash scripts/setup-linux-aarch64-cross.sh
+          sudo apt-get install -y libssl-dev pkg-config
 
       - name: Build risuko-cli
         working-directory: src-tauri
@@ -90,7 +85,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.npm_dir }}
-          path: ${{ github.workspace }}/../../.cargo-target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: src-tauri/target/${{ matrix.target }}/release/${{ matrix.binary }}
 
   # ───────────────────────────────────────────────────────
   # Build risuko-napi native modules for all platforms
@@ -103,23 +98,23 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: [self-hosted, darwin-x64]
+            os: macos-latest
             node_file: risuko.darwin-arm64.node
             npm_dir: darwin-arm64
           - target: x86_64-apple-darwin
-            os: [self-hosted, darwin-x64]
+            os: macos-latest
             node_file: risuko.darwin-x64.node
             npm_dir: darwin-x64
           - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, linux-x64]
+            os: ubuntu-22.04
             node_file: risuko.linux-x64-gnu.node
             npm_dir: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
-            os: [self-hosted, linux-arm64]
+            os: ubuntu-22.04-arm
             node_file: risuko.linux-arm64-gnu.node
             npm_dir: linux-arm64-gnu
           - target: x86_64-pc-windows-msvc
-            os: [self-hosted, win32-x64]
+            os: windows-latest
             node_file: risuko.win32-x64-msvc.node
             npm_dir: win32-x64-msvc
           - target: aarch64-pc-windows-msvc
@@ -129,8 +124,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -138,19 +131,20 @@ jobs:
 
       - name: MSVC environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
         with:
-          arch: amd64
+          arch: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: src-tauri -> target
+          key: napi-${{ matrix.target }}
 
       - name: Install Linux build deps
-        if: contains(matrix.target, 'linux')
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config file
-
-      - name: Install aarch64 Linux cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: bash scripts/setup-linux-aarch64-cross.sh
+          sudo apt-get install -y libssl-dev pkg-config
 
       - name: Build risuko-napi
         working-directory: src-tauri
@@ -161,11 +155,11 @@ jobs:
         run: |
           # cdylib output varies by platform
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            src="${CARGO_TARGET_DIR}/${{ matrix.target }}/release/risuko_napi.dll"
+            src="src-tauri/target/${{ matrix.target }}/release/risuko_napi.dll"
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            src="${CARGO_TARGET_DIR}/${{ matrix.target }}/release/librisuko_napi.dylib"
+            src="src-tauri/target/${{ matrix.target }}/release/librisuko_napi.dylib"
           else
-            src="${CARGO_TARGET_DIR}/${{ matrix.target }}/release/librisuko_napi.so"
+            src="src-tauri/target/${{ matrix.target }}/release/librisuko_napi.so"
           fi
           cp "$src" "${{ matrix.node_file }}"
 
@@ -181,11 +175,9 @@ jobs:
   publish:
     name: Publish to npm
     needs: [build-cli, build-napi]
-    runs-on: [self-hosted, linux-x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          clean: false
 
       - uses: pnpm/action-setup@v4
         with:

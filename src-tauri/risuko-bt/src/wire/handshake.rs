@@ -32,13 +32,27 @@ pub struct Handshake {
 
 impl Handshake {
     pub fn new_with_v2(info_hash: Id20, peer_id: Id20, advertise_v2: bool) -> Self {
+        Self::new_with_features(info_hash, peer_id, advertise_v2, true, true)
+    }
+
+    pub fn new_with_features(
+        info_hash: Id20,
+        peer_id: Id20,
+        advertise_v2: bool,
+        advertise_dht: bool,
+        advertise_fast: bool,
+    ) -> Self {
         let mut reserved = [0u8; 8];
         let (b, m) = reserved::EXT_PROTOCOL;
         reserved[b] |= m;
-        let (b, m) = reserved::DHT;
-        reserved[b] |= m;
-        let (b, m) = reserved::FAST;
-        reserved[b] |= m;
+        if advertise_dht {
+            let (b, m) = reserved::DHT;
+            reserved[b] |= m;
+        }
+        if advertise_fast {
+            let (b, m) = reserved::FAST;
+            reserved[b] |= m;
+        }
         if advertise_v2 {
             let (b, m) = reserved::V2;
             reserved[b] |= m;
@@ -126,6 +140,16 @@ mod tests {
         assert!(hs_off.has_ext_protocol());
         assert!(!hs_off.has_v2());
         assert!(hs_on.has_v2());
+    }
+
+    #[test]
+    fn feature_flags_can_disable_dht_for_private_torrents() {
+        let hs =
+            Handshake::new_with_features(Id20([0xaau8; 20]), Id20([0xbbu8; 20]), true, false, true);
+        assert!(hs.has_ext_protocol());
+        assert!(hs.has_v2());
+        assert_eq!(hs.reserved[reserved::DHT.0] & reserved::DHT.1, 0);
+        assert_ne!(hs.reserved[reserved::FAST.0] & reserved::FAST.1, 0);
     }
 
     #[test]

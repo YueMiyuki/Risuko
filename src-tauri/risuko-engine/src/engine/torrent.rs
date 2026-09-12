@@ -46,6 +46,7 @@ pub struct BtHealthSnapshot {
 struct ResolvedMagnetMeta {
     bytes: Arc<[u8]>,
     peers: Arc<[SocketAddr]>,
+    tracker_peers: Arc<[SocketAddr]>,
 }
 
 struct CachedMagnetMeta {
@@ -360,6 +361,17 @@ impl TorrentEngine {
         options: &Map<String, Value>,
         initial_peers: Vec<std::net::SocketAddr>,
     ) -> Result<TorrentHandle, String> {
+        self.add_torrent_bytes_with_peer_sources(data, options, initial_peers, Vec::new())
+            .await
+    }
+
+    async fn add_torrent_bytes_with_peer_sources(
+        &self,
+        data: &[u8],
+        options: &Map<String, Value>,
+        initial_peers: Vec<std::net::SocketAddr>,
+        initial_tracker_peers: Vec<std::net::SocketAddr>,
+    ) -> Result<TorrentHandle, String> {
         let session = self.get_session()?;
 
         let dir = options
@@ -390,6 +402,7 @@ impl TorrentEngine {
             list_only: false,
             create_subfolder,
             initial_peers,
+            initial_tracker_peers,
             p2p_proxy: task_p2p_proxy,
             p2p_proxy_is_task_override: task_p2p_proxy_is_override,
         };
@@ -463,7 +476,7 @@ impl TorrentEngine {
         timeout_secs: u64,
         cancellation: CancellationToken,
     ) -> Result<TorrentHandle, String> {
-        let (bytes, peers) = self
+        let (bytes, peers, tracker_peers) = self
             .resolve_magnet_bytes_with_cancellation(
                 magnet_uri,
                 options,
@@ -490,7 +503,11 @@ impl TorrentEngine {
         if cancellation.is_cancelled() {
             return Err(MAGNET_ROUTE_CHANGED.to_string());
         }
-        self.add_torrent_bytes_with_peers(&bytes, options, peers)
+        let meta = bt::parse_torrent(&bytes)
+            .map_err(|e| format!("Failed to parse resolved metadata: {e}"))?;
+        let (initial_peers, tracker_peers) =
+            bt::split_initial_peer_sources(meta.info.private, peers, tracker_peers);
+        self.add_torrent_bytes_with_peer_sources(&bytes, options, initial_peers, tracker_peers)
             .await
     }
 
@@ -517,7 +534,7 @@ impl TorrentEngine {
         tracing::info!("Resolving magnet metadata: {}", magnet_uri);
         let start = std::time::Instant::now();
         let (_, cancellation) = self.magnet_cache.route_snapshot().await;
-        let (torrent_bytes, _) = self
+        let (torrent_bytes, _, _) = self
             .resolve_magnet_bytes_with_cancellation(
                 magnet_uri,
                 options,
@@ -545,7 +562,7 @@ impl TorrentEngine {
         options: &Map<String, Value>,
         timeout_secs: u64,
         cancellation: CancellationToken,
-    ) -> Result<(Vec<u8>, Vec<SocketAddr>), String> {
+    ) -> Result<(Vec<u8>, Vec<SocketAddr>, Vec<SocketAddr>), String> {
         let info_hash_key = bt::Magnet::parse(magnet_uri)
             .ok()
             .map(|m| *m.info_hash().as_bytes());
@@ -624,7 +641,11 @@ impl TorrentEngine {
             return Err(MAGNET_ROUTE_CHANGED.to_string());
         }
 
-        Ok((resolved.bytes.to_vec(), resolved.peers.to_vec()))
+        Ok((
+            resolved.bytes.to_vec(),
+            resolved.peers.to_vec(),
+            resolved.tracker_peers.to_vec(),
+        ))
     }
 
     async fn resolve_magnet_uncached(
@@ -662,6 +683,7 @@ impl TorrentEngine {
                 .into_boxed_slice(),
             ),
             peers: Arc::from(resolved.peers.into_boxed_slice()),
+            tracker_peers: Arc::from(resolved.tracker_peers.into_boxed_slice()),
         })
     }
 
@@ -1147,6 +1169,7 @@ mod tests {
         ResolvedMagnetMeta {
             bytes: Arc::from(vec![byte].into_boxed_slice()),
             peers: Arc::from(Vec::<SocketAddr>::new().into_boxed_slice()),
+            tracker_peers: Arc::from(Vec::<SocketAddr>::new().into_boxed_slice()),
         }
     }
 

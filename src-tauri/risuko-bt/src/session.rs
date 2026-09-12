@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
@@ -17,6 +17,115 @@ use super::core::metainfo::{parse_torrent, FileDetails};
 use super::core::{generate_peer_id, Id20, Lengths};
 use super::peer::{KnownInfoHash, PeerCommand, PeerEvent, PeerHandle};
 use super::torrent::{spawn as spawn_torrent, ManagedTorrent, TorrentCommand, TorrentInit};
+
+#[derive(Default)]
+struct PrivateTorrentOwners {
+    count: usize,
+    dhts: Vec<std::sync::Weak<super::dht::Dht>>,
+}
+
+static PRIVATE_TORRENT_OWNERS: LazyLock<Mutex<HashMap<Id20, PrivateTorrentOwners>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_private_dht(entry: &mut PrivateTorrentOwners, dht: Arc<super::dht::Dht>) {
+    let weak = Arc::downgrade(&dht);
+    if !entry.dhts.iter().any(|known| known.ptr_eq(&weak)) {
+        entry.dhts.push(weak);
+    }
+}
+
+fn claim_private_hashes(dht: Option<Arc<super::dht::Dht>>, hashes: impl IntoIterator<Item = Id20>) {
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let entry = owners.entry(hash).or_default();
+        entry.count += 1;
+        if let Some(dht) = dht.as_ref() {
+            remember_private_dht(entry, dht.clone());
+            dht.set_private(hash, true);
+        }
+    }
+}
+
+fn mark_private_hashes(dht: Option<Arc<super::dht::Dht>>, hashes: impl IntoIterator<Item = Id20>) {
+    let Some(dht) = dht else {
+        return;
+    };
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let Some(entry) = owners.get_mut(&hash) else {
+            continue;
+        };
+        remember_private_dht(entry, dht.clone());
+        dht.set_private(hash, true);
+    }
+}
+
+fn release_private_hashes(hashes: impl IntoIterator<Item = Id20>) {
+    let mut owners = PRIVATE_TORRENT_OWNERS.lock();
+    for hash in hashes {
+        let Some(entry) = owners.get_mut(&hash) else {
+            continue;
+        };
+        entry.count = entry.count.saturating_sub(1);
+        if entry.count == 0 {
+            let entry = owners.remove(&hash).expect("private owner entry exists");
+            for dht in entry.dhts {
+                if let Some(dht) = dht.upgrade() {
+                    dht.set_private(hash, false);
+                }
+            }
+        }
+    }
+}
+
+struct PrivateHashClaimGuard {
+    hashes: Option<Vec<Id20>>,
+}
+
+impl PrivateHashClaimGuard {
+    fn claim(dht: Option<Arc<super::dht::Dht>>, hashes: Vec<Id20>) -> Self {
+        claim_private_hashes(dht, hashes.clone());
+        Self {
+            hashes: Some(hashes),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.hashes = None;
+    }
+}
+
+impl Drop for PrivateHashClaimGuard {
+    fn drop(&mut self) {
+        if let Some(hashes) = self.hashes.take() {
+            release_private_hashes(hashes);
+        }
+    }
+}
+
+struct PrivateHashReleaseGuard {
+    hashes: Option<Vec<Id20>>,
+}
+
+impl PrivateHashReleaseGuard {
+    fn new(hashes: Vec<Id20>) -> Self {
+        Self {
+            hashes: Some(hashes),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(hashes) = self.hashes.take() {
+            release_private_hashes(hashes);
+        }
+    }
+}
+
+impl Drop for PrivateHashReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct UpnpStatus {
@@ -53,6 +162,7 @@ pub struct AddTorrentOptions {
     pub list_only: bool,
     pub create_subfolder: bool,
     pub initial_peers: Vec<std::net::SocketAddr>,
+    pub initial_tracker_peers: Vec<std::net::SocketAddr>,
     pub p2p_proxy: Option<risuko_http::ProxyConnector>,
     pub p2p_proxy_is_task_override: bool,
 }
@@ -66,10 +176,29 @@ impl Default for AddTorrentOptions {
             list_only: false,
             create_subfolder: true,
             initial_peers: Vec::new(),
+            initial_tracker_peers: Vec::new(),
             p2p_proxy: None,
             p2p_proxy_is_task_override: false,
         }
     }
+}
+
+pub fn split_initial_peer_sources(
+    private_torrent: bool,
+    peers: Vec<SocketAddr>,
+    tracker_peers: Vec<SocketAddr>,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    if private_torrent {
+        return (Vec::new(), tracker_peers);
+    }
+    let tracker_set: std::collections::HashSet<_> = tracker_peers.iter().copied().collect();
+    (
+        peers
+            .into_iter()
+            .filter(|peer| !tracker_set.contains(peer))
+            .collect(),
+        tracker_peers,
+    )
 }
 
 pub enum AddTorrent {
@@ -94,6 +223,7 @@ pub struct Session {
     p2p_proxy: RwLock<Option<risuko_http::ProxyConnector>>,
     peer_id: Id20,
     listen_port: u16,
+    tracker_source_addr: Option<SocketAddr>,
     utp: Option<Arc<super::utp::UtpSocket>>,
     upload_limiter: Option<Arc<super::limiter::UploadLimiter>>,
     inner: Mutex<SessionInner>,
@@ -111,6 +241,16 @@ pub struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        let private_hashes: Vec<Id20> = self
+            .inner
+            .get_mut()
+            .torrents
+            .values()
+            .filter_map(|handle| handle.metadata.load_full())
+            .filter(|meta| meta.info.private)
+            .flat_map(|meta| meta.announce_infohashes())
+            .collect();
+        release_private_hashes(private_hashes);
         if let Some(h) = self.accept_handle.lock().take() {
             h.abort();
         }
@@ -156,7 +296,9 @@ impl Session {
             .and_then(|l| l.listen_addr)
             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
         let listener = TcpListener::bind(listen_addr).await?;
-        let local_port = listener.local_addr()?.port();
+        let bound_listen_addr = listener.local_addr()?;
+        let local_port = bound_listen_addr.port();
+        let tracker_source_addr = direct_tracker_source_addr(listen_addr, bound_listen_addr);
         tracing::info!("session listening on port {local_port}");
 
         let utp = match super::utp::UtpSocket::bind_with_proxy(
@@ -220,6 +362,7 @@ impl Session {
             p2p_proxy: RwLock::new(initial_p2p_proxy),
             peer_id,
             listen_port: local_port,
+            tracker_source_addr,
             utp,
             upload_limiter,
             inner: Mutex::new(SessionInner {
@@ -248,7 +391,26 @@ impl Session {
                             let Some(s) = weak.upgrade() else {
                                 return;
                             };
-                            let _ = s.add_peer(ih, addr).await;
+                            // BEP-27
+                            let Some(handle) = s.get(TorrentIdOrHash::Hash(ih)) else {
+                                continue;
+                            };
+                            let is_private = handle
+                                .metadata
+                                .load()
+                                .as_ref()
+                                .is_some_and(|meta| meta.info.private);
+                            if !is_private {
+                                let _ = handle
+                                    .cmd_tx()
+                                    .send(super::torrent::TorrentCommand::AddPeer(
+                                        super::torrent::PeerCandidate {
+                                            addr,
+                                            source: super::torrent::PeerSource::Lsd,
+                                        },
+                                    ))
+                                    .await;
+                            }
                         }
                     });
                     *session.lsd.lock() = Some(svc);
@@ -453,11 +615,11 @@ impl Session {
                 let meta = parse_torrent(&torrent_bytes)
                     .map_err(|e| format!("parse synthesized torrent: {e}"))?;
                 let mut opts = opts;
-                if opts.initial_peers.is_empty() {
-                    opts.initial_peers = resolved.peers;
-                } else {
-                    opts.initial_peers.extend(resolved.peers);
-                }
+                let tracker_peers = resolved.tracker_peers;
+                let (initial_peers, tracker_peers) =
+                    split_initial_peer_sources(meta.info.private, resolved.peers, tracker_peers);
+                opts.initial_tracker_peers.extend(tracker_peers);
+                opts.initial_peers.extend(initial_peers);
                 self.add_from_meta(meta, opts).await
             }
         }
@@ -611,8 +773,12 @@ impl Session {
             },
             p2p_proxy: route_proxy,
             p2p_proxy_is_task_override: opts.p2p_proxy_is_task_override,
+            tracker_source_addr: self.tracker_source_addr,
             blocklist: self.blocklist.clone(),
         };
+        let mut private_claim = info.private.then(|| {
+            PrivateHashClaimGuard::claim(self.dht.lock().clone(), meta.announce_infohashes())
+        });
         let handle = match spawn_torrent(id, init, self.peer_id, self.listen_port).await {
             Ok(h) => h,
             Err(e) => {
@@ -624,21 +790,45 @@ impl Session {
                 return Err(format!("spawn torrent: {e}"));
             }
         };
+        if let Some(claim) = private_claim.as_mut() {
+            claim.disarm();
+        }
         {
             let mut inner = self.inner.lock();
             inner.torrents.insert(id, handle.clone());
         }
-        if !opts.initial_peers.is_empty() {
+        if !opts.initial_peers.is_empty() || !opts.initial_tracker_peers.is_empty() {
             let cmd_tx = handle.cmd_tx();
             let peers = opts.initial_peers;
+            let tracker_peers = opts.initial_tracker_peers;
             tracing::info!(
-                "Seeding torrent id={id} with {} peers from magnet resolve",
-                peers.len()
+                "Seeding torrent id={id} with {} tracker and {} manual peers",
+                tracker_peers.len(),
+                peers.len(),
             );
             tokio::spawn(async move {
+                for addr in tracker_peers {
+                    if cmd_tx
+                        .send(super::torrent::TorrentCommand::AddPeer(
+                            super::torrent::PeerCandidate {
+                                addr,
+                                source: super::torrent::PeerSource::Tracker,
+                            },
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 for addr in peers {
                     if cmd_tx
-                        .send(super::torrent::TorrentCommand::AddPeer(addr))
+                        .send(super::torrent::TorrentCommand::AddPeer(
+                            super::torrent::PeerCandidate {
+                                addr,
+                                source: super::torrent::PeerSource::Manual,
+                            },
+                        ))
                         .await
                         .is_err()
                     {
@@ -647,8 +837,10 @@ impl Session {
                 }
             });
         }
-        if let Some(lsd) = self.lsd.lock().as_ref() {
-            lsd.add_infohash(meta.info_hash);
+        if !info.private {
+            if let Some(lsd) = self.lsd.lock().as_ref() {
+                lsd.add_infohash(meta.info_hash);
+            }
         }
         Ok(AddTorrentResponse::Added(id, handle))
     }
@@ -667,6 +859,15 @@ impl Session {
             utp.reconfigure_proxy(proxy.clone()).await;
         }
         *self.dht.lock() = dht.clone();
+        if dht.is_some() {
+            for handle in &handles {
+                if let Some(meta) = handle.metadata.load().as_ref() {
+                    if meta.info.private {
+                        mark_private_hashes(dht.clone(), meta.announce_infohashes());
+                    }
+                }
+            }
+        }
 
         let mut changed = Vec::with_capacity(handles.len());
         for handle in &handles {
@@ -789,7 +990,38 @@ impl Session {
     }
 
     pub async fn delete(&self, which: TorrentIdOrHash, with_files: bool) -> Result<(), String> {
-        let handle = self.get(which).ok_or_else(|| "not found".to_string())?;
+        let handle = {
+            let mut inner = self.inner.lock();
+            let id = match which {
+                TorrentIdOrHash::Id(id) => id,
+                TorrentIdOrHash::Hash(hash) => *inner
+                    .by_hash
+                    .get(&hash)
+                    .ok_or_else(|| "not found".to_string())?,
+            };
+            let handle = inner
+                .torrents
+                .remove(&id)
+                .ok_or_else(|| "not found".to_string())?;
+            handle
+        };
+        let is_private = handle
+            .metadata
+            .load()
+            .as_ref()
+            .is_some_and(|meta| meta.info.private);
+        if !is_private {
+            if let Some(lsd) = self.lsd.lock().as_ref() {
+                lsd.remove_infohash(handle.info_hash);
+            }
+        }
+        let private_hashes = handle
+            .metadata
+            .load()
+            .as_ref()
+            .filter(|meta| meta.info.private)
+            .map(|meta| meta.announce_infohashes());
+        let mut private_release = private_hashes.map(PrivateHashReleaseGuard::new);
         // Capture file paths for optional deletion before stopping the torrent (the torrent loop owns storage and drops it on Stop)
         let file_paths: Option<Vec<(PathBuf, bool)>> = if with_files {
             let create_subfolder = handle.create_subfolder;
@@ -827,19 +1059,24 @@ impl Session {
             None
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        handle
-            .cmd_tx()
-            .send(TorrentCommand::Stop(tx))
-            .await
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = handle.cmd_tx().send(TorrentCommand::Stop(tx)).await {
+            let mut inner = self.inner.lock();
+            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
+                inner.by_hash.remove(&handle.info_hash);
+            }
+            return Err(error.to_string());
+        }
         let _ = rx.await;
         {
             let mut inner = self.inner.lock();
-            inner.torrents.remove(&handle.id);
-            inner.by_hash.remove(&handle.info_hash);
+            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
+                inner.by_hash.remove(&handle.info_hash);
+            }
         }
-        if let Some(lsd) = self.lsd.lock().as_ref() {
-            lsd.remove_infohash(handle.info_hash);
+        if is_private {
+            if let Some(release) = private_release.as_mut() {
+                release.release();
+            }
         }
         if let Some(paths) = file_paths {
             for (p, is_dir) in paths {
@@ -864,7 +1101,10 @@ impl Session {
             .ok_or_else(|| "torrent not found".to_string())?;
         handle
             .cmd_tx()
-            .send(TorrentCommand::AddPeer(addr))
+            .send(TorrentCommand::AddPeer(super::torrent::PeerCandidate {
+                addr,
+                source: super::torrent::PeerSource::Manual,
+            }))
             .await
             .map_err(|e| e.to_string())
     }
@@ -933,6 +1173,15 @@ fn upnp_mapping_specs(tcp_port: u16, utp_port: Option<u16>) -> Vec<(u16, super::
     mappings
 }
 
+fn direct_tracker_source_addr(configured: SocketAddr, bound: SocketAddr) -> Option<SocketAddr> {
+    let ip = if configured.ip().is_unspecified() {
+        return None;
+    } else {
+        bound.ip()
+    };
+    Some(SocketAddr::new(ip, 0))
+}
+
 /// Bind a TCP listener on an IPv6 address with `IPV6_V6ONLY` set to avoid dual-stack conflicts when an IPv4 listener already bound the same port
 fn bind_v6_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -956,6 +1205,11 @@ fn known_infohashes(s: &Session) -> Vec<KnownInfoHash> {
         .map(|handle| KnownInfoHash {
             info_hash: handle.info_hash,
             advertise_v2: handle.advertise_v2.load(Ordering::Relaxed),
+            advertise_dht: handle
+                .metadata
+                .load()
+                .as_ref()
+                .is_none_or(|meta| !meta.info.private),
             ext_handshake_builder: Some(handle.ext_handshake_builder.clone()),
         })
         .collect()
@@ -1058,6 +1312,19 @@ mod tests {
         assert_eq!(
             upnp_mapping_specs(41_000, None),
             vec![(41_000, crate::upnp::MapProto::Tcp)]
+        );
+    }
+
+    #[test]
+    fn tracker_source_uses_explicit_listener_ip_and_ignores_wildcards() {
+        let bound: SocketAddr = "192.0.2.7:43123".parse().unwrap();
+        assert_eq!(
+            direct_tracker_source_addr("192.0.2.7:0".parse().unwrap(), bound),
+            Some("192.0.2.7:0".parse().unwrap())
+        );
+        assert_eq!(
+            direct_tracker_source_addr("0.0.0.0:0".parse().unwrap(), bound),
+            None
         );
     }
 }

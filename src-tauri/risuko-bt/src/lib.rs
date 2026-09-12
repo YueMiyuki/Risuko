@@ -16,6 +16,7 @@ pub mod torrent;
 pub mod tracker;
 pub mod upnp;
 pub mod utp;
+pub mod webseed;
 pub mod wire;
 
 pub use api::TorrentIdOrHash;
@@ -26,7 +27,7 @@ pub use core::metainfo::{
 pub use core::{generate_peer_id, Id20, Lengths, Magnet};
 pub use peer::EncryptionPolicy;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, ListenerOptions, Session,
-    SessionOptions, UpnpStatus,
+    split_initial_peer_sources, AddTorrent, AddTorrentOptions, AddTorrentResponse,
+    ListOnlyResponse, ListenerOptions, Session, SessionOptions, UpnpStatus,
 };
-pub use torrent::{ManagedTorrent, PeerSnapshot, TorrentStats};
+pub use torrent::{ManagedTorrent, PeerCandidate, PeerSnapshot, PeerSource, TorrentStats};

@@ -19,13 +19,11 @@ pub mod id {
     pub const HAVE_ALL: u8 = 0x0E;
     pub const HAVE_NONE: u8 = 0x0F;
     pub const REJECT_REQUEST: u8 = 0x10;
-    /// BEP-10 extension protocol container
+    pub const SUGGEST_PIECE: u8 = 0x0D;
+    pub const ALLOWED_FAST: u8 = 0x11;
     pub const EXTENDED: u8 = 20;
-    /// BEP 52: request a Merkle layer slice for a given pieces-root
     pub const HASH_REQUEST: u8 = 21;
-    /// BEP 52: response carrying layer hashes + sibling proof
     pub const HASHES: u8 = 22;
-    /// BEP 52: peer cannot serve the requested hash slice
     pub const HASH_REJECT: u8 = 23;
 }
 
@@ -73,6 +71,10 @@ pub enum Message {
         begin: u32,
         length: u32,
     },
+    /// BEP-6 advisory piece suggestion
+    SuggestPiece(u32),
+    /// BEP-6 piece that may be requested while choked
+    AllowedFast(u32),
     Extended {
         ext_id: u8,
         payload: Bytes,
@@ -172,6 +174,14 @@ impl MessageEncoder {
                 buf.put_u32(*index);
                 buf.put_u32(*begin);
                 buf.put_u32(*length);
+            }
+            Message::SuggestPiece(index) => {
+                buf.put_u8(id::SUGGEST_PIECE);
+                buf.put_u32(*index);
+            }
+            Message::AllowedFast(index) => {
+                buf.put_u8(id::ALLOWED_FAST);
+                buf.put_u32(*index);
             }
             Message::Extended { ext_id, payload } => {
                 buf.put_u8(id::EXTENDED);
@@ -359,11 +369,23 @@ impl MessageDecoder {
                 Message::Port(buf.get_u16())
             }
             id::HAVE_ALL => {
-                take(buf, remaining, id)?;
+                if remaining != 0 {
+                    return Err(MessageError::Truncated {
+                        id,
+                        expected: 0,
+                        got: remaining,
+                    });
+                }
                 Message::HaveAll
             }
             id::HAVE_NONE => {
-                take(buf, remaining, id)?;
+                if remaining != 0 {
+                    return Err(MessageError::Truncated {
+                        id,
+                        expected: 0,
+                        got: remaining,
+                    });
+                }
                 Message::HaveNone
             }
             id::REJECT_REQUEST => {
@@ -382,6 +404,26 @@ impl MessageDecoder {
                     begin,
                     length,
                 }
+            }
+            id::SUGGEST_PIECE => {
+                if remaining != 4 {
+                    return Err(MessageError::Truncated {
+                        id,
+                        expected: 4,
+                        got: remaining,
+                    });
+                }
+                Message::SuggestPiece(buf.get_u32())
+            }
+            id::ALLOWED_FAST => {
+                if remaining != 4 {
+                    return Err(MessageError::Truncated {
+                        id,
+                        expected: 4,
+                        got: remaining,
+                    });
+                }
+                Message::AllowedFast(buf.get_u32())
             }
             id::EXTENDED => {
                 if remaining < 1 {
@@ -674,6 +716,22 @@ mod tests {
                 length,
             } => assert_eq!((index, begin, length), (3, 16_384, 16_384)),
             other => panic!("expected RejectRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_have_all_and_none_reject_trailing_payload() {
+        for id in [id::HAVE_ALL, id::HAVE_NONE] {
+            let mut frame = BytesMut::from(&[0, 0, 0, 2, id, 0][..]);
+            let err = MessageDecoder::try_decode(&mut frame).unwrap_err();
+            assert!(matches!(
+                err,
+                MessageError::Truncated {
+                    id: actual,
+                    expected: 0,
+                    got: 1,
+                } if actual == id
+            ));
         }
     }
 }

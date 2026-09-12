@@ -1,7 +1,8 @@
 //! UDP tracker (BEP-15): client sends `Connect` (magic) to get a 64-bit `connection_id`, then `Announce` quoting it to get peers + interval + seeders/leechers; retransmits shortened to 3 tries to fit our async budget
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use rand::RngExt;
@@ -9,7 +10,7 @@ use tokio::net::{lookup_host, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::{AnnounceRequest, AnnounceResponse, TrackerError};
+use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, ScrapeResponse, TrackerError};
 
 /// Big-endian read/write helpers over byte slices, replacing `byteorder`; each maps 1:1 to `std` be-bytes and slices are sized exactly by the caller so `try_into` never fails
 mod be {
@@ -33,7 +34,29 @@ mod be {
 const PROTOCOL_ID: u64 = 0x41727101980;
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
+const CONNECTION_TTL: Duration = Duration::from_secs(60);
+const RETRANSMIT_ATTEMPTS: u32 = 4;
+
+fn retransmit_timeout(attempt: u32) -> Duration {
+    Duration::from_secs(15u64.saturating_mul(1u64 << attempt.min(2)))
+}
+
+#[derive(Clone, Copy)]
+struct CachedConnection {
+    id: u64,
+    created: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct ConnectionCacheKey {
+    target: SocketAddr,
+    source: SocketAddr,
+}
+
+static CONNECTION_CACHE: LazyLock<Mutex<HashMap<ConnectionCacheKey, CachedConnection>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     announce_with_proxy(url, req, None).await
@@ -44,15 +67,37 @@ pub async fn announce_with_proxy(
     req: &AnnounceRequest,
     proxy: Option<&risuko_http::ProxyConnector>,
 ) -> Result<AnnounceResponse, TrackerError> {
+    announce_with_proxy_and_source(url, req, proxy, None).await
+}
+
+pub async fn announce_with_proxy_and_source(
+    url: &str,
+    req: &AnnounceRequest,
+    proxy: Option<&risuko_http::ProxyConnector>,
+    source: Option<SocketAddr>,
+) -> Result<AnnounceResponse, TrackerError> {
     let (host, port) = parse_udp_url(url)?;
-    if let Some(proxy) = proxy {
+    let bypasses_proxy = proxy
+        .and_then(|proxy| proxy.udp_no_proxy().or_else(|| proxy.no_proxy()))
+        .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
+    let source_is_concrete = source.is_some_and(|source| !source.ip().is_unspecified());
+    if let Some(proxy) =
+        proxy.filter(|proxy| proxy.has_proxy() && !(source_is_concrete && bypasses_proxy))
+    {
         let socket = proxy
             .bind_udp_with_bypass()
             .await
             .map_err(|e| TrackerError::Http(e.to_string()))?;
         return announce_endpoint_proxy(socket, &host, port, req).await;
     }
-    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?);
+    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
+        .into_iter()
+        .filter(|target| {
+            source.is_none_or(|source| {
+                source.ip().is_unspecified() || source.is_ipv4() == target.is_ipv4()
+            })
+        })
+        .collect::<Vec<_>>();
     if targets.is_empty() {
         return Err(TrackerError::Url(format!("no DNS result for {host}")));
     }
@@ -60,7 +105,7 @@ pub async fn announce_with_proxy(
     let mut attempts = JoinSet::new();
     for target in targets {
         let req = req.clone();
-        attempts.spawn(async move { announce_endpoint(target, &req).await });
+        attempts.spawn(async move { announce_endpoint(target, &req, source).await });
     }
 
     let mut last_error = None;
@@ -83,28 +128,306 @@ pub async fn announce_with_proxy(
         .unwrap_or_else(|| TrackerError::Url(format!("no usable DNS endpoint for {host}"))))
 }
 
+const MAX_SCRAPE_HASHES_PER_REQUEST: usize = 74;
+
+pub async fn scrape(
+    url: &str,
+    info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    let mut results = Vec::with_capacity(info_hashes.len());
+    for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
+        results.extend(scrape_direct_batch(url, batch, source).await?);
+    }
+    Ok(results)
+}
+
+async fn scrape_direct_batch(
+    url: &str,
+    info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    if info_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if info_hashes.len() > MAX_SCRAPE_HASHES_PER_REQUEST {
+        return Err(TrackerError::Url(
+            "UDP scrape batch exceeds 74 info-hashes".into(),
+        ));
+    }
+    let (host, port) = parse_udp_url(url)?;
+    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
+        .into_iter()
+        .filter(|target| {
+            source.is_none_or(|source| {
+                source.ip().is_unspecified() || source.is_ipv4() == target.is_ipv4()
+            })
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(TrackerError::Url(format!("no DNS result for {host}")));
+    }
+
+    let mut last_error = None;
+    for target in targets {
+        match scrape_direct_endpoint(target, info_hashes, source).await {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(TrackerError::Timeout))
+}
+
+async fn scrape_direct_endpoint(
+    target: SocketAddr,
+    info_hashes: &[super::super::core::Id20],
+    source: Option<SocketAddr>,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    let bind_addr = direct_bind_addr(target, source);
+    let cache_key = ConnectionCacheKey {
+        target,
+        source: bind_addr,
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
+    sock.connect(target).await?;
+
+    let conn_id = match cached_connection(cache_key) {
+        Some(id) => id,
+        None => {
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            id
+        }
+    };
+    match scrape_inner(&sock, conn_id, info_hashes).await {
+        Ok(response) => Ok(response),
+        Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
+            invalidate_connection(cache_key);
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            scrape_inner(&sock, id, info_hashes).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn scrape_inner(
+    sock: &UdpSocket,
+    conn_id: u64,
+    info_hashes: &[super::super::core::Id20],
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    let txn = rand::rng().random::<u32>();
+    let mut body = Vec::with_capacity(16 + info_hashes.len() * 20);
+    body.extend_from_slice(&conn_id.to_be_bytes());
+    body.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
+    body.extend_from_slice(&txn.to_be_bytes());
+    for hash in info_hashes {
+        body.extend_from_slice(hash.as_bytes());
+    }
+    let mut buf = vec![0u8; 8 + info_hashes.len() * 12];
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
+        sock.send(&body).await?;
+        match timeout(retransmit_timeout(attempt), sock.recv(&mut buf)).await {
+            Ok(Ok(n)) if n >= 8 => {
+                let action = be::read_u32(&buf[..4]);
+                let rtxn = be::read_u32(&buf[4..8]);
+                if rtxn != txn {
+                    continue;
+                }
+                if action == ACTION_ERROR {
+                    return Err(TrackerError::Rejected(read_error(&buf[8..n])));
+                }
+                let expected = 8 + info_hashes.len() * 12;
+                if action != ACTION_SCRAPE || n != expected {
+                    continue;
+                }
+                let mut out = Vec::with_capacity(info_hashes.len());
+                for chunk in buf[8..expected].chunks_exact(12) {
+                    out.push(ScrapeResponse {
+                        complete: be::read_u32(&chunk[0..4]),
+                        downloaded: be::read_u32(&chunk[4..8]),
+                        incomplete: be::read_u32(&chunk[8..12]),
+                    });
+                }
+                return Ok(out);
+            }
+            _ => {}
+        }
+    }
+    Err(TrackerError::Timeout)
+}
+
+pub async fn scrape_with_proxy(
+    url: &str,
+    info_hashes: &[super::super::core::Id20],
+    proxy: Option<&risuko_http::ProxyConnector>,
+    source: Option<SocketAddr>,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    let Some(proxy) = proxy else {
+        return scrape(url, info_hashes, source).await;
+    };
+    if !proxy.has_proxy() {
+        return scrape(url, info_hashes, source).await;
+    }
+    if source.is_some_and(|source| !source.ip().is_unspecified()) {
+        let (host, port) = parse_udp_url(url)?;
+        let bypasses_proxy = proxy
+            .udp_no_proxy()
+            .or_else(|| proxy.no_proxy())
+            .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
+        if bypasses_proxy {
+            return scrape(url, info_hashes, source).await;
+        }
+    }
+    let mut results = Vec::with_capacity(info_hashes.len());
+    for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
+        results.extend(scrape_proxy_batch(url, batch, proxy).await?);
+    }
+    Ok(results)
+}
+
+async fn scrape_proxy_batch(
+    url: &str,
+    info_hashes: &[super::super::core::Id20],
+    proxy: &risuko_http::ProxyConnector,
+) -> Result<Vec<ScrapeResponse>, TrackerError> {
+    if info_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if info_hashes.len() > MAX_SCRAPE_HASHES_PER_REQUEST {
+        return Err(TrackerError::Url(
+            "UDP scrape batch exceeds 74 info-hashes".into(),
+        ));
+    }
+    let (host, port) = parse_udp_url(url)?;
+    let sock = proxy
+        .bind_udp_with_bypass()
+        .await
+        .map_err(|e| TrackerError::Http(e.to_string()))?;
+    let conn_id = connect_socket(&sock, &host, port).await?;
+    let txn = rand::rng().random::<u32>();
+    let mut body = Vec::with_capacity(16 + info_hashes.len() * 20);
+    body.extend_from_slice(&conn_id.to_be_bytes());
+    body.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
+    body.extend_from_slice(&txn.to_be_bytes());
+    for hash in info_hashes {
+        body.extend_from_slice(hash.as_bytes());
+    }
+    let mut buf = vec![0u8; 8 + info_hashes.len() * 12];
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
+        sock.send_to_host(&body, &host, port)
+            .await
+            .map_err(|e| TrackerError::Http(e.to_string()))?;
+        match timeout(retransmit_timeout(attempt), sock.recv_from_target(&mut buf)).await {
+            Ok(Ok((n, _))) if n >= 8 => {
+                let action = be::read_u32(&buf[..4]);
+                let rtxn = be::read_u32(&buf[4..8]);
+                if rtxn != txn {
+                    continue;
+                }
+                if action == ACTION_ERROR {
+                    return Err(TrackerError::Rejected(read_error(&buf[8..n])));
+                }
+                let expected = 8 + info_hashes.len() * 12;
+                if action != ACTION_SCRAPE || n != expected {
+                    continue;
+                }
+                return Ok(buf[8..expected]
+                    .chunks_exact(12)
+                    .map(|chunk| ScrapeResponse {
+                        complete: be::read_u32(&chunk[0..4]),
+                        downloaded: be::read_u32(&chunk[4..8]),
+                        incomplete: be::read_u32(&chunk[8..12]),
+                    })
+                    .collect());
+            }
+            _ => {}
+        }
+    }
+    Err(TrackerError::Timeout)
+}
+
 fn dedupe_endpoints(endpoints: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let mut seen = HashSet::new();
     endpoints
         .into_iter()
-        .filter(|endpoint| seen.insert(*endpoint))
+        .filter(|endpoint| is_valid_endpoint(*endpoint) && seen.insert(*endpoint))
         .collect()
 }
 
 async fn announce_endpoint(
     target: SocketAddr,
     req: &AnnounceRequest,
+    source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let sock = UdpSocket::bind(if target.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    })
-    .await?;
+    let bind_addr = direct_bind_addr(target, source);
+    let cache_key = ConnectionCacheKey {
+        target,
+        source: bind_addr,
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
     sock.connect(target).await?;
 
-    let conn_id = connect(&sock).await?;
-    announce_inner(&sock, conn_id, req).await
+    let conn_id = match cached_connection(cache_key) {
+        Some(id) => id,
+        None => {
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            id
+        }
+    };
+    match announce_inner(&sock, conn_id, req).await {
+        Ok(response) => Ok(response),
+        Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
+            invalidate_connection(cache_key);
+            let id = connect(&sock).await?;
+            cache_connection(cache_key, id);
+            announce_inner(&sock, id, req).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn direct_bind_addr(target: SocketAddr, source: Option<SocketAddr>) -> SocketAddr {
+    let compatible = source
+        .filter(|source| !source.ip().is_unspecified() && source.is_ipv4() == target.is_ipv4());
+    compatible
+        .map(|mut source| {
+            source.set_port(0);
+            source
+        })
+        .unwrap_or_else(|| {
+            if target.is_ipv6() {
+                SocketAddr::from(([0u16; 8], 0))
+            } else {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            }
+        })
+}
+
+fn cached_connection(key: ConnectionCacheKey) -> Option<u64> {
+    let mut cache = CONNECTION_CACHE.lock().ok()?;
+    cache.retain(|_, item| item.created.elapsed() < CONNECTION_TTL);
+    cache.get(&key).map(|item| item.id)
+}
+
+fn cache_connection(key: ConnectionCacheKey, id: u64) {
+    if let Ok(mut cache) = CONNECTION_CACHE.lock() {
+        cache.retain(|_, item| item.created.elapsed() < CONNECTION_TTL);
+        cache.insert(
+            key,
+            CachedConnection {
+                id,
+                created: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+fn invalidate_connection(key: ConnectionCacheKey) {
+    if let Ok(mut cache) = CONNECTION_CACHE.lock() {
+        cache.remove(&key);
+    }
 }
 
 async fn announce_endpoint_proxy(
@@ -115,7 +438,14 @@ async fn announce_endpoint_proxy(
 ) -> Result<AnnounceResponse, TrackerError> {
     let conn_id = connect_socket(&sock, host, port).await?;
     let is_ipv6 = host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6());
-    announce_inner_socket(&sock, conn_id, host, port, req, is_ipv6).await
+    match announce_inner_socket(&sock, conn_id, host, port, req, is_ipv6).await {
+        Ok(response) => Ok(response),
+        Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
+            let id = connect_socket(&sock, host, port).await?;
+            announce_inner_socket(&sock, id, host, port, req, is_ipv6).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn connect(sock: &UdpSocket) -> Result<u64, TrackerError> {
@@ -126,18 +456,16 @@ async fn connect(sock: &UdpSocket) -> Result<u64, TrackerError> {
     be::write_u32(&mut req[8..12], ACTION_CONNECT);
     be::write_u32(&mut req[12..16], txn);
 
-    for attempt in 0..3u32 {
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
         sock.send(&req).await?;
-        // Shorter than BEP-15 (15 * 2^n) to keep resolve-magnet snappy
-        let wait = Duration::from_secs(5u64 << attempt);
-        match timeout(wait, sock.recv(&mut buf)).await {
+        match timeout(retransmit_timeout(attempt), sock.recv(&mut buf)).await {
             Ok(Ok(n)) if n >= 8 => {
                 let action = be::read_u32(&buf[0..4]);
                 let rtxn = be::read_u32(&buf[4..8]);
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
-                if n < 16 || action != ACTION_CONNECT || rtxn != txn {
+                if n != 16 || action != ACTION_CONNECT || rtxn != txn {
                     continue;
                 }
                 return Ok(be::read_u64(&buf[8..16]));
@@ -159,19 +487,18 @@ async fn connect_socket(
     be::write_u64(&mut req[0..8], PROTOCOL_ID);
     be::write_u32(&mut req[8..12], ACTION_CONNECT);
     be::write_u32(&mut req[12..16], txn);
-    for attempt in 0..3u32 {
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
         sock.send_to_host(&req, host, port)
             .await
             .map_err(|e| TrackerError::Http(e.to_string()))?;
-        let wait = Duration::from_secs(5u64 << attempt);
-        match timeout(wait, sock.recv_from_target(&mut buf)).await {
+        match timeout(retransmit_timeout(attempt), sock.recv_from_target(&mut buf)).await {
             Ok(Ok((n, _))) if n >= 8 => {
                 let action = be::read_u32(&buf[0..4]);
                 let rtxn = be::read_u32(&buf[4..8]);
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
-                if n >= 16 && action == ACTION_CONNECT && rtxn == txn {
+                if n == 16 && action == ACTION_CONNECT && rtxn == txn {
                     return Ok(be::read_u64(&buf[8..16]));
                 }
             }
@@ -191,12 +518,11 @@ async fn announce_inner_socket(
 ) -> Result<AnnounceResponse, TrackerError> {
     let (body, txn) = build_announce_body(conn_id, req);
     let mut buf = vec![0u8; announce_response_buffer_len(true, req.num_want)];
-    for attempt in 0..3u32 {
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
         sock.send_to_host(&body, host, port)
             .await
             .map_err(|e| TrackerError::Http(e.to_string()))?;
-        let wait = Duration::from_secs(5u64 << attempt);
-        match timeout(wait, sock.recv_from_target(&mut buf)).await {
+        match timeout(retransmit_timeout(attempt), sock.recv_from_target(&mut buf)).await {
             Ok(Ok((n, from))) if n >= 8 => {
                 let effective_max = buf.len().min(MAX_UDP_PAYLOAD);
                 if n >= effective_max {
@@ -207,16 +533,15 @@ async fn announce_inner_socket(
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
-                if n >= 20 && action == ACTION_ANNOUNCE && rtxn == txn {
-                    let source_is_ipv6 = matches!(
-                        from,
-                        risuko_http::ProxyDatagramSource::Ip(address)
-                            if address.is_ipv6()
-                    );
-                    return Ok(parse_announce_response(
-                        &buf[..n],
-                        is_ipv6 || source_is_ipv6,
-                    ));
+                let source_is_ipv6 = matches!(
+                    from,
+                    risuko_http::ProxyDatagramSource::Ip(address)
+                        if address.is_ipv6()
+                );
+                let response_is_ipv6 = is_ipv6 || source_is_ipv6;
+                let stride = if response_is_ipv6 { 18 } else { 6 };
+                if n >= 20 && (n - 20) % stride == 0 && action == ACTION_ANNOUNCE && rtxn == txn {
+                    return Ok(parse_announce_response(&buf[..n], response_is_ipv6));
                 }
             }
             _ => {}
@@ -234,10 +559,9 @@ async fn announce_inner(
 
     let is_ipv6 = sock.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     let mut buf = vec![0u8; announce_response_buffer_len(is_ipv6, req.num_want)];
-    for attempt in 0..3u32 {
+    for attempt in 0..RETRANSMIT_ATTEMPTS {
         sock.send(&body).await?;
-        let wait = Duration::from_secs(5u64 << attempt);
-        match timeout(wait, sock.recv(&mut buf)).await {
+        match timeout(retransmit_timeout(attempt), sock.recv(&mut buf)).await {
             Ok(Ok(n)) if n >= 8 => {
                 let effective_max = buf.len().min(MAX_UDP_PAYLOAD);
                 if n >= effective_max {
@@ -248,7 +572,8 @@ async fn announce_inner(
                 if action == ACTION_ERROR {
                     return Err(TrackerError::Rejected(read_error(&buf[8..n])));
                 }
-                if n < 20 || action != ACTION_ANNOUNCE || rtxn != txn {
+                let stride = if is_ipv6 { 18 } else { 6 };
+                if n < 20 || (n - 20) % stride != 0 || action != ACTION_ANNOUNCE || rtxn != txn {
                     continue;
                 }
                 return Ok(parse_announce_response(&buf[..n], is_ipv6));
@@ -283,7 +608,7 @@ fn build_announce_body(conn_id: u64, req: &AnnounceRequest) -> ([u8; 98], u32) {
     be::write_u64(&mut body[72..80], req.uploaded);
     be::write_u32(&mut body[80..84], event_code(req));
     be::write_u32(&mut body[84..88], 0);
-    be::write_u32(&mut body[88..92], rand::rng().random::<u32>());
+    be::write_u32(&mut body[88..92], req.key);
     be::write_u32(&mut body[92..96], req.num_want);
     be::write_u16(&mut body[96..98], req.port);
     (body, txn)
@@ -301,13 +626,19 @@ fn parse_announce_response(buf: &[u8], is_ipv6: bool) -> AnnounceResponse {
             octets.copy_from_slice(&chunk[0..16]);
             let ip = std::net::Ipv6Addr::from(octets);
             let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-            peers.push(SocketAddr::new(IpAddr::V6(ip), port));
+            let endpoint = SocketAddr::new(IpAddr::V6(ip), port);
+            if is_valid_endpoint(endpoint) {
+                peers.push(endpoint);
+            }
         }
     } else {
         for chunk in buf[20..].chunks_exact(6) {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            peers.push(SocketAddr::new(IpAddr::V4(ip), port));
+            let endpoint = SocketAddr::new(IpAddr::V4(ip), port);
+            if is_valid_endpoint(endpoint) {
+                peers.push(endpoint);
+            }
         }
     }
     AnnounceResponse {
@@ -346,6 +677,9 @@ fn parse_udp_url(url: &str) -> Result<(String, u16), TrackerError> {
         ),
         None => return Err(TrackerError::Url(format!("missing port in {url}"))),
     };
+    if host.is_empty() || port == 0 {
+        return Err(TrackerError::Url(format!("invalid endpoint in {url}")));
+    }
     Ok((host, port))
 }
 
@@ -379,6 +713,44 @@ mod tests {
     #[test]
     fn rejects_wrong_scheme() {
         assert!(parse_udp_url("http://x:1").is_err());
+        assert!(parse_udp_url("udp://tracker.example:0").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_discovered_endpoints() {
+        let valid: SocketAddr = "192.0.2.1:80".parse().unwrap();
+        let unspecified: SocketAddr = "0.0.0.0:80".parse().unwrap();
+        let multicast: SocketAddr = "224.0.0.1:80".parse().unwrap();
+        let zero_port: SocketAddr = "192.0.2.2:0".parse().unwrap();
+        assert_eq!(
+            dedupe_endpoints([valid, unspecified, multicast, zero_port]),
+            vec![valid]
+        );
+    }
+
+    #[test]
+    fn drops_invalid_compact_peers() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
+        response.extend_from_slice(&42u32.to_be_bytes());
+        response.extend_from_slice(&1800u32.to_be_bytes());
+        response.extend_from_slice(&3u32.to_be_bytes());
+        response.extend_from_slice(&7u32.to_be_bytes());
+        response.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        response.extend_from_slice(&[192, 0, 2, 1, 0, 80]);
+
+        let parsed = parse_announce_response(&response, false);
+        assert_eq!(parsed.peers, vec!["192.0.2.1:80".parse().unwrap()]);
+    }
+
+    #[test]
+    fn scrape_splits_large_requests_at_the_protocol_batch_limit() {
+        let hashes = vec![crate::core::Id20([7u8; 20]); 149];
+        let sizes: Vec<usize> = hashes
+            .chunks(MAX_SCRAPE_HASHES_PER_REQUEST)
+            .map(|batch| batch.len())
+            .collect();
+        assert_eq!(sizes, vec![74, 74, 1]);
     }
 
     #[test]
@@ -400,5 +772,47 @@ mod tests {
 
         let parsed = parse_announce_response(&response, true);
         assert_eq!(parsed.peers, vec!["[::1]:6881".parse().unwrap()]);
+    }
+
+    #[test]
+    fn direct_bind_uses_matching_source_family() {
+        let v4_target: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let v4_source: SocketAddr = "192.0.2.7:0".parse().unwrap();
+        assert_eq!(
+            direct_bind_addr(v4_target, Some(v4_source)),
+            "192.0.2.7:0".parse().unwrap()
+        );
+
+        let v6_target: SocketAddr = "[2001:db8::1]:6969".parse().unwrap();
+        assert_eq!(
+            direct_bind_addr(v6_target, Some(v4_source)),
+            "[::]:0".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_connection_keeps_zero_and_isolates_source_routes() {
+        let target: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let first = ConnectionCacheKey {
+            target,
+            source: "192.0.2.7:0".parse().unwrap(),
+        };
+        let second = ConnectionCacheKey {
+            target,
+            source: "192.0.2.8:0".parse().unwrap(),
+        };
+
+        cache_connection(first, 0);
+        assert_eq!(cached_connection(first), Some(0));
+        assert_eq!(cached_connection(second), None);
+        invalidate_connection(first);
+    }
+
+    #[test]
+    fn bep15_retransmit_timeout_doubles_then_caps() {
+        assert_eq!(retransmit_timeout(0), Duration::from_secs(15));
+        assert_eq!(retransmit_timeout(1), Duration::from_secs(30));
+        assert_eq!(retransmit_timeout(2), Duration::from_secs(60));
+        assert_eq!(retransmit_timeout(3), Duration::from_secs(60));
     }
 }
