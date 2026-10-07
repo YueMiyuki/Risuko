@@ -284,15 +284,17 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_peers_streams_deduplicated_addresses() {
-        let m = Magnet::parse(
+        let mut m = Magnet::parse(
             "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862\
              &x.pe=203.0.113.5:6881&x.pe=127.0.0.1:7000&x.pe=localhost:7000",
         )
         .unwrap();
+        // Parsing drops repeated entries, so add a host that resolves to a listed literal without DNS
+        m.peers.push(MagnetPeer::Host("127.0.0.1".into(), 7000));
         let addrs: Vec<SocketAddr> = m.resolve_peers().collect().await;
         let loopback: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         assert!(addrs.contains(&"203.0.113.5:6881".parse().unwrap()));
-        // `localhost` may also resolve to 127.0.0.1, which must not repeat
+        // Neither the added host nor `localhost` may repeat 127.0.0.1
         assert_eq!(addrs.iter().filter(|a| **a == loopback).count(), 1);
     }
 

@@ -645,7 +645,10 @@ impl EngineOptions {
 pub(crate) fn json_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
-        Value::Number(n) => n.as_i64().map(|v| v != 0),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|v| v != 0)
+            .or_else(|| n.as_u64().map(|v| v != 0)),
         Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => Some(true),
             "false" | "0" | "no" | "off" => Some(false),
@@ -1227,8 +1230,9 @@ mod tests {
         sys.insert("i".into(), json!("0"));
         sys.insert("j".into(), json!(0));
         sys.insert("k".into(), json!("garbage"));
+        sys.insert("l".into(), json!(u64::MAX));
         let opts = EngineOptions::from_config(&sys, &Map::new());
-        for k in ["a", "b", "c", "d", "e"] {
+        for k in ["a", "b", "c", "d", "e", "l"] {
             assert_eq!(opts.get_bool(k), Some(true), "{k}");
         }
         for k in ["f", "g", "h", "i", "j"] {

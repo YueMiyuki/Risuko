@@ -79,12 +79,17 @@ impl PieceTracker {
         self.left
     }
 
-    fn scan_bytes_left(&self) -> u64 {
-        (0..self.lengths.total_pieces())
-            .filter(|&i| self.wanted[i as usize] && !self.have_local[i as usize])
-            .filter_map(|i| self.lengths.validate_piece(i).ok())
-            .map(|vpi| self.lengths.piece_length_of(vpi) as u64)
+    /// Total length of the pieces `include` selects
+    pub fn bytes_of(lengths: &Lengths, include: impl Fn(usize) -> bool) -> u64 {
+        (0..lengths.total_pieces())
+            .filter(|&i| include(i as usize))
+            .filter_map(|i| lengths.validate_piece(i).ok())
+            .map(|vpi| lengths.piece_length_of(vpi) as u64)
             .sum()
+    }
+
+    fn scan_bytes_left(&self) -> u64 {
+        Self::bytes_of(&self.lengths, |i| self.wanted[i] && !self.have_local[i])
     }
 
     /// Mark a piece as fully in-flight (all chunks requested, awaiting hash verification); `choose_requestable_piece` will skip it

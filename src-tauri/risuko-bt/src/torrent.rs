@@ -301,17 +301,6 @@ fn wanted_pieces(layout: &FileSet, lengths: &Lengths, only_files: Option<&[usize
     wanted
 }
 
-/// Total length of the `wanted` pieces
-fn wanted_bytes(lengths: &Lengths, wanted: &[bool]) -> u64 {
-    wanted
-        .iter()
-        .enumerate()
-        .filter(|(_, wanted)| **wanted)
-        .filter_map(|(i, _)| lengths.validate_piece(i as u32).ok())
-        .map(|vpi| lengths.piece_length_of(vpi) as u64)
-        .sum()
-}
-
 fn selected_file_set(only_files: Option<&[usize]>) -> Option<HashSet<usize>> {
     only_files.map(|files| files.iter().copied().collect())
 }
@@ -337,14 +326,12 @@ pub async fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCommand>(64);
     let file_lens: Vec<u64> = init.meta.info.iter_file_details().map(|f| f.len).collect();
     // Selection-aware until the loop rescans local pieces
-    let left_bytes = wanted_bytes(
+    let wanted = wanted_pieces(
+        &FileSet::from_meta(&init.meta.info, &init.root_dir),
         &init.lengths,
-        &wanted_pieces(
-            &FileSet::from_meta(&init.meta.info, &init.root_dir),
-            &init.lengths,
-            init.only_files.as_deref(),
-        ),
+        init.only_files.as_deref(),
     );
+    let left_bytes = PieceTracker::bytes_of(&init.lengths, |i| wanted[i]);
     let stats = Arc::new(Mutex::new(TorrentStats::initial(
         init.lengths.total_length(),
         left_bytes,
@@ -5553,10 +5540,8 @@ mod tests {
             wanted_pieces(&layout, &lengths, Some(&[1, 9])),
             vec![false; 3]
         );
-        assert_eq!(
-            wanted_bytes(&lengths, &wanted_pieces(&layout, &lengths, Some(&[2]))),
-            10
-        );
+        let wanted = wanted_pieces(&layout, &lengths, Some(&[2]));
+        assert_eq!(PieceTracker::bytes_of(&lengths, |i| wanted[i]), 10);
         assert_eq!(info.selectable_file_indices(), vec![0, 2]);
     }
 
