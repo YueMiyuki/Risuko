@@ -9,8 +9,8 @@ pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20;
 pub mod reserved {
     /// Bit 20 (byte 5, bit 0x10) — BEP-10 Extension Protocol
     pub const EXT_PROTOCOL: (usize, u8) = (5, 0x10);
-    /// Bit 3 of byte 7 (0x08) — BEP 52 v2 capable; matches libtorrent for interop; bit not yet ratified, flip this constant if it shifts
-    pub const V2: (usize, u8) = (7, 0x08);
+    /// Byte 7, mask 0x10 — BEP 52 "4th most significant bit in the last byte" (BEP 4: hybrid torrent legacy to v2 upgrade); 0x08 in the same byte is NAT Traversal
+    pub const V2: (usize, u8) = (7, 0x10);
     pub const DHT: (usize, u8) = (7, 0x01);
     pub const FAST: (usize, u8) = (7, 0x04);
 }

@@ -44,7 +44,7 @@ impl FilesystemStorage {
             .layout
             .files()
             .iter()
-            .filter(|f| f.length > 0)
+            .filter(|f| f.length > 0 && !f.padding)
             .map(|f| f.path.clone())
             .collect();
         task::spawn_blocking(move || {
@@ -72,8 +72,12 @@ impl FilesystemStorage {
         let mut tasks = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
         for span in spans {
-            let handle = self.handle(span.file_index).await?;
             let len = span.len as usize;
+            if self.is_padding(span.file_index) {
+                cursor += len;
+                continue;
+            }
+            let handle = self.handle(span.file_index).await?;
             let chunk = buf.slice(cursor..cursor + len);
             let file_offset = span.file_offset;
             tasks.push(task::spawn_blocking(move || {
@@ -85,6 +89,10 @@ impl FilesystemStorage {
             t.await.map_err(|e| io::Error::other(e.to_string()))??;
         }
         Ok(())
+    }
+
+    fn is_padding(&self, idx: usize) -> bool {
+        self.layout.files()[idx].padding
     }
 
     async fn handle(&self, idx: usize) -> Result<Arc<std::fs::File>, StorageError> {
@@ -152,7 +160,7 @@ impl FilesystemStorage {
     /// Allocate all files (sparse) on disk if they don't yet exist
     pub async fn preallocate(&self) -> Result<(), StorageError> {
         // Open each file just long enough to preallocate, then drop the handle; caching handles here would defeat lazy opening and can exhaust the process open-file limit on torrents with many files
-        for f in self.layout.files().iter() {
+        for f in self.layout.files().iter().filter(|f| !f.padding) {
             let path = f.path.clone();
             let target_len = f.length;
             task::spawn_blocking(move || -> io::Result<()> {
@@ -200,8 +208,13 @@ impl FilesystemStorage {
         let mut tasks = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
         for span in spans {
-            let handle = self.handle(span.file_index).await?;
             let len = span.len as usize;
+            if self.is_padding(span.file_index) {
+                buf[cursor..cursor + len].fill(0);
+                cursor += len;
+                continue;
+            }
+            let handle = self.handle(span.file_index).await?;
             let file_offset = span.file_offset;
             let join = task::spawn_blocking(move || -> io::Result<Vec<u8>> {
                 let mut out = vec![0u8; len];
@@ -304,6 +317,62 @@ mod tests {
         ]);
         let top = Value::Dict(vec![(b"info".to_vec(), info)]);
         encode_to_vec(&top)
+    }
+
+    #[tokio::test]
+    async fn bep47_padding_files_stay_off_disk_and_read_as_zeros() {
+        let file = |len: i64, path: &[u8], attr: Option<&[u8]>| {
+            let mut entry = Vec::new();
+            if let Some(attr) = attr {
+                entry.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            entry.push((b"length".to_vec(), Value::Int(len)));
+            entry.push((
+                b"path".to_vec(),
+                Value::List(
+                    path.split(|b| *b == b'/')
+                        .map(|c| Value::Bytes(c.to_vec()))
+                        .collect(),
+                ),
+            ));
+            Value::Dict(entry)
+        };
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![
+                    file(10, b"a.txt", None),
+                    file(6, b".pad/6", Some(b"p")),
+                    file(4, b"b.txt", Some(b"x")),
+                ]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16 * 1024)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 20])),
+        ]);
+        let meta =
+            parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))).unwrap();
+        let padding: Vec<bool> = meta.info.files.iter().map(|f| f.padding).collect();
+        assert_eq!(padding, [false, true, false]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let storage = FilesystemStorage::new(&meta.info, &root);
+        storage.preallocate().await.unwrap();
+        let payload: Vec<u8> = (1u8..=20).collect();
+        storage.write_at(0, &payload).await.unwrap();
+        storage.flush().await.unwrap();
+
+        let mut out = vec![0xffu8; 20];
+        storage.read_at(0, &mut out).await.unwrap();
+        assert_eq!(out[..10], payload[..10]);
+        assert_eq!(out[10..16], [0u8; 6]);
+        assert_eq!(out[16..], payload[16..]);
+        assert!(!root.join(".pad").exists());
+        assert_eq!(
+            tokio::fs::read(root.join("b.txt")).await.unwrap(),
+            payload[16..]
+        );
     }
 
     #[tokio::test]

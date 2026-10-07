@@ -21,6 +21,7 @@ use super::tracker::{AnnounceEvent, AnnounceRequest};
 use super::wire::extended::{
     parse_ut_metadata, ut_metadata_request, ut_metadata_type, ExtHandshake, EXT_HANDSHAKE_ID,
 };
+use super::wire::handshake::reserved as handshake_reserved;
 use super::wire::{Message, MessageEncoder};
 
 const META_PIECE_SIZE: usize = 16 * 1024;
@@ -597,12 +598,10 @@ async fn try_fetch_from_peer_inner(
     let peer_ext = loop {
         match rx.recv().await? {
             PeerEvent::Handshook { reserved, .. } => {
-                let supports = reserved[5] & 0x10 != 0;
-                if !supports {
+                if !reserved_bit(&reserved, handshake_reserved::EXT_PROTOCOL) {
                     return None;
                 }
-                // BEP 52 v2 capability bit (reserved byte 7, bit 0x08)
-                peer_supports_v2 = reserved[7] & 0x08 != 0;
+                peer_supports_v2 = reserved_bit(&reserved, handshake_reserved::V2);
                 peer_supports_ext = Some(true);
             }
             PeerEvent::Message(Message::Extended { ext_id: 0, payload }) => {
@@ -807,14 +806,18 @@ async fn fetch_piece_layers(
     Some(out)
 }
 
+fn reserved_bit(reserved: &[u8; 8], (byte, mask): (usize, u8)) -> bool {
+    reserved[byte] & mask != 0
+}
+
 async fn wait_for_handshook(
     rx: &mut tokio::sync::mpsc::Receiver<PeerEvent>,
 ) -> Option<(bool, bool)> {
     loop {
         match rx.recv().await? {
             PeerEvent::Handshook { reserved, .. } => {
-                let supports_ext = reserved[5] & 0x10 != 0;
-                let supports_v2 = reserved[7] & 0x08 != 0;
+                let supports_ext = reserved_bit(&reserved, handshake_reserved::EXT_PROTOCOL);
+                let supports_v2 = reserved_bit(&reserved, handshake_reserved::V2);
                 return Some((supports_ext, supports_v2));
             }
             PeerEvent::Disconnected { .. } => return None,

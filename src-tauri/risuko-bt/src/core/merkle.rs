@@ -328,7 +328,7 @@ pub enum PieceVerifier {
     /// BEP 52 Merkle verification. `tables` is one entry per file in `info.files` order; `piece_to_file` resolves a torrent-global piece index to (file index, piece index within that file)
     V2Merkle {
         tables: Arc<Vec<MerkleProofTable>>,
-        /// Cumulative byte offset at the start of each file, length `tables.len() + 1`; the last entry is the total torrent length
+        /// Byte offset of each file's first byte in the piece-aligned torrent space (BEP 52 starts every non-empty file on a piece boundary), length `tables.len() + 1`; the last entry is the end of the final file
         file_offsets: Arc<Vec<u64>>,
         piece_length: u32,
     },
@@ -350,7 +350,10 @@ impl PieceVerifier {
         let mut tables = Vec::with_capacity(v2.files.len());
         let mut offsets = Vec::with_capacity(v2.files.len() + 1);
         let mut acc: u64 = 0;
-        offsets.push(0);
+        let overflow = |f: &super::metainfo::TorrentMetaInfoV2| MerkleError::LayerLengthMismatch {
+            got: f.length as usize,
+            expected: u64::MAX as usize,
+        };
         for f in &v2.files {
             let layer = meta
                 .piece_layers
@@ -364,14 +367,18 @@ impl PieceVerifier {
                 layer,
             )?;
             tables.push(table);
-            acc = acc
-                .checked_add(f.length)
-                .ok_or(MerkleError::LayerLengthMismatch {
-                    got: f.length as usize,
-                    expected: u64::MAX as usize,
-                })?;
-            offsets.push(acc);
+            // Same alignment the v1 facade materialises as padding entries
+            let start = acc
+                .checked_add(super::metainfo::v2_alignment_padding(
+                    acc,
+                    f.length,
+                    v2.piece_length,
+                ))
+                .ok_or_else(|| overflow(f))?;
+            offsets.push(start);
+            acc = start.checked_add(f.length).ok_or_else(|| overflow(f))?;
         }
+        offsets.push(acc);
         Ok(Self::V2Merkle {
             tables: Arc::new(tables),
             file_offsets: Arc::new(offsets),
@@ -415,6 +422,12 @@ impl PieceVerifier {
                     .ok_or(VerifyError::PieceOutOfRange(piece_index))?;
                 let local_piece_idx =
                     ((piece_offset - file_offsets[file_idx]) / *piece_length as u64) as u32;
+                // A file's last piece is followed by alignment padding up to the next file's piece boundary; only the file's own bytes are hashed
+                let own_len = table
+                    .piece_size(local_piece_idx)
+                    .ok_or(VerifyError::PieceOutOfRange(piece_index))?
+                    as usize;
+                let piece_bytes = piece_bytes.get(..own_len).unwrap_or(piece_bytes);
                 table
                     .verify_piece(local_piece_idx, piece_bytes)
                     .map_err(|e| match e {

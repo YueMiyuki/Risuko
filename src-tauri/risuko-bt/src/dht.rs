@@ -2072,7 +2072,11 @@ fn build_query_response(
     let Some(remote_id) = remote_id else {
         return Some(krpc_error(tid, 203, b"invalid id"));
     };
-    server.add_routing(remote_id, from);
+    // BEP 43: read-only nodes answer no queries, so they must stay out of the routing table
+    let read_only = msg.get(b"ro").and_then(Value::as_int) == Some(1);
+    if !read_only {
+        server.add_routing(remote_id, from);
+    }
 
     let mut response = vec![
         (
@@ -2708,6 +2712,31 @@ mod tests {
         drop(guard);
 
         assert!(pending.lock().contains_key(&txn));
+    }
+
+    #[test]
+    fn read_only_querier_is_answered_but_not_routed() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let ping = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![(b"id".to_vec(), Value::Bytes(vec![7u8; 20]))]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
+            (b"ro".to_vec(), Value::Int(1)),
+            (b"t".to_vec(), Value::Bytes(b"ro".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = build_query_response(&ping, "127.0.0.1:6000".parse().unwrap(), &state).unwrap();
+        assert_eq!(
+            decode_all(&reply)
+                .unwrap()
+                .get(b"y")
+                .and_then(Value::as_bytes),
+            Some(b"r" as &[u8])
+        );
+        assert_eq!(state.routing.lock().len(), 0);
     }
 
     #[test]

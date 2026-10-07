@@ -344,6 +344,8 @@ struct Peer {
     optimistic_unchoke: bool,
     their_ut_pex_id: Option<u8>,
     pex_sent: HashSet<SocketAddr>,
+    /// Dialable endpoint: `addr` for outbound peers, `addr.ip()` + the extended-handshake `p` port for inbound ones (their source port is ephemeral); only this is gossiped over PEX
+    listen_addr: Option<SocketAddr>,
     outbound: bool,
     supports_fast: bool,
     initial_availability: Option<InitialAvailability>,
@@ -408,6 +410,7 @@ impl Peer {
             optimistic_unchoke: false,
             their_ut_pex_id: None,
             pex_sent: HashSet::new(),
+            listen_addr: outbound.then_some(addr),
             outbound,
             supports_fast,
             initial_availability: None,
@@ -1356,14 +1359,19 @@ async fn torrent_loop(
                 }
                 if !private_torrent && now.duration_since(last_pex) >= PEX_INTERVAL {
                     last_pex = now;
-                    let current: HashSet<SocketAddr> = peers.values().map(|p| p.addr).collect();
+                    let current: HashSet<SocketAddr> =
+                        peers.values().filter_map(|p| p.listen_addr).collect();
                     for p in peers.values_mut() {
                         let Some(pex_id) = p.their_ut_pex_id else {
                             continue;
                         };
                         let added: Vec<SocketAddr> = current
                             .iter()
-                            .filter(|a| **a != p.addr && !p.pex_sent.contains(a))
+                            .filter(|a| {
+                                **a != p.addr
+                                    && Some(**a) != p.listen_addr
+                                    && !p.pex_sent.contains(a)
+                            })
                             .take(MAX_PEX_ADDED_PER_MSG)
                             .copied()
                             .collect();
@@ -2518,6 +2526,11 @@ async fn process_peer_event(
                             peer.their_ut_metadata_id = peer_ext.ut_metadata_id();
                             peer.their_ut_holepunch_id = peer_ext.ut_holepunch_id();
                             peer.their_ut_pex_id = peer_ext.ut_pex_id();
+                            if let (false, Some(port)) = (peer.outbound, peer_ext.port) {
+                                if port != 0 {
+                                    peer.listen_addr = Some(SocketAddr::new(peer.addr.ip(), port));
+                                }
+                            }
                             if peer.client.is_none() {
                                 peer.client = peer_ext.client;
                             }
@@ -2570,8 +2583,8 @@ async fn process_peer_event(
                             }
                         }
                     } else if ext_id == OUR_UT_HOLEPUNCH_ID && !private_torrent {
-                        // BEP-55 hole punching
-                        let from_addr = peer.addr;
+                        // BEP-55 hole punching; the initiator is identified by the endpoint other peers can dial
+                        let from_addr = peer.listen_addr.unwrap_or(peer.addr);
                         let from_hp_id = peer.their_ut_holepunch_id;
                         let from_cmd = peer.cmd_tx.clone();
                         if let Some(hp) = parse_holepunch(&payload) {
@@ -2805,6 +2818,11 @@ async fn fetch_webseed_batch(ctx: WebSeedContext, piece_indices: Vec<u32>) -> We
         let mut mirror_ok = true;
         for (file_idx, file_offset, span_len) in &spans {
             let file = &ctx.layout.files()[*file_idx];
+            if file.padding {
+                // BEP 47: padding never exists on the web seed; its bytes are the zeros `batch` already holds
+                cursor = cursor.saturating_add(*span_len as usize);
+                continue;
+            }
             let url = match super::webseed::build_file_url(
                 &ctx.bases[mirror_idx],
                 &ctx.info.name,
@@ -3041,7 +3059,8 @@ fn handle_holepunch(
             }
             let active_addrs = peers
                 .values()
-                .map(|peer| peer.addr)
+                .flat_map(|peer| [Some(peer.addr), peer.listen_addr])
+                .flatten()
                 .chain(pending_dials.values().copied())
                 .collect::<HashSet<_>>();
             if promote_holepunch_candidate(
@@ -3071,7 +3090,10 @@ fn handle_holepunch(
             } else if !super::magnet::is_dialable_peer_addr(hp.addr) {
                 Relay::Err(holepunch_err::NO_SUCH_PEER)
             } else {
-                match peers.values().find(|p| p.addr == hp.addr) {
+                match peers
+                    .values()
+                    .find(|p| p.addr == hp.addr || p.listen_addr == Some(hp.addr))
+                {
                     Some(t) => match t.their_ut_holepunch_id {
                         Some(thp) => Relay::Connect(t.cmd_tx.clone(), thp),
                         None => Relay::Err(holepunch_err::NO_SUPPORT),
@@ -5037,6 +5059,50 @@ mod tests {
     }
 
     #[test]
+    fn holepunch_rendezvous_reaches_inbound_peer_by_listen_addr() {
+        // Inbound target: connected from an ephemeral port, gossiped by its extended-handshake listen port
+        let target_listen = test_peer(14_011);
+        let (target_tx, mut target_rx) = mpsc::channel(4);
+        let mut target = Peer::connected(test_peer(51_000), target_tx, 1, 1, 1, false, false, None);
+        target.listen_addr = Some(target_listen);
+        target.their_ut_holepunch_id = Some(9);
+        let peers = HashMap::from([(1u32, target)]);
+        let initiator = SocketAddr::from(([198, 51, 100, 7], 14_012));
+        let (from_cmd, mut from_rx) = mpsc::channel(4);
+
+        handle_holepunch(
+            HolepunchMsg {
+                msg_type: holepunch_type::RENDEZVOUS,
+                addr: target_listen,
+                err_code: 0,
+            },
+            initiator,
+            Some(7),
+            &from_cmd,
+            &peers,
+            &HashMap::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &RwLock::new(BlockList::default()),
+        );
+
+        let connect_to = |cmd: PeerCommand, ext: u8| match cmd {
+            PeerCommand::Send(Message::Extended { ext_id, payload }) if ext_id == ext => {
+                let msg = parse_holepunch(&payload).expect("holepunch payload");
+                assert_eq!(msg.msg_type, holepunch_type::CONNECT);
+                msg.addr
+            }
+            other => panic!("expected holepunch CONNECT, got {other:?}"),
+        };
+        assert_eq!(connect_to(target_rx.try_recv().unwrap(), 9), initiator);
+        assert_eq!(connect_to(from_rx.try_recv().unwrap(), 7), target_listen);
+    }
+
+    #[test]
     fn holepunch_connect_marks_target_for_utp_first_dial() {
         let target = test_peer(14_003);
         let (from_cmd, _rx) = mpsc::channel(1);
@@ -5281,10 +5347,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["a".into()],
                     length: 15,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 15,
+                    padding: false,
                 },
             ],
             single_file_mode: false,
@@ -5930,10 +5998,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["first.bin".into()],
                     length: 5,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["second.bin".into()],
                     length: 7,
+                    padding: false,
                 },
             ],
             single_file_mode: false,
@@ -5962,6 +6032,7 @@ mod tests {
             files: vec![TorrentMetaInfo {
                 path: vec!["payload.bin".into()],
                 length: payload.len() as u64,
+                padding: false,
             }],
             single_file_mode: true,
         });
@@ -6036,10 +6107,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["a".into()],
                     length: 15,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 15,
+                    padding: false,
                 },
             ],
             single_file_mode: false,

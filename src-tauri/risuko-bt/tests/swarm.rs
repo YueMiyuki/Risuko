@@ -42,6 +42,7 @@ fn build_meta(payload: &[u8]) -> TorrentMeta {
         files: vec![TorrentMetaInfo {
             path: vec!["payload.bin".to_string()],
             length: payload.len() as u64,
+            padding: false,
         }],
         single_file_mode: true,
     };
