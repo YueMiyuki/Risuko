@@ -11,7 +11,7 @@ import android.util.Log
 
 /**
  * Native fallback shown when the system WebView is too old to render the UI and
- * no newer kernel could be swapped in.
+ * no newer kernel could be swapped in
  */
 internal object OutdatedWebViewNotice {
 

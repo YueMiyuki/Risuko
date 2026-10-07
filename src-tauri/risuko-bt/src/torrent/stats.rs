@@ -90,6 +90,8 @@ impl LiveStats {
 pub struct TorrentStats {
     pub total_bytes: u64,
     pub progress_bytes: u64,
+    /// Bytes still needed for the selected files
+    pub left_bytes: u64,
     pub uploaded_bytes: u64,
     pub finished: bool,
     pub file_progress: Vec<u64>,
@@ -104,6 +106,7 @@ impl TorrentStats {
         Self {
             total_bytes,
             progress_bytes: 0,
+            left_bytes: total_bytes,
             uploaded_bytes: 0,
             finished: false,
             file_progress,

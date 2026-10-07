@@ -36,7 +36,7 @@ function onLabelClick(event: MouseEvent) {
 	if (target instanceof Element && target.closest("[data-slot='checkbox']")) {
 		return;
 	}
-	// Reka-ui renders a button, so a native <label> click would toggle twice.
+	// Reka-ui renders a button, so a native <label> click would toggle twice
 	event.preventDefault();
 	if (props.disabled) {
 		return;

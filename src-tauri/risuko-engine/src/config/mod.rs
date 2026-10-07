@@ -128,7 +128,7 @@ pub fn proxy_http_profile_is_explicit(value: &Value) -> bool {
 
 /// Whether a proxy value contains a non-default nested P2P profile.  A
 /// default profile must not erase legacy/system P2P engine keys while older
-/// configurations are being migrated.
+/// configurations are being migrated
 pub fn proxy_p2p_profile_is_explicit(value: &Value) -> bool {
     let normalized = normalize_proxy_config(value);
     normalized.get("p2p")

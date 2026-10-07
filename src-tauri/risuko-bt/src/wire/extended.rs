@@ -47,6 +47,10 @@ pub struct ExtHandshake {
     pub port: Option<u16>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
+    /// `e`: prefers MSE-encrypted connections
+    pub prefers_encryption: bool,
+    /// BEP 21 `upload_only`: the peer is a (partial) seed
+    pub upload_only: bool,
 }
 
 impl ExtHandshake {
@@ -58,17 +62,21 @@ impl ExtHandshake {
         Self {
             supported,
             metadata_size,
-            client: Some(format!(
-                "{} {}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            )),
+            client: Some(crate::core::peer_id::CLIENT_VERSION.to_string()),
             yourip: None,
             reqq: None,
             port: None,
             ipv4: None,
             ipv6: None,
+            prefers_encryption: false,
+            upload_only: false,
         }
+    }
+
+    /// Advertise `e: 1` when our policy prefers MSE
+    pub fn with_encryption_preference(mut self, prefers: bool) -> Self {
+        self.prefers_encryption = prefers;
+        self
     }
 
     /// Set `yourip` to the peer's address (compact-encoded on the wire); builder helper used by the connection layer per dial / accept
@@ -107,6 +115,12 @@ impl ExtHandshake {
         m_entries.sort_by(|a, b| a.0.cmp(&b.0));
         // Bencode dicts must be lexicographically sorted by key; `m`, `metadata_size`, `v`, `yourip` are distinct and pushed in that fixed sorted order
         let mut dict = vec![(b"m".to_vec(), Value::Dict(m_entries))];
+        if self.prefers_encryption {
+            dict.push((b"e".to_vec(), Value::Int(1)));
+        }
+        if self.upload_only {
+            dict.push((b"upload_only".to_vec(), Value::Int(1)));
+        }
         if let Some(sz) = self.metadata_size {
             dict.push((b"metadata_size".to_vec(), Value::Int(sz as i64)));
         }
@@ -194,6 +208,12 @@ impl ExtHandshake {
             .and_then(|(_, v)| v.as_bytes())
             .and_then(|b| <[u8; 16]>::try_from(b).ok())
             .map(Ipv6Addr::from);
+        let flag = |key: &[u8]| {
+            dict.iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.as_int())
+                .is_some_and(|n| n != 0)
+        };
         Some(Self {
             supported,
             metadata_size,
@@ -203,6 +223,8 @@ impl ExtHandshake {
             port,
             ipv4,
             ipv6,
+            prefers_encryption: flag(b"e"),
+            upload_only: flag(b"upload_only"),
         })
     }
 
@@ -400,7 +422,8 @@ pub fn parse_ut_pex(
     Some((v4, v6))
 }
 
-pub fn build_ut_pex(added: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
+/// Encode a BEP 11 message with each added contact's flags
+pub fn build_ut_pex(added: &[(SocketAddr, u8)], dropped: &[SocketAddr]) -> Bytes {
     fn split(addrs: &[SocketAddr]) -> (Vec<u8>, Vec<u8>) {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
@@ -421,9 +444,19 @@ pub fn build_ut_pex(added: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
     let added: Vec<_> = added
         .iter()
         .copied()
-        .filter(|addr| valid_pex_endpoint(*addr))
+        .filter(|(addr, _)| valid_pex_endpoint(*addr))
         .take(50)
         .collect();
+    let flags = |v6: bool| -> Vec<u8> {
+        added
+            .iter()
+            .filter(|(addr, _)| addr.is_ipv6() == v6)
+            .map(|(_, flags)| *flags)
+            .collect()
+    };
+    let added_flags4 = flags(false);
+    let added_flags6 = flags(true);
+    let added: Vec<SocketAddr> = added.iter().map(|(addr, _)| *addr).collect();
     let dropped: Vec<_> = dropped
         .iter()
         .copied()
@@ -434,15 +467,9 @@ pub fn build_ut_pex(added: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
     let (dropped4, dropped6) = split(&dropped);
     let dict = vec![
         (b"added".to_vec(), Value::Bytes(added4.clone())),
-        (
-            b"added.f".to_vec(),
-            Value::Bytes(vec![0u8; added4.len() / 6]),
-        ),
+        (b"added.f".to_vec(), Value::Bytes(added_flags4)),
         (b"added6".to_vec(), Value::Bytes(added6.clone())),
-        (
-            b"added6.f".to_vec(),
-            Value::Bytes(vec![0u8; added6.len() / 18]),
-        ),
+        (b"added6.f".to_vec(), Value::Bytes(added_flags6)),
         (b"dropped".to_vec(), Value::Bytes(dropped4)),
         (b"dropped6".to_vec(), Value::Bytes(dropped6)),
     ];
@@ -538,10 +565,24 @@ mod tests {
         let v4a: SocketAddr = "10.1.2.3:6881".parse().unwrap();
         let v6a: SocketAddr = "[2001:db8::7]:51413".parse().unwrap();
         let gone: SocketAddr = "10.9.9.9:1000".parse().unwrap();
-        let payload = build_ut_pex(&[v4a, v6a], &[gone]);
+        let payload = build_ut_pex(&[(v4a, 0x11), (v6a, 0x06)], &[gone]);
         let (v4, v6) = parse_ut_pex(&payload).unwrap();
         assert_eq!(v4, vec![v4a]);
         assert_eq!(v6, vec![v6a]);
+        let full = parse_ut_pex_full(&payload).unwrap();
+        assert_eq!(full.added, vec![(v4a, 0x11), (v6a, 0x06)]);
+        assert_eq!(full.dropped, vec![gone]);
+    }
+
+    #[test]
+    fn handshake_carries_encryption_and_upload_only() {
+        let mut hs = ExtHandshake::new_outgoing(3, 4, None).with_encryption_preference(true);
+        hs.upload_only = true;
+        let decoded = ExtHandshake::decode(&hs.encode()).unwrap();
+        assert!(decoded.prefers_encryption);
+        assert!(decoded.upload_only);
+        let plain = ExtHandshake::decode(&ExtHandshake::new_outgoing(3, 4, None).encode()).unwrap();
+        assert!(!plain.prefers_encryption && !plain.upload_only);
     }
 
     #[test]
@@ -703,7 +744,12 @@ mod tests {
 
     #[test]
     fn holepunch_accepts_legacy_non_error_without_err_code() {
-        let mut bytes = build_holepunch(holepunch_type::CONNECT, "203.0.113.7:51413".parse().unwrap(), 0).to_vec();
+        let mut bytes = build_holepunch(
+            holepunch_type::CONNECT,
+            "203.0.113.7:51413".parse().unwrap(),
+            0,
+        )
+        .to_vec();
         bytes.truncate(bytes.len() - 4);
         assert_eq!(parse_holepunch(&bytes).unwrap().err_code, 0);
     }

@@ -70,7 +70,7 @@ impl VaultManager {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Build a manager with a forced `enabled` flag, skipping the OS probe.
+    /// Build a manager with a forced `enabled` flag, skipping the OS probe
     #[cfg(test)]
     pub(crate) fn for_test(enabled: bool) -> Self {
         Self {
@@ -101,7 +101,7 @@ impl VaultManager {
         self.put_at(SERVICE, id, secrets)
     }
 
-    /// Retrieve the secret JSON object for the given credential id.
+    /// Retrieve the secret JSON object for the given credential id
     pub fn get(&self, id: &str) -> Result<Option<Value>, String> {
         self.get_at(SERVICE, id)
     }

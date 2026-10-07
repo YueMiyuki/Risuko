@@ -70,7 +70,7 @@ internal object WebViewUpgradeBootstrap {
         }
     }
 
-    /** @return true if the swap was applied. */
+    /** @return true if the swap was applied */
     private fun trySwap(context: Context, packageName: String): Boolean {
         return try {
             WebViewSwap.swapToInstalledPackage(context, packageName)
@@ -81,7 +81,7 @@ internal object WebViewUpgradeBootstrap {
         }
     }
 
-    /** Current system WebView as (packageName, versionName, major) or null. */
+    /** Current system WebView as (packageName, versionName, major) or null */
     private fun currentWebView(context: Context): Triple<String, String?, Int>? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val pi = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()

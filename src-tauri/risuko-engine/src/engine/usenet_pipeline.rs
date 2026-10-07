@@ -180,7 +180,7 @@ impl ResumeSidecar {
         let target = path.to_path_buf();
         // Once started, spawn_blocking runs this small durable transaction to
         // completion even if the caller is cancelled. TempPath removes the
-        // intermediate file on every error path.
+        // intermediate file on every error path
         tokio::task::spawn_blocking(move || write_and_rename(&temp, &target, &payload))
             .await
             .map_err(|error| format!("resume metadata persistence task failed: {error}"))?

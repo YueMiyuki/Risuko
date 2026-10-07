@@ -316,7 +316,7 @@ fn load_piece_meta(
 
     // A byte-for-byte resume is safe only when both requests carry the same
     // strong validator. Weak or missing ETags cannot be used with If-Match and
-    // do not guarantee that byte ranges are from the same representation.
+    // do not guarantee that byte ranges are from the same representation
     if !matches!(
         (&meta.etag, etag),
         (Some(saved), Some(current)) if etags_strongly_equal(saved, current)
@@ -2024,7 +2024,7 @@ async fn piece_worker(
     // Track consecutive zero-progress failures across piece claims. Work
     // stealing may hand this worker a different piece after each failure, so
     // resetting merely because the index changed would make the retry bound
-    // ineffective. Any successful progress resets the budget below.
+    // ineffective. Any successful progress resets the budget below
     let mut retry_count: u32 = 0;
     let mut source_error_streak: u32 = 0;
     loop {
@@ -2150,7 +2150,7 @@ async fn piece_worker(
                 if !charge_retry_if_no_progress(&mut retry_count, downloaded) {
                     // A stream error after bytes were flushed still advanced
                     // the piece. Treat that attempt as mirror progress so a
-                    // flaky but productive source is not blacklisted.
+                    // flaky but productive source is not blacklisted
                     pool.record_success(&mirror_key, downloaded, started.elapsed().as_secs_f64());
                     let backoff = partial_error_backoff(source_error_streak);
                     tracing::warn!(
@@ -2202,7 +2202,7 @@ async fn download_piece_stream(
 
     let strong_expected_etag = expected_etag.filter(|etag| {
         // Comparing a tag to itself is a compact validity check for the strong
-        // ETag syntax accepted by `etags_strongly_equal`.
+        // ETag syntax accepted by `etags_strongly_equal`
         etags_strongly_equal(etag, etag)
     });
 
@@ -2234,7 +2234,7 @@ async fn download_piece_stream(
             .is_some_and(|actual| !etags_strongly_equal(actual, expected));
         if mismatch {
             // Do not wait for a potentially stalled response body before the
-            // worker can fail over or observe cancellation.
+            // worker can fail over or observe cancellation
             drop(resp);
             return Err(PieceDownloadError::Source(
                 "Server file changed (ETag mismatch), aborting download".to_string(),
@@ -3639,13 +3639,13 @@ mod tests {
         assert!(load_piece_meta(&part, PIECE_SIZE * 3, &other).is_none());
 
         // A weak validator must never restore byte-range progress, even when
-        // its opaque value matches the previously saved strong validator.
+        // its opaque value matches the previously saved strong validator
         save_piece_meta(&part, &q, PIECE_SIZE * 3, &etag);
         let weak = Some("W/\"abc\"".to_string());
         assert!(load_piece_meta(&part, PIECE_SIZE * 3, &weak).is_none());
 
         // Likewise, a sidecar created without a validator cannot later be
-        // trusted merely because the current probe happens to return one.
+        // trusted merely because the current probe happens to return one
         save_piece_meta(&part, &q, PIECE_SIZE * 3, &None);
         assert!(load_piece_meta(&part, PIECE_SIZE * 3, &etag).is_none());
 

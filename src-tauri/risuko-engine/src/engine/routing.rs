@@ -32,6 +32,11 @@ pub fn resolve_routing(
     default_dir: &str,
     file_category_dirs: &std::collections::HashMap<String, String>,
 ) -> RoutingDecision {
+    // Desktop downloads carry a `.part` suffix until they finish
+    let filename = filename
+        .strip_suffix(".part")
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(filename);
     // 1. Custom routing rules
     for rule in rules {
         if !rule.enabled {
@@ -139,6 +144,17 @@ mod tests {
         let dec = resolve_routing(&rules, "movie.mkv", "/Downloads", &cats);
         assert_eq!(dec.tag, Some("Movies".into()));
         assert_eq!(dec.dir, "/Movies");
+    }
+
+    #[test]
+    fn part_suffix_is_ignored() {
+        let rules = vec![rule("r1", "Movies", "*.mkv", "/Movies", true)];
+        let mut cats = HashMap::new();
+        cats.insert("music".into(), "/Music".into());
+        let dec = resolve_routing(&rules, "movie.mkv.part", "/Downloads", &cats);
+        assert_eq!(dec.dir, "/Movies");
+        let dec = resolve_routing(&[], "song.mp3.part", "/Downloads", &cats);
+        assert_eq!(dec.dir, "/Music");
     }
 
     #[test]

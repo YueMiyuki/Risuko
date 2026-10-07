@@ -476,13 +476,14 @@ impl Session {
         let Some(first) = event_rx.recv().await else {
             return;
         };
-        let (info_hash, reserved, peer_id) = match &first {
+        let (info_hash, reserved, peer_id, encrypted, utp) = match &first {
             PeerEvent::Handshook {
                 info_hash,
                 reserved,
                 peer_id,
-                ..
-            } => (*info_hash, *reserved, *peer_id),
+                encrypted,
+                utp,
+            } => (*info_hash, *reserved, *peer_id, *encrypted, *utp),
             _ => return,
         };
         if self.blocklist.read().contains(addr.ip()) {
@@ -490,14 +491,7 @@ impl Session {
             let _ = handle.tx.try_send(PeerCommand::Disconnect);
             return;
         }
-        let target = {
-            let inner = self.inner.lock();
-            inner
-                .by_hash
-                .get(&info_hash)
-                .and_then(|id| inner.torrents.get(id).cloned())
-        };
-        let Some(t) = target else {
+        let Some(t) = self.get(TorrentIdOrHash::Hash(info_hash)) else {
             // Peer handshook for a torrent that is no longer managed, close
             handle.io_abort.abort();
             let _ = handle.tx.try_send(PeerCommand::Disconnect);
@@ -512,6 +506,8 @@ impl Session {
                 reserved,
                 peer_id,
                 io_abort: handle.io_abort,
+                encrypted,
+                utp,
             })
             .await;
     }
@@ -839,7 +835,9 @@ impl Session {
         }
         if !info.private {
             if let Some(lsd) = self.lsd.lock().as_ref() {
-                lsd.add_infohash(meta.info_hash);
+                for hash in meta.announce_infohashes() {
+                    lsd.add_infohash(hash);
+                }
             }
         }
         Ok(AddTorrentResponse::Added(id, handle))
@@ -965,7 +963,21 @@ impl Session {
                 .by_hash
                 .get(&h)
                 .and_then(|id| inner.torrents.get(id))
-                .cloned(),
+                .cloned()
+                // Hybrid torrents also answer to their truncated v2 hash
+                .or_else(|| {
+                    inner
+                        .torrents
+                        .values()
+                        .find(|handle| {
+                            handle
+                                .metadata
+                                .load()
+                                .as_ref()
+                                .is_some_and(|meta| meta.announce_infohashes().contains(&h))
+                        })
+                        .cloned()
+                }),
         }
     }
 
@@ -1012,7 +1024,14 @@ impl Session {
             .is_some_and(|meta| meta.info.private);
         if !is_private {
             if let Some(lsd) = self.lsd.lock().as_ref() {
-                lsd.remove_infohash(handle.info_hash);
+                let hashes = handle
+                    .metadata
+                    .load()
+                    .as_ref()
+                    .map_or_else(|| vec![handle.info_hash], |meta| meta.announce_infohashes());
+                for hash in hashes {
+                    lsd.remove_infohash(hash);
+                }
             }
         }
         let private_hashes = handle
@@ -1030,9 +1049,14 @@ impl Session {
             handle
                 .with_metadata(|meta| {
                     let name_empty = meta.info.name.is_empty();
+                    // Per-torrent part-file directory
+                    let parts_dir = (
+                        super::storage::parts_dir_for(&root, &handle.info_hash.to_hex()),
+                        true,
+                    );
                     if meta.info.single_file_mode && !name_empty {
                         // Single-file: file lives directly under root
-                        vec![(root.join(&meta.info.name), false)]
+                        vec![(root.join(&meta.info.name), false), parts_dir]
                     } else if !meta.info.single_file_mode && create_subfolder && !name_empty {
                         // Multi-file grouped: root_dir IS the torrent folder, safe to remove wholesale
                         vec![(root, true)]
@@ -1051,6 +1075,7 @@ impl Session {
                                 }
                                 Some((p, false))
                             })
+                            .chain(std::iter::once(parts_dir))
                             .collect()
                     }
                 })
@@ -1089,6 +1114,15 @@ impl Session {
                     Ok(()) => tracing::info!("deleted torrent data: {}", p.display()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => tracing::warn!("failed to delete {}: {}", p.display(), e),
+                }
+                // Remove the shared part-file directory once empty
+                if p.parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == super::storage::PARTS_DIR)
+                {
+                    if let Some(parent) = p.parent() {
+                        let _ = tokio::fs::remove_dir(parent).await;
+                    }
                 }
             }
         }
@@ -1202,15 +1236,24 @@ fn known_infohashes(s: &Session) -> Vec<KnownInfoHash> {
         .lock()
         .torrents
         .values()
-        .map(|handle| KnownInfoHash {
-            info_hash: handle.info_hash,
-            advertise_v2: handle.advertise_v2.load(Ordering::Relaxed),
-            advertise_dht: handle
-                .metadata
-                .load()
-                .as_ref()
-                .is_none_or(|meta| !meta.info.private),
-            ext_handshake_builder: Some(handle.ext_handshake_builder.clone()),
+        .flat_map(|handle| {
+            let meta = handle.metadata.load();
+            let advertise_dht = meta.as_ref().is_none_or(|meta| !meta.info.private);
+            // Hybrid torrents accept both hashes
+            let mut hashes = vec![handle.info_hash];
+            if let Some(meta) = meta.as_ref() {
+                for hash in meta.announce_infohashes() {
+                    if !hashes.contains(&hash) {
+                        hashes.push(hash);
+                    }
+                }
+            }
+            hashes.into_iter().map(move |info_hash| KnownInfoHash {
+                info_hash,
+                advertise_v2: handle.advertise_v2.load(Ordering::Relaxed),
+                advertise_dht,
+                ext_handshake_builder: Some(handle.ext_handshake_builder.clone()),
+            })
         })
         .collect()
 }
@@ -1256,7 +1299,7 @@ async fn run_accept_loop(listener: TcpListener, weak: std::sync::Weak<Session>) 
     }
 }
 
-/// Inbound µTP (BEP-29) accept loop; mirrors [`run_accept_loop`] but over the shared µTP endpoint where each accepted connection runs the plaintext BT responder handshake (µTP carries no MSE layer) and is routed to its torrent by info-hash; parameterised on a `Weak<Session>` so it doesn't keep the session alive and the session's Drop aborts it via `utp_accept_handle`
+/// Inbound µTP (BEP-29) accept loop: like [`run_accept_loop`], with the plaintext or MSE handshake chosen by the encryption policy
 async fn run_utp_accept_loop(utp: Arc<super::utp::UtpSocket>, weak: std::sync::Weak<Session>) {
     loop {
         let stream = match utp.accept().await {
@@ -1277,11 +1320,12 @@ async fn run_utp_accept_loop(utp: Arc<super::utp::UtpSocket>, weak: std::sync::W
             if allowed.is_empty() {
                 return;
             }
-            let res = super::peer::accept_utp_plaintext(
+            let res = super::peer::accept_utp(
                 stream,
                 s.peer_id,
                 allowed,
                 std::time::Duration::from_secs(30),
+                s.opts.encryption,
             )
             .await;
             match res {

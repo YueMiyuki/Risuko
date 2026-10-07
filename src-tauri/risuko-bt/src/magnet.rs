@@ -283,6 +283,18 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     for p in extra_peers {
         let _ = peer_tx.send((*p, PeerSource::Manual));
     }
+    // BEP-9 `x.pe` peers, resolved off the hot path
+    if !magnet.peers.is_empty() {
+        let tx = peer_tx.clone();
+        let magnet_peers = magnet.clone();
+        tokio::spawn(async move {
+            for addr in magnet_peers.resolve_peers().await {
+                if tx.send((addr, PeerSource::Manual)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     drop(peer_tx);
 
     // First successful (info, piece_layers, winner_addr) triple wins via this oneshot
@@ -475,6 +487,7 @@ fn metadata_announce_request(info_hash: Id20, peer_id: Id20, listen_port: u16) -
         left: u64::MAX / 2,
         event: AnnounceEvent::Started,
         num_want: 200,
+        obfuscate: false,
     }
 }
 
@@ -705,50 +718,68 @@ async fn try_fetch_from_peer_inner(
     Some((info_bytes, layers.unwrap_or_default(), complete))
 }
 
-/// Issue a `HASH_REQUEST` for every file's full piece layer in `v2` and collect the validated responses keyed by `pieces_root`; returns `None` only on connection-level errors (peer disappears), while a `HashReject` for any file is reported as a missing entry the caller treats as "incomplete"
+/// Fetch and verify every file's piece layer via BEP 52 hash requests; `None` on connection errors, missing entries for rejected files
 async fn fetch_piece_layers(
     handle: &super::peer::PeerHandle,
     rx: &mut tokio::sync::mpsc::Receiver<PeerEvent>,
     v2: &ValidatedTorrentMetaV2Info,
 ) -> Option<BTreeMap<Id32, Vec<u8>>> {
+    use super::core::merkle::{pad_hash, piece_layer_requests, BLOCK_SIZE};
+
     let piece_length = v2.piece_length;
     // base_layer for piece-aligned requests = log2(piece_length / 16 KiB)
-    let base_layer = (piece_length / super::core::merkle::BLOCK_SIZE).trailing_zeros();
+    let base_layer = (piece_length / BLOCK_SIZE).trailing_zeros();
 
-    // Group files by `pieces_root` — duplicates can appear when the same file content is referenced more than once; send one request per distinct root that requires a layer (file > piece_length)
-    let mut wanted: BTreeMap<Id32, (u64, u32)> = BTreeMap::new();
+    /// One file's layer being reassembled from chunk responses
+    struct LayerFetch {
+        file_len: u64,
+        /// Outstanding `(index, length)` chunks
+        pending: Vec<(u32, u32)>,
+        /// Padded layer, pre-filled with the pad hash for skipped padding chunks
+        layer: Vec<u8>,
+    }
+
+    // One fetch per distinct `pieces_root` that has a layer (file > piece_length)
+    let pad = pad_hash(piece_length / BLOCK_SIZE);
+    let mut wanted: BTreeMap<Id32, LayerFetch> = BTreeMap::new();
     for f in &v2.files {
-        if f.length <= piece_length as u64 {
+        if f.length <= piece_length as u64 || wanted.contains_key(&f.pieces_root) {
             continue;
         }
-        wanted
-            .entry(f.pieces_root)
-            .or_insert((f.length, piece_length));
+        let piece_count = f.length.div_ceil(piece_length as u64) as u32;
+        let padded = piece_count.max(2).next_power_of_two() as usize;
+        wanted.insert(
+            f.pieces_root,
+            LayerFetch {
+                file_len: f.length,
+                pending: piece_layer_requests(piece_count),
+                layer: pad.0.repeat(padded),
+            },
+        );
     }
     if wanted.is_empty() {
         return Some(BTreeMap::new());
     }
 
     // Send all requests up front so the peer can pipeline its responses
-    for (root, (file_len, plen)) in &wanted {
-        let piece_count = file_len.div_ceil(*plen as u64) as u32;
-        let length = (piece_count as usize).next_power_of_two().max(2) as u32;
-        let req = Message::HashRequest {
-            pieces_root: root.0,
-            base_layer,
-            index: 0,
-            length,
-            proof_layers: 0,
-        };
-        if handle.tx.send(PeerCommand::Send(req)).await.is_err() {
-            return None;
+    for (root, fetch) in &wanted {
+        for &(index, length) in &fetch.pending {
+            let req = Message::HashRequest {
+                pieces_root: root.0,
+                base_layer,
+                index,
+                length,
+                proof_layers: 0,
+            };
+            if handle.tx.send(PeerCommand::Send(req)).await.is_err() {
+                return None;
+            }
         }
     }
 
     let mut out: BTreeMap<Id32, Vec<u8>> = BTreeMap::new();
-    let mut remaining = wanted.len();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while remaining > 0 {
+    while out.len() < wanted.len() {
         let timeout_at = deadline.saturating_duration_since(tokio::time::Instant::now());
         if timeout_at.is_zero() {
             break;
@@ -761,33 +792,47 @@ async fn fetch_piece_layers(
             PeerEvent::Message(Message::Hashes {
                 pieces_root,
                 base_layer: rb,
-                index: 0,
-                length: rl,
+                index,
+                length,
                 proof_layers: 0,
                 hashes,
             }) => {
                 let root = Id32(pieces_root);
-                let Some((file_len, plen)) = wanted.get(&root).copied() else {
-                    continue;
-                };
-                if rb != base_layer {
+                if rb != base_layer || out.contains_key(&root) {
                     continue;
                 }
-                let piece_count = file_len.div_ceil(plen as u64) as u32;
-                let expected_padded = (piece_count as usize).next_power_of_two().max(2) as u32;
-                if rl != expected_padded || hashes.len() != expected_padded as usize * 32 {
+                let Some(fetch) = wanted.get_mut(&root) else {
+                    continue;
+                };
+                let Some(pos) = fetch
+                    .pending
+                    .iter()
+                    .position(|&chunk| chunk == (index, length))
+                else {
+                    continue;
+                };
+                if hashes.len() != length as usize * 32 {
+                    continue;
+                }
+                fetch.pending.swap_remove(pos);
+                let start = index as usize * 32;
+                fetch.layer[start..start + hashes.len()].copy_from_slice(&hashes);
+                if !fetch.pending.is_empty() {
                     continue;
                 }
                 match MerkleProofTable::verify_full_piece_layer_response(
-                    root, file_len, plen, &hashes,
+                    root,
+                    fetch.file_len,
+                    piece_length,
+                    &fetch.layer,
                 ) {
                     Ok(canonical) => {
-                        if out.insert(root, canonical).is_none() {
-                            remaining -= 1;
-                        }
+                        out.insert(root, canonical);
                     }
                     Err(e) => {
+                        // A bad chunk spoils the layer; try another peer
                         tracing::debug!("piece-layer verify failed for {root:?}: {e}");
+                        return Some(out);
                     }
                 }
             }

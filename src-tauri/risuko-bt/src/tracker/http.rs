@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
-use super::super::bencode::{decode_all_external, DecodeLimits};
+use super::super::bencode::{decode_all_external, DecodeLimits, Value};
 use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, TrackerError};
 
 /// RFC 3986 unreserved + `-_.~` are safe in a URL without percent-encoding
@@ -77,11 +77,6 @@ pub async fn announce_with_proxy_and_source(
     proxy: Option<&risuko_http::ProxyConnector>,
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let query = build_query(req);
-    // Append to existing query string if the URL already has one
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let full = format!("{}{}{}", url, sep, query);
-
     let client = if let Some(proxy) = proxy {
         let mut builder = risuko_http::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -104,7 +99,28 @@ pub async fn announce_with_proxy_and_source(
     } else {
         client().clone()
     };
+    fetch_announce(&client, url, req).await
+}
 
+/// Announce from one address family only (BEP 7)
+pub async fn announce_for_family(
+    url: &str,
+    req: &AnnounceRequest,
+    family: super::AddressFamily,
+) -> Result<AnnounceResponse, TrackerError> {
+    let client = source_client(family.unspecified())?;
+    fetch_announce(&client, url, req).await
+}
+
+async fn fetch_announce(
+    client: &risuko_http::Client,
+    url: &str,
+    req: &AnnounceRequest,
+) -> Result<AnnounceResponse, TrackerError> {
+    let query = build_query(req);
+    // Append to existing query string if the URL already has one
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let full = format!("{}{}{}", url, sep, query);
     let bytes = client
         .get(&full)
         .send()
@@ -115,16 +131,25 @@ pub async fn announce_with_proxy_and_source(
         .bytes()
         .await
         .map_err(|e| TrackerError::Http(e.to_string()))?;
-
-    parse_response(&bytes)
+    parse_response(&bytes, req)
 }
 
 fn build_query(req: &AnnounceRequest) -> String {
-    let ih = percent_encode(req.info_hash.as_bytes(), QUERY_SAFE);
     let pid = percent_encode(req.peer_id.as_bytes(), QUERY_SAFE);
+    // BEP 8: `sha_ih` replaces `info_hash` and the port is obscured
+    let (hash_param, hash, port) = if req.obfuscate {
+        (
+            "sha_ih",
+            super::obfuscation::sha_ih(&req.info_hash),
+            super::obfuscation::obscure_port(&req.info_hash, req.port),
+        )
+    } else {
+        ("info_hash", req.info_hash, req.port)
+    };
+    let hash = percent_encode(hash.as_bytes(), QUERY_SAFE);
     let mut s = format!(
-        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&numwant={}&key={}",
-        ih, pid, req.port, req.uploaded, req.downloaded, req.left, req.num_want, req.key
+        "{hash_param}={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&numwant={}&key={}",
+        hash, pid, port, req.uploaded, req.downloaded, req.left, req.num_want, req.key
     );
     let ev = req.event.as_str();
     if !ev.is_empty() {
@@ -134,7 +159,29 @@ fn build_query(req: &AnnounceRequest) -> String {
     s
 }
 
-fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
+/// Compact peer field as plaintext, decrypting BEP 8 responses
+fn reveal_peers<'a>(
+    raw: &'a [u8],
+    stride: usize,
+    req: &AnnounceRequest,
+    response: &Value,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    if !req.obfuscate {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+    let window = |key: &[u8]| response.get(key).and_then(Value::as_int).map(|n| n as u32);
+    super::obfuscation::deobfuscate_peers(
+        &req.info_hash,
+        response.get(b"iv").and_then(Value::as_bytes),
+        window(b"i"),
+        window(b"n"),
+        raw,
+        stride,
+    )
+    .map(std::borrow::Cow::Owned)
+}
+
+fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
     let value = decode_all_external(bytes, TRACKER_RESPONSE_LIMITS)?;
     value
         .as_dict()
@@ -162,7 +209,11 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     let mut peers = Vec::new();
     let mut seen = HashSet::new();
     // Compact IPv4 (BEP-23): 6 bytes per peer
-    if let Some(raw) = value.get(b"peers").and_then(|v| v.as_bytes()) {
+    if let Some(raw) = value
+        .get(b"peers")
+        .and_then(|v| v.as_bytes())
+        .and_then(|raw| reveal_peers(raw, 6, req, &value))
+    {
         for chunk in raw.chunks_exact(6) {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -171,7 +222,11 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
                 peers.push(endpoint);
             }
         }
-    } else if let Some(list) = value.get(b"peers").and_then(|v| v.as_list()) {
+    } else if let Some(list) = value
+        .get(b"peers")
+        .and_then(|v| v.as_list())
+        .filter(|_| !req.obfuscate)
+    {
         // Dictionary model (BEP-3 original): each entry is a dict with `ip` and `port` keys
         for entry in list {
             if entry.as_dict().is_some() {
@@ -192,7 +247,11 @@ fn parse_response(bytes: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     }
 
     // Compact IPv6 (BEP-7): 18 bytes per peer
-    if let Some(raw) = value.get(b"peers6").and_then(|v| v.as_bytes()) {
+    if let Some(raw) = value
+        .get(b"peers6")
+        .and_then(|v| v.as_bytes())
+        .and_then(|raw| reveal_peers(raw, 18, req, &value))
+    {
         for chunk in raw.chunks_exact(18) {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&chunk[..16]);
@@ -230,6 +289,7 @@ mod tests {
             left: 100,
             event: super::super::AnnounceEvent::Started,
             num_want: 50,
+            obfuscate: false,
         }
     }
 
@@ -260,7 +320,7 @@ mod tests {
             (b"interval".to_vec(), Value::Int(60)),
             (b"peers".to_vec(), Value::Bytes(peers_bin)),
         ]));
-        let r = parse_response(&body).unwrap();
+        let r = parse_response(&body, &req()).unwrap();
         assert_eq!(r.interval, Duration::from_secs(60));
         assert_eq!(r.peers.len(), 2);
         assert_eq!(r.peers[0].port(), 6881);
@@ -279,7 +339,7 @@ mod tests {
             (b"peers".to_vec(), Value::Bytes(peers_bin)),
         ]));
 
-        let response = parse_response(&body).unwrap();
+        let response = parse_response(&body, &req()).unwrap();
         assert_eq!(
             response.peers,
             vec![
@@ -322,7 +382,7 @@ mod tests {
                 ])]),
             ),
         ]));
-        let response = parse_response(&body).unwrap();
+        let response = parse_response(&body, &req()).unwrap();
         assert_eq!(response.peers, vec![SocketAddr::new(IpAddr::V6(ip), 6881)]);
     }
 
@@ -348,17 +408,74 @@ mod tests {
                 ]),
             ),
         ]));
-        let response = parse_response(&body).unwrap();
+        let response = parse_response(&body, &req()).unwrap();
         assert_eq!(response.peers, vec!["[2001:db8::8]:6881".parse().unwrap()]);
     }
 
     #[test]
     fn accepts_unsorted_response_and_trailing_whitespace() {
         let body = b"d5:peers0:8:intervali60ee\r\n";
-        let response = parse_response(body).unwrap();
+        let response = parse_response(body, &req()).unwrap();
 
         assert_eq!(response.interval, Duration::from_secs(60));
         assert!(response.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn obfuscated_announce_sends_sha_ih_and_decrypts_peers() {
+        use super::super::obfuscation::{deobfuscate_peers, obscure_port, sha_ih};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut request = req();
+        request.obfuscate = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let info_hash = request.info_hash;
+        let tracker = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Tracker-side obfuscation of two peers, keyed with an IV
+            let plain = [198u8, 51, 100, 2, 0x1a, 0xe1, 203, 0, 113, 5, 0x1a, 0xe2];
+            let iv = b"rotating-iv".to_vec();
+            let peers = deobfuscate_peers(&info_hash, Some(&iv), None, None, &plain, 6).unwrap();
+            let body = encode_to_vec(&Value::Dict(vec![
+                (b"interval".to_vec(), Value::Int(600)),
+                (b"iv".to_vec(), Value::Bytes(iv)),
+                (b"peers".to_vec(), Value::Bytes(peers)),
+            ]));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            head
+        });
+
+        let response = super::super::announce_with_proxy_and_source(
+            &url,
+            &request,
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = tracker.await.unwrap();
+        let expected_sha = percent_encode(sha_ih(&info_hash).as_bytes(), QUERY_SAFE).to_string();
+        assert!(head.contains(&format!("sha_ih={expected_sha}")));
+        assert!(!head.contains("info_hash="), "BEP 8 forbids sending both");
+        let obscured = obscure_port(&info_hash, request.port);
+        assert!(head.contains(&format!("&port={obscured}&")));
+        assert_eq!(
+            response.peers,
+            vec![
+                "198.51.100.2:6881".parse::<SocketAddr>().unwrap(),
+                "203.0.113.5:6882".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -367,7 +484,7 @@ mod tests {
             b"failure reason".to_vec(),
             Value::Bytes(b"nope".to_vec()),
         )]));
-        let err = parse_response(&body).unwrap_err();
+        let err = parse_response(&body, &req()).unwrap_err();
         assert!(matches!(err, TrackerError::Rejected(ref m) if m == "nope"));
     }
 }

@@ -5,6 +5,8 @@ use super::super::core::lengths::{Lengths, ValidPieceIndex};
 pub struct PieceTracker {
     lengths: Lengths,
     have_local: Vec<bool>,
+    /// Pieces overlapping a selected file; others are never picked or required
+    wanted: Vec<bool>,
     /// Pieces where all chunks are requested but not yet hash-verified; cleared on verify success/failure or when a peer owning chunks disconnects
     in_flight: Vec<bool>,
     /// How many peers advertise each piece
@@ -21,6 +23,7 @@ impl PieceTracker {
         Self {
             lengths,
             have_local: vec![false; n],
+            wanted: vec![true; n],
             in_flight: vec![false; n],
             availability: vec![0; n],
             sorted: Vec::new(),
@@ -44,6 +47,27 @@ impl PieceTracker {
 
     pub fn has_local(&self, idx: ValidPieceIndex) -> bool {
         self.have_local[idx.get_usize()]
+    }
+
+    /// Restrict picking to `wanted`; a mask of the wrong length is ignored
+    pub fn set_wanted(&mut self, wanted: Vec<bool>) {
+        if wanted.len() == self.wanted.len() {
+            self.wanted = wanted;
+            self.sorted_dirty = true;
+        }
+    }
+
+    pub fn is_wanted(&self, idx: ValidPieceIndex) -> bool {
+        self.wanted[idx.get_usize()]
+    }
+
+    /// Bytes of wanted pieces we don't have yet (the tracker `left` value)
+    pub fn bytes_left(&self) -> u64 {
+        (0..self.lengths.total_pieces())
+            .filter(|&i| self.wanted[i as usize] && !self.have_local[i as usize])
+            .filter_map(|i| self.lengths.validate_piece(i).ok())
+            .map(|vpi| self.lengths.piece_length_of(vpi) as u64)
+            .sum()
     }
 
     /// Mark a piece as fully in-flight (all chunks requested, awaiting hash verification); `choose_requestable_piece` will skip it
@@ -142,8 +166,12 @@ impl PieceTracker {
         self.sorted_dirty = true;
     }
 
+    /// Every wanted piece is local
     pub fn is_complete(&self) -> bool {
-        self.have_local.iter().all(|b| *b)
+        self.have_local
+            .iter()
+            .zip(&self.wanted)
+            .all(|(have, wanted)| *have || !*wanted)
     }
 
     /// Pick the rarest piece the peer has that we don't, breaking ties with the lowest index; returns None if nothing useful; used for interest checks (does NOT skip in-flight pieces); `peer_bitfield` is indexed like `bitfield()`: MSB-first within bytes
@@ -174,7 +202,7 @@ impl PieceTracker {
         let mut pieces = Vec::new();
         for index in 0..self.lengths.total_pieces() {
             let idx = index as usize;
-            if self.have_local[idx] || self.in_flight[idx] {
+            if self.have_local[idx] || self.in_flight[idx] || !self.wanted[idx] {
                 continue;
             }
             if let Ok(vpi) = self.lengths.validate_piece(index) {
@@ -206,7 +234,7 @@ impl PieceTracker {
             if peer_bitfield.get(byte).is_none_or(|b| b & (1 << bit) == 0) {
                 continue;
             }
-            if self.have_local[i] {
+            if self.have_local[i] || !self.wanted[i] {
                 continue;
             }
             if skip_in_flight && self.in_flight[i] {
@@ -251,7 +279,7 @@ impl PieceTracker {
         self.sorted.clear();
         let n = self.lengths.total_pieces() as usize;
         for i in 0..n {
-            if self.have_local[i] || self.availability[i] == 0 {
+            if self.have_local[i] || !self.wanted[i] || self.availability[i] == 0 {
                 continue;
             }
             if let Ok(vpi) = self.lengths.validate_piece(i as u32) {
@@ -454,6 +482,26 @@ mod tests {
             .map(|p| p.get())
             .collect();
         assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn unwanted_pieces_are_never_picked_or_required() {
+        let mut t = PieceTracker::new(lengths(4));
+        t.add_peer_bitfield(&[0b1111_0000]);
+        t.set_wanted(vec![false, true, false, true]);
+        let picked: Vec<u32> = t
+            .choose_requestable_pieces(&[0b1111_0000], 0)
+            .into_iter()
+            .map(|p| p.get())
+            .collect();
+        assert_eq!(picked, vec![1, 3]);
+        assert_eq!(t.choose_missing_pieces().len(), 2);
+        assert_eq!(t.bytes_left(), 2 * 1024);
+        t.set_local(t.lengths.validate_piece(1).unwrap(), true);
+        t.set_local(t.lengths.validate_piece(3).unwrap(), true);
+        assert!(t.is_complete());
+        assert!(t.choose_piece(&[0b1111_0000]).is_none());
+        assert_eq!(t.bytes_left(), 0);
     }
 
     #[test]

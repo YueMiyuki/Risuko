@@ -1,5 +1,6 @@
 //! µTP (BEP-29) Micro Transport Protocol over UDP: an additive TCP-alternative peer-wire transport; since the peer layer is generic over `AsyncRead + AsyncWrite`, a [`stream::UtpStream`] can replace a `TcpStream` with the BT/MSE handshake unchanged. Layout: [`packet`] wire header + extension codec (pure, no I/O), [`socket`] shared UDP endpoint demuxing datagrams to per-peer state machines, [`stream`] per-connection `AsyncRead`/`AsyncWrite` handle
 
+mod dontfrag;
 pub mod packet;
 pub mod socket;
 pub mod stream;

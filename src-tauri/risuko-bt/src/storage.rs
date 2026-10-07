@@ -1,7 +1,8 @@
 //! Storage backend: maps piece/byte offsets to underlying files with async read/write primitives; [`FilesystemStorage`] uses positional `pread`/`pwrite` via `spawn_blocking`, so non-overlapping reads/writes to one file need no internal lock (a per-file `Mutex<File>` would serialize chunk writes and cap single-file torrents at one peer)
 
+use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -21,18 +22,147 @@ pub enum StorageError {
     OutOfRange { offset: u64, total: u64 },
 }
 
+type HandleCache = Mutex<Vec<Option<Arc<std::fs::File>>>>;
+
+/// Hidden directory (inside a torrent's save root) holding part files
+pub const PARTS_DIR: &str = ".risuko-parts";
+
+pub fn parts_dir_for(root: &Path, info_hash_hex: &str) -> PathBuf {
+    root.join(PARTS_DIR).join(info_hash_hex)
+}
+
 /// Filesystem backed storage using the torrent's file layout
 pub struct FilesystemStorage {
     layout: FileSet,
+    piece_length: u64,
     /// Open handles per file, lazily opened on first access; `Arc<std::fs::File>` is safely shareable because we only use positional I/O (`read_at`/`write_at` on Unix, `seek_read`/`seek_write` on Windows), which do not touch the shared file cursor
-    handles: Mutex<Vec<Option<Arc<std::fs::File>>>>,
+    handles: HandleCache,
+    /// Part-file directory holding unselected files' boundary-piece bytes in sparse shadow files; `None` writes everything to the real files
+    parts_dir: Option<PathBuf>,
+    /// Files whose bytes currently live in their shadow file
+    shadowed: Mutex<Vec<bool>>,
+    shadow_handles: HandleCache,
+    /// Shared by I/O, exclusive while a shadow is promoted
+    io_gate: tokio::sync::RwLock<()>,
 }
 
 impl FilesystemStorage {
     pub fn new(info: &ValidatedTorrentMetaV1Info, root: &Path) -> Self {
         let layout = FileSet::from_meta(info, root);
-        let handles = Mutex::new(vec![None; layout.files().len()]);
-        Self { layout, handles }
+        let files = layout.files().len();
+        Self {
+            layout,
+            piece_length: info.piece_length as u64,
+            handles: Mutex::new(vec![None; files]),
+            parts_dir: None,
+            shadowed: Mutex::new(vec![false; files]),
+            shadow_handles: Mutex::new(vec![None; files]),
+            io_gate: tokio::sync::RwLock::new(()),
+        }
+    }
+
+    /// Keep unselected files' boundary bytes in `dir`
+    pub fn with_parts_dir(mut self, dir: PathBuf) -> Self {
+        self.parts_dir = Some(dir);
+        self
+    }
+
+    fn shadow_path(&self, idx: usize) -> Option<PathBuf> {
+        self.parts_dir.as_ref().map(|dir| dir.join(idx.to_string()))
+    }
+
+    fn is_shadowed(&self, idx: usize) -> bool {
+        self.shadowed.lock().get(idx).copied().unwrap_or(false)
+    }
+
+    /// Apply a file selection (`None` = every file): unselected files that don't exist yet get shadowed; returns shadowed files that are now selected, for [`Self::promote_file`]
+    pub async fn set_selection(&self, selected: Option<&HashSet<usize>>) -> Vec<usize> {
+        let Some(parts_dir) = self.parts_dir.clone() else {
+            return Vec::new();
+        };
+        let candidates: Vec<(usize, PathBuf, bool)> = self
+            .layout
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| !f.padding && f.length > 0 && !self.is_shadowed(*idx))
+            .map(|(idx, f)| {
+                let unselected = selected.is_some_and(|set| !set.contains(&idx));
+                (idx, f.path.clone(), unselected)
+            })
+            .collect();
+        let newly_shadowed = task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter(|(idx, path, unselected)| {
+                    !path.exists() && (*unselected || parts_dir.join(idx.to_string()).exists())
+                })
+                .map(|(idx, _, _)| idx)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let mut shadowed = self.shadowed.lock();
+        for idx in newly_shadowed {
+            shadowed[idx] = true;
+        }
+        shadowed
+            .iter()
+            .enumerate()
+            .filter(|(idx, is_shadowed)| {
+                **is_shadowed && selected.is_none_or(|set| set.contains(idx))
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Move a now-selected file's shadow bytes into the real file; only its first and last piece can hold any
+    pub async fn promote_file(&self, idx: usize) -> Result<(), StorageError> {
+        let _exclusive = self.io_gate.write().await;
+        if !self.is_shadowed(idx) {
+            return Ok(());
+        }
+        let Some(shadow_path) = self.shadow_path(idx) else {
+            return Ok(());
+        };
+        let file = &self.layout.files()[idx];
+        let ranges = boundary_ranges(file.offset, file.length, self.piece_length);
+        let real = self.handle(idx).await?;
+        let copy_from = shadow_path.clone();
+        task::spawn_blocking(move || -> io::Result<()> {
+            let Ok(shadow) = std::fs::File::open(&copy_from) else {
+                return Ok(()); // nothing was ever written
+            };
+            let shadow_len = shadow.metadata()?.len();
+            for (start, len) in ranges {
+                let end = (start + len).min(shadow_len);
+                if end <= start {
+                    continue;
+                }
+                let mut buf = vec![0u8; (end - start) as usize];
+                pread_exact(&shadow, start, &mut buf)?;
+                pwrite_all(&real, start, &buf)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))??;
+        self.shadowed.lock()[idx] = false;
+        self.shadow_handles.lock()[idx] = None;
+        let parts_dir = self.parts_dir.clone();
+        let _ = task::spawn_blocking(move || {
+            let _ = std::fs::remove_file(&shadow_path);
+            // remove_dir only removes empty directories
+            if let Some(dir) = parts_dir {
+                if std::fs::remove_dir(&dir).is_ok() {
+                    if let Some(parent) = dir.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
+            }
+        })
+        .await;
+        Ok(())
     }
 
     pub fn layout(&self) -> &FileSet {
@@ -47,11 +177,16 @@ impl FilesystemStorage {
             .filter(|f| f.length > 0 && !f.padding)
             .map(|f| f.path.clone())
             .collect();
+        let parts_dir = self.parts_dir.clone();
         task::spawn_blocking(move || {
-            !paths.is_empty()
-                && paths
-                    .iter()
-                    .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+            let shadows = parts_dir
+                .and_then(|dir| std::fs::read_dir(dir).ok())
+                .is_some_and(|mut entries| entries.next().is_some());
+            shadows
+                || (!paths.is_empty()
+                    && paths
+                        .iter()
+                        .any(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0)))
         })
         .await
         .unwrap_or(false)
@@ -69,6 +204,7 @@ impl FilesystemStorage {
         if spans.is_empty() {
             return Ok(());
         }
+        let _shared = self.io_gate.read().await;
         let mut tasks = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
         for span in spans {
@@ -77,7 +213,7 @@ impl FilesystemStorage {
                 cursor += len;
                 continue;
             }
-            let handle = self.handle(span.file_index).await?;
+            let handle = self.span_handle(span.file_index).await?;
             let chunk = buf.slice(cursor..cursor + len);
             let file_offset = span.file_offset;
             tasks.push(task::spawn_blocking(move || {
@@ -95,35 +231,16 @@ impl FilesystemStorage {
         self.layout.files()[idx].padding
     }
 
+    /// The shadow while `idx` is shadowed, otherwise the real file
+    async fn span_handle(&self, idx: usize) -> Result<Arc<std::fs::File>, StorageError> {
+        match self.shadow_path(idx).filter(|_| self.is_shadowed(idx)) {
+            Some(path) => open_cached(&self.shadow_handles, idx, path).await,
+            None => self.handle(idx).await,
+        }
+    }
+
     async fn handle(&self, idx: usize) -> Result<Arc<std::fs::File>, StorageError> {
-        if let Some(h) = self.handles.lock().get(idx).and_then(|s| s.clone()) {
-            return Ok(h);
-        }
-
-        let path = self.layout.files()[idx].path.clone();
-        let file = task::spawn_blocking(move || -> io::Result<std::fs::File> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-        })
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))??;
-        let arc = Arc::new(file);
-
-        let mut guard = self.handles.lock();
-        if let Some(Some(existing)) = guard.get(idx).cloned() {
-            return Ok(existing);
-        }
-        if let Some(slot) = guard.get_mut(idx) {
-            *slot = Some(arc.clone());
-        }
-        Ok(arc)
+        open_cached(&self.handles, idx, self.layout.files()[idx].path.clone()).await
     }
 
     /// Flush buffered writes and drop every cached file handle
@@ -159,8 +276,22 @@ impl FilesystemStorage {
 
     /// Allocate all files (sparse) on disk if they don't yet exist
     pub async fn preallocate(&self) -> Result<(), StorageError> {
+        self.preallocate_selected(None).await
+    }
+
+    /// Allocate the files in `selected` (all when `None`)
+    pub async fn preallocate_selected(
+        &self,
+        selected: Option<&std::collections::HashSet<usize>>,
+    ) -> Result<(), StorageError> {
         // Open each file just long enough to preallocate, then drop the handle; caching handles here would defeat lazy opening and can exhaust the process open-file limit on torrents with many files
-        for f in self.layout.files().iter().filter(|f| !f.padding) {
+        for (_, f) in self
+            .layout
+            .files()
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| !f.padding && selected.is_none_or(|set| set.contains(idx)))
+        {
             let path = f.path.clone();
             let target_len = f.length;
             task::spawn_blocking(move || -> io::Result<()> {
@@ -205,6 +336,7 @@ impl FilesystemStorage {
 
         // Start all span reads first, then copy each owned buffer into place; `buf` cannot cross spawned tasks, so handles carry cursor and length
         let spans: Vec<_> = self.layout.spans_for(offset, buf.len() as u64).collect();
+        let _shared = self.io_gate.read().await;
         let mut tasks = Vec::with_capacity(spans.len());
         let mut cursor = 0usize;
         for span in spans {
@@ -214,7 +346,7 @@ impl FilesystemStorage {
                 cursor += len;
                 continue;
             }
-            let handle = self.handle(span.file_index).await?;
+            let handle = self.span_handle(span.file_index).await?;
             let file_offset = span.file_offset;
             let join = task::spawn_blocking(move || -> io::Result<Vec<u8>> {
                 let mut out = vec![0u8; len];
@@ -243,6 +375,53 @@ impl FilesystemStorage {
                 .map_err(|e| io::Error::other(e.to_string()))??;
         }
         Ok(())
+    }
+}
+
+/// Open `path` (creating parents) on first use and cache the handle
+async fn open_cached(
+    cache: &HandleCache,
+    idx: usize,
+    path: PathBuf,
+) -> Result<Arc<std::fs::File>, StorageError> {
+    if let Some(h) = cache.lock().get(idx).and_then(|s| s.clone()) {
+        return Ok(h);
+    }
+    let file = task::spawn_blocking(move || -> io::Result<std::fs::File> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+    })
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))??;
+    let arc = Arc::new(file);
+    let mut guard = cache.lock();
+    if let Some(Some(existing)) = guard.get(idx).cloned() {
+        return Ok(existing);
+    }
+    if let Some(slot) = guard.get_mut(idx) {
+        *slot = Some(arc.clone());
+    }
+    Ok(arc)
+}
+
+/// File-relative ranges of a file's first and last piece, merged when they touch
+fn boundary_ranges(offset: u64, length: u64, piece_length: u64) -> Vec<(u64, u64)> {
+    if length == 0 || piece_length == 0 {
+        return Vec::new();
+    }
+    let first_end = (piece_length - offset % piece_length).min(length);
+    let last_start = ((offset + length - 1) / piece_length * piece_length).saturating_sub(offset);
+    if last_start <= first_end {
+        vec![(0, length)]
+    } else {
+        vec![(0, first_end), (last_start, length - last_start)]
     }
 }
 
@@ -317,6 +496,72 @@ mod tests {
         ]);
         let top = Value::Dict(vec![(b"info".to_vec(), info)]);
         encode_to_vec(&top)
+    }
+
+    #[test]
+    fn boundary_ranges_cover_first_and_last_piece() {
+        // Offset 10, 50 bytes, 16-byte pieces
+        assert_eq!(boundary_ranges(10, 50, 16), vec![(0, 6), (38, 12)]);
+        // Within one piece or two adjacent pieces: the whole file
+        assert_eq!(boundary_ranges(3, 5, 16), vec![(0, 5)]);
+        assert_eq!(boundary_ranges(10, 20, 16), vec![(0, 20)]);
+        assert!(boundary_ranges(0, 0, 16).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unselected_file_bytes_wait_in_a_part_file_until_selected() {
+        let file = |len: i64, name: &[u8]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(len)),
+                (
+                    b"path".to_vec(),
+                    Value::List(vec![Value::Bytes(name.to_vec())]),
+                ),
+            ])
+        };
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![file(10, b"a.bin"), file(22, b"b.bin")]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 40])),
+        ]);
+        let meta =
+            parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let parts = parts_dir_for(&root, "abcd");
+        let storage = FilesystemStorage::new(&meta.info, &root).with_parts_dir(parts.clone());
+
+        // Piece 0 covers all of a.bin and the start of b.bin
+        let only_b: HashSet<usize> = [1].into_iter().collect();
+        assert!(storage.set_selection(Some(&only_b)).await.is_empty());
+        let piece0: Vec<u8> = (1u8..=16).collect();
+        storage.write_at(0, &piece0).await.unwrap();
+        assert!(
+            !root.join("a.bin").exists(),
+            "unselected file must not appear"
+        );
+        assert!(parts.join("0").exists());
+        let mut back = vec![0u8; 16];
+        storage.read_at(0, &mut back).await.unwrap();
+        assert_eq!(
+            back, piece0,
+            "boundary piece reads back through the part file"
+        );
+
+        // Selecting a.bin moves its bytes out of the part file
+        assert_eq!(storage.set_selection(None).await, vec![0]);
+        storage.promote_file(0).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(root.join("a.bin")).await.unwrap(),
+            piece0[..10]
+        );
+        assert!(!parts.exists() && !root.join(PARTS_DIR).exists());
+        storage.read_at(0, &mut back).await.unwrap();
+        assert_eq!(back, piece0);
     }
 
     #[tokio::test]

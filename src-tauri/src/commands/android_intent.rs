@@ -32,7 +32,7 @@ static DIRECTORY_PICKER_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _: *mut c_void) -> jint {
     // SAFETY: Android gives us a process-lifetime `JavaVM*`. In jni 0.22,
     // `JavaVM::from_raw` initializes the crate-wide singleton and returns an
-    // owned handle directly (it no longer returns a `Result`).
+    // owned handle directly (it no longer returns a `Result`)
     let vm_raw = vm.cast::<c_void>();
     let vm = unsafe { JavaVM::from_raw(vm) };
     let _ = JAVA_VM.set(vm);
@@ -73,7 +73,7 @@ fn init_ndk_context(java_vm: *mut c_void) -> Result<(), String> {
     if ANDROID_APP.set(app_global).is_err() {
         return Err("ANDROID_APP already set".to_string());
     }
-    // SAFETY: pointers are valid for the process lifetime; called exactly once.
+    // SAFETY: pointers are valid for the process lifetime; called exactly once
     unsafe {
         ndk_context::initialize_android_context(java_vm, ctx_ptr);
     }
@@ -121,7 +121,7 @@ pub extern "system" fn Java_app_risuko_mobile_MainActivity_nativeOnDirectoryPick
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         // `try_to_string` returns an error for a null `JString`, so a null
-        // `request_id` collapses to an empty string and a null `uri` to `None`.
+        // `request_id` collapses to an empty string and a null `uri` to `None`
         let request_id = request_id.try_to_string(env).unwrap_or_default();
         if request_id.is_empty() {
             return Ok(());

@@ -87,7 +87,7 @@ pub enum Message {
         length: u32,
         proof_layers: u32,
     },
-    /// BEP 52 response; `hashes` carries `length` requested hashes followed by [`hashes_uncle_count`] uncle hashes (SHA-256, 32 bytes each)
+    /// BEP 52 response: `length` hashes followed by [`hashes_uncle_count`] uncle hashes
     Hashes {
         pieces_root: [u8; 32],
         base_layer: u32,
@@ -243,7 +243,7 @@ impl MessageEncoder {
     }
 }
 
-/// Number of uncle hashes trailing the base-layer hashes in a BEP 52 `hashes` message: the first `log2(length) - 1` proof layers are implied by the requested subtree and omitted, but still count towards `proof_layers`
+/// Uncle hashes in a BEP 52 `hashes` message: the first `log2(length) - 1` proof layers are implied by the hashes and omitted
 pub fn hashes_uncle_count(length: u32, proof_layers: u32) -> usize {
     let subtree_layers = length
         .max(1)
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn hashes_omits_proof_layers_covered_by_the_request() {
-        // length=8 spans a 3-layer subtree, so of 5 proof layers only 5 - (3 - 1) = 3 uncles are sent
+        // length 8 implies 2 of the 5 proof layers, leaving 3 uncles
         assert_eq!(hashes_uncle_count(8, 5), 3);
         assert_eq!(hashes_uncle_count(2, 3), 3);
         assert_eq!(hashes_uncle_count(512, 0), 0);

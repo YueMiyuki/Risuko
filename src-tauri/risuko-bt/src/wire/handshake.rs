@@ -9,7 +9,7 @@ pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20;
 pub mod reserved {
     /// Bit 20 (byte 5, bit 0x10) — BEP-10 Extension Protocol
     pub const EXT_PROTOCOL: (usize, u8) = (5, 0x10);
-    /// Byte 7, mask 0x10 — BEP 52 "4th most significant bit in the last byte" (BEP 4: hybrid torrent legacy to v2 upgrade); 0x08 in the same byte is NAT Traversal
+    /// BEP 52 v2 upgrade bit (BEP 4: byte 7, 0x10; 0x08 is NAT Traversal)
     pub const V2: (usize, u8) = (7, 0x10);
     pub const DHT: (usize, u8) = (7, 0x01);
     pub const FAST: (usize, u8) = (7, 0x04);

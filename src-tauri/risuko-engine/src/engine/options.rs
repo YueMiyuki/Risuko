@@ -205,16 +205,7 @@ impl EngineOptions {
 
     /// Coerce common boolean representations: native bools, "true"/"false" strings, "1"/"0" strings, and numeric 0/1
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.global.get(key)? {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) => match s.as_str() {
-                "true" | "1" | "yes" => Some(true),
-                "false" | "0" | "no" => Some(false),
-                _ => None,
-            },
-            Value::Number(n) => n.as_u64().map(|v| v != 0),
-            _ => None,
-        }
+        self.global.get(key).and_then(json_bool)
     }
 
     pub fn p2p_proxy_connector(&self) -> Result<risuko_http::ProxyConnector, String> {
@@ -630,7 +621,7 @@ impl EngineOptions {
             }
         }
         // A task-level TCP P2P override applies to UDP as well unless it has
-        // explicitly supplied a separate UDP route.
+        // explicitly supplied a separate UDP route
         if task_has_p2p_route
             && !task_proxy_has_nested_p2p_udp
             && !task_opts.contains_key("p2p-udp-proxy")
@@ -647,6 +638,20 @@ impl EngineOptions {
             merged.insert(TASK_P2P_PROXY_OVERRIDE_KEY.to_string(), Value::Bool(true));
         }
         merged
+    }
+}
+
+/// JSON bool, number, or `"true"`/`"false"`/`"1"`/`"0"`/`"yes"`/`"no"` string
+pub(crate) fn json_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        Value::Number(n) => n.as_u64().map(|v| v != 0),
+        _ => None,
     }
 }
 

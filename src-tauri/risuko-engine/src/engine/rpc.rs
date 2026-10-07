@@ -1123,6 +1123,7 @@ fn list_methods() -> Value {
         "addUri",
         "addMedia",
         "addTorrent",
+        "addMetalink",
         "addNzb",
         "addEd2k",
         "remove",
@@ -1563,6 +1564,18 @@ mod tests {
             .unwrap()
             .iter()
             .any(|method| method.as_str() == Some("risuko.addNzb")));
+    }
+
+    #[test]
+    fn list_methods_advertises_metalink() {
+        let methods = list_methods();
+        for name in ["aria2.addMetalink", "risuko.addMetalink"] {
+            assert!(methods
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some(name)));
+        }
     }
 
     #[test]

@@ -343,6 +343,13 @@ fn as_length(value: Option<&bencode::Value>) -> i64 {
     }
 }
 
+/// BEP 47 padding entry, hidden like the engine does so `select-file` indices match
+fn is_padding_entry(item: &bencode::Value) -> bool {
+    item.get(b"attr")
+        .and_then(bencode::Value::as_bytes)
+        .is_some_and(|attr| attr.contains(&b'p'))
+}
+
 fn dict_get_first<'a>(dict: &'a bencode::Value, keys: &[&[u8]]) -> Option<&'a bencode::Value> {
     keys.iter().find_map(|key| dict.get(key))
 }
@@ -599,6 +606,12 @@ fn resolve_torrent_from_bytes(
 
     if let Some(files_value) = info.get(b"files") {
         if let Some(raw_files) = files_value.as_list() {
+            let visible_files: Vec<bencode::Value> = raw_files
+                .iter()
+                .filter(|item| !is_padding_entry(item))
+                .cloned()
+                .collect();
+            let raw_files = visible_files.as_slice();
             let file_count = raw_files.len();
             if !force_preview && file_count > MAX_TORRENT_PREVIEW_FILES {
                 return Ok(ResolvedTorrentPayload {
@@ -1161,6 +1174,59 @@ mod tests {
         let mut ranges = vec![(1, 3)];
         push_index_to_ranges(&mut ranges, 5);
         assert_eq!(ranges, vec![(1, 3), (5, 5)]);
+    }
+
+    // -- padding files --
+
+    #[test]
+    fn torrent_preview_hides_padding_files() {
+        use bencode::Value;
+        let file = |path: &[u8], attr: Option<&[u8]>| {
+            let mut entry = Vec::new();
+            if let Some(attr) = attr {
+                entry.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            entry.push((b"length".to_vec(), Value::Int(4)));
+            entry.push((
+                b"path".to_vec(),
+                Value::List(vec![Value::Bytes(path.to_vec())]),
+            ));
+            Value::Dict(entry)
+        };
+        let torrent = bencode::encode_to_vec(&Value::Dict(vec![(
+            b"info".to_vec(),
+            Value::Dict(vec![
+                (
+                    b"files".to_vec(),
+                    Value::List(vec![
+                        file(b"a.txt", None),
+                        file(b"pad0", Some(b"p")),
+                        file(b"b.txt", Some(b"x")),
+                    ]),
+                ),
+                (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            ]),
+        )]));
+        let listed = resolve_torrent_from_bytes(&torrent, "t.torrent", false, None, 0, 50).unwrap();
+        assert_eq!(listed.file_count, 2);
+        let names: Vec<&str> = listed.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+
+        // Indices count visible files, as `select-file` does
+        let paged = resolve_torrent_from_bytes(&torrent, "t.torrent", true, None, 0, 50).unwrap();
+        let mut indices: Vec<(String, Option<usize>)> = paged
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.index))
+            .collect();
+        indices.sort();
+        assert_eq!(
+            indices,
+            vec![
+                ("a.txt".to_string(), Some(1)),
+                ("b.txt".to_string(), Some(2))
+            ]
+        );
     }
 
     // -- encode_index_ranges --

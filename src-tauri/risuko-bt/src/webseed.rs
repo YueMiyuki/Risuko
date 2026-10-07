@@ -304,13 +304,7 @@ pub async fn fetch_range_response(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     if status != 206 {
-        validate_range_response(
-            status,
-            content_range.as_deref(),
-            0,
-            requested,
-            max_body,
-        )?;
+        validate_range_response(status, content_range.as_deref(), 0, requested, max_body)?;
     }
     if let Some(length) = response.content_length() {
         if length > max_body {
@@ -379,9 +373,10 @@ mod tests {
     #[test]
     fn bounds_url_list_and_deduplicates_in_order() {
         let mut values = vec![Value::Bytes(b"https://mirror.example/first".to_vec())];
-        values.extend((0..MAX_URL_LIST_ENTRIES + 4).map(|i| {
-            Value::Bytes(format!("https://mirror.example/{i}").into_bytes())
-        }));
+        values.extend(
+            (0..MAX_URL_LIST_ENTRIES + 4)
+                .map(|i| Value::Bytes(format!("https://mirror.example/{i}").into_bytes())),
+        );
         values.push(Value::Bytes(b"https://mirror.example/first".to_vec()));
         let urls = parse_url_list(&Value::List(values));
         assert_eq!(urls.len(), MAX_URL_LIST_ENTRIES);

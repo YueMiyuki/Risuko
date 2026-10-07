@@ -459,11 +459,18 @@ pub async fn remove_download_result(gid: String) -> Result<()> {
 
 // Events
 
+/// Not error-first and spread, so JS receives (eventName, gid) as the typings declare
+type EventCallback = napi::threadsafe_function::ThreadsafeFunction<
+    FnArgs<(String, String)>,
+    napi::bindgen_prelude::Unknown<'static>,
+    FnArgs<(String, String)>,
+    napi::Status,
+    false,
+>;
+
 /// Subscribe to engine events; the callback receives (eventName, gid) and returns `Result<()>` on success
 #[napi(ts_args_type = "callback: (eventName: string, gid: string) => void")]
-pub async fn on_event(
-    callback: napi::threadsafe_function::ThreadsafeFunction<(String, String)>,
-) -> Result<()> {
+pub async fn on_event(callback: EventCallback) -> Result<()> {
     let (event_task, rx) = {
         let guard = ENGINE.lock().await;
         let engine = guard
@@ -485,7 +492,7 @@ pub async fn on_event(
                     let name = event.method_name().to_string();
                     let gid = event.gid().to_string();
                     callback.call(
-                        Ok((name, gid)),
+                        (name, gid).into(),
                         napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                     );
                 }

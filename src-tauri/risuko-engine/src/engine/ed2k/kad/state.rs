@@ -74,7 +74,7 @@ pub fn load(config_dir: &Path, local_hint: Option<NodeId>) -> io::Result<LoadedK
         Err(error) => return Err(error),
     };
 
-    // Limit the read as well as checking metadata: a file can grow between metadata() and read().
+    // Limit the read as well as checking metadata: a file can grow between metadata() and read()
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let read_result = file
         .take(MAX_STATE_FILE_BYTES.saturating_add(1))

@@ -10,7 +10,7 @@ pub struct FileInfo {
     pub length: u64,
     /// Absolute offset of this file's first byte within the torrent
     pub offset: u64,
-    /// BEP 47 padding: reads yield zeros, writes are dropped, nothing exists on disk
+    /// BEP 47 padding: reads as zeros and never touches disk
     pub padding: bool,
 }
 

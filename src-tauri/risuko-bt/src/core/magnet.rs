@@ -1,5 +1,6 @@
-//! Magnet URI parser (BEP-9 / BEP-52 / BEP-53 subset): v1 (`xt=urn:btih:<hex|base32>`), v2 (`xt=urn:btmh:<multihash-hex>`, SHA-256 only) and hybrid magnets, plus optional trackers (`tr=`), display name (`dn=`) and `so=` (BEP-53) file-select indices
+//! Magnet URI parser (BEP-9 / BEP-52 / BEP-53 subset): `btih` and SHA-256 `btmh` hashes, `tr=`, `dn=`, `x.pe=` and `so=`
 
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use super::hash::{Id20, Id32};
@@ -16,6 +17,40 @@ pub enum MagnetError {
     Parse(String),
 }
 
+/// A `x.pe` peer: an IP literal or a hostname
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MagnetPeer {
+    Addr(SocketAddr),
+    Host(String, u16),
+}
+
+impl MagnetPeer {
+    fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if let Ok(addr) = raw.parse::<SocketAddr>() {
+            return (addr.port() != 0).then_some(Self::Addr(addr));
+        }
+        let (host, port) = raw.rsplit_once(':')?;
+        let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+        // Brackets or colons mean a malformed IPv6 literal
+        if host.is_empty() || host.contains([':', '[', ']', '/', ' ']) {
+            return None;
+        }
+        Some(Self::Host(host.to_ascii_lowercase(), port))
+    }
+
+    /// Resolve to socket addresses; IP literals resolve to themselves
+    pub async fn resolve(&self) -> Vec<SocketAddr> {
+        match self {
+            Self::Addr(addr) => vec![*addr],
+            Self::Host(host, port) => tokio::net::lookup_host((host.as_str(), *port))
+                .await
+                .map(|addrs| addrs.collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Magnet {
     /// Wire infohash: v1 SHA-1 if present, else truncated SHA-256
@@ -27,6 +62,8 @@ pub struct Magnet {
     pub trackers: Vec<String>,
     pub display_name: Option<String>,
     pub select_only: Option<Vec<usize>>,
+    /// BEP-9 `x.pe` peers to contact directly
+    pub peers: Vec<MagnetPeer>,
 }
 
 impl Magnet {
@@ -56,6 +93,7 @@ impl Magnet {
                     trackers: vec![],
                     display_name: None,
                     select_only: None,
+                    peers: vec![],
                 });
             }
         }
@@ -71,6 +109,7 @@ impl Magnet {
         let mut trackers = Vec::new();
         let mut display_name: Option<String> = None;
         let mut select_only: Option<Vec<usize>> = None;
+        let mut peers: Vec<MagnetPeer> = Vec::new();
 
         for (k, v) in url.query_pairs() {
             match &*k {
@@ -96,6 +135,17 @@ impl Magnet {
                 }
                 "tr" => trackers.push(v.into_owned()),
                 "dn" => display_name = Some(v.into_owned()),
+                "x.pe" => {
+                    // Bounded so an untrusted URI can't trigger unbounded DNS lookups
+                    const MAX_MAGNET_PEERS: usize = 64;
+                    if peers.len() < MAX_MAGNET_PEERS {
+                        if let Some(peer) = MagnetPeer::parse(&v) {
+                            if !peers.contains(&peer) {
+                                peers.push(peer);
+                            }
+                        }
+                    }
+                }
                 "so" => {
                     // BEP-53 encoding: comma-separated indices or ranges a-b
                     let mut indices = Vec::new();
@@ -152,7 +202,21 @@ impl Magnet {
             trackers,
             display_name,
             select_only,
+            peers,
         })
+    }
+
+    /// Resolve every `x.pe` entry, deduplicated, in URI order
+    pub async fn resolve_peers(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        for peer in &self.peers {
+            for addr in peer.resolve().await {
+                if !out.contains(&addr) {
+                    out.push(addr);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -187,6 +251,24 @@ mod tests {
         .unwrap();
         assert_eq!(m.trackers.len(), 2);
         assert_eq!(m.select_only.as_deref(), Some(&[0usize, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn parse_x_pe_peers() {
+        let m = Magnet::parse(
+            "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862\
+             &x.pe=203.0.113.5:6881&x.pe=%5B2001:db8::1%5D:51413&x.pe=Peer.Example:7000\
+             &x.pe=bad&x.pe=203.0.113.5:0&x.pe=203.0.113.5:6881",
+        )
+        .unwrap();
+        assert_eq!(
+            m.peers,
+            vec![
+                MagnetPeer::Addr("203.0.113.5:6881".parse().unwrap()),
+                MagnetPeer::Addr("[2001:db8::1]:51413".parse().unwrap()),
+                MagnetPeer::Host("peer.example".into(), 7000),
+            ]
+        );
     }
 
     #[test]
