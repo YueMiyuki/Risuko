@@ -14,7 +14,7 @@ use super::events::{EngineEvent, EventBroadcaster};
 use super::http;
 use super::media;
 use super::options::EngineOptions;
-use super::routing::{resolve_routing, TaskRoutingRule};
+use super::routing::{resolve_routing, strip_part_suffix, TaskRoutingRule};
 use super::session::SessionManager;
 use super::speed_limiter::{parse_speed_limit, SpeedLimiter};
 use super::task::{
@@ -701,6 +701,20 @@ fn metalink_checksums(options: &Map<String, Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `select-file` from changeOption: numbers become strings and null clears the selection; other non-string values are ignored as `Ok(None)`
+fn normalize_select_file(value: &Value) -> Result<Option<String>, String> {
+    let selection = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        _ => return Ok(None),
+    };
+    if !selection.trim().is_empty() && torrent::parse_select_file(&selection).is_none() {
+        return Err(format!("Invalid select-file value: {selection}"));
+    }
+    Ok(Some(selection))
+}
+
 fn apply_select_file(files: &mut [DownloadFile], options: &Map<String, Value>) {
     let raw = options
         .get("select-file")
@@ -1212,7 +1226,7 @@ impl TaskManager {
         };
 
         let (dir, tag) = self
-            .resolve_routing_for_task(&options, &filename_hint)
+            .resolve_routing_for_task(&options, strip_part_suffix(&filename_hint))
             .await;
 
         self.enqueue(DownloadTask::new_http(gid, uris, dir, tag, options))
@@ -1767,6 +1781,26 @@ impl TaskManager {
                                     handle.id,
                                 )
                                 .await;
+                                // change_option skips a torrent with no id yet, so apply a selection changed while resolving now
+                                let applied = resolve_options
+                                    .get("select-file")
+                                    .cloned()
+                                    .or_else(|| handle.select_file.clone().map(Value::String));
+                                let latest = {
+                                    let guard = tasks.read().await;
+                                    guard
+                                        .iter()
+                                        .find(|task| task.gid == gid)
+                                        .and_then(|task| task.options.get("select-file").cloned())
+                                };
+                                if latest != applied {
+                                    let raw = latest.as_ref().and_then(Value::as_str);
+                                    if let Err(e) = engine.set_select_file(handle.id, raw).await {
+                                        tracing::warn!(
+                                            "[task:{gid}] could not apply file selection: {e}"
+                                        );
+                                    }
+                                }
                                 let tracker_urls = {
                                     let guard = tasks.read().await;
                                     guard
@@ -1901,7 +1935,7 @@ impl TaskManager {
         };
 
         let (dir, tag) = self
-            .resolve_routing_for_task(&options, &filename_hint)
+            .resolve_routing_for_task(&options, strip_part_suffix(&filename_hint))
             .await;
 
         self.enqueue(DownloadTask::new_ftp(
@@ -4484,11 +4518,19 @@ impl TaskManager {
         })
     }
 
-    pub async fn change_option(&self, gid: &str, opts: Map<String, Value>) -> Result<(), String> {
+    pub async fn change_option(
+        &self,
+        gid: &str,
+        mut opts: Map<String, Value>,
+    ) -> Result<(), String> {
         // Forward file selection changes to the running torrent
-        let reselect = opts
-            .get("select-file")
-            .map(|v| v.as_str().unwrap_or("").to_string());
+        let reselect = match opts.remove("select-file") {
+            Some(value) => normalize_select_file(&value)?,
+            None => None,
+        };
+        if let Some(selection) = &reselect {
+            opts.insert("select-file".to_string(), Value::String(selection.clone()));
+        }
         let mut tasks = self.tasks.write().await;
         let is_torrent = tasks
             .iter()
@@ -5871,6 +5913,27 @@ mod tests {
         assert!(!looks_like_url("/path/to/file"));
         assert!(!looks_like_url("file.txt"));
         assert!(!looks_like_url(""));
+    }
+
+    #[test]
+    fn change_option_select_file_is_normalized() {
+        use serde_json::json;
+        assert_eq!(
+            normalize_select_file(&json!("1-2,4")),
+            Ok(Some("1-2,4".into()))
+        );
+        assert_eq!(normalize_select_file(&json!(3)), Ok(Some("3".into())));
+        // Empty and null clear the selection
+        assert_eq!(normalize_select_file(&json!("")), Ok(Some(String::new())));
+        assert_eq!(normalize_select_file(&json!(null)), Ok(Some(String::new())));
+        // Other types keep the previous selection
+        assert_eq!(normalize_select_file(&json!(true)), Ok(None));
+        assert_eq!(normalize_select_file(&json!([1])), Ok(None));
+        assert_eq!(normalize_select_file(&json!({"a": 1})), Ok(None));
+        // Nothing parseable is rejected instead of selecting every file
+        assert!(normalize_select_file(&json!("x")).is_err());
+        assert!(normalize_select_file(&json!(0)).is_err());
+        assert!(normalize_select_file(&json!(-2)).is_err());
     }
 
     #[test]

@@ -1064,6 +1064,8 @@ impl Session {
                         // Flat layout, or any case with an empty torrent name (defensive): enumerate per-file paths under root so we never `remove_dir_all` the parent
                         meta.info
                             .iter_file_details()
+                            // Padding never touches disk; a same-named `.pad/<len>` there is someone else's
+                            .filter(|f| !f.padding)
                             .filter_map(|f| {
                                 let mut p = root.clone();
                                 // Defense-in-depth: metainfo parsing already rejects unsafe path components, but never join a `..`/`.`/empty/root component here so an upstream regression can't turn deletion into an arbitrary-path removal
@@ -1248,9 +1250,12 @@ fn known_infohashes(s: &Session) -> Vec<KnownInfoHash> {
                     }
                 }
             }
+            // Set while v2 layers are served; a hybrid keeps the bit off on its v1 hash (see `add_from_meta`) but asserts it on the truncated-v2 alias that v2 peers dial
+            let serves_v2 = handle.advertise_v2.load(Ordering::Relaxed);
+            let v1_hash = meta.as_ref().and_then(|meta| meta.info_hashes().v1);
             hashes.into_iter().map(move |info_hash| KnownInfoHash {
                 info_hash,
-                advertise_v2: handle.advertise_v2.load(Ordering::Relaxed),
+                advertise_v2: serves_v2 && Some(info_hash) != v1_hash,
                 advertise_dht,
                 ext_handshake_builder: Some(handle.ext_handshake_builder.clone()),
             })

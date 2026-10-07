@@ -264,9 +264,18 @@ async fn dial_with_transport_order(
     }
 }
 
+/// Peer identity failure that no other transport or encryption mode can fix
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TerminalDialError(&'static str);
+
+fn terminal_dial_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, TerminalDialError(message))
+}
+
 fn alternate_dial_cannot_help(err: &std::io::Error) -> bool {
-    let message = err.to_string();
-    message == "info hash mismatch" || message.starts_with("self-connection ")
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<TerminalDialError>())
 }
 
 /// Accept an inbound peer: peer sends handshake first, we reply. `known_hashes` lists info-hashes the responder hosts, used to validate plaintext handshakes and resolve the obfuscated req2 field in MSE. First byte peeked: `0x13` means plaintext BEP-3, any other byte starts an MSE handshake (Ya)
@@ -604,10 +613,7 @@ where
     let remote_hs = Handshake::parse(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
     if remote_hs.info_hash != spawn.info_hash {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "info hash mismatch",
-        ));
+        return Err(terminal_dial_error("info hash mismatch"));
     }
     write_ext_handshake_if_supported(
         &mut writer,
@@ -829,10 +835,7 @@ where
         let remote_hs = Handshake::parse(&hs_arr)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
         if remote_hs.info_hash != spawn.info_hash {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "info hash mismatch after mse",
-            ));
+            return Err(terminal_dial_error("info hash mismatch after mse"));
         }
         let r = Rc4ReadHalf::new(read_h, dec_in, rest);
         let w = Rc4WriteHalf::new(write_h, enc_out);
@@ -855,10 +858,7 @@ where
         let remote_hs = Handshake::parse(&hs_arr)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
         if remote_hs.info_hash != spawn.info_hash {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "info hash mismatch after mse",
-            ));
+            return Err(terminal_dial_error("info hash mismatch after mse"));
         }
         let r = std::io::Cursor::new(rest).chain(read_h);
         (Box::new(r), Box::new(write_h), remote_hs)
@@ -1195,8 +1195,7 @@ fn finish_spawn(
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
     // Reject self-connections: the DHT can hand us our own externally-mapped address, and without this we complete a full handshake with ourselves, burning a peer slot on a connection that can never serve data
     if remote_hs.peer_id == our_peer_id {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(terminal_dial_error(
             "self-connection (peer_id matches ours)",
         ));
     }
@@ -1515,14 +1514,15 @@ mod tests {
             );
         }
 
-        assert!(alternate_dial_cannot_help(&std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        for message in [
             "info hash mismatch",
-        )));
-        assert!(alternate_dial_cannot_help(&std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            "info hash mismatch after mse",
             "self-connection (peer_id matches ours)",
-        )));
+        ] {
+            let err = terminal_dial_error(message);
+            assert!(alternate_dial_cannot_help(&err), "{message} is terminal");
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     #[tokio::test]

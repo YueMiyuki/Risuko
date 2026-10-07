@@ -1,9 +1,18 @@
 //! Magnet URI parser (BEP-9 / BEP-52 / BEP-53 subset): `btih` and SHA-256 `btmh` hashes, `tr=`, `dn=`, `x.pe=` and `so=`
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
+
+use futures_util::{future, stream, Stream, StreamExt};
 
 use super::hash::{Id20, Id32};
+
+/// Per-hostname DNS budget for `x.pe` peers
+const PEER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Concurrent `x.pe` hostname lookups
+const MAX_CONCURRENT_PEER_LOOKUPS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MagnetError {
@@ -39,14 +48,19 @@ impl MagnetPeer {
         Some(Self::Host(host.to_ascii_lowercase(), port))
     }
 
-    /// Resolve to socket addresses; IP literals resolve to themselves
+    /// Resolve to socket addresses; IP literals resolve to themselves, a lookup that fails or outlasts [`PEER_LOOKUP_TIMEOUT`] to nothing
     pub async fn resolve(&self) -> Vec<SocketAddr> {
         match self {
             Self::Addr(addr) => vec![*addr],
-            Self::Host(host, port) => tokio::net::lookup_host((host.as_str(), *port))
-                .await
-                .map(|addrs| addrs.collect())
-                .unwrap_or_default(),
+            Self::Host(host, port) => tokio::time::timeout(
+                PEER_LOOKUP_TIMEOUT,
+                tokio::net::lookup_host((host.as_str(), *port)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|addrs| addrs.collect())
+            .unwrap_or_default(),
         }
     }
 }
@@ -206,17 +220,14 @@ impl Magnet {
         })
     }
 
-    /// Resolve every `x.pe` entry, deduplicated, in URI order
-    pub async fn resolve_peers(&self) -> Vec<SocketAddr> {
-        let mut out = Vec::new();
-        for peer in &self.peers {
-            for addr in peer.resolve().await {
-                if !out.contains(&addr) {
-                    out.push(addr);
-                }
-            }
-        }
-        out
+    /// Resolve every `x.pe` entry with bounded concurrency, yielding deduplicated addresses as each lookup finishes so one slow host never holds back the rest
+    pub fn resolve_peers(&self) -> impl Stream<Item = SocketAddr> + Send + 'static {
+        let mut seen = HashSet::new();
+        stream::iter(self.peers.clone())
+            .map(|peer| async move { peer.resolve().await })
+            .buffer_unordered(MAX_CONCURRENT_PEER_LOOKUPS)
+            .flat_map(stream::iter)
+            .filter(move |addr| future::ready(seen.insert(*addr)))
     }
 }
 
@@ -269,6 +280,20 @@ mod tests {
                 MagnetPeer::Host("peer.example".into(), 7000),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_peers_streams_deduplicated_addresses() {
+        let m = Magnet::parse(
+            "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862\
+             &x.pe=203.0.113.5:6881&x.pe=127.0.0.1:7000&x.pe=localhost:7000",
+        )
+        .unwrap();
+        let addrs: Vec<SocketAddr> = m.resolve_peers().collect().await;
+        let loopback: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        assert!(addrs.contains(&"203.0.113.5:6881".parse().unwrap()));
+        // `localhost` may also resolve to 127.0.0.1, which must not repeat
+        assert_eq!(addrs.iter().filter(|a| **a == loopback).count(), 1);
     }
 
     #[test]

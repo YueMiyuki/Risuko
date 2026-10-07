@@ -369,7 +369,7 @@ impl TorrentEngine {
             .await
     }
 
-    /// `magnet_select` is a magnet's BEP 53 `so=`, used when the task has no `select-file`
+    /// `magnet_select` is a magnet's BEP 53 `so=`, used when the task has no `select-file` key
     async fn add_torrent_bytes_with_peer_sources(
         &self,
         data: &[u8],
@@ -395,19 +395,8 @@ impl TorrentEngine {
         let selectable = bt::parse_torrent(data)
             .map(|meta| meta.info.selectable_file_indices())
             .ok();
-        let mut adopted_select_file = None;
-        let only_files = match (Self::parse_select_files(options), magnet_select) {
-            (Some(display), _) => Some(match &selectable {
-                Some(selectable) => display_to_torrent_indices(&display, selectable),
-                None => display,
-            }),
-            (None, Some(so)) => selectable.as_ref().map(|selectable| {
-                let display = torrent_to_display_indices(so, selectable);
-                adopted_select_file = Some(format_select_file(&display));
-                display_to_torrent_indices(&display, selectable)
-            }),
-            (None, None) => None,
-        };
+        let (only_files, adopted_select_file) =
+            initial_file_selection(options, magnet_select, selectable.as_deref());
         let create_subfolder = options
             .get("bt-create-subfolder")
             .and_then(super::options::json_bool)
@@ -439,8 +428,12 @@ impl TorrentEngine {
             .await
             .map_err(|e| format!("Failed to add torrent: {}", e))?;
 
+        // An already-managed torrent keeps its own selection, so only a fresh add reports `so=`
+        let added = matches!(response, bt::AddTorrentResponse::Added(..));
         let mut handle = extract_handle(response)?;
-        handle.select_file = adopted_select_file;
+        if added {
+            handle.select_file = adopted_select_file;
+        }
         tracing::info!(
             "Torrent added: id={}, info_hash={:?}",
             handle.id,
@@ -916,6 +909,35 @@ fn extract_file_details(info: &bt::ValidatedTorrentMetaV1Info) -> Vec<TorrentFil
         .collect()
 }
 
+/// Initial `only_files` plus the `select-file` adopted from a magnet's `so=`
+fn initial_file_selection(
+    options: &Map<String, Value>,
+    magnet_select: Option<&[usize]>,
+    selectable: Option<&[usize]>,
+) -> (Option<Vec<usize>>, Option<String>) {
+    if let Some(display) = TorrentEngine::parse_select_files(options) {
+        let only_files = match selectable {
+            Some(selectable) => display_to_torrent_indices(&display, selectable),
+            None => display,
+        };
+        return (Some(only_files), None);
+    }
+    // Any task `select-file`, even an empty one meaning every file, overrides `so=`
+    if options.contains_key("select-file") {
+        return (None, None);
+    }
+    let (Some(so), Some(selectable)) = (magnet_select, selectable) else {
+        return (None, None);
+    };
+    let display = torrent_to_display_indices(so, selectable);
+    // A `so=` naming only padding or missing entries would select nothing
+    if display.is_empty() {
+        return (None, None);
+    }
+    let only_files = display_to_torrent_indices(&display, selectable);
+    (Some(only_files), Some(format_select_file(&display)))
+}
+
 /// Cap on indices one `select-file` may expand to
 const MAX_SELECT_FILE_INDICES: usize = 1_000_000;
 
@@ -978,11 +1000,11 @@ pub(crate) fn display_to_torrent_indices(display: &[usize], selectable: &[usize]
         .collect()
 }
 
-/// Torrent file positions (e.g. BEP 53 `so=`) to user-facing indices
+/// Torrent file positions (e.g. BEP 53 `so=`) to user-facing indices; `selectable` is ascending
 pub(crate) fn torrent_to_display_indices(torrent: &[usize], selectable: &[usize]) -> Vec<usize> {
     torrent
         .iter()
-        .filter_map(|t| selectable.iter().position(|s| s == t))
+        .filter_map(|t| selectable.binary_search(t).ok())
         .collect()
 }
 
@@ -1324,6 +1346,37 @@ mod tests {
         assert_eq!(
             torrent_to_display_indices(&[0, 1, 2], &selectable),
             vec![0, 1]
+        );
+        assert_eq!(
+            torrent_to_display_indices(&[2, 9, 0], &selectable),
+            vec![1, 0]
+        );
+    }
+
+    #[test]
+    fn task_select_file_overrides_magnet_so() {
+        // Torrent entry 1 is padding
+        let selectable = [0, 2, 3];
+        let so: &[usize] = &[2, 3];
+        let mut opts = Map::new();
+        assert_eq!(
+            initial_file_selection(&opts, Some(so), Some(&selectable)),
+            (Some(vec![2, 3]), Some("2-3".to_string()))
+        );
+        assert_eq!(
+            initial_file_selection(&opts, Some(&[1, 7]), Some(&selectable)),
+            (None, None)
+        );
+        // An explicitly empty selection means every file
+        opts.insert("select-file".into(), json!(""));
+        assert_eq!(
+            initial_file_selection(&opts, Some(so), Some(&selectable)),
+            (None, None)
+        );
+        opts.insert("select-file".into(), json!("1"));
+        assert_eq!(
+            initial_file_selection(&opts, Some(so), Some(&selectable)),
+            (Some(vec![0]), None)
         );
     }
 

@@ -11,12 +11,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use risuko_http::{Error as HttpError, ProxyDatagram};
 
-use super::dontfrag::{is_message_too_big, DontFragment};
+use super::dontfrag::{is_message_too_big, UdpSender};
 use super::now_micros;
 use super::packet::{PacketType, UtpHeader, HEADER_LEN};
 use super::socket::{
@@ -63,7 +62,7 @@ const DUP_ACK_THRESHOLD: usize = 3;
 const MAX_SACK_BYTES: usize = 32;
 /// Packets further than this past `ack_nr` are dropped rather than buffered
 const MAX_REORDER_DISTANCE: u16 = 2048;
-/// Base delay is the minimum over the last two minutes (BEP 29), tracked in one-minute buckets
+/// Base delay is the minimum over the last two minutes (BEP 29), tracked in one-minute buckets that count the active one (RFC 6817 BASE_HISTORY, libutp DELAY_BASE_HISTORY)
 const BASE_DELAY_BUCKET: Duration = Duration::from_secs(60);
 const BASE_DELAY_BUCKETS: usize = 2;
 /// Current delay is the minimum of the last few samples (libutp CUR_DELAY_SIZE)
@@ -144,7 +143,7 @@ impl DelayHistory {
         match (self.bucket_start, self.bucket_min) {
             (Some(start), Some(min)) if now.duration_since(start) >= BASE_DELAY_BUCKET => {
                 self.history.push_back(min);
-                while self.history.len() > BASE_DELAY_BUCKETS {
+                while self.history.len() >= BASE_DELAY_BUCKETS {
                     self.history.pop_front();
                 }
                 self.bucket_start = Some(now);
@@ -332,6 +331,9 @@ impl ConnState {
             self.retransmit(idx);
         }
         if self.state == State::Connected {
+            if !self.send_buf.is_empty() {
+                self.maybe_reopen_mtu_search();
+            }
             while !self.send_buf.is_empty() {
                 if self.should_probe() {
                     let payload = self.probe_payload();
@@ -382,6 +384,18 @@ impl ConnState {
         self.mtu_probe = None;
     }
 
+    /// Raise the ceiling again once the re-probe interval has passed, in case the path improved; only checked with data queued, since probing needs data
+    fn maybe_reopen_mtu_search(&mut self) {
+        if !self.pmtud {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.mtu_reprobe_at {
+            self.mtu_reprobe_at = now + MTU_REPROBE_INTERVAL;
+            self.mtu_ceiling = self.mtu_ceiling.max(max_datagram(self.remote));
+        }
+    }
+
     /// Probe while the search is open and the window is wide enough to surround the probe with normal packets (libtorrent's rule)
     fn should_probe(&self) -> bool {
         self.pmtud
@@ -392,9 +406,10 @@ impl ConnState {
             && self.max_window > 3 * self.mtu_floor
     }
 
-    /// Probe payload: the midpoint datagram less worst-case overhead
+    /// Probe payload: the midpoint datagram less the header and SACK extension its encoding adds, so the probe is exactly the midpoint
     fn probe_payload(&self) -> usize {
-        (self.mtu_floor + self.mtu_ceiling) / 2 - UTP_OVERHEAD
+        let sack = self.build_selective_ack().map_or(0, |mask| 2 + mask.len());
+        (self.mtu_floor + self.mtu_ceiling) / 2 - HEADER_LEN - sack
     }
 
     /// Like [`Self::transmit_new`] for a probe, which is sent with don't-fragment set
@@ -431,6 +446,11 @@ impl ConnState {
     /// If `seq` is the probe, lower the ceiling and return true so its loss isn't treated as congestion
     fn on_mtu_probe_lost(&mut self, seq: u16) -> bool {
         match self.mtu_probe {
+            // No bigger than the proven floor, so the loss says nothing about size
+            Some((probe, size)) if probe == seq && size <= self.mtu_floor => {
+                self.mtu_probe = None;
+                false
+            }
             Some((probe, size)) if probe == seq => {
                 self.mtu_ceiling = size - 1;
                 self.update_mtu_limits();
@@ -440,9 +460,13 @@ impl ConnState {
         }
     }
 
-    /// The OS refused the probe (e.g. EMSGSIZE): lower the ceiling and resend without don't-fragment
-    pub(crate) fn mtu_probe_send_failed(&mut self, seq: u16) {
-        self.on_mtu_probe_lost(seq);
+    /// The OS refused the probe: EMSGSIZE lowers the ceiling, any other error only abandons the probe; either way it's resent without don't-fragment
+    pub(crate) fn mtu_probe_send_failed(&mut self, seq: u16, too_big: bool) {
+        if too_big {
+            self.on_mtu_probe_lost(seq);
+        } else if self.mtu_probe.is_some_and(|(probe, _)| probe == seq) {
+            self.mtu_probe = None;
+        }
         if let Some(idx) = self.unacked.iter().position(|p| p.seq_nr == seq) {
             self.retransmit(idx);
         }
@@ -781,10 +805,6 @@ impl ConnState {
                 self.probe_due = true;
             }
         }
-        if self.pmtud && now >= self.mtu_reprobe_at {
-            self.mtu_reprobe_at = now + MTU_REPROBE_INTERVAL;
-            self.mtu_ceiling = self.mtu_ceiling.max(max_datagram(self.remote));
-        }
         let Some(base) = self.rto_base else {
             return;
         };
@@ -965,7 +985,7 @@ pub(crate) struct DriverConfig {
 #[derive(Clone)]
 pub(crate) enum DatagramTransport {
     /// Shared UDP socket, with don't-fragment control where supported
-    Direct(Arc<UdpSocket>, Option<Arc<DontFragment>>),
+    Direct(Arc<UdpSender>),
     Proxy(Arc<ProxyDatagram>),
 }
 
@@ -1034,7 +1054,8 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
     // Kick off the handshake / initial ack and arm the connect notifier
     {
         let mut st = shared.state.lock();
-        st.pmtud = matches!(cfg.transport, DatagramTransport::Direct(_, Some(_)));
+        st.pmtud =
+            matches!(&cfg.transport, DatagramTransport::Direct(sender) if sender.can_probe());
         if let Role::Initiator(tx) = role {
             st.connect_notify = Some(tx);
             // Send the SYN (seq 1). It lives in `unacked` for retransmission
@@ -1144,7 +1165,7 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
 
 /// Drain the outbox to the wire. Datagrams are collected under the lock and sent after releasing it so UDP I/O never blocks the state mutex
 async fn flush(shared: &Arc<Shared>, cfg: &DriverConfig) {
-    let (datagrams, probe, mtu_floor) = {
+    let probe = {
         let mut st = shared.state.lock();
         if st
             .send_retry_at
@@ -1153,34 +1174,27 @@ async fn flush(shared: &Arc<Shared>, cfg: &DriverConfig) {
             return;
         }
         st.send_retry_at = None;
-        (
-            std::mem::take(&mut st.outbox),
-            st.probe_out.take(),
-            st.mtu_floor,
-        )
+        st.probe_out.take()
     };
-    if let Some((seq, bytes)) = &probe {
+    if let Some((seq, bytes)) = probe {
         let sent = match &cfg.transport {
-            DatagramTransport::Direct(udp, Some(df)) => {
-                df.send_to(udp, bytes, cfg.remote, true).await
-            }
-            _ => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            DatagramTransport::Direct(sender) => sender.send_probe(&bytes, cfg.remote).await,
+            DatagramTransport::Proxy(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
         };
         if let Err(error) = sent {
-            if !is_message_too_big(&error) {
+            // Only EMSGSIZE answers the probe; anything else leaves an ordinary resend to the send path below
+            let too_big = is_message_too_big(&error);
+            if !too_big {
                 tracing::debug!("µTP MTU probe to {} failed: {error}", cfg.remote);
             }
-            shared.state.lock().mtu_probe_send_failed(*seq);
+            shared.state.lock().mtu_probe_send_failed(seq, too_big);
         }
     }
+    let datagrams = std::mem::take(&mut shared.state.lock().outbox);
     let mut datagrams = datagrams.into_iter();
     while let Some(d) = datagrams.next() {
         let result = match &cfg.transport {
-            // Oversized (a resent probe): send under the DF lock so it can't inherit a probe's DF bit
-            DatagramTransport::Direct(udp, Some(df)) if d.len() > mtu_floor => {
-                df.send_to(udp, &d, cfg.remote, false).await
-            }
-            DatagramTransport::Direct(udp, _) => udp.send_to(&d, cfg.remote).await.map(|_| ()),
+            DatagramTransport::Direct(sender) => sender.send_to(&d, cfg.remote).await,
             DatagramTransport::Proxy(proxy) => proxy
                 .send_to(&d, cfg.remote)
                 .await
@@ -1638,7 +1652,7 @@ mod tests {
         st.fill_send_window();
         let (probe_seq, probe_bytes) = st.probe_out.clone().expect("probe queued");
         assert_eq!(probe_seq, 2, "the first data packet is the probe");
-        assert!(probe_bytes.len() > floor && probe_bytes.len() <= (floor + ceiling) / 2);
+        assert_eq!(probe_bytes.len(), (floor + ceiling) / 2);
         // Normal packets keep the proven size while the probe is out
         assert!(st.outbox.iter().all(|d| d.len() <= floor));
         st.handle_packet(&ack(probe_seq, None), &[]);
@@ -1703,10 +1717,73 @@ mod tests {
         st.fill_send_window();
         let (seq, bytes) = st.probe_out.take().unwrap();
         st.outbox.clear();
-        st.mtu_probe_send_failed(seq);
+        st.mtu_probe_send_failed(seq, true);
         assert_eq!(st.mtu_ceiling, bytes.len() - 1);
         assert_eq!(st.outbox.len(), 1);
         assert_eq!(UtpHeader::decode(&st.outbox[0]).unwrap().0.seq_nr, seq);
+    }
+
+    #[test]
+    fn probe_send_error_other_than_too_big_keeps_the_ceiling() {
+        let shared = probing_initiator();
+        let mut st = shared.state.lock();
+        let ceiling = st.mtu_ceiling;
+        st.send_buf.extend(std::iter::repeat_n(9u8, 8 * MSS));
+        st.fill_send_window();
+        let (seq, _) = st.probe_out.take().unwrap();
+        st.outbox.clear();
+        st.mtu_probe_send_failed(seq, false);
+        assert_eq!(st.mtu_ceiling, ceiling);
+        assert!(st.mtu_probe.is_none(), "an unprobed resend proves nothing");
+        assert_eq!(st.outbox.len(), 1);
+        assert_eq!(UtpHeader::decode(&st.outbox[0]).unwrap().0.seq_nr, seq);
+    }
+
+    #[test]
+    fn acked_probes_close_the_search() {
+        let shared = probing_initiator();
+        let mut st = shared.state.lock();
+        let ceiling = st.mtu_ceiling;
+        for _ in 0..16 {
+            st.send_buf.extend(std::iter::repeat_n(9u8, 8 * MSS));
+            st.fill_send_window();
+            let Some((_, bytes)) = st.probe_out.take() else {
+                break;
+            };
+            let floor = st.mtu_floor;
+            assert_eq!(bytes.len(), (floor + st.mtu_ceiling) / 2);
+            let last = st.seq_nr.wrapping_sub(1);
+            st.handle_packet(&ack(last, None), &[]);
+            assert!(st.mtu_floor > floor, "every acked probe raises the floor");
+            st.send_buf.clear();
+            st.outbox.clear();
+        }
+        assert_eq!(st.mtu_ceiling, ceiling);
+        assert!(st.mtu_floor + MTU_SEARCH_GRANULARITY > ceiling);
+    }
+
+    #[test]
+    fn losing_a_probe_no_bigger_than_the_floor_is_ordinary_loss() {
+        let shared = probing_initiator();
+        let mut st = shared.state.lock();
+        let (floor, ceiling) = (st.mtu_floor, st.mtu_ceiling);
+        st.mtu_probe = Some((7, floor));
+        assert!(!st.on_mtu_probe_lost(7));
+        assert_eq!((st.mtu_floor, st.mtu_ceiling), (floor, ceiling));
+        assert!(st.mtu_probe.is_none());
+    }
+
+    #[test]
+    fn mtu_search_reopens_once_data_follows_the_reprobe_interval() {
+        let shared = probing_initiator();
+        let mut st = shared.state.lock();
+        st.mtu_ceiling = st.mtu_floor;
+        st.mtu_reprobe_at = Instant::now() - Duration::from_millis(1);
+        st.send_buf.extend(std::iter::repeat_n(9u8, 8 * MSS));
+        st.fill_send_window();
+        assert_eq!(st.mtu_ceiling, MAX_DATAGRAM_V4);
+        assert!(st.probe_out.is_some());
+        assert!(st.mtu_reprobe_at > Instant::now());
     }
 
     #[test]
@@ -1784,12 +1861,9 @@ mod tests {
         );
         hist.add_sample(51_000, t0);
         assert_eq!(hist.add_sample(51_000, t0), 50_000);
-        // Three minutes of 20 ms samples age out the 1 ms minimum
-        for minute in 1..=3 {
-            hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET * minute);
-        }
-        hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET * 3);
-        assert_eq!(hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET * 3), 0);
+        // The 1 ms minimum still sets the base a minute on, and has aged out two minutes on
+        assert_eq!(hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET), 19_000);
+        assert_eq!(hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET * 2), 0);
         // Wrapping timestamps compare correctly
         assert!(wrapping_lt(u32::MAX - 5, 3));
     }

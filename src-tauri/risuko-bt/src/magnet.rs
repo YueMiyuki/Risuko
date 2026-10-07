@@ -13,7 +13,8 @@ use tokio::task::JoinSet;
 use super::core::hash::sha256;
 use super::core::merkle::MerkleProofTable;
 use super::core::{
-    generate_peer_id, parse_info_v2_from_bytes, Id20, Id32, Magnet, ValidatedTorrentMetaV2Info,
+    generate_peer_id, parse_info_v2_from_bytes, Id20, Id32, Magnet, TorrentInfoHashes,
+    ValidatedTorrentMetaV2Info,
 };
 use super::dht::Dht;
 use super::peer::{connect_with_utp_fallback, PeerCommand, PeerEvent, SpawnPeer};
@@ -26,6 +27,8 @@ use super::wire::{Message, MessageEncoder};
 
 const META_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: usize = 32 * 1024 * 1024;
+/// Padded piece-layer hashes fetched per magnet (64 MiB), mirroring libtorrent's 2^21 piece cap
+const MAX_PIECE_LAYER_HASHES: u64 = 1 << 21;
 const OUR_UT_METADATA_ID: u8 = 3;
 const OUR_UT_PEX_ID: u8 = 4;
 const TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -288,7 +291,9 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
         let tx = peer_tx.clone();
         let magnet_peers = magnet.clone();
         tokio::spawn(async move {
-            for addr in magnet_peers.resolve_peers().await {
+            use futures_util::StreamExt;
+            let mut addrs = std::pin::pin!(magnet_peers.resolve_peers());
+            while let Some(addr) = addrs.next().await {
                 if tx.send((addr, PeerSource::Manual)).is_err() {
                     break;
                 }
@@ -363,6 +368,10 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                                 try_fetch_from_peer(
                                     addr,
                                     info_hash,
+                                    TorrentInfoHashes {
+                                        v1: want_v1,
+                                        v2: want_v2,
+                                    },
                                     our_peer_id,
                                     encryption,
                                     advertise_v2,
@@ -373,28 +382,8 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                             .await
                             .ok()
                             .flatten();
+                            // Info dict already matched the magnet's hashes
                             let Some((bytes, layers, layers_complete)) = fetched else { return };
-
-                            let digest = Sha1::digest(&bytes);
-                            let sha1_ok = Id20::from_slice(digest.as_slice())
-                                .map(|h| match want_v1 {
-                                    // Hybrid / pure-v1: must match declared v1
-                                    Some(v1) => h == v1,
-                                    // Pure-v2 magnet: peer cannot deliver a v1 dict by definition, so trust the v2 check below and skip the v1 gate
-                                    None => true,
-                                })
-                                .unwrap_or(false);
-                            // BEP 52: pure-v2 / hybrid magnets must also pass SHA-256 cross-validation against urn:btmh (hybrid info dicts hash identically under both algorithms)
-                            let sha256_ok = match want_v2 {
-                                Some(v2) => sha256(&bytes) == v2,
-                                None => true,
-                            };
-                            if !sha1_ok || !sha256_ok {
-                                tracing::debug!(
-                                    "peer {addr}: info hash mismatch (sha1_ok={sha1_ok} sha256_ok={sha256_ok})"
-                                );
-                                return;
-                            }
                             if !layers_complete {
                                 if can_use_v1_metadata_without_piece_layers(want_v1, &bytes) {
                                     if let Some(tx) = result_tx.lock().take() {
@@ -557,10 +546,22 @@ fn can_use_v1_metadata_without_piece_layers(want_v1: Option<Id20>, info_bytes: &
     })
 }
 
-/// Outcome of a single-peer fetch attempt: raw info dict bytes, any validated piece layers, and whether the layers cover every file that requires them; `(_, _, false)` means the metadata is v2 but at least one file's layer was rejected/missing, so the caller should try another peer rather than committing this partial result
+/// Whether a fetched info dict hashes to the magnet's declared v1 / v2 info-hashes
+fn info_matches_magnet(info_bytes: &[u8], want: TorrentInfoHashes) -> bool {
+    // Pure-v2 magnet: peer cannot deliver a v1 dict by definition, so only the v2 check gates
+    let sha1_ok = want.v1.is_none_or(|v1| {
+        Id20::from_slice(Sha1::digest(info_bytes).as_slice()).is_ok_and(|h| h == v1)
+    });
+    // BEP 52: pure-v2 / hybrid magnets must also pass SHA-256 cross-validation against urn:btmh (hybrid info dicts hash identically under both algorithms)
+    sha1_ok && want.v2.is_none_or(|v2| sha256(info_bytes) == v2)
+}
+
+/// Outcome of a single-peer fetch attempt: raw info dict bytes, any validated piece layers, and whether the layers cover every file that requires them; `(_, _, false)` means the metadata is v2 but at least one file's layer was rejected/missing, so the caller should try another peer rather than committing this partial result; `None` also covers an info dict that does not match `want`
+#[allow(clippy::too_many_arguments)]
 async fn try_fetch_from_peer(
     addr: SocketAddr,
     info_hash: Id20,
+    want: TorrentInfoHashes,
     our_peer_id: Id20,
     encryption: crate::peer::EncryptionPolicy,
     advertise_v2: bool,
@@ -596,7 +597,7 @@ async fn try_fetch_from_peer(
     .ok()?;
 
     // Run the protocol inside a helper so every exit path disconnects the peer actor below; otherwise timed-out or rejected probes leak the socket and reader task
-    let result = try_fetch_from_peer_inner(&handle, rx).await;
+    let result = try_fetch_from_peer_inner(&handle, rx, want).await;
     let _ = handle.tx.send(PeerCommand::Disconnect).await;
     result
 }
@@ -604,6 +605,7 @@ async fn try_fetch_from_peer(
 async fn try_fetch_from_peer_inner(
     handle: &super::peer::PeerHandle,
     mut rx: tokio::sync::mpsc::Receiver<PeerEvent>,
+    want: TorrentInfoHashes,
 ) -> Option<(Vec<u8>, BTreeMap<Id32, Vec<u8>>, bool)> {
     // Collect Handshook and the peer's extended handshake from a single receive loop; the extended handshake message can arrive before the BT handshake event under some orderings, and draining two sequential loops would drop whichever arrives first in the other arm
     let mut peer_supports_ext: Option<bool> = None;
@@ -692,6 +694,11 @@ async fn try_fetch_from_peer_inner(
     if info_bytes.len() != total_size {
         return None;
     }
+    // Verify before trusting any field; v2 file lengths size the piece-layer fetch below
+    if !info_matches_magnet(&info_bytes, want) {
+        tracing::debug!("peer {}: info hash mismatch", handle.addr);
+        return None;
+    }
 
     // If the info dict is v2, attempt to fetch each file's piece layer on the same connection via BEP 52 HASH_REQUEST; a peer that has the info but cannot serve layers (HashReject / no v2 support) yields `(_, _, false)` so the driver tries another peer
     let v2 = match parse_info_v2_from_bytes(&info_bytes) {
@@ -742,18 +749,28 @@ async fn fetch_piece_layers(
     // One fetch per distinct `pieces_root` that has a layer (file > piece_length)
     let pad = pad_hash(piece_length / BLOCK_SIZE);
     let mut wanted: BTreeMap<Id32, LayerFetch> = BTreeMap::new();
+    let mut total_hashes = 0u64;
     for f in &v2.files {
         if f.length <= piece_length as u64 || wanted.contains_key(&f.pieces_root) {
             continue;
         }
-        let piece_count = f.length.div_ceil(piece_length as u64) as u32;
-        let padded = piece_count.max(2).next_power_of_two() as usize;
+        // Bound before allocating; a hash-matched dict can still declare absurd file lengths
+        let piece_count = f.length.div_ceil(piece_length as u64);
+        let padded = piece_count
+            .max(2)
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX);
+        total_hashes = total_hashes.saturating_add(padded);
+        if total_hashes > MAX_PIECE_LAYER_HASHES {
+            tracing::debug!("piece layers exceed {MAX_PIECE_LAYER_HASHES} hashes; not fetching");
+            return Some(BTreeMap::new());
+        }
         wanted.insert(
             f.pieces_root,
             LayerFetch {
                 file_len: f.length,
-                pending: piece_layer_requests(piece_count),
-                layer: pad.0.repeat(padded),
+                pending: piece_layer_requests(piece_count as u32),
+                layer: pad.0.repeat(padded as usize),
             },
         );
     }
@@ -1023,6 +1040,49 @@ mod tests {
         // Wire-bit advertisement still applies because the metadata carries v2 hashes, so peers that gate engagement on the V2 reserved bit see us as v2-aware; serving piece layers / announcing v2 info-hashes remains gated on `supports_v2_wire` (false here), so the runtime falls back to the v1 download path
         assert!(meta.info_v2.is_some());
         assert!(!crate::core::supports_v2_wire(&meta));
+    }
+
+    #[test]
+    fn info_must_match_every_declared_hash() {
+        let info = b"d4:name5:helloe";
+        let v1 = Id20::from_slice(Sha1::digest(info).as_slice()).unwrap();
+        let v2 = sha256(info);
+        let other_v1 = Id20([9u8; 20]);
+        let other_v2 = Id32([9u8; 32]);
+        let want = |v1, v2| TorrentInfoHashes { v1, v2 };
+
+        assert!(info_matches_magnet(info, want(Some(v1), None)));
+        assert!(info_matches_magnet(info, want(None, Some(v2))));
+        assert!(info_matches_magnet(info, want(Some(v1), Some(v2))));
+        assert!(!info_matches_magnet(info, want(Some(other_v1), None)));
+        assert!(!info_matches_magnet(info, want(None, Some(other_v2))));
+        assert!(!info_matches_magnet(info, want(Some(v1), Some(other_v2))));
+    }
+
+    #[tokio::test]
+    async fn oversized_piece_layers_are_refused_before_requesting() {
+        let (tx, mut cmd_rx) = mpsc::channel(8);
+        let handle = super::super::peer::PeerHandle {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            tx,
+            io_abort: tokio::spawn(async {}).abort_handle(),
+        };
+        let (_event_tx, mut rx) = mpsc::channel(1);
+        let piece_length = 16 * 1024;
+        let v2 = ValidatedTorrentMetaV2Info {
+            name: "huge".into(),
+            piece_length,
+            private: false,
+            files: vec![crate::core::metainfo::TorrentMetaInfoV2 {
+                path: vec!["huge".into()],
+                length: (MAX_PIECE_LAYER_HASHES + 1) * piece_length as u64,
+                pieces_root: Id32([1u8; 32]),
+            }],
+        };
+
+        let layers = fetch_piece_layers(&handle, &mut rx, &v2).await;
+        assert!(layers.is_some_and(|l| l.is_empty()));
+        assert!(cmd_rx.try_recv().is_err(), "no hash request may be sent");
     }
 
     #[test]

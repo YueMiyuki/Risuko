@@ -2,6 +2,7 @@ pub mod http;
 pub mod obfuscation;
 pub mod udp;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -121,7 +122,10 @@ pub async fn announce_with_proxy(
     announce_with_proxy_and_source(url, req, timeout, proxy, None).await
 }
 
-/// BEP 7: without a fixed source address, announce once per address family and merge the answers; a configured source or proxy keeps a single announce
+/// How long the slower family may still answer after the other succeeds
+const FAMILY_ANNOUNCE_GRACE: Duration = Duration::from_secs(3);
+
+/// BEP 7: without a fixed source address, announce once per address family and merge the answers; a configured source or a proxied route keeps a single announce
 pub async fn announce_with_proxy_and_source(
     url: &str,
     req: &AnnounceRequest,
@@ -129,26 +133,66 @@ pub async fn announce_with_proxy_and_source(
     proxy: Option<&risuko_http::ProxyConnector>,
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let proxied = proxy.is_some_and(|proxy| proxy.has_proxy());
+    let proxied = proxy.is_some_and(|proxy| routes_via_proxy(url, proxy));
     if source.is_some() || proxied {
         return announce_once(url, req, timeout, proxy, source).await;
     }
-    let (v4, v6) = tokio::join!(
-        announce_family(url, req, timeout, AddressFamily::V4),
-        announce_family(url, req, timeout, AddressFamily::V6),
-    );
-    merge_family_responses(v4, v6)
+    join_family_announces(
+        announce_family(url, req, timeout, proxy, AddressFamily::V4),
+        announce_family(url, req, timeout, proxy, AddressFamily::V6),
+    )
+    .await
+}
+
+/// Whether this tracker's route goes through the proxy; `no_proxy` matches are contacted direct
+fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
+    if url.starts_with("udp://") {
+        udp::routes_via_proxy(url, proxy)
+    } else {
+        http::routes_via_proxy(url, proxy)
+    }
+}
+
+/// Once one family succeeds the other only gets `FAMILY_ANNOUNCE_GRACE`; after a failure it keeps its own timeout
+async fn join_family_announces(
+    v4: impl Future<Output = Result<AnnounceResponse, TrackerError>>,
+    v6: impl Future<Output = Result<AnnounceResponse, TrackerError>>,
+) -> Result<AnnounceResponse, TrackerError> {
+    async fn rest(
+        first: &Result<AnnounceResponse, TrackerError>,
+        other: impl Future<Output = Result<AnnounceResponse, TrackerError>>,
+    ) -> Result<AnnounceResponse, TrackerError> {
+        if first.is_err() {
+            return other.await;
+        }
+        tokio::time::timeout(FAMILY_ANNOUNCE_GRACE, other)
+            .await
+            .unwrap_or(Err(TrackerError::Timeout))
+    }
+
+    tokio::pin!(v4, v6);
+    tokio::select! {
+        v4 = &mut v4 => {
+            let v6 = rest(&v4, v6).await;
+            merge_family_responses(v4, v6)
+        }
+        v6 = &mut v6 => {
+            let v4 = rest(&v6, v4).await;
+            merge_family_responses(v4, v6)
+        }
+    }
 }
 
 async fn announce_family(
     url: &str,
     req: &AnnounceRequest,
     timeout: Duration,
+    proxy: Option<&risuko_http::ProxyConnector>,
     family: AddressFamily,
 ) -> Result<AnnounceResponse, TrackerError> {
     let attempt = async {
         if url.starts_with("http://") || url.starts_with("https://") {
-            http::announce_for_family(url, req, family).await
+            http::announce_for_family(url, req, family, proxy).await
         } else if url.starts_with("udp://") {
             udp::announce_for_family(url, req, family).await
         } else {
@@ -334,6 +378,60 @@ mod tests {
         );
         assert!(AddressFamily::V6.matches(&"[::1]:1".parse().unwrap()));
         assert!(AddressFamily::V4.unspecified().ip().is_unspecified());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_family_success_waits_only_a_grace_period_for_the_other() {
+        let started = tokio::time::Instant::now();
+        let merged = join_family_announces(std::future::pending(), async {
+            Ok(response(&["[2001:db8::1]:1"], 60, 1))
+        })
+        .await
+        .unwrap();
+        assert_eq!(merged.peers.len(), 1);
+        assert_eq!(started.elapsed(), FAMILY_ANNOUNCE_GRACE);
+
+        // A failed family leaves the other its own timeout
+        let started = tokio::time::Instant::now();
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Ok(response(&["198.51.100.1:1"], 60, 1))
+        };
+        let merged = join_family_announces(slow, async { Err(TrackerError::Timeout) })
+            .await
+            .unwrap();
+        assert_eq!(merged.peers.len(), 1);
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn only_a_proxied_route_keeps_a_single_announce() {
+        use risuko_http::{Proxy, ProxyConnector};
+
+        let proxy = ProxyConnector::from_proxy(
+            Proxy::all("socks5://127.0.0.1:1080")
+                .unwrap()
+                .with_bypass("direct.example"),
+        );
+        assert!(routes_via_proxy("http://tracker.example/announce", &proxy));
+        assert!(routes_via_proxy("udp://tracker.example:6969", &proxy));
+        assert!(!routes_via_proxy("https://direct.example/announce", &proxy));
+        assert!(!routes_via_proxy(
+            "udp://tracker.direct.example:6969/announce",
+            &proxy
+        ));
+
+        // A TCP-only proxy leaves UDP trackers direct
+        let tcp_only = proxy.with_udp_proxy(Some(ProxyConnector::direct()));
+        assert!(routes_via_proxy(
+            "http://tracker.example/announce",
+            &tcp_only
+        ));
+        assert!(!routes_via_proxy("udp://tracker.example:6969", &tcp_only));
+        assert!(!routes_via_proxy(
+            "http://tracker.example/announce",
+            &ProxyConnector::direct()
+        ));
     }
 
     #[test]

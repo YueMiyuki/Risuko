@@ -80,6 +80,8 @@ impl FilesystemStorage {
         let Some(parts_dir) = self.parts_dir.clone() else {
             return Vec::new();
         };
+        // Exclusive so no in-flight write lands in a real file this call reroutes to its shadow
+        let _exclusive = self.io_gate.write().await;
         let candidates: Vec<(usize, PathBuf, bool)> = self
             .layout
             .files()
@@ -243,16 +245,18 @@ impl FilesystemStorage {
         open_cached(&self.handles, idx, self.layout.files()[idx].path.clone()).await
     }
 
-    /// Flush buffered writes and drop every cached file handle
+    /// Flush buffered writes and drop every cached file handle, shadows included
     pub async fn close_handles(&self) -> Result<(), StorageError> {
-        let snapshot: Vec<Arc<std::fs::File>> = {
-            let mut guard = self.handles.lock();
-            let snap = guard.iter().filter_map(|h| h.clone()).collect();
-            for slot in guard.iter_mut() {
-                *slot = None;
-            }
-            snap
-        };
+        let snapshot: Vec<Arc<std::fs::File>> = [&self.handles, &self.shadow_handles]
+            .into_iter()
+            .flat_map(|cache| {
+                let mut guard = cache.lock();
+                guard
+                    .iter_mut()
+                    .filter_map(Option::take)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let mut first_error: Option<io::Error> = None;
         for handle in snapshot {
             match task::spawn_blocking(move || handle.sync_data())
@@ -363,12 +367,12 @@ impl FilesystemStorage {
         Ok(())
     }
 
-    /// Flush in-flight writes
+    /// Flush in-flight writes, shadows included
     pub async fn flush(&self) -> Result<(), StorageError> {
-        let snapshot: Vec<_> = {
-            let g = self.handles.lock();
-            g.iter().filter_map(|h| h.clone()).collect()
-        };
+        let snapshot: Vec<_> = [&self.handles, &self.shadow_handles]
+            .into_iter()
+            .flat_map(|cache| cache.lock().iter().flatten().cloned().collect::<Vec<_>>())
+            .collect();
         for handle in snapshot {
             task::spawn_blocking(move || handle.sync_data())
                 .await
@@ -537,6 +541,15 @@ mod tests {
 
         // Piece 0 covers all of a.bin and the start of b.bin
         let only_b: HashSet<usize> = [1].into_iter().collect();
+        {
+            // Rerouting waits out in-flight I/O
+            let _io = storage.io_gate.read().await;
+            let rerouted = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                storage.set_selection(Some(&only_b)),
+            );
+            assert!(rerouted.await.is_err());
+        }
         assert!(storage.set_selection(Some(&only_b)).await.is_empty());
         let piece0: Vec<u8> = (1u8..=16).collect();
         storage.write_at(0, &piece0).await.unwrap();
@@ -550,6 +563,12 @@ mod tests {
         assert_eq!(
             back, piece0,
             "boundary piece reads back through the part file"
+        );
+        storage.flush().await.unwrap();
+        storage.close_handles().await.unwrap();
+        assert!(
+            storage.shadow_handles.lock().iter().all(Option::is_none),
+            "close_handles must release part-file descriptors too"
         );
 
         // Selecting a.bin moves its bytes out of the part file

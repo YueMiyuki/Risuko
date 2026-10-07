@@ -7,6 +7,8 @@ pub struct PieceTracker {
     have_local: Vec<bool>,
     /// Pieces overlapping a selected file; others are never picked or required
     wanted: Vec<bool>,
+    /// Running byte total of wanted pieces not held locally
+    left: u64,
     /// Pieces where all chunks are requested but not yet hash-verified; cleared on verify success/failure or when a peer owning chunks disconnects
     in_flight: Vec<bool>,
     /// How many peers advertise each piece
@@ -24,6 +26,7 @@ impl PieceTracker {
             lengths,
             have_local: vec![false; n],
             wanted: vec![true; n],
+            left: lengths.total_length(),
             in_flight: vec![false; n],
             availability: vec![0; n],
             sorted: Vec::new(),
@@ -37,11 +40,20 @@ impl PieceTracker {
     }
 
     pub fn set_local(&mut self, idx: ValidPieceIndex, have: bool) {
-        self.have_local[idx.get_usize()] = have;
+        let i = idx.get_usize();
+        if self.have_local[i] != have && self.wanted[i] {
+            let len = self.lengths.piece_length_of(idx) as u64;
+            if have {
+                self.left -= len;
+            } else {
+                self.left += len;
+            }
+        }
+        self.have_local[i] = have;
         self.sorted_dirty = true;
         if have {
             // No longer in-flight once verified
-            self.in_flight[idx.get_usize()] = false;
+            self.in_flight[i] = false;
         }
     }
 
@@ -54,6 +66,7 @@ impl PieceTracker {
         if wanted.len() == self.wanted.len() {
             self.wanted = wanted;
             self.sorted_dirty = true;
+            self.left = self.scan_bytes_left();
         }
     }
 
@@ -63,6 +76,10 @@ impl PieceTracker {
 
     /// Bytes of wanted pieces we don't have yet (the tracker `left` value)
     pub fn bytes_left(&self) -> u64 {
+        self.left
+    }
+
+    fn scan_bytes_left(&self) -> u64 {
         (0..self.lengths.total_pieces())
             .filter(|&i| self.wanted[i as usize] && !self.have_local[i as usize])
             .filter_map(|i| self.lengths.validate_piece(i).ok())
@@ -502,6 +519,28 @@ mod tests {
         assert!(t.is_complete());
         assert!(t.choose_piece(&[0b1111_0000]).is_none());
         assert_eq!(t.bytes_left(), 0);
+    }
+
+    #[test]
+    fn running_bytes_left_matches_full_scan() {
+        // Short last piece
+        let mut t = PieceTracker::new(Lengths::new(4 * 1024 + 100, 1024).unwrap());
+        let piece = |t: &PieceTracker, i| t.lengths.validate_piece(i).unwrap();
+        assert_eq!(t.bytes_left(), 4 * 1024 + 100);
+        t.set_local(piece(&t, 4), true);
+        t.set_local(piece(&t, 4), true);
+        assert_eq!(t.bytes_left(), 4 * 1024);
+        t.set_wanted(vec![true, false, true, false, true]);
+        assert_eq!(t.bytes_left(), 2 * 1024);
+        // Unwanted pieces never move the counter
+        t.set_local(piece(&t, 1), true);
+        assert_eq!(t.bytes_left(), 2 * 1024);
+        t.set_local(piece(&t, 4), false);
+        assert_eq!(t.bytes_left(), 2 * 1024 + 100);
+        t.set_local(piece(&t, 0), true);
+        t.set_wanted(vec![true; 5]);
+        assert_eq!(t.bytes_left(), 2 * 1024 + 100);
+        assert_eq!(t.bytes_left(), t.scan_bytes_left());
     }
 
     #[test]

@@ -61,7 +61,11 @@ pub fn deobfuscate_peers(
             if n == 0 || n > MAX_KEYSTREAM_PEERS {
                 return None;
             }
-            (i as usize * stride, take(&mut rc4, n as usize * stride))
+            // The keystream wraps every `n` peers, so reducing `i` first keeps the offset small
+            (
+                (i % n) as usize * stride,
+                take(&mut rc4, n as usize * stride),
+            )
         }
         _ => (0, take(&mut rc4, data.len())),
     };
@@ -124,6 +128,17 @@ mod tests {
         let (window, i, n) = tracker_window(b"iv-bytes", &list, 2, 1, 2);
         let plain =
             deobfuscate_peers(&ih(), Some(b"iv-bytes"), Some(i), Some(n), &window, 6).unwrap();
+        assert_eq!(plain, list[6..]);
+    }
+
+    #[test]
+    fn window_start_past_the_keystream_wraps_like_the_reduced_index() {
+        let list = hex::decode("d048c1561ae1d151ad0f37f180d506081ae1").unwrap();
+        let (window, i, n) = tracker_window(b"iv-bytes", &list, 2, 1, 2);
+        // `i ^ 1` recovers the mask; `u32::MAX` is peer 1 modulo the 2-peer keystream
+        let far = i ^ 1 ^ u32::MAX;
+        let plain =
+            deobfuscate_peers(&ih(), Some(b"iv-bytes"), Some(far), Some(n), &window, 6).unwrap();
         assert_eq!(plain, list[6..]);
     }
 

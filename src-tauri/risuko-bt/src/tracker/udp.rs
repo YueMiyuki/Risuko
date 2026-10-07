@@ -79,9 +79,7 @@ pub async fn announce_with_proxy_and_source(
     reject_obfuscation(req, url)?;
     let (host, port) = parse_udp_url(url)?;
     let url_data: Arc<[u8]> = udp_url_data(url).into();
-    let bypasses_proxy = proxy
-        .and_then(|proxy| proxy.udp_no_proxy().or_else(|| proxy.no_proxy()))
-        .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
+    let bypasses_proxy = proxy.is_some_and(|proxy| is_bypassed(proxy, &host, port));
     let source_is_concrete = source.is_some_and(|source| !source.ip().is_unspecified());
     if let Some(proxy) =
         proxy.filter(|proxy| proxy.has_proxy() && !(source_is_concrete && bypasses_proxy))
@@ -117,6 +115,19 @@ pub async fn announce_for_family(
         .filter(|target| family.matches(target))
         .collect::<Vec<_>>();
     race_endpoints(targets, &host, req, None, url_data).await
+}
+
+/// Whether datagrams to the tracker at `url` go through the UDP proxy rather than direct
+pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
+    proxy.udp_proxy().is_some()
+        && !parse_udp_url(url).is_ok_and(|(host, port)| is_bypassed(proxy, &host, port))
+}
+
+fn is_bypassed(proxy: &risuko_http::ProxyConnector, host: &str, port: u16) -> bool {
+    proxy
+        .udp_no_proxy()
+        .or_else(|| proxy.no_proxy())
+        .is_some_and(|no_proxy| no_proxy.matches_host_port(host, Some(port)))
 }
 
 /// UDP announces can't carry BEP 8's `sha_ih`
@@ -308,11 +319,7 @@ pub async fn scrape_with_proxy(
     }
     if source.is_some_and(|source| !source.ip().is_unspecified()) {
         let (host, port) = parse_udp_url(url)?;
-        let bypasses_proxy = proxy
-            .udp_no_proxy()
-            .or_else(|| proxy.no_proxy())
-            .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
-        if bypasses_proxy {
+        if is_bypassed(proxy, &host, port) {
             return scrape(url, info_hashes, source).await;
         }
     }

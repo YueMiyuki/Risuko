@@ -101,12 +101,12 @@ pub struct TorrentStats {
 }
 
 impl TorrentStats {
-    pub(crate) fn initial(total_bytes: u64, file_lens: Vec<u64>) -> Self {
+    pub(crate) fn initial(total_bytes: u64, left_bytes: u64, file_lens: Vec<u64>) -> Self {
         let file_progress = vec![0u64; file_lens.len()];
         Self {
             total_bytes,
             progress_bytes: 0,
-            left_bytes: total_bytes,
+            left_bytes,
             uploaded_bytes: 0,
             finished: false,
             file_progress,

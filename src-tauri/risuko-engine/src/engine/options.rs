@@ -641,30 +641,22 @@ impl EngineOptions {
     }
 }
 
-/// JSON bool, number, or `"true"`/`"false"`/`"1"`/`"0"`/`"yes"`/`"no"` string
+/// JSON bool, integer (non-zero = true), or a trimmed, case-insensitive `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` string
 pub(crate) fn json_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
-        Value::String(s) => match s.as_str() {
-            "true" | "1" | "yes" => Some(true),
-            "false" | "0" | "no" => Some(false),
+        Value::Number(n) => n.as_i64().map(|v| v != 0),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
             _ => None,
         },
-        Value::Number(n) => n.as_u64().map(|v| v != 0),
         _ => None,
     }
 }
 
 fn value_as_bool(value: &Value) -> bool {
-    match value {
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_i64().is_some_and(|value| value != 0),
-        Value::String(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        ),
-        _ => false,
-    }
+    json_bool(value).unwrap_or(false)
 }
 
 pub(crate) fn build_p2p_proxy_connector(
@@ -1244,6 +1236,28 @@ mod tests {
         }
         assert_eq!(opts.get_bool("k"), None);
         assert_eq!(opts.get_bool("missing"), None);
+    }
+
+    #[test]
+    fn json_bool_matches_value_as_bool() {
+        for v in [
+            json!(" TRUE "),
+            json!("On"),
+            json!("yes"),
+            json!(-1),
+            json!(2),
+        ] {
+            assert_eq!(json_bool(&v), Some(true), "{v}");
+            assert!(value_as_bool(&v), "{v}");
+        }
+        for v in [json!(" False"), json!("OFF"), json!("no"), json!(0)] {
+            assert_eq!(json_bool(&v), Some(false), "{v}");
+            assert!(!value_as_bool(&v), "{v}");
+        }
+        for v in [json!("maybe"), json!(1.5), json!(null), json!([true])] {
+            assert_eq!(json_bool(&v), None, "{v}");
+            assert!(!value_as_bool(&v), "{v}");
+        }
     }
 
     #[test]

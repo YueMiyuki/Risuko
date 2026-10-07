@@ -32,11 +32,6 @@ pub fn resolve_routing(
     default_dir: &str,
     file_category_dirs: &std::collections::HashMap<String, String>,
 ) -> RoutingDecision {
-    // Desktop downloads carry a `.part` suffix until they finish
-    let filename = filename
-        .strip_suffix(".part")
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or(filename);
     // 1. Custom routing rules
     for rule in rules {
         if !rule.enabled {
@@ -71,6 +66,14 @@ pub fn resolve_routing(
         tag: None,
         dir: default_dir.to_string(),
     }
+}
+
+/// Final name for HTTP/FTP/SFTP downloads, which treat a trailing `.part` as their temp suffix
+pub(crate) fn strip_part_suffix(filename: &str) -> &str {
+    filename
+        .strip_suffix(".part")
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(filename)
 }
 
 /// Case-insensitive glob match using the `glob` crate
@@ -147,14 +150,24 @@ mod tests {
     }
 
     #[test]
-    fn part_suffix_is_ignored() {
+    fn part_suffix_is_stripped_only_on_request() {
         let rules = vec![rule("r1", "Movies", "*.mkv", "/Movies", true)];
         let mut cats = HashMap::new();
         cats.insert("music".into(), "/Music".into());
-        let dec = resolve_routing(&rules, "movie.mkv.part", "/Downloads", &cats);
+        let dec = resolve_routing(
+            &rules,
+            strip_part_suffix("movie.mkv.part"),
+            "/Downloads",
+            &cats,
+        );
         assert_eq!(dec.dir, "/Movies");
-        let dec = resolve_routing(&[], "song.mp3.part", "/Downloads", &cats);
+        let dec = resolve_routing(&[], strip_part_suffix("song.mp3.part"), "/Downloads", &cats);
         assert_eq!(dec.dir, "/Music");
+        assert_eq!(strip_part_suffix(".part"), ".part");
+        // A real `*.part` name is routed as-is
+        let rules = vec![rule("r2", "Parts", "*.part", "/Parts", true)];
+        let dec = resolve_routing(&rules, "movie.mkv.part", "/Downloads", &cats);
+        assert_eq!(dec.dir, "/Parts");
     }
 
     #[test]

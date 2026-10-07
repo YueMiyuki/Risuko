@@ -16,7 +16,7 @@ use rand::RngExt;
 use sha1::{Digest, Sha1};
 
 use super::blocklist::BlockList;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -80,6 +80,8 @@ const OUR_UT_HOLEPUNCH_ID: u8 = 5;
 const MAX_PEX_SOURCE_ENTRIES: usize = 4096;
 const META_PIECE_SIZE: usize = 16 * 1024;
 const MAX_FAST_PIECES: usize = 10;
+/// Concurrent disk-backed BEP 52 leaf-hash replies per torrent
+const MAX_LEAF_HASH_JOBS: usize = 4;
 const MAX_SUGGESTED_PIECES: usize = 64;
 const WEBSEED_MAX_WORKERS: usize = 4;
 const WEBSEED_MAX_PIECES_PER_JOB: usize = 8;
@@ -299,6 +301,17 @@ fn wanted_pieces(layout: &FileSet, lengths: &Lengths, only_files: Option<&[usize
     wanted
 }
 
+/// Total length of the `wanted` pieces
+fn wanted_bytes(lengths: &Lengths, wanted: &[bool]) -> u64 {
+    wanted
+        .iter()
+        .enumerate()
+        .filter(|(_, wanted)| **wanted)
+        .filter_map(|(i, _)| lengths.validate_piece(i as u32).ok())
+        .map(|vpi| lengths.piece_length_of(vpi) as u64)
+        .sum()
+}
+
 fn selected_file_set(only_files: Option<&[usize]>) -> Option<HashSet<usize>> {
     only_files.map(|files| files.iter().copied().collect())
 }
@@ -323,8 +336,18 @@ pub async fn spawn(
     let name = Some(init.meta.info.name.clone());
     let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCommand>(64);
     let file_lens: Vec<u64> = init.meta.info.iter_file_details().map(|f| f.len).collect();
+    // Selection-aware until the loop rescans local pieces
+    let left_bytes = wanted_bytes(
+        &init.lengths,
+        &wanted_pieces(
+            &FileSet::from_meta(&init.meta.info, &init.root_dir),
+            &init.lengths,
+            init.only_files.as_deref(),
+        ),
+    );
     let stats = Arc::new(Mutex::new(TorrentStats::initial(
         init.lengths.total_length(),
+        left_bytes,
         file_lens,
     )));
     let meta_arc = Arc::new(init.meta.clone());
@@ -649,8 +672,10 @@ async fn torrent_loop(
         }
     };
     let serve_v2_layers = supports_v2 && hash_tables.is_some();
+    let leaf_hash_jobs = Arc::new(Semaphore::new(MAX_LEAF_HASH_JOBS));
     let advertise_v2 = init.advertise_v2 && serve_v2_layers;
-    advertise_v2_flag.store(advertise_v2, Ordering::Relaxed);
+    // Inbound handshakes pick the bit per info-hash from this (see `known_infohashes`)
+    advertise_v2_flag.store(serve_v2_layers, Ordering::Relaxed);
 
     let (pipeline_floor, pipeline_cap) = pipeline_bounds(init.max_outstanding_per_peer);
     let max_peers = init.max_peers.unwrap_or(DEFAULT_MAX_PEERS).max(1);
@@ -1305,6 +1330,7 @@ async fn torrent_loop(
                     &verifier,
                     &info_bytes,
                     hash_tables.as_deref().map(|v| &**v),
+                    &leaf_hash_jobs,
                     pipeline_floor,
                     pipeline_cap,
                     max_peers,
@@ -2153,6 +2179,7 @@ async fn process_peer_event(
     verifier: &PieceVerifier,
     info_bytes: &Arc<Vec<u8>>,
     hash_tables: Option<&[MerkleProofTable]>,
+    leaf_hash_jobs: &Arc<Semaphore>,
     pipeline_floor: usize,
     pipeline_cap: usize,
     max_peers: usize,
@@ -2684,6 +2711,7 @@ async fn process_peer_event(
                         serve_leaf_hash_request(
                             request,
                             hash_tables,
+                            leaf_hash_jobs,
                             storage,
                             piece_tracker,
                             lengths,
@@ -5001,14 +5029,18 @@ impl LeafHashRequest {
     }
 }
 
-/// Torrent offset of the v2 file with `root`, matching v2 files to non-padding layout entries in order
+/// Torrent offset of the v2 file with `root`, matching v2 files to non-padding, non-empty layout entries in order (v2 lists no empty files)
 fn v2_file_offset(
     tables: &[MerkleProofTable],
     layout: &FileSet,
     root: super::core::Id32,
 ) -> Option<(usize, u64)> {
     let k = tables.iter().position(|t| t.file_root == root)?;
-    let file = layout.files().iter().filter(|f| !f.padding).nth(k)?;
+    let file = layout
+        .files()
+        .iter()
+        .filter(|f| !f.padding && f.length > 0)
+        .nth(k)?;
     let table = &tables[k];
     (file.length == table.file_length && file.offset.is_multiple_of(table.piece_length as u64))
         .then_some((k, file.offset))
@@ -5018,6 +5050,7 @@ fn v2_file_offset(
 fn serve_leaf_hash_request(
     request: LeafHashRequest,
     tables: Option<&[MerkleProofTable]>,
+    jobs: &Arc<Semaphore>,
     storage: &Arc<FilesystemStorage>,
     piece_tracker: &PieceTracker,
     lengths: &Lengths,
@@ -5042,12 +5075,17 @@ fn serve_leaf_hash_request(
         });
         all_local.then(|| (table.clone(), file_offset, pieces))
     })();
-    let Some((table, file_offset, pieces)) = plan else {
+    // Reject past the cap so flooded requests can't pile up disk reads and rehashing
+    let permit = plan
+        .as_ref()
+        .and_then(|_| Arc::clone(jobs).try_acquire_owned().ok());
+    let (Some((table, file_offset, pieces)), Some(permit)) = (plan, permit) else {
         let _ = cmd_tx.try_send(PeerCommand::Send(request.reject()));
         return;
     };
     let storage = Arc::clone(storage);
     tokio::spawn(async move {
+        let _permit = permit;
         let mut piece_blocks = HashMap::with_capacity(pieces.len());
         for p in pieces {
             let start = p as u64 * table.piece_length as u64;
@@ -5515,6 +5553,10 @@ mod tests {
             wanted_pieces(&layout, &lengths, Some(&[1, 9])),
             vec![false; 3]
         );
+        assert_eq!(
+            wanted_bytes(&lengths, &wanted_pieces(&layout, &lengths, Some(&[2]))),
+            10
+        );
         assert_eq!(info.selectable_file_indices(), vec![0, 2]);
     }
 
@@ -5823,6 +5865,91 @@ mod tests {
         (vec![table], file_root)
     }
 
+    #[test]
+    fn v2_file_offset_skips_empty_v1_entries() {
+        let piece_length = BLOCK_SIZE;
+        let (mut tables, _) = make_v2_tables(2, piece_length);
+        let (second, second_root) = make_v2_tables(3, piece_length);
+        tables.extend(second);
+        let file = |name: &str, length: u64| TorrentMetaInfo {
+            path: vec![name.into()],
+            length,
+            padding: false,
+        };
+        let info = ValidatedTorrentMetaV1Info {
+            name: "hybrid".into(),
+            piece_length,
+            pieces: vec![0; 20 * 5],
+            private: false,
+            // Empty files have no v2 table
+            files: vec![
+                file("a", 2 * piece_length as u64),
+                file("empty", 0),
+                file("b", 3 * piece_length as u64),
+            ],
+            single_file_mode: false,
+        };
+        let layout = FileSet::from_meta(&info, Path::new("/tmp"));
+        assert_eq!(
+            v2_file_offset(&tables, &layout, second_root),
+            Some((1, 2 * piece_length as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_hash_requests_past_the_job_cap_are_rejected() {
+        let piece_length = BLOCK_SIZE;
+        let (tables, root) = make_v2_tables(2, piece_length);
+        let info = ValidatedTorrentMetaV1Info {
+            name: "leaf.bin".into(),
+            piece_length,
+            pieces: vec![0; 20 * 2],
+            private: false,
+            files: vec![TorrentMetaInfo {
+                path: vec!["leaf.bin".into()],
+                length: 2 * piece_length as u64,
+                padding: false,
+            }],
+            single_file_mode: true,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
+        let lengths = Lengths::new(2 * piece_length as u64, piece_length).unwrap();
+        let mut tracker = PieceTracker::new(lengths);
+        for i in 0..2 {
+            tracker.set_local(lengths.validate_piece(i).unwrap(), true);
+        }
+        let request = LeafHashRequest {
+            pieces_root: root.0,
+            index: 0,
+            length: 2,
+            proof_layers: 0,
+        };
+        let jobs = Arc::new(Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel(4);
+        let serve = |tx| {
+            serve_leaf_hash_request(
+                request,
+                Some(&tables),
+                &jobs,
+                &storage,
+                &tracker,
+                &lengths,
+                tx,
+            )
+        };
+
+        // The worker holds the only permit until it runs
+        serve(tx.clone());
+        assert_eq!(jobs.available_permits(), 0);
+        assert!(rx.try_recv().is_err());
+        serve(tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PeerCommand::Send(Message::HashReject { .. }))
+        ));
+    }
+
     fn two_file_layout() -> (Lengths, FileSet) {
         let info = ValidatedTorrentMetaV1Info {
             name: "root".into(),
@@ -5895,6 +6022,7 @@ mod tests {
     fn verified_piece_progress_is_idempotent() {
         let (lengths, layout) = two_file_layout();
         let mut stats = TorrentStats::initial(
+            lengths.total_length(),
             lengths.total_length(),
             layout.files().iter().map(|f| f.length).collect(),
         );
@@ -6469,7 +6597,7 @@ mod tests {
     #[tokio::test]
     async fn add_trackers_after_shutdown_uses_a_fresh_poller_set() {
         let (tx, _rx) = mpsc::channel(8);
-        let stats = Arc::new(Mutex::new(TorrentStats::initial(0, vec![])));
+        let stats = Arc::new(Mutex::new(TorrentStats::initial(0, 0, vec![])));
         let peer_id = Id20::new([0; 20]);
         let hashes = vec![Id20::new([1; 20])];
         let mut pollers = spawn_tracker_pollers(

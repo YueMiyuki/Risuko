@@ -456,7 +456,7 @@ fn encode_index_ranges(ranges: &[(usize, usize)]) -> Option<String> {
 }
 
 fn collect_direct_children(
-    raw_files: &[bencode::Value],
+    raw_files: &[&bencode::Value],
     normalized_root_name: &str,
     parent_segments: &[String],
 ) -> Vec<ResolvedTorrentItem> {
@@ -606,10 +606,9 @@ fn resolve_torrent_from_bytes(
 
     if let Some(files_value) = info.get(b"files") {
         if let Some(raw_files) = files_value.as_list() {
-            let visible_files: Vec<bencode::Value> = raw_files
+            let visible_files: Vec<&bencode::Value> = raw_files
                 .iter()
                 .filter(|item| !is_padding_entry(item))
-                .cloned()
                 .collect();
             let raw_files = visible_files.as_slice();
             let file_count = raw_files.len();

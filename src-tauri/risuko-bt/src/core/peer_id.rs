@@ -69,16 +69,20 @@ mod tests {
 
     #[test]
     fn prefix_tracks_crate_version() {
-        let expected = format!(
-            "-RS{}{}{}0-",
-            env!("CARGO_PKG_VERSION_MAJOR"),
-            env!("CARGO_PKG_VERSION_MINOR"),
-            env!("CARGO_PKG_VERSION_PATCH")
-        );
-        // Single-digit components encode as themselves
-        if expected.len() == 8 {
-            assert_eq!(&PEER_ID_PREFIX[..], expected.as_bytes());
-        }
+        let digit = |part: &str| version_char(part.parse().unwrap());
+        let expected = [
+            b'-',
+            b'R',
+            b'S',
+            digit(env!("CARGO_PKG_VERSION_MAJOR")),
+            digit(env!("CARGO_PKG_VERSION_MINOR")),
+            digit(env!("CARGO_PKG_VERSION_PATCH")),
+            b'0',
+            b'-',
+        ];
+        assert_eq!(PEER_ID_PREFIX, expected);
+        assert_eq!(version_char(0), b'0');
+        assert_eq!(version_char(9), b'9');
         assert_eq!(version_char(10), b'A');
         assert_eq!(version_char(36), b'a');
         assert_eq!(version_char(99), b'z');

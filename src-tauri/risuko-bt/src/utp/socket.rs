@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
 use risuko_http::{NoProxy, ProxyConnector, ProxyDatagram, ProxyDatagramSource};
 
-use super::dontfrag::DontFragment;
+use super::dontfrag::UdpSender;
 use super::packet::{PacketType, UtpHeader};
 use super::stream::{self, DatagramTransport, DriverConfig, Role, RoleKind, UtpStream};
 
@@ -82,9 +82,8 @@ const ROUTER_READ_SLAB: usize = MAX_DATAGRAM * 64;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct UtpSocket {
-    udp: Arc<UdpSocket>,
-    /// Don't-fragment control for path-MTU discovery; `None` where unsupported
-    dont_fragment: Option<Arc<DontFragment>>,
+    /// Every send on the UDP socket, with don't-fragment control for path-MTU discovery
+    sender: Arc<UdpSender>,
     registry: ConnRegistry,
     proxy_registry: ProxyConnRegistry,
     local_addr: SocketAddr,
@@ -129,7 +128,7 @@ impl UtpSocket {
     /// Bind a fresh UDP socket and start serving µTP on it
     pub async fn bind(addr: SocketAddr) -> io::Result<Arc<Self>> {
         let udp = UdpSocket::bind(addr).await?;
-        Ok(Self::from_udp(Arc::new(udp)))
+        Ok(Self::with_udp(Arc::new(udp), true))
     }
 
     pub async fn bind_with_proxy(
@@ -137,29 +136,28 @@ impl UtpSocket {
         proxy: Option<ProxyConnector>,
     ) -> io::Result<Arc<Self>> {
         let udp = Arc::new(UdpSocket::bind(addr).await?);
-        let socket = Self::from_udp(udp);
+        let socket = Self::with_udp(udp, true);
         socket.reconfigure_proxy(proxy).await;
         Ok(socket)
     }
 
-    /// Build a µTP endpoint over an existing UDP socket (e.g. one shared with another protocol on the same port)
+    /// Build a µTP endpoint over an existing UDP socket (e.g. one shared with another protocol on the same port); path-MTU discovery stays off, since its don't-fragment toggle is socket-wide and senders outside µTP can't be coordinated
     pub fn from_udp(udp: Arc<UdpSocket>) -> Arc<Self> {
+        Self::with_udp(udp, false)
+    }
+
+    /// `exclusive`: µTP is the socket's only sender, so path-MTU probes may toggle don't-fragment on it
+    fn with_udp(udp: Arc<UdpSocket>, exclusive: bool) -> Arc<Self> {
         let local_addr = udp
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
         let proxy_registry: ProxyConnRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-        let dont_fragment = DontFragment::for_socket(&udp).map(Arc::new);
-        let router_handle = tokio::spawn(router(
-            udp.clone(),
-            dont_fragment.clone(),
-            registry.clone(),
-            accept_tx,
-        ));
+        let sender = Arc::new(UdpSender::new(udp.clone(), exclusive));
+        let router_handle = tokio::spawn(router(udp, sender.clone(), registry.clone(), accept_tx));
         Arc::new(Self {
-            udp,
-            dont_fragment,
+            sender,
             registry,
             proxy_registry,
             local_addr,
@@ -276,13 +274,11 @@ impl UtpSocket {
         let send_id = recv_id.wrapping_add(1);
 
         let transport = match route {
-            OutboundRoute::Direct => {
-                DatagramTransport::Direct(self.udp.clone(), self.dont_fragment.clone())
-            }
+            OutboundRoute::Direct => DatagramTransport::Direct(self.sender.clone()),
             OutboundRoute::Proxy(proxy) => DatagramTransport::Proxy(proxy),
             OutboundRoute::Blocked { error, bypass } => {
                 if bypass.matches_host_port(&remote.ip().to_string(), Some(remote.port())) {
-                    DatagramTransport::Direct(self.udp.clone(), self.dont_fragment.clone())
+                    DatagramTransport::Direct(self.sender.clone())
                 } else {
                     remove_connection_registration(&self.registry, key, &token);
                     remove_proxy_connection_registration(&self.proxy_registry, recv_id, &token);
@@ -366,7 +362,7 @@ impl Drop for UtpSocket {
 /// Reads every datagram and routes it to the owning connection, or opens a new inbound connection for an unrecognized SYN
 async fn router(
     udp: Arc<UdpSocket>,
-    dont_fragment: Option<Arc<DontFragment>>,
+    sender: Arc<UdpSender>,
     registry: ConnRegistry,
     accept_tx: mpsc::UnboundedSender<UtpStream>,
 ) {
@@ -409,17 +405,10 @@ async fn router(
             }
         }
         match header.packet_type {
-            PacketType::Syn => open_inbound(
-                &udp,
-                dont_fragment.as_ref(),
-                &registry,
-                &accept_tx,
-                src,
-                &header,
-            ),
+            PacketType::Syn => open_inbound(&sender, &registry, &accept_tx, src, &header),
             // BEP 29: reset packets for connections we don't know
             _ => {
-                let _ = udp.try_send_to(&reset_for(&header), src);
+                let _ = sender.try_send_to(&reset_for(&header), src);
             }
         }
     }
@@ -442,8 +431,7 @@ pub(crate) fn reset_for(header: &UtpHeader) -> Vec<u8> {
 
 /// Create the responder side of a connection from an inbound SYN
 fn open_inbound(
-    udp: &Arc<UdpSocket>,
-    dont_fragment: Option<&Arc<DontFragment>>,
+    sender: &Arc<UdpSender>,
     registry: &ConnRegistry,
     accept_tx: &mpsc::UnboundedSender<UtpStream>,
     src: SocketAddr,
@@ -477,7 +465,7 @@ fn open_inbound(
     shared.state.lock().seed_responder(syn);
 
     let cfg = DriverConfig {
-        transport: DatagramTransport::Direct(udp.clone(), dont_fragment.cloned()),
+        transport: DatagramTransport::Direct(sender.clone()),
         remote: src,
         incoming: inc_rx,
         registry: registry.clone(),
@@ -524,17 +512,17 @@ async fn proxy_router(
                 } else {
                     &[header.connection_id]
                 };
+                // Ids are shared across peers, so skip a candidate owned by another peer
                 let Some((key, connection)) = candidates.iter().find_map(|id| {
+                    let key = (src, *id);
                     let connection = proxy_registry.lock().get(id).cloned()?;
-                    Some(((src, *id), connection))
+                    (connection.key == key).then_some((key, connection))
                 }) else {
                     continue;
                 };
-                if connection.key == key {
-                    if let Some(entry) = registry.lock().get(&key) {
-                        if entry.token.matches(&connection.token) {
-                            let _ = entry.sender.send((header, payload));
-                        }
+                if let Some(entry) = registry.lock().get(&key) {
+                    if entry.token.matches(&connection.token) {
+                        let _ = entry.sender.send((header, payload));
                     }
                 }
             }
@@ -673,6 +661,12 @@ mod tests {
             .await
             .expect("registry sender kept the driver channel open");
         assert!(received.is_none());
+    }
+
+    #[tokio::test]
+    async fn externally_shared_socket_skips_path_mtu_discovery() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        assert!(!UtpSocket::from_udp(udp).sender.can_probe());
     }
 
     #[test]
@@ -851,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn path_mtu_discovery_raises_packet_size_on_a_roomy_path() {
         let (client_sock, server_sock) = loopback_pair().await;
-        if client_sock.dont_fragment.is_none() {
+        if !client_sock.sender.can_probe() {
             return; // no DF control on this platform
         }
         let server_addr = server_sock.local_addr();
@@ -884,7 +878,7 @@ mod tests {
     async fn path_mtu_discovery_settles_below_a_narrow_path() {
         const PATH_MTU: usize = 1300;
         let (client_sock, server_sock) = loopback_pair().await;
-        if client_sock.dont_fragment.is_none() {
+        if !client_sock.sender.can_probe() {
             return;
         }
         // A 1300-byte path: oversized datagrams are dropped on first sight (DF probes) and pass on resend (fragmented)

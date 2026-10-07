@@ -77,39 +77,60 @@ pub async fn announce_with_proxy_and_source(
     proxy: Option<&risuko_http::ProxyConnector>,
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let client = if let Some(proxy) = proxy {
-        let mut builder = risuko_http::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(4);
-        if let Some(route) = proxy.proxy() {
-            builder = builder.proxy(route.clone());
-        }
-        if let Some(bypass) = proxy.no_proxy() {
-            builder = builder.no_proxy(bypass.clone());
-        }
-        if let Some(source) = source.filter(|source| !source.ip().is_unspecified()) {
-            builder = builder.local_socket_address(tracker_source_addr(source));
-        }
-        builder
-            .build()
-            .map_err(|e| TrackerError::Http(e.to_string()))?
-    } else if let Some(source) = source.filter(|source| !source.ip().is_unspecified()) {
-        source_client(source)?
-    } else {
-        client().clone()
+    let source = source.filter(|source| !source.ip().is_unspecified());
+    let client = match (proxy, source) {
+        (Some(proxy), _) => proxy_client(proxy, source)?,
+        (None, Some(source)) => source_client(source)?,
+        (None, None) => client().clone(),
     };
     fetch_announce(&client, url, req).await
 }
 
-/// Announce from one address family only (BEP 7)
+/// Announce from one address family only (BEP 7); a proxy still routes redirects away from a bypassed tracker
 pub async fn announce_for_family(
     url: &str,
     req: &AnnounceRequest,
     family: super::AddressFamily,
+    proxy: Option<&risuko_http::ProxyConnector>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let client = source_client(family.unspecified())?;
+    let client = match proxy.filter(|proxy| proxy.proxy().is_some()) {
+        Some(proxy) => proxy_client(proxy, Some(family.unspecified()))?,
+        None => source_client(family.unspecified())?,
+    };
     fetch_announce(&client, url, req).await
+}
+
+/// Whether the client tunnels `url` through the TCP proxy rather than connecting direct
+pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
+    proxy.proxy().is_some()
+        && !url::Url::parse(url).is_ok_and(|url| {
+            proxy
+                .no_proxy()
+                .is_some_and(|no_proxy| no_proxy.matches_url(&url))
+        })
+}
+
+/// `source` pins direct connections only; proxy control connections pick their own
+fn proxy_client(
+    proxy: &risuko_http::ProxyConnector,
+    source: Option<SocketAddr>,
+) -> Result<risuko_http::Client, TrackerError> {
+    let mut builder = risuko_http::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(4);
+    if let Some(route) = proxy.proxy() {
+        builder = builder.proxy(route);
+    }
+    if let Some(bypass) = proxy.no_proxy() {
+        builder = builder.no_proxy(bypass);
+    }
+    if let Some(source) = source {
+        builder = builder.local_socket_address(tracker_source_addr(source));
+    }
+    builder
+        .build()
+        .map_err(|e| TrackerError::Http(e.to_string()))
 }
 
 async fn fetch_announce(
@@ -169,12 +190,16 @@ fn reveal_peers<'a>(
     if !req.obfuscate {
         return Some(std::borrow::Cow::Borrowed(raw));
     }
-    let window = |key: &[u8]| response.get(key).and_then(Value::as_int).map(|n| n as u32);
+    // Outer `None` is a window parameter outside `u32`, which drops the field instead of wrapping
+    let window = |key: &[u8]| match response.get(key).and_then(Value::as_int) {
+        Some(n) => u32::try_from(n).ok().map(Some),
+        None => Some(None),
+    };
     super::obfuscation::deobfuscate_peers(
         &req.info_hash,
         response.get(b"iv").and_then(Value::as_bytes),
-        window(b"i"),
-        window(b"n"),
+        window(b"i")?,
+        window(b"n")?,
         raw,
         stride,
     )
@@ -476,6 +501,32 @@ mod tests {
                 "203.0.113.5:6882".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn obfuscated_window_outside_u32_drops_the_peer_list() {
+        use super::super::obfuscation::deobfuscate_peers;
+
+        let mut request = req();
+        request.obfuscate = true;
+        let plain = [198u8, 51, 100, 2, 0x1a, 0xe1, 203, 0, 113, 5, 0x1a, 0xe2];
+        let iv = b"rotating-iv".to_vec();
+        let peers =
+            deobfuscate_peers(&request.info_hash, Some(&iv), None, None, &plain, 6).unwrap();
+        let body = |window: Option<(&[u8], i64)>| {
+            let mut dict = vec![
+                (b"interval".to_vec(), Value::Int(600)),
+                (b"iv".to_vec(), Value::Bytes(iv.clone())),
+                (b"peers".to_vec(), Value::Bytes(peers.clone())),
+            ];
+            dict.extend(window.map(|(key, n)| (key.to_vec(), Value::Int(n))));
+            encode_to_vec(&Value::Dict(dict))
+        };
+        let parsed = |window| parse_response(&body(window), &request).unwrap().peers;
+
+        assert_eq!(parsed(None).len(), 2);
+        assert!(parsed(Some((b"i", -1))).is_empty());
+        assert!(parsed(Some((b"n", 1 << 32))).is_empty());
     }
 
     #[test]
