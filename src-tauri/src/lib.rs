@@ -180,13 +180,58 @@ fn init_logging(
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_workarounds() {
     // WebKitGTK's DMA-BUF renderer (default since 2.42) frequently fails to initialize EGL/GBM on NVIDIA, virtualized GPUs, Wayland sessions without a working GBM backend, or older Mesa stacks. The failure manifests as: "Could not create GBM EGL display: EGL_NOT_INITIALIZED. Aborting..." followed by SIGABRT before the window is shown. Disabling DMA-BUF forces the legacy GLES path which is far more compatible. See: https://github.com/tauri-apps/tauri/issues/9304
+    // `__NV_DISABLE_EXPLICIT_SYNC` is read by the NVIDIA driver only; Tauri documents it for the Wayland "Error 71" crash and reports no performance cost, so it is safe to carry for every GPU. See: https://v2.tauri.app/develop/debug/linux-graphics/
     for (key, value) in [
         ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
         ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+        ("__NV_DISABLE_EXPLICIT_SYNC", "1"),
     ] {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
         }
+    }
+}
+
+/// Log the app, webview and (on Linux) display environment once per launch so freeze and rendering reports carry the facts that decide the WebKitGTK code path (session type, GDK backend, IM modules, renderer overrides) without a follow-up round trip
+fn log_runtime_diagnostics(app: &tauri::App) {
+    let webview = tauri::webview_version().unwrap_or_else(|e| format!("unknown ({e})"));
+    tracing::info!(
+        "Risuko {} starting (webview {})",
+        app.package_info().version,
+        webview
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        // AppImage launchers force GDK_BACKEND=x11, so a Wayland session can still run through XWayland; logging both the session and the backend keeps that visible
+        const KEYS: [&str; 17] = [
+            "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP",
+            "DESKTOP_SESSION",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "GDK_BACKEND",
+            "GTK_IM_MODULE",
+            "QT_IM_MODULE",
+            "XMODIFIERS",
+            "APPIMAGE",
+            "WEBKIT_DISABLE_DMABUF_RENDERER",
+            "WEBKIT_DISABLE_COMPOSITING_MODE",
+            "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
+            "WEBKIT_USE_SKIA_FOR_COMPOSITION",
+            "__NV_DISABLE_EXPLICIT_SYNC",
+            "__GLX_VENDOR_LIBRARY_NAME",
+            "LIBGL_ALWAYS_SOFTWARE",
+        ];
+        let snapshot = KEYS
+            .iter()
+            .map(|key| match std::env::var_os(key) {
+                Some(value) => format!("{key}={}", value.to_string_lossy()),
+                None => format!("{key}=<unset>"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!("Linux display environment: {snapshot}");
     }
 }
 
@@ -240,6 +285,7 @@ pub fn run() {
         } else {
             tracing::info!("Log directory: {}", log_dir.display());
         }
+        log_runtime_diagnostics(app);
 
         let app_state = state::AppState::new(config, storage, log_dir, log_guard)?;
         app.manage(app_state);

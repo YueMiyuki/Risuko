@@ -650,13 +650,10 @@ export default {
 				}
 			});
 		},
+		// WebKitGTK denies navigator.clipboard.readText() (NotAllowedError, no DOM paste
+		// access), so Linux also reads through the Rust plugin; its command runs on the
+		// async runtime, and the race in tryFillFromClipboard bounds an unanswered read
 		readClipboardText(): Promise<string> {
-			if (is.linux()) {
-				if (!navigator.clipboard?.readText) {
-					return Promise.reject(new Error("clipboard API unavailable"));
-				}
-				return navigator.clipboard.readText();
-			}
 			return readText();
 		},
 		async tryFillFromClipboard(generation = this.uriGeneration) {
