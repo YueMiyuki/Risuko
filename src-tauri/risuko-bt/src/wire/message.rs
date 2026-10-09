@@ -87,7 +87,7 @@ pub enum Message {
         length: u32,
         proof_layers: u32,
     },
-    /// BEP 52 response; `hashes` carries `length` requested hashes followed by `proof_layers` sibling hashes (SHA-256, 32 bytes each)
+    /// BEP 52 response: `length` hashes followed by [`hashes_uncle_count`] uncle hashes
     Hashes {
         pieces_root: [u8; 32],
         base_layer: u32,
@@ -241,6 +241,17 @@ impl MessageEncoder {
         buf[..4].copy_from_slice(&body_len.to_be_bytes());
         buf.freeze()
     }
+}
+
+/// Uncle hashes in a BEP 52 `hashes` message: the first `log2(length) - 1` proof layers are implied by the hashes and omitted
+pub fn hashes_uncle_count(length: u32, proof_layers: u32) -> usize {
+    let subtree_layers = length
+        .max(1)
+        .checked_next_power_of_two()
+        .map_or(u32::BITS, u32::trailing_zeros);
+    (proof_layers as usize)
+        .saturating_add(1)
+        .saturating_sub(subtree_layers as usize)
 }
 
 /// Stateful decoder that consumes bytes from a `BytesMut` buffer
@@ -485,7 +496,7 @@ impl MessageDecoder {
                 let length = buf.get_u32();
                 let proof_layers = buf.get_u32();
                 let expected_hash_bytes = (length as usize)
-                    .checked_add(proof_layers as usize)
+                    .checked_add(hashes_uncle_count(length, proof_layers))
                     .and_then(|n| n.checked_mul(32))
                     .ok_or(MessageError::TooLarge(usize::MAX))?;
                 let actual = remaining - 48;
@@ -675,6 +686,31 @@ mod tests {
         chopped[..4].copy_from_slice(&new_body_len.to_be_bytes());
         let err = MessageDecoder::try_decode(&mut chopped).unwrap_err();
         assert!(matches!(err, MessageError::Truncated { .. }));
+    }
+
+    #[test]
+    fn hashes_omits_proof_layers_covered_by_the_request() {
+        // length 8 implies 2 of the 5 proof layers, leaving 3 uncles
+        assert_eq!(hashes_uncle_count(8, 5), 3);
+        assert_eq!(hashes_uncle_count(2, 3), 3);
+        assert_eq!(hashes_uncle_count(512, 0), 0);
+        assert_eq!(
+            hashes_uncle_count(u32::MAX, u32::MAX),
+            u32::MAX as usize + 1 - 32
+        );
+        let hashes = vec![0x5au8; (8 + 3) * 32];
+        let decoded = round_trip(Message::Hashes {
+            pieces_root: [1u8; 32],
+            base_layer: 0,
+            index: 8,
+            length: 8,
+            proof_layers: 5,
+            hashes: Bytes::from(hashes),
+        });
+        match decoded {
+            Message::Hashes { hashes, .. } => assert_eq!(hashes.len(), 11 * 32),
+            other => panic!("expected Hashes, got {other:?}"),
+        }
     }
 
     #[test]

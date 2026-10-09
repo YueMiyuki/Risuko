@@ -5,7 +5,7 @@ import app.risuko.webview_upgrade.reflect.Reflect
 /**
  *   Reader for `android.os.SystemProperties` (hidden API)
  *  
- *   e.g.
+ *   For example:
  *   adb shell setprop debug.risuko.wvup.force com.android.chrome   # force a swap
  *   adb shell setprop debug.risuko.wvup.nudge 1                    # force the dialog
  *   adb shell setprop debug.risuko.wvup.minupgrade 999            # raise threshold

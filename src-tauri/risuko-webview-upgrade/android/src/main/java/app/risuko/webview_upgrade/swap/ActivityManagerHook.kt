@@ -13,7 +13,7 @@ import app.risuko.webview_upgrade.sandbox.SandboxExtras
 import java.util.regex.Pattern
 
 /**
- * Reroutes Chromium's multi-process renderer binds onto stub services.
+ * Reroutes Chromium's multi-process renderer binds onto stub services
  */
 internal class ActivityManagerHook(
     private val context: Context,

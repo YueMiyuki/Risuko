@@ -1,5 +1,5 @@
 /**
- * Set version across all risuko npm packages.
+ * Set version across all risuko npm packages
  *
  * Usage: node scripts/set-npm-version.mjs 0.2.0
  */

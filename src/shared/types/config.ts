@@ -142,12 +142,12 @@ export interface P2pProxyProfile {
 	enable?: boolean;
 	server?: string;
 	bypass?: string;
-	/** Optional SOCKS5 route for UDP-capable P2P operations. */
+	/** Optional SOCKS5 route for UDP-capable P2P operations */
 	udp?: P2pUdpProxyProfile;
 }
 
 export interface P2pUdpProxyProfile {
-	/** Empty means inherit the main P2P route when the runtime supports it. */
+	/** Empty means inherit the main P2P route when the runtime supports it */
 	server?: string;
 	bypass?: string;
 }
@@ -155,7 +155,7 @@ export interface P2pUdpProxyProfile {
 export interface ProxyConfig {
 	http?: ProxyProfile;
 	p2p?: P2pProxyProfile;
-	// Legacy fields are accepted while older settings are being migrated.
+	// Legacy fields are accepted while older settings are being migrated
 	enable?: boolean;
 	server?: string;
 	bypass?: string;
@@ -457,7 +457,7 @@ const normalizeBypassEntry = (raw: string): string | null => {
 		return null;
 	}
 	// A dotted all-numeric token is intended to be an IPv4 address.  Do not
-	// reinterpret malformed forms such as 001.002.003.004 as DNS hostnames.
+	// reinterpret malformed forms such as 001.002.003.004 as DNS hostnames
 	if (
 		host.includes(".") &&
 		host.split(".").every((label) => /^\d+$/.test(label))
@@ -484,7 +484,7 @@ const normalizeBypassEntry = (raw: string): string | null => {
 	return `${host}${port === null ? "" : `:${port}`}`;
 };
 
-/** Normalize bypass entries without exposing credentials or preserving duplicate rules. */
+/** Normalize bypass entries without exposing credentials or preserving duplicate rules */
 export const normalizeProxyBypass = (value: unknown): string => {
 	const raw = Array.isArray(value)
 		? value
@@ -530,7 +530,7 @@ const normalizeProxyScopes = (value: unknown): ProxyScope[] => {
 	return scopes;
 };
 
-/** Return the canonical nested proxy shape used by preferences and cloud sync. */
+/** Return the canonical nested proxy shape used by preferences and cloud sync */
 export const normalizeProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	const root =
 		value && typeof value === "object" && !Array.isArray(value)
@@ -546,7 +546,7 @@ export const normalizeProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	// Migrate legacy values field-by-field.  A partially written nested profile
 	// (for example from an older sync client) must not discard legacy values for
 	// fields it did not send; explicit nested values still win, including false,
-	// an empty string, or an empty scope array.
+	// an empty string, or an empty scope array
 	const legacyHttp = hasLegacyFields ? root : {};
 	const http = nestedHttp ? { ...legacyHttp, ...nestedHttp } : legacyHttp;
 	const p2p =
@@ -620,7 +620,7 @@ export const normalizeNetworkProxyConfig = (
 	const legacyUdpBypass = normalizeProxyBypass(setting("p2p-udp-no-proxy"));
 	// Current clients publish flattened UDP keys as a derived view of the TCP
 	// route when the nested UDP override is blank. Preserve that blank so later
-	// TCP edits continue to flow through to UDP.
+	// TCP edits continue to flow through to UDP
 	const flattenedUdpInheritsTcp =
 		legacyUdpServer.length > 0 &&
 		legacyUdpServer === legacyTcpServer &&
@@ -681,7 +681,7 @@ export const normalizeNetworkProxyConfig = (
 	};
 };
 
-/** Return a proxy profile suitable for diagnostics/logging, with URL userinfo removed. */
+/** Return a proxy profile suitable for diagnostics/logging, with URL userinfo removed */
 export const redactProxyUrl = (value: string): string => {
 	const trimmed = value.trim();
 	if (!trimmed) {
@@ -729,7 +729,7 @@ export const redactProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	};
 };
 
-/** Redact both nested profiles and legacy flattened engine keys in a diagnostic object. */
+/** Redact both nested profiles and legacy flattened engine keys in a diagnostic object */
 export const redactProxySettings = (
 	value: Record<string, unknown>,
 ): Record<string, unknown> => {

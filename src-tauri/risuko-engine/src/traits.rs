@@ -57,7 +57,7 @@ fn atomic_temp_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// Best-effort startup cleanup for crash residue left by [`write_file_atomically`].
+/// Best-effort startup cleanup for crash residue left by [`write_file_atomically`]
 pub(crate) fn cleanup_stale_atomic_write_files(directory: &Path) {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -136,7 +136,7 @@ pub(crate) fn write_file_atomically(path: &Path, data: &[u8]) -> Result<(), Stri
         .map_err(|e| format!("Failed to persist {}: {}", path.display(), e.error))?;
 
     // Best effort: the file itself is durable and atomically replaced even on
-    // platforms that do not allow opening a directory for syncing.
+    // platforms that do not allow opening a directory for syncing
     if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();
     }

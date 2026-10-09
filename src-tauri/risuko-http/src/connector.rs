@@ -200,7 +200,7 @@ impl ProxyConnector {
         self
     }
 
-    /// Use a shared resolver object.
+    /// Use a shared resolver object
     pub fn resolver_arc(mut self, resolver: Arc<dyn Resolve>) -> Self {
         self.inner.resolver = resolver.clone();
         if let Some(udp_inner) = self.udp_inner.as_mut() {
@@ -329,7 +329,7 @@ pub enum ProxyDatagramSource {
 }
 
 /// Match a datagram source against the endpoint used for an outstanding
-/// request without resolving a proxy-supplied hostname locally.
+/// request without resolving a proxy-supplied hostname locally
 pub fn datagram_source_matches(source: &ProxyDatagramSource, target: SocketAddr) -> bool {
     match source {
         ProxyDatagramSource::Ip(source) => *source == target,
@@ -1565,7 +1565,7 @@ impl Connector {
     }
 
     /// Proxy control connections intentionally do not inherit a direct
-    /// destination source address. A proxy chooses the tracker-facing source.
+    /// destination source address. A proxy chooses the tracker-facing source
     async fn direct_proxy_connection(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let mut connector = self.clone();
         connector.local_addr = None;
@@ -2183,7 +2183,7 @@ mod tests {
             relay.send_to(&response, source).await.unwrap();
 
             // Keep the association control stream alive while the caller reads
-            // the relayed response.
+            // the relayed response
             let mut one = [0u8; 1];
             let _ = control.read(&mut one).await;
         });
@@ -2581,7 +2581,7 @@ mod tests {
     async fn http_proxy_udp_ipv6_bypass_uses_opposite_family_socket() {
         let Ok(destination) = UdpSocket::bind("[::1]:0").await else {
             // Some CI hosts disable IPv6; the dual-family path is covered on
-            // hosts where an IPv6 loopback socket is available.
+            // hosts where an IPv6 loopback socket is available
             return;
         };
         let destination_addr = destination.local_addr().unwrap();

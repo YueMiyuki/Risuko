@@ -82,6 +82,8 @@ pub struct TorrentMeta {
     pub info: ValidatedTorrentMetaV1Info,
     pub announce: Option<String>,
     pub announce_list: Vec<Vec<String>>,
+    /// BEP 8 `obfuscate-announce-list`, same tiers as `announce_list`
+    pub obfuscate_announce_list: Vec<Vec<String>>,
     pub url_list: Vec<String>,
     pub bootstrap_nodes: Vec<(Id20, SocketAddr)>,
     pub bootstrap_hosts: Vec<(Id20, String, u16)>,
@@ -131,6 +133,8 @@ pub struct TorrentMetaInfo {
     /// Components relative to the torrent root (never absolute, never `..`)
     pub path: Vec<String>,
     pub length: u64,
+    /// BEP 47 padding (or v2 alignment): all zeros, never written to disk or fetched from web seeds
+    pub padding: bool,
 }
 
 /// Aggregated file view returned by [`ValidatedTorrentMetaV1Info::iter_file_details`]
@@ -139,6 +143,8 @@ pub struct FileDetails {
     /// Joined path, suitable for display. Slashes are used regardless of OS
     pub filename: String,
     pub len: u64,
+    /// BEP 47 padding entry: never shown to users or selectable
+    pub padding: bool,
 }
 
 impl ValidatedTorrentMetaV1Info {
@@ -146,7 +152,18 @@ impl ValidatedTorrentMetaV1Info {
         self.files.iter().map(|f| FileDetails {
             filename: f.path.join("/"),
             len: f.length,
+            padding: f.padding,
         })
+    }
+
+    /// Indices in `files` of entries users see and select (all but padding)
+    pub fn selectable_file_indices(&self) -> Vec<usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.padding)
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     pub fn piece_count(&self) -> u32 {
@@ -229,21 +246,25 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
         .ok_or(MetaError::BadInfo("top-level not dict"))?;
 
     let announce = get_str(&value, b"announce");
-    let announce_list = value
-        .get(b"announce-list")
-        .and_then(Value::as_list)
-        .map(|tiers| {
-            tiers
-                .iter()
-                .filter_map(|tier| tier.as_list())
-                .map(|urls| {
-                    urls.iter()
-                        .filter_map(|u| u.as_str().map(String::from))
-                        .collect()
-                })
-                .collect::<Vec<Vec<String>>>()
-        })
-        .unwrap_or_default();
+    let tier_list = |key: &[u8]| {
+        value
+            .get(key)
+            .and_then(Value::as_list)
+            .map(|tiers| {
+                tiers
+                    .iter()
+                    .filter_map(|tier| tier.as_list())
+                    .map(|urls| {
+                        urls.iter()
+                            .filter_map(|u| u.as_str().map(String::from))
+                            .collect()
+                    })
+                    .collect::<Vec<Vec<String>>>()
+            })
+            .unwrap_or_default()
+    };
+    let announce_list = tier_list(b"announce-list");
+    let obfuscate_announce_list = tier_list(b"obfuscate-announce-list");
     let url_list = parse_url_list(&value);
     let (bootstrap_nodes, bootstrap_hosts) = parse_bootstrap_nodes(&value);
     let comment = get_str(&value, b"comment");
@@ -295,6 +316,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
             info,
             announce,
             announce_list,
+            obfuscate_announce_list,
             url_list,
             bootstrap_nodes,
             bootstrap_hosts,
@@ -333,6 +355,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
         info,
         announce,
         announce_list,
+        obfuscate_announce_list,
         url_list,
         bootstrap_nodes,
         bootstrap_hosts,
@@ -520,9 +543,14 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
                 }
                 path_components.push(s.to_string());
             }
+            let padding = entry
+                .get(b"attr")
+                .and_then(Value::as_bytes)
+                .is_some_and(|attr| attr.contains(&b'p'));
             files.push(TorrentMetaInfo {
                 path: path_components,
                 length: length as u64,
+                padding,
             });
         }
         (files, false)
@@ -538,6 +566,7 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
             vec![TorrentMetaInfo {
                 path: vec![name.clone()],
                 length: length as u64,
+                padding: false,
             }],
             true,
         )
@@ -570,22 +599,32 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
     let single_file_mode =
         v2.files.len() == 1 && v2.files[0].path.len() == 1 && v2.files[0].path[0] == v2.name;
 
-    let files = v2
-        .files
-        .iter()
-        .map(|f| {
-            // For multi-file torrents v2 paths start with the torrent name; strip it to match the v1 `info.files[].path` convention
-            let path = if !single_file_mode && f.path.first().is_some_and(|p| p == &v2.name) {
-                f.path[1..].to_vec()
-            } else {
-                f.path.clone()
-            };
-            TorrentMetaInfo {
-                path,
-                length: f.length,
-            }
-        })
-        .collect();
+    let mut files = Vec::with_capacity(v2.files.len());
+    let mut offset = 0u64;
+    for f in &v2.files {
+        // BEP 52 starts every file on a piece boundary; model the gap as padding
+        let pad = v2_alignment_padding(offset, f.length, v2.piece_length);
+        if pad > 0 {
+            files.push(TorrentMetaInfo {
+                path: vec![".pad".into(), pad.to_string()],
+                length: pad,
+                padding: true,
+            });
+            offset += pad;
+        }
+        // For multi-file torrents v2 paths start with the torrent name; strip it to match the v1 `info.files[].path` convention
+        let path = if !single_file_mode && f.path.first().is_some_and(|p| p == &v2.name) {
+            f.path[1..].to_vec()
+        } else {
+            f.path.clone()
+        };
+        files.push(TorrentMetaInfo {
+            path,
+            length: f.length,
+            padding: false,
+        });
+        offset += f.length;
+    }
     ValidatedTorrentMetaV1Info {
         name: v2.name.clone(),
         piece_length: v2.piece_length,
@@ -593,6 +632,17 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
         private: v2.private,
         files,
         single_file_mode,
+    }
+}
+
+/// Alignment padding BEP 52 implies before a v2 file at `offset`
+pub(crate) fn v2_alignment_padding(offset: u64, file_length: u64, piece_length: u32) -> u64 {
+    if file_length == 0 || piece_length == 0 {
+        return 0;
+    }
+    match offset % piece_length as u64 {
+        0 => 0,
+        rem => piece_length as u64 - rem,
     }
 }
 
@@ -1085,5 +1135,60 @@ mod tests {
         assert!(meta
             .bootstrap_hosts
             .contains(&(host_id, "router.example.org".to_string(), 6883,)));
+    }
+
+    #[test]
+    fn pure_v2_multi_file_aligns_each_file_to_a_piece_boundary() {
+        use crate::core::merkle::{hash_block, PieceVerifier};
+        const PIECE: usize = 16 * 1024;
+        let a: Vec<u8> = (0..10 * 1024).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..5 * 1024).map(|i| (i % 241) as u8).collect();
+        let leaf = |data: &[u8]| {
+            Value::Dict(vec![(
+                b"".to_vec(),
+                Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(data.len() as i64)),
+                    (
+                        b"pieces root".to_vec(),
+                        Value::Bytes(hash_block(data).0.to_vec()),
+                    ),
+                ]),
+            )])
+        };
+        let info = Value::Dict(vec![
+            (
+                b"file tree".to_vec(),
+                Value::Dict(vec![(b"a".to_vec(), leaf(&a)), (b"b".to_vec(), leaf(&b))]),
+            ),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(PIECE as i64)),
+        ]);
+        let top = Value::Dict(vec![(b"info".to_vec(), info)]);
+        let meta = parse_torrent(&super::super::super::bencode::encode_to_vec(&top)).unwrap();
+
+        let layout: Vec<(String, u64, bool)> = meta
+            .info
+            .files
+            .iter()
+            .map(|f| (f.path.join("/"), f.length, f.padding))
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                ("a".to_string(), a.len() as u64, false),
+                (".pad/6144".to_string(), (PIECE - a.len()) as u64, true),
+                ("b".to_string(), b.len() as u64, false),
+            ]
+        );
+        // One piece per file, as v2 peers count them
+        assert_eq!(meta.info.piece_count(), 2);
+
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        let mut piece0 = a.clone();
+        piece0.resize(PIECE, 0);
+        verifier.verify(0, &piece0).unwrap();
+        verifier.verify(1, &b).unwrap();
+        assert!(verifier.verify(1, &piece0[..b.len()]).is_err());
     }
 }

@@ -10,6 +10,8 @@ pub struct FileInfo {
     pub length: u64,
     /// Absolute offset of this file's first byte within the torrent
     pub offset: u64,
+    /// BEP 47 padding: reads as zeros and never touches disk
+    pub padding: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ impl FileSet {
                     path,
                     length: f.length,
                     offset,
+                    padding: f.padding,
                 };
                 offset += f.length;
                 info
@@ -139,14 +142,17 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["a".into()],
                     length: 10,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 20,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["c".into()],
                     length: 5,
+                    padding: false,
                 },
             ],
             single_file_mode: false,

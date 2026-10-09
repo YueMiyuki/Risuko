@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
 use risuko_http::{NoProxy, ProxyConnector, ProxyDatagram, ProxyDatagramSource};
 
+use super::dontfrag::UdpSender;
 use super::packet::{PacketType, UtpHeader};
 use super::stream::{self, DatagramTransport, DriverConfig, Role, RoleKind, UtpStream};
 
@@ -81,7 +82,8 @@ const ROUTER_READ_SLAB: usize = MAX_DATAGRAM * 64;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct UtpSocket {
-    udp: Arc<UdpSocket>,
+    /// Every send on the UDP socket, with don't-fragment control for path-MTU discovery
+    sender: Arc<UdpSender>,
     registry: ConnRegistry,
     proxy_registry: ProxyConnRegistry,
     local_addr: SocketAddr,
@@ -126,7 +128,7 @@ impl UtpSocket {
     /// Bind a fresh UDP socket and start serving µTP on it
     pub async fn bind(addr: SocketAddr) -> io::Result<Arc<Self>> {
         let udp = UdpSocket::bind(addr).await?;
-        Ok(Self::from_udp(Arc::new(udp)))
+        Ok(Self::with_udp(Arc::new(udp), true))
     }
 
     pub async fn bind_with_proxy(
@@ -134,22 +136,28 @@ impl UtpSocket {
         proxy: Option<ProxyConnector>,
     ) -> io::Result<Arc<Self>> {
         let udp = Arc::new(UdpSocket::bind(addr).await?);
-        let socket = Self::from_udp(udp);
+        let socket = Self::with_udp(udp, true);
         socket.reconfigure_proxy(proxy).await;
         Ok(socket)
     }
 
-    /// Build a µTP endpoint over an existing UDP socket (e.g. one shared with another protocol on the same port)
+    /// Build a µTP endpoint over an existing UDP socket (e.g. one shared with another protocol on the same port); path-MTU discovery stays off, since its don't-fragment toggle is socket-wide and senders outside µTP can't be coordinated
     pub fn from_udp(udp: Arc<UdpSocket>) -> Arc<Self> {
+        Self::with_udp(udp, false)
+    }
+
+    /// `exclusive`: µTP is the socket's only sender, so path-MTU probes may toggle don't-fragment on it
+    fn with_udp(udp: Arc<UdpSocket>, exclusive: bool) -> Arc<Self> {
         let local_addr = udp
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
         let proxy_registry: ProxyConnRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-        let router_handle = tokio::spawn(router(udp.clone(), registry.clone(), accept_tx));
+        let sender = Arc::new(UdpSender::new(udp.clone(), exclusive));
+        let router_handle = tokio::spawn(router(udp, sender.clone(), registry.clone(), accept_tx));
         Arc::new(Self {
-            udp,
+            sender,
             registry,
             proxy_registry,
             local_addr,
@@ -175,7 +183,7 @@ impl UtpSocket {
         }
 
         // Drop every connection routed through the old proxy before replacing
-        // the router. Direct-route connections remain registered.
+        // the router. Direct-route connections remain registered
         {
             let mut proxy_registry = self.proxy_registry.lock();
             let old_connections = proxy_registry.values().cloned().collect::<Vec<_>>();
@@ -266,11 +274,11 @@ impl UtpSocket {
         let send_id = recv_id.wrapping_add(1);
 
         let transport = match route {
-            OutboundRoute::Direct => DatagramTransport::Direct(self.udp.clone()),
+            OutboundRoute::Direct => DatagramTransport::Direct(self.sender.clone()),
             OutboundRoute::Proxy(proxy) => DatagramTransport::Proxy(proxy),
             OutboundRoute::Blocked { error, bypass } => {
                 if bypass.matches_host_port(&remote.ip().to_string(), Some(remote.port())) {
-                    DatagramTransport::Direct(self.udp.clone())
+                    DatagramTransport::Direct(self.sender.clone())
                 } else {
                     remove_connection_registration(&self.registry, key, &token);
                     remove_proxy_connection_registration(&self.proxy_registry, recv_id, &token);
@@ -354,6 +362,7 @@ impl Drop for UtpSocket {
 /// Reads every datagram and routes it to the owning connection, or opens a new inbound connection for an unrecognized SYN
 async fn router(
     udp: Arc<UdpSocket>,
+    sender: Arc<UdpSender>,
     registry: ConnRegistry,
     accept_tx: mpsc::UnboundedSender<UtpStream>,
 ) {
@@ -381,17 +390,48 @@ async fn router(
                 let _ = entry.sender.send((header, payload));
                 continue;
             }
+            // An RST may carry our send id (recv ± 1)
+            if header.packet_type == PacketType::Reset {
+                for id in [
+                    header.connection_id.wrapping_sub(1),
+                    header.connection_id.wrapping_add(1),
+                ] {
+                    if let Some(entry) = reg.get(&(src, id)) {
+                        let _ = entry.sender.send((header.clone(), payload.clone()));
+                        break;
+                    }
+                }
+                continue;
+            }
         }
-        // Otherwise only a SYN is meaningful; everything else is a stray packet for a connection we don't have (ignored)
-        if header.packet_type == PacketType::Syn {
-            open_inbound(&udp, &registry, &accept_tx, src, &header);
+        match header.packet_type {
+            PacketType::Syn => open_inbound(&sender, &registry, &accept_tx, src, &header),
+            // BEP 29: reset packets for connections we don't know
+            _ => {
+                let _ = sender.try_send_to(&reset_for(&header), src);
+            }
         }
     }
 }
 
+/// ST_RESET answering a packet for a connection we don't have
+pub(crate) fn reset_for(header: &UtpHeader) -> Vec<u8> {
+    UtpHeader {
+        packet_type: PacketType::Reset,
+        connection_id: header.connection_id,
+        timestamp_micros: super::now_micros(),
+        timestamp_diff_micros: 0,
+        wnd_size: 0,
+        seq_nr: rand::rng().random(),
+        ack_nr: header.seq_nr,
+        selective_ack: None,
+    }
+    .encode(&[])
+}
+
 /// Create the responder side of a connection from an inbound SYN
 fn open_inbound(
-    udp: &Arc<UdpSocket>,
+    sender: &Arc<UdpSender>,
     registry: &ConnRegistry,
     accept_tx: &mpsc::UnboundedSender<UtpStream>,
     src: SocketAddr,
@@ -404,8 +444,10 @@ fn open_inbound(
 
     let (token, inc_rx) = {
         let mut reg = registry.lock();
-        if reg.contains_key(&key) {
-            return; // duplicate / retransmitted SYN for an open connection
+        if let Some(existing) = reg.get(&key) {
+            // Retransmitted SYN: our STATE was lost, so let the connection answer again
+            let _ = existing.sender.send((syn.clone(), Bytes::new()));
+            return;
         }
         let (inc_tx, inc_rx) = mpsc::unbounded_channel();
         let token = ConnectionToken::new();
@@ -423,7 +465,7 @@ fn open_inbound(
     shared.state.lock().seed_responder(syn);
 
     let cfg = DriverConfig {
-        transport: DatagramTransport::Direct(udp.clone()),
+        transport: DatagramTransport::Direct(sender.clone()),
         remote: src,
         incoming: inc_rx,
         registry: registry.clone(),
@@ -461,13 +503,26 @@ async fn proxy_router(
         let payload = buf.split_to(n).freeze().slice(payload_offset..);
         match src {
             ProxyDatagramSource::Ip(src) => {
-                let key = (src, header.connection_id);
-                let connection = proxy_registry.lock().get(&header.connection_id).cloned();
-                if let Some(connection) = connection.filter(|connection| connection.key == key) {
-                    if let Some(entry) = registry.lock().get(&key) {
-                        if entry.token.matches(&connection.token) {
-                            let _ = entry.sender.send((header, payload));
-                        }
+                let candidates: &[u16] = if header.packet_type == PacketType::Reset {
+                    &[
+                        header.connection_id,
+                        header.connection_id.wrapping_sub(1),
+                        header.connection_id.wrapping_add(1),
+                    ]
+                } else {
+                    &[header.connection_id]
+                };
+                // Ids are shared across peers, so skip a candidate owned by another peer
+                let Some((key, connection)) = candidates.iter().find_map(|id| {
+                    let key = (src, *id);
+                    let connection = proxy_registry.lock().get(id).cloned()?;
+                    (connection.key == key).then_some((key, connection))
+                }) else {
+                    continue;
+                };
+                if let Some(entry) = registry.lock().get(&key) {
+                    if entry.token.matches(&connection.token) {
+                        let _ = entry.sender.send((header, payload));
                     }
                 }
             }
@@ -608,6 +663,12 @@ mod tests {
         assert!(received.is_none());
     }
 
+    #[tokio::test]
+    async fn externally_shared_socket_skips_path_mtu_discovery() {
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        assert!(!UtpSocket::from_udp(udp).sender.can_probe());
+    }
+
     #[test]
     fn stale_cleanup_preserves_reused_connection_registration() {
         let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -637,5 +698,242 @@ mod tests {
 
         assert!(registry.lock().contains_key(&key));
         assert!(proxy_registry.lock().contains_key(&key.1));
+    }
+
+    /// UDP relay to `server` dropping datagrams by per-direction index
+    async fn lossy_relay(
+        server: SocketAddr,
+        drop_c2s: fn(usize) -> bool,
+        drop_s2c: fn(usize) -> bool,
+    ) -> SocketAddr {
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let front_addr = front.local_addr().unwrap();
+        let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        {
+            let (front, back, client) = (front.clone(), back.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let mut n_seen = 0usize;
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client.lock() = Some(from);
+                    let drop = drop_c2s(n_seen);
+                    n_seen += 1;
+                    if !drop {
+                        let _ = back.send_to(&buf[..n], server).await;
+                    }
+                }
+            });
+        }
+        tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let mut n_seen = 0usize;
+            while let Ok((n, _)) = back.recv_from(&mut buf).await {
+                let drop = drop_s2c(n_seen);
+                n_seen += 1;
+                let target = *client.lock();
+                if let (false, Some(target)) = (drop, target) {
+                    let _ = front.send_to(&buf[..n], target).await;
+                }
+            }
+        });
+        front_addr
+    }
+
+    #[tokio::test]
+    async fn bulk_transfer_survives_loss_and_a_lost_syn_ack() {
+        let (client_sock, server_sock) = loopback_pair().await;
+        // Drop the SYN's STATE and every 7th client datagram
+        let relay = lossy_relay(
+            server_sock.local_addr(),
+            |i| i > 0 && i % 7 == 0,
+            |i| i == 0,
+        )
+        .await;
+        const N: usize = 200 * 1024;
+        let data: Vec<u8> = (0..N).map(|i| (i % 253) as u8).collect();
+        let expected = data.clone();
+
+        let server = tokio::spawn(async move {
+            let mut s = server_sock.accept().await.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            let mut c = client_sock.connect(relay).await.unwrap();
+            c.write_all(&data).await.unwrap();
+            c.shutdown().await.unwrap();
+        })
+        .await
+        .expect("lossy send timed out");
+        let got = tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("lossy recv timed out")
+            .unwrap();
+        assert_eq!(got.len(), expected.len());
+        assert!(got == expected, "payload corrupted across retransmissions");
+    }
+
+    #[tokio::test]
+    async fn unknown_connection_is_answered_with_reset() {
+        let sock = UtpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stray = UtpHeader {
+            packet_type: PacketType::Data,
+            connection_id: 4242,
+            timestamp_micros: 1,
+            timestamp_diff_micros: 0,
+            wnd_size: 1000,
+            seq_nr: 77,
+            ack_nr: 5,
+            selective_ack: None,
+        };
+        raw.send_to(&stray.encode(b"hi"), sock.local_addr())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), raw.recv_from(&mut buf))
+            .await
+            .expect("no reset received")
+            .unwrap();
+        let (reset, _) = UtpHeader::decode(&buf[..n]).unwrap();
+        assert_eq!(reset.packet_type, PacketType::Reset);
+        assert_eq!(reset.connection_id, 4242);
+        assert_eq!(reset.ack_nr, 77);
+    }
+
+    #[tokio::test]
+    async fn reset_addressed_to_send_id_aborts_the_connection() {
+        let client_sock = UtpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let raw_addr = raw.local_addr().unwrap();
+        // Answer the SYN, then reset using the client's send id
+        let responder = {
+            let raw = raw.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; MAX_DATAGRAM];
+                let (n, client) = raw.recv_from(&mut buf).await.unwrap();
+                let (syn, _) = UtpHeader::decode(&buf[..n]).unwrap();
+                assert_eq!(syn.packet_type, PacketType::Syn);
+                let mut state = syn.clone();
+                state.packet_type = PacketType::State;
+                state.seq_nr = 1000;
+                state.ack_nr = syn.seq_nr;
+                raw.send_to(&state.encode(&[]), client).await.unwrap();
+                let mut reset = state;
+                reset.packet_type = PacketType::Reset;
+                reset.connection_id = syn.connection_id.wrapping_add(1);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                raw.send_to(&reset.encode(&[]), client).await.unwrap();
+            })
+        };
+        let mut stream = client_sock.connect(raw_addr).await.unwrap();
+        responder.await.unwrap();
+        let mut buf = [0u8; 8];
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("reset not observed")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn path_mtu_discovery_raises_packet_size_on_a_roomy_path() {
+        let (client_sock, server_sock) = loopback_pair().await;
+        if !client_sock.sender.can_probe() {
+            return; // no DF control on this platform
+        }
+        let server_addr = server_sock.local_addr();
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 249) as u8).collect();
+        let expected = data.clone();
+        let server = tokio::spawn(async move {
+            let mut s = server_sock.accept().await.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        let floor = tokio::time::timeout(Duration::from_secs(20), async move {
+            let mut c = client_sock.connect(server_addr).await.unwrap();
+            c.write_all(&data).await.unwrap();
+            c.flush().await.unwrap();
+            let floor = c.mtu_floor();
+            c.shutdown().await.unwrap();
+            floor
+        })
+        .await
+        .expect("transfer timed out");
+        assert_eq!(server.await.unwrap(), expected);
+        assert!(
+            floor > 1254,
+            "loopback carries more than the starting size (floor {floor})"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_mtu_discovery_settles_below_a_narrow_path() {
+        const PATH_MTU: usize = 1300;
+        let (client_sock, server_sock) = loopback_pair().await;
+        if !client_sock.sender.can_probe() {
+            return;
+        }
+        // A 1300-byte path: oversized datagrams are dropped on first sight (DF probes) and pass on resend (fragmented)
+        let server_addr = server_sock.local_addr();
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay = front.local_addr().unwrap();
+        let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        {
+            let (front, back, client_addr) = (front.clone(), back.clone(), client_addr.clone());
+            tokio::spawn(async move {
+                let mut seen = std::collections::HashSet::new();
+                let mut buf = [0u8; MAX_DATAGRAM];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    *client_addr.lock() = Some(from);
+                    let seq = u16::from_be_bytes([buf[16], buf[17]]);
+                    if n > PATH_MTU && seen.insert(seq) {
+                        continue;
+                    }
+                    let _ = back.send_to(&buf[..n], server_addr).await;
+                }
+            });
+        }
+        tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            while let Ok((n, _)) = back.recv_from(&mut buf).await {
+                let target = *client_addr.lock();
+                if let Some(target) = target {
+                    let _ = front.send_to(&buf[..n], target).await;
+                }
+            }
+        });
+
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 241) as u8).collect();
+        let expected = data.clone();
+        let server = tokio::spawn(async move {
+            let mut s = server_sock.accept().await.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        let floor = tokio::time::timeout(Duration::from_secs(30), async move {
+            let mut c = client_sock.connect(relay).await.unwrap();
+            c.write_all(&data).await.unwrap();
+            c.flush().await.unwrap();
+            let floor = c.mtu_floor();
+            c.shutdown().await.unwrap();
+            floor
+        })
+        .await
+        .expect("transfer over the narrow path timed out");
+        assert!(server.await.unwrap() == expected, "payload corrupted");
+        assert!(
+            floor > 1254 && floor <= PATH_MTU,
+            "floor {floor} should settle between the start size and the path MTU"
+        );
     }
 }

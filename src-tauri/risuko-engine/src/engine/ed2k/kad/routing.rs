@@ -21,12 +21,12 @@ pub const MAX_LOOKUP_SOURCES: usize = 300;
 pub type KadId = [u8; ID_BYTES];
 
 // Wall-clock timestamps intentionally remain persisted for diagnostics, but probe snapshots need
-// an ordering token that cannot collide when two refreshes happen in the same second.
+// an ordering token that cannot collide when two refreshes happen in the same second
 static NEXT_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_refresh_generation() -> u64 {
     let generation = NEXT_REFRESH_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
-    // Zero is reserved for old state files that predate the generation field.
+    // Zero is reserved for old state files that predate the generation field
     if generation == 0 {
         1
     } else {
@@ -139,13 +139,13 @@ pub struct Contact {
     pub version: u8,
     pub last_seen: u64,
     pub last_verified: u64,
-    /// Process-local monotonic refresh order used to validate liveness probe snapshots.
+    /// Process-local monotonic refresh order used to validate liveness probe snapshots
     #[serde(skip)]
     refresh_generation: u64,
 }
 
 // Equality is the persisted contact contract. The process-local generation is
-// compared separately where liveness snapshot identity matters.
+// compared separately where liveness snapshot identity matters
 impl PartialEq for Contact {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -352,7 +352,7 @@ impl RoutingTable {
         }
 
         // Contacts reconstructed from old state files have no process-local generation. Assign one
-        // without changing their persisted wall-clock timestamps before they can be probed.
+        // without changing their persisted wall-clock timestamps before they can be probed
         if contact.refresh_generation == 0 {
             contact.refresh_generation = next_refresh_generation();
         }
@@ -420,7 +420,7 @@ impl RoutingTable {
 
     pub fn closest_with_replacements(&self, target: NodeId, limit: usize) -> Vec<Contact> {
         // Replacements are an auxiliary lookup source, so apply the same hard cap before
-        // collecting either active contacts or replacements.
+        // collecting either active contacts or replacements
         let limit = limit.min(MAX_LOOKUP_QUERIES);
         let mut contacts = self.closest(target, limit);
         if contacts.len() < limit {
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(table.insert(original), InsertResult::Inserted);
         let snapshot = table.get(original_id).unwrap();
 
-        // `insert` refreshes an existing contact even when the wall-clock second is unchanged.
+        // `insert` refreshes an existing contact even when the wall-clock second is unchanged
         let refreshed = Contact::with_times(
             original_id.0,
             SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4672),

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use rand::RngExt;
@@ -76,10 +76,10 @@ pub async fn announce_with_proxy_and_source(
     proxy: Option<&risuko_http::ProxyConnector>,
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
+    reject_obfuscation(req, url)?;
     let (host, port) = parse_udp_url(url)?;
-    let bypasses_proxy = proxy
-        .and_then(|proxy| proxy.udp_no_proxy().or_else(|| proxy.no_proxy()))
-        .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
+    let url_data: Arc<[u8]> = udp_url_data(url).into();
+    let bypasses_proxy = proxy.is_some_and(|proxy| is_bypassed(proxy, &host, port));
     let source_is_concrete = source.is_some_and(|source| !source.ip().is_unspecified());
     if let Some(proxy) =
         proxy.filter(|proxy| proxy.has_proxy() && !(source_is_concrete && bypasses_proxy))
@@ -88,7 +88,7 @@ pub async fn announce_with_proxy_and_source(
             .bind_udp_with_bypass()
             .await
             .map_err(|e| TrackerError::Http(e.to_string()))?;
-        return announce_endpoint_proxy(socket, &host, port, req).await;
+        return announce_endpoint_proxy(socket, &host, port, req, &url_data).await;
     }
     let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
         .into_iter()
@@ -98,16 +98,65 @@ pub async fn announce_with_proxy_and_source(
             })
         })
         .collect::<Vec<_>>();
+    race_endpoints(targets, &host, req, source, url_data).await
+}
+
+/// Announce from one address family only (BEP 7)
+pub async fn announce_for_family(
+    url: &str,
+    req: &AnnounceRequest,
+    family: super::AddressFamily,
+) -> Result<AnnounceResponse, TrackerError> {
+    reject_obfuscation(req, url)?;
+    let (host, port) = parse_udp_url(url)?;
+    let url_data: Arc<[u8]> = udp_url_data(url).into();
+    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
+        .into_iter()
+        .filter(|target| family.matches(target))
+        .collect::<Vec<_>>();
+    race_endpoints(targets, &host, req, None, url_data).await
+}
+
+/// Whether datagrams to the tracker at `url` go through the UDP proxy rather than direct
+pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
+    proxy.udp_proxy().is_some()
+        && !parse_udp_url(url).is_ok_and(|(host, port)| is_bypassed(proxy, &host, port))
+}
+
+fn is_bypassed(proxy: &risuko_http::ProxyConnector, host: &str, port: u16) -> bool {
+    proxy
+        .udp_no_proxy()
+        .or_else(|| proxy.no_proxy())
+        .is_some_and(|no_proxy| no_proxy.matches_host_port(host, Some(port)))
+}
+
+/// UDP announces can't carry BEP 8's `sha_ih`
+fn reject_obfuscation(req: &AnnounceRequest, url: &str) -> Result<(), TrackerError> {
+    if req.obfuscate {
+        return Err(TrackerError::UnsupportedScheme(format!(
+            "{url}: BEP 8 obfuscation needs an HTTP tracker"
+        )));
+    }
+    Ok(())
+}
+
+/// Announce to every endpoint concurrently and keep the first answer
+async fn race_endpoints(
+    targets: Vec<SocketAddr>,
+    host: &str,
+    req: &AnnounceRequest,
+    source: Option<SocketAddr>,
+    url_data: Arc<[u8]>,
+) -> Result<AnnounceResponse, TrackerError> {
     if targets.is_empty() {
         return Err(TrackerError::Url(format!("no DNS result for {host}")));
     }
-
     let mut attempts = JoinSet::new();
     for target in targets {
         let req = req.clone();
-        attempts.spawn(async move { announce_endpoint(target, &req, source).await });
+        let url_data = url_data.clone();
+        attempts.spawn(async move { announce_endpoint(target, &req, source, &url_data).await });
     }
-
     let mut last_error = None;
     while let Some(result) = attempts.join_next().await {
         match result {
@@ -123,7 +172,6 @@ pub async fn announce_with_proxy_and_source(
             }
         }
     }
-
     Err(last_error
         .unwrap_or_else(|| TrackerError::Url(format!("no usable DNS endpoint for {host}"))))
 }
@@ -271,11 +319,7 @@ pub async fn scrape_with_proxy(
     }
     if source.is_some_and(|source| !source.ip().is_unspecified()) {
         let (host, port) = parse_udp_url(url)?;
-        let bypasses_proxy = proxy
-            .udp_no_proxy()
-            .or_else(|| proxy.no_proxy())
-            .is_some_and(|no_proxy| no_proxy.matches_host_port(&host, Some(port)));
-        if bypasses_proxy {
+        if is_bypassed(proxy, &host, port) {
             return scrape(url, info_hashes, source).await;
         }
     }
@@ -359,6 +403,7 @@ async fn announce_endpoint(
     target: SocketAddr,
     req: &AnnounceRequest,
     source: Option<SocketAddr>,
+    url_data: &[u8],
 ) -> Result<AnnounceResponse, TrackerError> {
     let bind_addr = direct_bind_addr(target, source);
     let cache_key = ConnectionCacheKey {
@@ -376,13 +421,13 @@ async fn announce_endpoint(
             id
         }
     };
-    match announce_inner(&sock, conn_id, req).await {
+    match announce_inner(&sock, conn_id, req, url_data).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
             invalidate_connection(cache_key);
             let id = connect(&sock).await?;
             cache_connection(cache_key, id);
-            announce_inner(&sock, id, req).await
+            announce_inner(&sock, id, req, url_data).await
         }
         Err(error) => Err(error),
     }
@@ -435,14 +480,15 @@ async fn announce_endpoint_proxy(
     host: &str,
     port: u16,
     req: &AnnounceRequest,
+    url_data: &[u8],
 ) -> Result<AnnounceResponse, TrackerError> {
     let conn_id = connect_socket(&sock, host, port).await?;
     let is_ipv6 = host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6());
-    match announce_inner_socket(&sock, conn_id, host, port, req, is_ipv6).await {
+    match announce_inner_socket(&sock, conn_id, host, port, req, is_ipv6, url_data).await {
         Ok(response) => Ok(response),
         Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
             let id = connect_socket(&sock, host, port).await?;
-            announce_inner_socket(&sock, id, host, port, req, is_ipv6).await
+            announce_inner_socket(&sock, id, host, port, req, is_ipv6, url_data).await
         }
         Err(error) => Err(error),
     }
@@ -508,6 +554,7 @@ async fn connect_socket(
     Err(TrackerError::Timeout)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn announce_inner_socket(
     sock: &risuko_http::ProxyDatagram,
     conn_id: u64,
@@ -515,8 +562,9 @@ async fn announce_inner_socket(
     port: u16,
     req: &AnnounceRequest,
     is_ipv6: bool,
+    url_data: &[u8],
 ) -> Result<AnnounceResponse, TrackerError> {
-    let (body, txn) = build_announce_body(conn_id, req);
+    let (body, txn) = build_announce_body(conn_id, req, url_data);
     let mut buf = vec![0u8; announce_response_buffer_len(true, req.num_want)];
     for attempt in 0..RETRANSMIT_ATTEMPTS {
         sock.send_to_host(&body, host, port)
@@ -554,8 +602,9 @@ async fn announce_inner(
     sock: &UdpSocket,
     conn_id: u64,
     req: &AnnounceRequest,
+    url_data: &[u8],
 ) -> Result<AnnounceResponse, TrackerError> {
-    let (body, txn) = build_announce_body(conn_id, req);
+    let (body, txn) = build_announce_body(conn_id, req, url_data);
 
     let is_ipv6 = sock.peer_addr().map(|a| a.is_ipv6()).unwrap_or(false);
     let mut buf = vec![0u8; announce_response_buffer_len(is_ipv6, req.num_want)];
@@ -595,9 +644,12 @@ fn announce_response_buffer_len(is_ipv6: bool, num_want: u32) -> usize {
 
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
-fn build_announce_body(conn_id: u64, req: &AnnounceRequest) -> ([u8; 98], u32) {
+/// BEP 41 option types appended after the 98-byte announce
+const OPTION_URL_DATA: u8 = 0x2;
+
+fn build_announce_body(conn_id: u64, req: &AnnounceRequest, url_data: &[u8]) -> (Vec<u8>, u32) {
     let txn = rand::rng().random::<u32>();
-    let mut body = [0u8; 98];
+    let mut body = vec![0u8; 98];
     be::write_u64(&mut body[0..8], conn_id);
     be::write_u32(&mut body[8..12], ACTION_ANNOUNCE);
     be::write_u32(&mut body[12..16], txn);
@@ -611,7 +663,25 @@ fn build_announce_body(conn_id: u64, req: &AnnounceRequest) -> ([u8; 98], u32) {
     be::write_u32(&mut body[88..92], req.key);
     be::write_u32(&mut body[92..96], req.num_want);
     be::write_u16(&mut body[96..98], req.port);
+    // BEP 41 URLData, split into options of at most 255 bytes
+    for chunk in url_data.chunks(u8::MAX as usize) {
+        body.push(OPTION_URL_DATA);
+        body.push(chunk.len() as u8);
+        body.extend_from_slice(chunk);
+    }
     (body, txn)
+}
+
+/// Path and query of a `udp://` URL, sent as BEP 41 URLData
+fn udp_url_data(url: &str) -> Vec<u8> {
+    let Some(rest) = url.strip_prefix("udp://") else {
+        return Vec::new();
+    };
+    let rest = rest.split('#').next().unwrap_or(rest);
+    match rest.find(['/', '?']) {
+        Some(start) => rest.as_bytes()[start..].to_vec(),
+        None => Vec::new(),
+    }
 }
 
 fn parse_announce_response(buf: &[u8], is_ipv6: bool) -> AnnounceResponse {
@@ -686,6 +756,37 @@ fn parse_udp_url(url: &str) -> Result<(String, u16), TrackerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_data_option_carries_path_and_query() {
+        assert_eq!(
+            udp_url_data("udp://tracker.example.com:80/dir?a=b&c=d#frag"),
+            b"/dir?a=b&c=d"
+        );
+        assert_eq!(udp_url_data("udp://tracker.example.com:80?k=1"), b"?k=1");
+        assert!(udp_url_data("udp://[::1]:2710").is_empty());
+
+        use crate::core::Id20;
+        let req = AnnounceRequest {
+            info_hash: Id20([1u8; 20]),
+            peer_id: Id20([2u8; 20]),
+            key: 7,
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: super::super::AnnounceEvent::None,
+            num_want: 50,
+            obfuscate: false,
+        };
+        let (plain, _) = build_announce_body(1, &req, b"");
+        assert_eq!(plain.len(), 98);
+        let long = vec![b'x'; 300];
+        let (body, _) = build_announce_body(1, &req, &long);
+        assert_eq!(&body[98..100], &[OPTION_URL_DATA, 255]);
+        assert_eq!(&body[355..357], &[OPTION_URL_DATA, 45]);
+        assert_eq!(body.len(), 98 + 2 + 255 + 2 + 45);
+    }
 
     #[test]
     fn parses_udp_url() {

@@ -47,15 +47,26 @@ pub fn compute_root(leaves: &[Id32]) -> Id32 {
     layer[0]
 }
 
-/// Compute the Merkle root over `leaves` padded out to `padded_len` (which must be a power of two ≥ leaves.len()). Used to derive a piece's root from its constituent block hashes when the piece is the last piece of a file: BEP 52 pads the leaf layer at the file level, not at the piece level, so the per-piece subtree may need its own padding logic
-pub fn compute_root_padded(leaves: &[Id32], padded_len: usize) -> Id32 {
+/// Hash of an all-zero subtree spanning `blocks` leaves (libtorrent's `merkle_pad`); piece-layer padding is `pad_hash(blocks_per_piece)`, not zero
+pub fn pad_hash(blocks: u32) -> Id32 {
+    let mut pad = Id32([0u8; 32]);
+    let mut span = 1u32;
+    while span < blocks {
+        pad = hash_pair(&pad, &pad);
+        span = span.saturating_mul(2);
+    }
+    pad
+}
+
+/// Merkle root over `leaves` padded with `pad` to `padded_len` (a power of two)
+pub fn compute_root_with_pad(leaves: &[Id32], padded_len: usize, pad: Id32) -> Id32 {
     assert!(padded_len.is_power_of_two() || padded_len == 0);
     assert!(leaves.len() <= padded_len);
     if padded_len == 0 {
         return Id32([0u8; 32]);
     }
     let mut layer: Vec<Id32> = leaves.to_vec();
-    layer.resize(padded_len, Id32([0u8; 32]));
+    layer.resize(padded_len, pad);
     while layer.len() > 1 {
         layer = layer
             .chunks_exact(2)
@@ -63,6 +74,20 @@ pub fn compute_root_padded(leaves: &[Id32], padded_len: usize) -> Id32 {
             .collect();
     }
     layer[0]
+}
+
+/// Merkle root over `leaves` zero-padded to `padded_len` (leaf-layer padding, e.g. a file's last piece)
+pub fn compute_root_padded(leaves: &[Id32], padded_len: usize) -> Id32 {
+    compute_root_with_pad(leaves, padded_len, Id32([0u8; 32]))
+}
+
+/// File root from its piece layer, padded with zero-subtree hashes
+pub fn piece_layer_root(piece_hashes: &[Id32], blocks_per_piece: u32) -> Id32 {
+    compute_root_with_pad(
+        piece_hashes,
+        piece_hashes.len().next_power_of_two(),
+        pad_hash(blocks_per_piece),
+    )
 }
 
 /// Per-file proof table built from the metainfo `piece layers` entry. Holds the SHA-256 hashes at the piece-leaf layer of the file's Merkle tree, one entry per piece. Once a piece's blocks have been downloaded we hash them to derive that piece's root and check it against `piece_root_hashes[piece_index_within_file]`
@@ -80,6 +105,28 @@ pub struct MerkleProofTable {
     pub blocks_per_piece: u32,
     /// SHA-256 root of each piece, in order. Length == `piece_count` For files smaller than one piece, this is empty and `file_root` alone is used
     pub piece_root_hashes: Vec<Id32>,
+    /// Padded piece layer and every layer above it, built on first use to serve proofs
+    upper_layers: std::sync::OnceLock<Vec<Vec<Id32>>>,
+}
+
+/// BEP 52: hash requests SHOULD NOT ask for more than 512 hashes
+pub const HASH_REQUEST_CHUNK: u32 = 512;
+/// Largest hash request we answer (libtorrent's cap)
+pub const MAX_SERVED_HASHES: u32 = 8192;
+/// Largest leaf-layer request we answer; each hash costs reading 16 KiB
+pub const MAX_SERVED_LEAF_HASHES: u32 = 512;
+
+/// `(index, length)` requests covering a file's piece layer in chunks of at most [`HASH_REQUEST_CHUNK`], skipping chunks that are only padding
+pub fn piece_layer_requests(piece_count: u32) -> Vec<(u32, u32)> {
+    let padded = piece_count.max(2).next_power_of_two();
+    if padded <= HASH_REQUEST_CHUNK {
+        return vec![(0, padded)];
+    }
+    (0..padded)
+        .step_by(HASH_REQUEST_CHUNK as usize)
+        .take_while(|index| *index < piece_count)
+        .map(|index| (index, HASH_REQUEST_CHUNK))
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +173,7 @@ impl MerkleProofTable {
                 piece_count,
                 blocks_per_piece,
                 piece_root_hashes: Vec::new(),
+                upper_layers: std::sync::OnceLock::new(),
             });
         }
 
@@ -144,8 +192,8 @@ impl MerkleProofTable {
             .map(|c| Id32::from_slice(c).expect("32-byte chunk"))
             .collect();
 
-        // Verify root: the file-level Merkle tree root is computed over the piece-layer leaves padded to the next power of two
-        let recomputed = compute_root(&piece_root_hashes);
+        // The file root covers the piece layer padded with zero-subtree hashes
+        let recomputed = piece_layer_root(&piece_root_hashes, blocks_per_piece);
         if recomputed != file_root {
             return Err(MerkleError::RootMismatch);
         }
@@ -157,6 +205,7 @@ impl MerkleProofTable {
             piece_count,
             blocks_per_piece,
             piece_root_hashes,
+            upper_layers: std::sync::OnceLock::new(),
         })
     }
 
@@ -200,17 +249,194 @@ impl MerkleProofTable {
         self.blocks_per_piece.trailing_zeros()
     }
 
-    /// Encode the piece layer for an outbound `HASHES` response: leaf hashes padded with zero-hashes to `piece_layer_padded_len`, flat 32-byte concatenation. Returns `None` for single-piece files (no layer to serve)
+    /// Piece layer for a `HASHES` reply, padded to `piece_layer_padded_len`; `None` for single-piece files
     pub fn serve_full_piece_layer(&self) -> Option<Vec<u8>> {
         let padded = self.piece_layer_padded_len() as usize;
         if padded == 0 {
             return None;
         }
+        let pad = pad_hash(self.blocks_per_piece);
         let mut out = Vec::with_capacity(padded * 32);
         for h in &self.piece_root_hashes {
             out.extend_from_slice(&h.0);
         }
-        out.resize(padded * 32, 0);
+        while out.len() < padded * 32 {
+            out.extend_from_slice(&pad.0);
+        }
+        Some(out)
+    }
+
+    /// Layers from the padded piece layer (index 0) up to the single-entry root
+    fn upper_layers(&self) -> &[Vec<Id32>] {
+        self.upper_layers.get_or_init(|| {
+            let padded = self.piece_layer_padded_len() as usize;
+            let mut layer = self.piece_root_hashes.clone();
+            layer.resize(padded, pad_hash(self.blocks_per_piece));
+            let mut layers = vec![layer];
+            while layers.last().is_some_and(|l| l.len() > 1) {
+                let next = layers
+                    .last()
+                    .unwrap()
+                    .chunks_exact(2)
+                    .map(|pair| hash_pair(&pair[0], &pair[1]))
+                    .collect();
+                layers.push(next);
+            }
+            layers
+        })
+    }
+
+    fn block_count(&self) -> u64 {
+        self.file_length.div_ceil(BLOCK_SIZE as u64)
+    }
+
+    /// Leaves of the whole file tree (the block layer padded to a power of two)
+    fn leaf_count(&self) -> u64 {
+        if self.piece_root_hashes.is_empty() {
+            self.block_count().max(1).next_power_of_two()
+        } else {
+            self.blocks_per_piece as u64 * self.piece_layer_padded_len() as u64
+        }
+    }
+
+    /// Validate a leaf-layer (`base_layer` 0) request and list the file-local pieces needed to answer it; `None` for requests we won't answer
+    pub fn leaf_request_pieces(
+        &self,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+    ) -> Option<Vec<u32>> {
+        if self.file_length == 0 || length < 2 || !length.is_power_of_two() {
+            return None;
+        }
+        if length > MAX_SERVED_LEAF_HASHES || !index.is_multiple_of(length) {
+            return None;
+        }
+        let leaves = self.leaf_count();
+        if index as u64 + length as u64 > leaves {
+            return None;
+        }
+        let height = leaves.trailing_zeros();
+        let subtree_layers = length.trailing_zeros();
+        let uncles = crate::wire::message::hashes_uncle_count(length, proof_layers) as u32;
+        if subtree_layers.checked_add(uncles)? > height {
+            return None;
+        }
+        // Uncles below the piece layer are hashed from blocks of the same piece
+        let piece_layer = self.blocks_per_piece.trailing_zeros();
+        let (mut lo, mut hi) = (index as u64, index as u64 + length as u64);
+        let mut node = (index / length) as u64;
+        for layer in subtree_layers..subtree_layers + uncles {
+            if !self.piece_root_hashes.is_empty() && layer >= piece_layer {
+                break;
+            }
+            let sibling = node ^ 1;
+            lo = lo.min(sibling << layer);
+            hi = hi.max((sibling + 1) << layer);
+            node >>= 1;
+        }
+        let hi = hi.min(self.block_count());
+        if lo >= hi {
+            return Some(Vec::new()); // only padding past the end of the file
+        }
+        let bpp = self.blocks_per_piece as u64;
+        Some(((lo / bpp) as u32..=((hi - 1) / bpp) as u32).collect())
+    }
+
+    /// Answer a leaf-layer request from the block hashes of the pieces [`Self::leaf_request_pieces`] named; blocks past the file end are zero
+    pub fn answer_leaf_request(
+        &self,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+        piece_blocks: &std::collections::HashMap<u32, Vec<Id32>>,
+    ) -> Option<Vec<u8>> {
+        self.leaf_request_pieces(index, length, proof_layers)?;
+        let bpp = self.blocks_per_piece as u64;
+        let blocks = self.block_count();
+        let piece_layer = self.blocks_per_piece.trailing_zeros();
+        let block_hash = |b: u64| -> Option<Id32> {
+            if b >= blocks {
+                return Some(Id32([0u8; 32]));
+            }
+            piece_blocks
+                .get(&((b / bpp) as u32))?
+                .get((b % bpp) as usize)
+                .copied()
+        };
+        // At or above the piece layer from the cached tree, below it from blocks
+        let node_hash = |layer: u32, i: u64| -> Option<Id32> {
+            if !self.piece_root_hashes.is_empty() && layer >= piece_layer {
+                let upper = self.upper_layers();
+                return upper
+                    .get((layer - piece_layer) as usize)?
+                    .get(i as usize)
+                    .copied();
+            }
+            let mut level: Vec<Id32> = ((i << layer)..((i + 1) << layer))
+                .map(block_hash)
+                .collect::<Option<_>>()?;
+            while level.len() > 1 {
+                level = level
+                    .chunks_exact(2)
+                    .map(|pair| hash_pair(&pair[0], &pair[1]))
+                    .collect();
+            }
+            level.first().copied()
+        };
+        let subtree_layers = length.trailing_zeros();
+        let uncles = crate::wire::message::hashes_uncle_count(length, proof_layers) as u32;
+        let mut out = Vec::with_capacity((length + uncles) as usize * 32);
+        for b in index as u64..index as u64 + length as u64 {
+            out.extend_from_slice(&block_hash(b)?.0);
+        }
+        let mut node = (index / length) as u64;
+        for layer in subtree_layers..subtree_layers + uncles {
+            out.extend_from_slice(&node_hash(layer, node ^ 1)?.0);
+            node >>= 1;
+        }
+        Some(out)
+    }
+
+    /// Answer a piece-layer `HASH_REQUEST`: `length` hashes from `index` plus the uncle hashes `proof_layers` asks for, lowest first; `None` for malformed requests or proofs past the root
+    pub fn hashes_for_request(
+        &self,
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+    ) -> Option<Vec<u8>> {
+        if self.piece_root_hashes.is_empty() || base_layer != self.piece_layer_base() {
+            return None;
+        }
+        if length < 2 || !length.is_power_of_two() || length > MAX_SERVED_HASHES {
+            return None;
+        }
+        if !index.is_multiple_of(length) {
+            return None;
+        }
+        let layers = self.upper_layers();
+        let base = &layers[0];
+        let end = index.checked_add(length)? as usize;
+        if end > base.len() {
+            return None;
+        }
+        let subtree_layers = length.trailing_zeros();
+        let uncles = crate::wire::message::hashes_uncle_count(length, proof_layers) as u32;
+        // The root has no sibling: proofs may climb at most to the layer below it
+        let height = layers.len() as u32 - 1;
+        if subtree_layers.checked_add(uncles)? > height {
+            return None;
+        }
+        let mut out = Vec::with_capacity((length + uncles) as usize * 32);
+        for hash in &base[index as usize..end] {
+            out.extend_from_slice(&hash.0);
+        }
+        let mut node = index / length;
+        for layer in &layers[subtree_layers as usize..(subtree_layers + uncles) as usize] {
+            out.extend_from_slice(&layer[(node ^ 1) as usize].0);
+            node >>= 1;
+        }
         Some(out)
     }
 
@@ -248,14 +474,14 @@ impl MerkleProofTable {
             .chunks_exact(32)
             .map(|c| Id32::from_slice(c).expect("32-byte chunk"))
             .collect();
-        // Trailing entries beyond `piece_count` must be zero — this is the only valid padding per BEP 52
-        for h in &leaves[piece_count as usize..] {
-            if h.0 != [0u8; 32] {
-                return Err(MerkleError::RootMismatch);
-            }
+        // Entries past `piece_count` must be the zero-subtree pad hash
+        let blocks_per_piece = piece_length / BLOCK_SIZE;
+        let pad = pad_hash(blocks_per_piece);
+        if leaves[piece_count as usize..].iter().any(|h| *h != pad) {
+            return Err(MerkleError::RootMismatch);
         }
         // Root must collapse from the (already-padded) leaves
-        let recomputed = compute_root_padded(&leaves, padded);
+        let recomputed = compute_root_with_pad(&leaves, padded, pad);
         if recomputed != file_root {
             return Err(MerkleError::RootMismatch);
         }
@@ -328,7 +554,7 @@ pub enum PieceVerifier {
     /// BEP 52 Merkle verification. `tables` is one entry per file in `info.files` order; `piece_to_file` resolves a torrent-global piece index to (file index, piece index within that file)
     V2Merkle {
         tables: Arc<Vec<MerkleProofTable>>,
-        /// Cumulative byte offset at the start of each file, length `tables.len() + 1`; the last entry is the total torrent length
+        /// Offset of each file in the piece-aligned torrent space (BEP 52), plus the end of the last file
         file_offsets: Arc<Vec<u64>>,
         piece_length: u32,
     },
@@ -350,7 +576,10 @@ impl PieceVerifier {
         let mut tables = Vec::with_capacity(v2.files.len());
         let mut offsets = Vec::with_capacity(v2.files.len() + 1);
         let mut acc: u64 = 0;
-        offsets.push(0);
+        let overflow = |f: &super::metainfo::TorrentMetaInfoV2| MerkleError::LayerLengthMismatch {
+            got: f.length as usize,
+            expected: u64::MAX as usize,
+        };
         for f in &v2.files {
             let layer = meta
                 .piece_layers
@@ -364,14 +593,18 @@ impl PieceVerifier {
                 layer,
             )?;
             tables.push(table);
-            acc = acc
-                .checked_add(f.length)
-                .ok_or(MerkleError::LayerLengthMismatch {
-                    got: f.length as usize,
-                    expected: u64::MAX as usize,
-                })?;
-            offsets.push(acc);
+            // Same alignment the v1 facade materialises as padding entries
+            let start = acc
+                .checked_add(super::metainfo::v2_alignment_padding(
+                    acc,
+                    f.length,
+                    v2.piece_length,
+                ))
+                .ok_or_else(|| overflow(f))?;
+            offsets.push(start);
+            acc = start.checked_add(f.length).ok_or_else(|| overflow(f))?;
         }
+        offsets.push(acc);
         Ok(Self::V2Merkle {
             tables: Arc::new(tables),
             file_offsets: Arc::new(offsets),
@@ -415,6 +648,12 @@ impl PieceVerifier {
                     .ok_or(VerifyError::PieceOutOfRange(piece_index))?;
                 let local_piece_idx =
                     ((piece_offset - file_offsets[file_idx]) / *piece_length as u64) as u32;
+                // Drop the alignment padding after a file's last piece
+                let own_len = table
+                    .piece_size(local_piece_idx)
+                    .ok_or(VerifyError::PieceOutOfRange(piece_index))?
+                    as usize;
+                let piece_bytes = piece_bytes.get(..own_len).unwrap_or(piece_bytes);
                 table
                     .verify_piece(local_piece_idx, piece_bytes)
                     .map_err(|e| match e {
@@ -440,6 +679,7 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn synth_file(file_length: u64, piece_length: u32) -> (Vec<u8>, MerkleProofTable) {
         // Build a deterministic byte pattern, hash all blocks, derive layer
@@ -470,9 +710,11 @@ mod tests {
         }
 
         let file_root = if piece_count == 1 {
-            piece_roots[0]
+            // A single-piece file's tree spans only its own blocks
+            let blocks: Vec<Id32> = data.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+            compute_root(&blocks)
         } else {
-            compute_root(&piece_roots)
+            piece_layer_root(&piece_roots, blocks_per_piece)
         };
 
         let layer_bytes: Vec<u8> = if file_length <= piece_length as u64 {
@@ -564,7 +806,7 @@ mod tests {
 
     #[test]
     fn full_piece_layer_serve_and_verify_round_trip() {
-        // 5-piece file (next_pow2 = 8) so we exercise zero-padding
+        // 5-piece file (next_pow2 = 8) so we exercise padding
         let piece_len: u32 = 64 * 1024;
         let file_len: u64 = 5 * piece_len as u64 - 1024;
         let (_data, table) = synth_file(file_len, piece_len);
@@ -572,8 +814,12 @@ mod tests {
         assert_eq!(table.piece_layer_padded_len(), 8);
         let served = table.serve_full_piece_layer().expect("multi-piece serves");
         assert_eq!(served.len(), 8 * 32);
-        // Last 3 entries must be zero (padding)
-        assert!(served[(5 * 32)..(8 * 32)].iter().all(|&b| b == 0));
+        // Last 3 entries are the root of an all-zero 4-block subtree, not zero bytes
+        let pad = pad_hash(4);
+        assert_ne!(pad.0, [0u8; 32]);
+        assert!(served[(5 * 32)..(8 * 32)]
+            .chunks_exact(32)
+            .all(|entry| entry == pad.0));
         let canonical = MerkleProofTable::verify_full_piece_layer_response(
             table.file_root,
             file_len,
@@ -587,6 +833,177 @@ mod tests {
             MerkleProofTable::from_layer_bytes(table.file_root, file_len, piece_len, &canonical)
                 .expect("rebuilds");
         assert_eq!(rebuilt.piece_root_hashes, table.piece_root_hashes);
+    }
+
+    #[test]
+    fn piece_layer_root_matches_the_leaf_level_tree() {
+        // 5 blocks in 32 KiB pieces: 3 pieces, layer padded to 4
+        let blocks: Vec<Id32> = (0u8..5)
+            .map(|i| hash_block(&[i; BLOCK_SIZE as usize]))
+            .collect();
+        let truth = compute_root(&blocks);
+        let pieces: Vec<Id32> = blocks
+            .chunks(2)
+            .map(|piece| compute_root_padded(piece, 2))
+            .collect();
+        assert_eq!(piece_layer_root(&pieces, 2), truth);
+        // Zero-padding the piece layer (the old behaviour) gives a different root
+        assert_ne!(compute_root(&pieces), truth);
+
+        let layer: Vec<u8> = pieces.iter().flat_map(|p| p.0).collect();
+        let file_len = 5 * BLOCK_SIZE as u64;
+        MerkleProofTable::from_layer_bytes(truth, file_len, 2 * BLOCK_SIZE, &layer)
+            .expect("libtorrent-shaped layer validates");
+    }
+
+    #[test]
+    fn hash_requests_are_chunked_and_skip_pure_padding() {
+        assert_eq!(piece_layer_requests(1), vec![(0, 2)]);
+        assert_eq!(piece_layer_requests(300), vec![(0, 512)]);
+        assert_eq!(piece_layer_requests(512), vec![(0, 512)]);
+        // 1100 pieces pad to 2048; the chunk at 1536 would be padding only
+        assert_eq!(
+            piece_layer_requests(1100),
+            vec![(0, 512), (512, 512), (1024, 512)]
+        );
+    }
+
+    #[test]
+    fn serves_piece_layer_ranges_with_uncle_proofs() {
+        // 6 pieces of 32 KiB -> layer padded to 8, three layers above it (4, 2, 1)
+        let piece_len = 2 * BLOCK_SIZE;
+        let file_len = 6 * piece_len as u64 - 100;
+        let (_data, table) = synth_file(file_len, piece_len);
+        let base = table.piece_layer_base();
+        let layers = table.upper_layers().to_vec();
+        assert_eq!(layers.len(), 4);
+        assert_eq!(layers[3][0], table.file_root);
+
+        // Whole layer, no proof
+        let whole = table.hashes_for_request(base, 0, 8, 0).unwrap();
+        assert_eq!(whole, table.serve_full_piece_layer().unwrap());
+
+        // Two hashes at index 4 with uncles at layers 1 and 2
+        let ranged = table.hashes_for_request(base, 4, 2, 2).unwrap();
+        assert_eq!(ranged.len(), 4 * 32);
+        let hashes: Vec<Id32> = ranged
+            .chunks_exact(32)
+            .map(|c| Id32::from_slice(c).unwrap())
+            .collect();
+        // Climbing from the pair recomputes the root
+        let pair = hash_pair(&hashes[0], &hashes[1]);
+        let up = hash_pair(&pair, &hashes[2]);
+        assert_eq!(hash_pair(&hashes[3], &up), table.file_root);
+        // proof_layers=3 would need a sibling of the root
+        assert!(table.hashes_for_request(base, 4, 2, 3).is_none());
+
+        // Malformed requests are refused
+        assert!(
+            table.hashes_for_request(base, 3, 2, 0).is_none(),
+            "unaligned index"
+        );
+        assert!(
+            table.hashes_for_request(base, 0, 3, 0).is_none(),
+            "length not a power of two"
+        );
+        assert!(
+            table.hashes_for_request(base, 8, 2, 0).is_none(),
+            "past the layer"
+        );
+        assert!(
+            table.hashes_for_request(0, 0, 2, 0).is_none(),
+            "leaf layer not held"
+        );
+    }
+
+    /// File root computed directly from every block
+    fn leaf_tree_root(data: &[u8], leaves: usize) -> Id32 {
+        let mut level: Vec<Id32> = data.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+        level.resize(leaves, Id32([0u8; 32]));
+        compute_root(&level)
+    }
+
+    fn piece_blocks(data: &[u8], piece_len: u32) -> HashMap<u32, Vec<Id32>> {
+        data.chunks(piece_len as usize)
+            .enumerate()
+            .map(|(p, piece)| {
+                (
+                    p as u32,
+                    piece.chunks(BLOCK_SIZE as usize).map(hash_block).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Climb from a response's hashes through its uncles to the root
+    fn climb(response: &[u8], index: u32, length: u32) -> Id32 {
+        let hashes: Vec<Id32> = response
+            .chunks_exact(32)
+            .map(|c| Id32::from_slice(c).unwrap())
+            .collect();
+        let mut node = compute_root(&hashes[..length as usize]);
+        let mut position = index / length;
+        for uncle in &hashes[length as usize..] {
+            node = if position.is_multiple_of(2) {
+                hash_pair(&node, uncle)
+            } else {
+                hash_pair(uncle, &node)
+            };
+            position /= 2;
+        }
+        node
+    }
+
+    #[test]
+    fn leaf_requests_prove_up_to_the_root() {
+        // 5 pieces of 4 blocks: 18 blocks padded to 32 leaves
+        let piece_len = 4 * BLOCK_SIZE;
+        let file_len = 4 * piece_len as u64 + BLOCK_SIZE as u64 + 100;
+        let (data, table) = synth_file(file_len, piece_len);
+        assert_eq!(leaf_tree_root(&data, 32), table.file_root);
+        let blocks = piece_blocks(&data, piece_len);
+
+        // Uncles inside piece 1, then from the piece layer up
+        let full_proof = 32u32.trailing_zeros(); // proof layers reaching the root
+        assert_eq!(
+            table.leaf_request_pieces(6, 2, full_proof - 1),
+            Some(vec![1])
+        );
+        let response = table
+            .answer_leaf_request(6, 2, full_proof - 1, &blocks)
+            .unwrap();
+        assert_eq!(response.len(), (2 + 4) * 32);
+        assert_eq!(climb(&response, 6, 2), table.file_root);
+
+        // 8 hashes span 3 layers, so proof layers 4 yields 2 uncles
+        assert_eq!(table.leaf_request_pieces(8, 8, 4), Some(vec![2, 3]));
+        let response = table.answer_leaf_request(8, 8, 4, &blocks).unwrap();
+        assert_eq!(response.len(), (8 + 2) * 32);
+        assert_eq!(climb(&response, 8, 8), table.file_root);
+
+        // The partial last piece pads its missing blocks with zero hashes
+        let response = table.answer_leaf_request(16, 4, 4, &blocks).unwrap();
+        assert_eq!(climb(&response, 16, 4), table.file_root);
+
+        // Missing piece data, proofs past the root, or malformed ranges are refused
+        let mut partial = blocks.clone();
+        partial.remove(&1);
+        assert!(table.answer_leaf_request(6, 2, 4, &partial).is_none());
+        assert!(table.leaf_request_pieces(6, 2, full_proof).is_none());
+        assert!(table.leaf_request_pieces(5, 2, 0).is_none());
+        assert!(table.leaf_request_pieces(0, 1024, 0).is_none());
+    }
+
+    #[test]
+    fn leaf_requests_work_for_single_piece_files() {
+        // 3 blocks in one 16-block piece: no piece layer, tree of 4 leaves
+        let piece_len = 16 * BLOCK_SIZE;
+        let file_len = 3 * BLOCK_SIZE as u64 - 10;
+        let (data, table) = synth_file(file_len, piece_len);
+        let blocks = piece_blocks(&data, piece_len);
+        assert_eq!(table.leaf_request_pieces(2, 2, 1), Some(vec![0]));
+        let response = table.answer_leaf_request(2, 2, 1, &blocks).unwrap();
+        assert_eq!(climb(&response, 2, 2), table.file_root);
     }
 
     #[test]

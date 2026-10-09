@@ -26,8 +26,8 @@ internal object WebViewSwap {
 
     /**
      * @return the PackageInfo now backing WebView (its `versionName` is the new
-     *   kernel version), or null if read-back failed.
-     * @throws PreconditionException if called too late / off the main thread.
+     *   kernel version), or null if read-back failed
+     * @throws PreconditionException if called too late / off the main thread
      */
     @Synchronized
     fun swapToInstalledPackage(context: Context, packageName: String): PackageInfo? {

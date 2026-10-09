@@ -273,7 +273,7 @@ pub fn run() {
             });
         }
 
-        // Windows/Linux use a custom title bar, so disable native decorations macOS keeps decorations and uses `titleBarStyle: Overlay`
+        // Windows/Linux use a custom title bar, so disable native decorations; macOS keeps decorations and uses `titleBarStyle: Overlay`
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.set_decorations(false);

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 /**
- * Bootstrap npm package records locally by publishing placeholder artifacts.
+ * Bootstrap npm package records locally by publishing placeholder artifacts
  *
  * This is useful for first-time scoped package creation, so npm package pages
- * exist and Trusted Publishing can be configured in the npm web UI.
+ * exist and Trusted Publishing can be configured in the npm web UI
  *
  * Usage:
  *   node scripts/bootstrap-npm-local.mjs

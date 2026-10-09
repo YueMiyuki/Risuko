@@ -294,7 +294,7 @@ fn dht_targets_match(expected: &DhtTarget, actual: &DhtTarget) -> bool {
         ) => expected_port == actual_port && expected_host.eq_ignore_ascii_case(actual_host),
         // Proxy readers may report the hostname-form source used in a SOCKS5
         // domain request as an IP address. Direct requests are normalized to
-        // Addr before registration and therefore never use this fallback.
+        // Addr before registration and therefore never use this fallback
         (DhtTarget::Host(..), DhtTarget::Addr(..)) => true,
         _ => false,
     }
@@ -331,7 +331,7 @@ impl DhtRouteSwap {
         self.next.clone()
     }
 
-    /// Finalize the route transition and stop the old runtime.
+    /// Finalize the route transition and stop the old runtime
     pub async fn commit(self) {
         let owns_current = {
             let guard = shared_dht_cell().lock().await;
@@ -422,7 +422,7 @@ impl Dht {
     }
 
     /// Stop iterative lookups while keeping this runtime available for a
-    /// possible route rollback.
+    /// possible route rollback
     pub fn cancel_lookups(&self) {
         self.abort_lookups();
     }
@@ -431,7 +431,8 @@ impl Dht {
         if let Some(path) = self.routing_state_path.clone() {
             let routes = self.routing_snapshot();
             let log_path = path.clone();
-            let result = tokio::task::spawn_blocking(move || save_routing_state_file(&path, &routes)).await;
+            let result =
+                tokio::task::spawn_blocking(move || save_routing_state_file(&path, &routes)).await;
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
@@ -687,7 +688,7 @@ impl Dht {
         if let Some(previous) = previous.as_ref() {
             // A route swap may take time to rebuild the surrounding runtime;
             // stop old lookups immediately so they cannot keep announcing on
-            // the previous proxy while the swap is in progress.
+            // the previous proxy while the swap is in progress
             previous.cancel_lookups();
         }
 
@@ -892,7 +893,7 @@ impl Dht {
                 }
                 if dht.proxy_datagram.is_some() {
                     // Proxied DHT sockets cannot issue the direct refresh pings
-                    // needed to validate liveness transitions.
+                    // needed to validate liveness transitions
                     continue;
                 }
                 let stale = dht.refresh_routing(K);
@@ -1124,7 +1125,7 @@ impl Dht {
                 // Resolve bootstrap names before sending any traffic and only
                 // retain publicly routable addresses. Using the validated
                 // numeric endpoint for proxy requests also prevents a proxy
-                // from resolving the same hostname to a private address.
+                // from resolving the same hostname to a private address
                 let addresses = lookup_host((host.as_str(), port))
                     .await
                     .ok()?
@@ -1404,7 +1405,10 @@ fn load_routing_state_file(path: &Path) -> std::io::Result<Vec<(Id20, SocketAddr
 }
 
 fn save_routing_state_file(path: &Path, contacts: &[(Id20, SocketAddr)]) -> std::io::Result<usize> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     let mut data = String::from("risuko-dht-routing-v1\n");
@@ -1867,21 +1871,17 @@ pub(crate) fn public_dht_endpoint(addr: SocketAddr) -> bool {
         IpAddr::V4(ip) => public_dht_ipv4(ip),
         IpAddr::V6(ip) => {
             // IPv4-compatible and IPv4-mapped IPv6 addresses carry an IPv4
-            // endpoint, so apply the IPv4 policy before accepting the address.
+            // endpoint, so apply the IPv4 policy before accepting the address
             if let Some(ipv4) = ip.to_ipv4() {
-                return public_dht_endpoint(SocketAddr::new(
-                    ipv4.into(),
-                    addr.port(),
-                ));
+                return public_dht_endpoint(SocketAddr::new(ipv4.into(), addr.port()));
             }
             let segments = ip.segments();
             // Documentation and benchmarking prefixes are not publicly
-            // routable DHT endpoints even though they are global unicast.
-            let documentation = segments[0] == 0x2001
-                && (segments[1] == 0x0db8 || segments[1] == 0x0002);
+            // routable DHT endpoints even though they are global unicast
+            let documentation =
+                segments[0] == 0x2001 && (segments[1] == 0x0db8 || segments[1] == 0x0002);
             let orchid = segments[0] == 0x2001
-                && ((segments[1] & 0xfff0) == 0x0010
-                    || (segments[1] & 0xfff0) == 0x0020);
+                && ((segments[1] & 0xfff0) == 0x0010 || (segments[1] & 0xfff0) == 0x0020);
             let discard_only =
                 segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0);
             !ip.is_loopback()
@@ -1897,7 +1897,7 @@ pub(crate) fn public_dht_endpoint(addr: SocketAddr) -> bool {
 fn public_dht_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     // Ipv4Addr::is_private does not include CGNAT, reserved, benchmarking,
-    // or several IANA special-purpose ranges.
+    // or several IANA special-purpose ranges
     octets[0] != 0
         && !ip.is_unspecified()
         && !ip.is_loopback()
@@ -2072,7 +2072,11 @@ fn build_query_response(
     let Some(remote_id) = remote_id else {
         return Some(krpc_error(tid, 203, b"invalid id"));
     };
-    server.add_routing(remote_id, from);
+    // BEP 43: read-only nodes stay out of the routing table
+    let read_only = msg.get(b"ro").and_then(Value::as_int) == Some(1);
+    if !read_only {
+        server.add_routing(remote_id, from);
+    }
 
     let mut response = vec![
         (
@@ -2711,6 +2715,31 @@ mod tests {
     }
 
     #[test]
+    fn read_only_querier_is_answered_but_not_routed() {
+        let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
+        let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
+        let ping = Value::Dict(vec![
+            (
+                b"a".to_vec(),
+                Value::Dict(vec![(b"id".to_vec(), Value::Bytes(vec![7u8; 20]))]),
+            ),
+            (b"q".to_vec(), Value::Bytes(b"ping".to_vec())),
+            (b"ro".to_vec(), Value::Int(1)),
+            (b"t".to_vec(), Value::Bytes(b"ro".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+        ]);
+        let reply = build_query_response(&ping, "127.0.0.1:6000".parse().unwrap(), &state).unwrap();
+        assert_eq!(
+            decode_all(&reply)
+                .unwrap()
+                .get(b"y")
+                .and_then(Value::as_bytes),
+            Some(b"r" as &[u8])
+        );
+        assert_eq!(state.routing.lock().len(), 0);
+    }
+
+    #[test]
     fn inbound_ping_and_unknown_query() {
         let our_id = Id20::from_slice(&[9u8; 20]).unwrap();
         let state = InboundDhtState::new(our_id, Arc::new(Mutex::new(RoutingTable::new(our_id))));
@@ -2830,7 +2859,7 @@ mod tests {
         state.add_peer(hash, "[2001:db8::1]:6881".parse().unwrap());
 
         // `want` asks for IPv6 routing nodes, but the KRPC packet itself was
-        // sent over IPv4. BEP-32 requires 6-byte IPv4 peer values here.
+        // sent over IPv4. BEP-32 requires 6-byte IPv4 peer values here
         let request = Value::Dict(vec![
             (
                 b"a".to_vec(),
@@ -2951,7 +2980,10 @@ mod tests {
                 (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
             ]);
             let reply = decode_all(&build_query_response(&request, from, &state).unwrap()).unwrap();
-            assert_eq!(reply.get(b"y").and_then(Value::as_bytes), Some(b"r" as &[u8]));
+            assert_eq!(
+                reply.get(b"y").and_then(Value::as_bytes),
+                Some(b"r" as &[u8])
+            );
             assert!(reply.get(b"e").is_none());
         }
         assert_eq!(state.routing.lock().len(), 1);

@@ -64,7 +64,7 @@ fn platform_fallocate(file: &File, len: u64) -> io::Result<()> {
     fallocate(file, FallocateFlags::empty(), 0, signed_len)
         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     // Empty flags extend a shorter file to `len`, but never shrink a longer
-    // one. Avoid an extra metadata-changing truncate on the common grow path.
+    // one. Avoid an extra metadata-changing truncate on the common grow path
     if current_len > len {
         file.set_len(len)
     } else {

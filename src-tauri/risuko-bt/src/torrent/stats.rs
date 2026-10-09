@@ -90,6 +90,8 @@ impl LiveStats {
 pub struct TorrentStats {
     pub total_bytes: u64,
     pub progress_bytes: u64,
+    /// Bytes still needed for the selected files
+    pub left_bytes: u64,
     pub uploaded_bytes: u64,
     pub finished: bool,
     pub file_progress: Vec<u64>,
@@ -99,11 +101,12 @@ pub struct TorrentStats {
 }
 
 impl TorrentStats {
-    pub(crate) fn initial(total_bytes: u64, file_lens: Vec<u64>) -> Self {
+    pub(crate) fn initial(total_bytes: u64, left_bytes: u64, file_lens: Vec<u64>) -> Self {
         let file_progress = vec![0u64; file_lens.len()];
         Self {
             total_bytes,
             progress_bytes: 0,
+            left_bytes,
             uploaded_bytes: 0,
             finished: false,
             file_progress,

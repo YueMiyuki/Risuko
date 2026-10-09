@@ -1501,7 +1501,7 @@ async fn run_dispatcher(
 
         // Resolve domain-form relay sources outside the pending lock. DNS can
         // await, and holding this lock would prevent new Kad requests from
-        // registering while one malformed/unresolvable source is examined.
+        // registering while one malformed/unresolvable source is examined
         let candidates = {
             let entries = pending.lock().await;
             entries

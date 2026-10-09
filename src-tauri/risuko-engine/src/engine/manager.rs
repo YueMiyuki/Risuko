@@ -14,7 +14,7 @@ use super::events::{EngineEvent, EventBroadcaster};
 use super::http;
 use super::media;
 use super::options::EngineOptions;
-use super::routing::{resolve_routing, TaskRoutingRule};
+use super::routing::{resolve_routing, strip_part_suffix, TaskRoutingRule};
 use super::session::SessionManager;
 use super::speed_limiter::{parse_speed_limit, SpeedLimiter};
 use super::task::{
@@ -701,6 +701,20 @@ fn metalink_checksums(options: &Map<String, Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `select-file` from changeOption: numbers become strings and null clears the selection; other non-string values are ignored as `Ok(None)`
+fn normalize_select_file(value: &Value) -> Result<Option<String>, String> {
+    let selection = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Null => String::new(),
+        _ => return Ok(None),
+    };
+    if !selection.trim().is_empty() && torrent::parse_select_file(&selection).is_none() {
+        return Err(format!("Invalid select-file value: {selection}"));
+    }
+    Ok(Some(selection))
+}
+
 fn apply_select_file(files: &mut [DownloadFile], options: &Map<String, Value>) {
     let raw = options
         .get("select-file")
@@ -713,11 +727,9 @@ fn apply_select_file(files: &mut [DownloadFile], options: &Map<String, Value>) {
         }
         return;
     }
-    let wanted: std::collections::HashSet<usize> = raw
-        .split(',')
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-        .filter(|i| *i >= 1)
-        .map(|i| i - 1)
+    let wanted: std::collections::HashSet<usize> = torrent::parse_select_file(raw)
+        .unwrap_or_default()
+        .into_iter()
         .collect();
     for (i, f) in files.iter_mut().enumerate() {
         f.selected = if wanted.contains(&i) { "true" } else { "false" }.to_string();
@@ -1214,7 +1226,7 @@ impl TaskManager {
         };
 
         let (dir, tag) = self
-            .resolve_routing_for_task(&options, &filename_hint)
+            .resolve_routing_for_task(&options, strip_part_suffix(&filename_hint))
             .await;
 
         self.enqueue(DownloadTask::new_http(gid, uris, dir, tag, options))
@@ -1604,7 +1616,7 @@ impl TaskManager {
     ) -> Result<Vec<torrent::TorrentFileInfo>, String> {
         // Keep the task-option snapshot and the engine's route generation
         // together. A proxy reload must either wait for this preview to finish
-        // or start after it has captured the new profile.
+        // or start after it has captured the new profile
         let _p2p_reload_guard = self.p2p_reload_lock.lock().await;
         let merged = self.options.read().await.merge_task_options(&options);
         let te_guard = self.torrent_engine.read().await;
@@ -1638,7 +1650,7 @@ impl TaskManager {
             p2p_route_generation.load(std::sync::atomic::Ordering::Acquire);
         // This snapshot is taken while the caller owns p2p_reload_lock. The
         // engine-side generation check below closes the small gap after this
-        // task is spawned but before its first network operation.
+        // task is spawned but before its first network operation
         let expected_engine_generation = match torrent_engine.read().await.clone() {
             Some(engine) => Some(engine.magnet_route_generation().await),
             None => None,
@@ -1694,6 +1706,16 @@ impl TaskManager {
                         if let Some(trackers) = task.options.get("bt-tracker") {
                             resolve_options.insert("bt-tracker".to_string(), trackers.clone());
                         }
+                        // A selection changed while resolving wins over the one captured at add time
+                        match task.options.get("select-file") {
+                            Some(selection) => {
+                                resolve_options
+                                    .insert("select-file".to_string(), selection.clone());
+                            }
+                            None => {
+                                resolve_options.remove("select-file");
+                            }
+                        }
                     }
                 }
 
@@ -1733,6 +1755,12 @@ impl TaskManager {
                                 task.meta_version = handle.meta_version.clone();
                                 task.error_code = None;
                                 task.error_message = None;
+                                // Record a BEP 53 `so=` selection so the file list matches
+                                if let Some(selection) = handle.select_file.clone() {
+                                    task.options
+                                        .entry("select-file".to_string())
+                                        .or_insert(Value::String(selection));
+                                }
                                 attached = true;
                             }
                         }
@@ -1753,6 +1781,26 @@ impl TaskManager {
                                     handle.id,
                                 )
                                 .await;
+                                // change_option skips a torrent with no id yet, so apply a selection changed while resolving now
+                                let applied = resolve_options
+                                    .get("select-file")
+                                    .cloned()
+                                    .or_else(|| handle.select_file.clone().map(Value::String));
+                                let latest = {
+                                    let guard = tasks.read().await;
+                                    guard
+                                        .iter()
+                                        .find(|task| task.gid == gid)
+                                        .and_then(|task| task.options.get("select-file").cloned())
+                                };
+                                if latest != applied {
+                                    let raw = latest.as_ref().and_then(Value::as_str);
+                                    if let Err(e) = engine.set_select_file(handle.id, raw).await {
+                                        tracing::warn!(
+                                            "[task:{gid}] could not apply file selection: {e}"
+                                        );
+                                    }
+                                }
                                 let tracker_urls = {
                                     let guard = tasks.read().await;
                                     guard
@@ -1887,7 +1935,7 @@ impl TaskManager {
         };
 
         let (dir, tag) = self
-            .resolve_routing_for_task(&options, &filename_hint)
+            .resolve_routing_for_task(&options, strip_part_suffix(&filename_hint))
             .await;
 
         self.enqueue(DownloadTask::new_ftp(
@@ -2308,7 +2356,7 @@ impl TaskManager {
         self.try_start_next_unlocked().await;
     }
 
-    /// Start waiting workers while the caller already owns the P2P reload gate.
+    /// Start waiting workers while the caller already owns the P2P reload gate
     async fn try_start_next_unlocked(&self) {
         let (max_concurrent, options_snapshot) = {
             let options_guard = self.options.read().await;
@@ -3399,7 +3447,7 @@ impl TaskManager {
                             let create_subfolder = task
                                 .options
                                 .get("bt-create-subfolder")
-                                .and_then(|v| v.as_bool())
+                                .and_then(super::options::json_bool)
                                 .unwrap_or(bt_create_subfolder_default);
                             let base_dir = if let Some(resolved_root) =
                                 stats.resolved_root.as_ref().filter(|s| !s.is_empty())
@@ -3420,23 +3468,8 @@ impl TaskManager {
                                 .options
                                 .get("select-file")
                                 .and_then(|v| v.as_str())
-                                .and_then(|raw| {
-                                    let raw = raw.trim();
-                                    if raw.is_empty() {
-                                        return None;
-                                    }
-                                    let set: std::collections::HashSet<usize> = raw
-                                        .split(',')
-                                        .filter_map(|s| s.trim().parse::<usize>().ok())
-                                        .filter(|&i| i >= 1)
-                                        .map(|i| i - 1) // 1-based to 0-based
-                                        .collect();
-                                    if set.is_empty() {
-                                        None
-                                    } else {
-                                        Some(set)
-                                    }
-                                });
+                                .and_then(torrent::parse_select_file)
+                                .map(|indices| indices.into_iter().collect());
 
                             let (selected_total, selected_completed) = sync_torrent_files(
                                 &mut task.files,
@@ -3552,7 +3585,7 @@ impl TaskManager {
 
     /// Reconcile active magnet tasks while the caller already owns the P2P
     /// reload gate. Keeping the option snapshot and route epoch under that
-    /// gate prevents a resolver from pairing old options with a new route.
+    /// gate prevents a resolver from pairing old options with a new route
     async fn ensure_active_magnet_resolvers_unlocked(&self) {
         let jobs = {
             // Acquire in the same order as remove() (torrent_ids -> pending_magnets -> tasks) to avoid a deadlock where remove() holds torrent_ids.write() while waiting for tasks.write() and we hold tasks.read() while waiting for torrent_ids.read()
@@ -4287,7 +4320,7 @@ impl TaskManager {
 
             if task.kind == TaskKind::Torrent {
                 // Reject only actual URI/dir/out changes so a full-form patch
-                // that restates the current values can still apply trackers/options.
+                // that restates the current values can still apply trackers/options
                 if normalized_uris
                     .as_ref()
                     .is_some_and(|uris| uris != &task.uris)
@@ -4485,8 +4518,23 @@ impl TaskManager {
         })
     }
 
-    pub async fn change_option(&self, gid: &str, opts: Map<String, Value>) -> Result<(), String> {
+    pub async fn change_option(
+        &self,
+        gid: &str,
+        mut opts: Map<String, Value>,
+    ) -> Result<(), String> {
+        // Forward file selection changes to the running torrent
+        let reselect = match opts.remove("select-file") {
+            Some(value) => normalize_select_file(&value)?,
+            None => None,
+        };
+        if let Some(selection) = &reselect {
+            opts.insert("select-file".to_string(), Value::String(selection.clone()));
+        }
         let mut tasks = self.tasks.write().await;
+        let is_torrent = tasks
+            .iter()
+            .any(|t| t.gid == gid && t.kind == TaskKind::Torrent);
         if let Some(task) = tasks.iter_mut().find(|t| t.gid == gid) {
             // If seed-time is being set to 0, stop seeding immediately
             if let Some(v) = opts.get("seed-time") {
@@ -4522,9 +4570,27 @@ impl TaskManager {
             for (k, v) in opts {
                 task.options.insert(k, v);
             }
+            drop(tasks);
+            if let (true, Some(selection)) = (is_torrent, reselect) {
+                self.apply_torrent_selection(gid, &selection).await;
+            }
             return Ok(());
         }
         Err(format!("GID {} not found", gid))
+    }
+
+    /// Push `select-file` to the live torrent; one still resolving picks it up when added
+    async fn apply_torrent_selection(&self, gid: &str, selection: &str) {
+        let Some(tid) = self.torrent_ids.read().await.get(gid).copied() else {
+            return;
+        };
+        let Some(engine) = self.torrent_engine.read().await.clone() else {
+            return;
+        };
+        let raw = (!selection.trim().is_empty()).then_some(selection);
+        if let Err(e) = engine.set_select_file(tid, raw).await {
+            tracing::warn!("[task:{gid}] could not apply file selection: {e}");
+        }
     }
 
     fn is_p2p_task_kind(kind: TaskKind) -> bool {
@@ -4600,7 +4666,7 @@ impl TaskManager {
 
         // Invalidate resolver jobs before changing task state or rebuilding
         // any shared runtime. New jobs cannot capture this epoch until the
-        // reload has finished updating the effective options.
+        // reload has finished updating the effective options
         self.p2p_route_generation.fetch_add(1, Ordering::AcqRel);
 
         let active_p2p: Vec<(String, TaskKind)> = {
@@ -4623,7 +4689,7 @@ impl TaskManager {
 
         // Invalidate metadata lookups before rebuilding any shared P2P
         // runtime. They may have captured the old profile and otherwise
-        // could keep announcing or dialing through it after the swap.
+        // could keep announcing or dialing through it after the swap
         if let Some(engine) = self.torrent_engine.read().await.clone() {
             engine.invalidate_magnet_resolutions().await;
         }
@@ -5351,7 +5417,7 @@ impl TaskManager {
         .await;
     }
 
-    /// Map `gid` to `torrent_id` and drop mappings whose torrent is no longer in the bt session. Replacing a finished torrent on re-add leaves the old gid pointing at a deleted id; those Active/seeder tasks must be marked Complete so the magnet resolver does not resurrect them.
+    /// Map `gid` to `torrent_id` and drop mappings whose torrent is no longer in the bt session. Replacing a finished torrent on re-add leaves the old gid pointing at a deleted id; those Active/seeder tasks must be marked Complete so the magnet resolver does not resurrect them
     async fn remember_torrent_id_in(
         torrent_engine: &Arc<RwLock<Option<TorrentEngine>>>,
         torrent_ids: &Arc<RwLock<HashMap<String, usize>>>,
@@ -5591,11 +5657,14 @@ fn resolve_seed_goal(
 ) -> (bool, u64, f64) {
     let manual = opts
         .get("keep-seeding")
-        .and_then(|v| v.as_bool())
+        .and_then(super::options::json_bool)
         .unwrap_or(g_manual);
     let seed_time = opts
         .get("seed-time")
-        .and_then(|v| v.as_u64())
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        })
         .unwrap_or(g_seed_time);
     let seed_ratio = opts
         .get("seed-ratio")
@@ -5680,7 +5749,7 @@ fn sync_torrent_files(
     *target = file_details
         .iter()
         .map(|fd| {
-            let completed = file_progress.get(fd.index).copied().unwrap_or(0);
+            let completed = file_progress.get(fd.torrent_index).copied().unwrap_or(0);
             let is_selected = selected_indices.is_none_or(|set| set.contains(&fd.index));
             if is_selected {
                 selected_total += fd.length;
@@ -5847,6 +5916,27 @@ mod tests {
     }
 
     #[test]
+    fn change_option_select_file_is_normalized() {
+        use serde_json::json;
+        assert_eq!(
+            normalize_select_file(&json!("1-2,4")),
+            Ok(Some("1-2,4".into()))
+        );
+        assert_eq!(normalize_select_file(&json!(3)), Ok(Some("3".into())));
+        // Empty and null clear the selection
+        assert_eq!(normalize_select_file(&json!("")), Ok(Some(String::new())));
+        assert_eq!(normalize_select_file(&json!(null)), Ok(Some(String::new())));
+        // Other types keep the previous selection
+        assert_eq!(normalize_select_file(&json!(true)), Ok(None));
+        assert_eq!(normalize_select_file(&json!([1])), Ok(None));
+        assert_eq!(normalize_select_file(&json!({"a": 1})), Ok(None));
+        // Nothing parseable is rejected instead of selecting every file
+        assert!(normalize_select_file(&json!("x")).is_err());
+        assert!(normalize_select_file(&json!(0)).is_err());
+        assert!(normalize_select_file(&json!(-2)).is_err());
+    }
+
+    #[test]
     fn per_task_seed_goal_overrides_global() {
         // Globals off: a per-task seed-time still starts and bounds seeding
         let mut opts = Map::new();
@@ -5855,6 +5945,13 @@ mod tests {
         assert!(keep);
         assert_eq!(time, 30);
         assert_eq!(ratio, 0.0);
+
+        // String values, as the CLI and aria2-style clients send them
+        let mut opts = Map::new();
+        opts.insert("seed-time".into(), serde_json::json!("45"));
+        let (keep, time, _) = resolve_seed_goal(&opts, false, 0, 0.0);
+        assert!(keep);
+        assert_eq!(time, 45);
 
         // Unset per-task keys fall back to the globals
         let (keep, time, ratio) = resolve_seed_goal(&Map::new(), false, 10, 1.5);
@@ -5869,6 +5966,13 @@ mod tests {
         assert!(keep);
         assert_eq!(time, 0);
         assert_eq!(ratio, 0.0);
+
+        // String booleans count too, and an explicit "false" beats the global
+        let mut opts = Map::new();
+        opts.insert("keep-seeding".into(), serde_json::json!("true"));
+        assert_eq!(resolve_seed_goal(&opts, false, 99, 9.0), (true, 0, 0.0));
+        opts.insert("keep-seeding".into(), serde_json::json!("false"));
+        assert_eq!(resolve_seed_goal(&opts, true, 0, 0.0), (false, 0, 0.0));
 
         // string ratio (config-set form) still parses
         let mut opts = Map::new();

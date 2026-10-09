@@ -714,8 +714,15 @@ mod tests {
             .build()
             .unwrap();
 
-        let error = client.get("http://blocked.example/").send().await.unwrap_err();
-        assert!(error.to_string().contains("Connect"), "unexpected error: {error}");
+        let error = client
+            .get("http://blocked.example/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Connect"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -833,7 +840,7 @@ mod tests {
         let client = Client::builder()
             .proxy(Proxy::all(format!("http://{address}")).unwrap())
             // A v6 source cannot connect to this v4 proxy. The request must
-            // still succeed because only direct destination routes are bound.
+            // still succeed because only direct destination routes are bound
             .local_address(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
             .build()
             .unwrap();

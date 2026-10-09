@@ -205,16 +205,7 @@ impl EngineOptions {
 
     /// Coerce common boolean representations: native bools, "true"/"false" strings, "1"/"0" strings, and numeric 0/1
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.global.get(key)? {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) => match s.as_str() {
-                "true" | "1" | "yes" => Some(true),
-                "false" | "0" | "no" => Some(false),
-                _ => None,
-            },
-            Value::Number(n) => n.as_u64().map(|v| v != 0),
-            _ => None,
-        }
+        self.global.get(key).and_then(json_bool)
     }
 
     pub fn p2p_proxy_connector(&self) -> Result<risuko_http::ProxyConnector, String> {
@@ -630,7 +621,7 @@ impl EngineOptions {
             }
         }
         // A task-level TCP P2P override applies to UDP as well unless it has
-        // explicitly supplied a separate UDP route.
+        // explicitly supplied a separate UDP route
         if task_has_p2p_route
             && !task_proxy_has_nested_p2p_udp
             && !task_opts.contains_key("p2p-udp-proxy")
@@ -650,16 +641,25 @@ impl EngineOptions {
     }
 }
 
-fn value_as_bool(value: &Value) -> bool {
+/// JSON bool, integer (non-zero = true), or a trimmed, case-insensitive `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` string
+pub(crate) fn json_bool(value: &Value) -> Option<bool> {
     match value {
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_i64().is_some_and(|value| value != 0),
-        Value::String(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        ),
-        _ => false,
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|v| v != 0)
+            .or_else(|| n.as_u64().map(|v| v != 0)),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
+}
+
+fn value_as_bool(value: &Value) -> bool {
+    json_bool(value).unwrap_or(false)
 }
 
 pub(crate) fn build_p2p_proxy_connector(
@@ -1230,8 +1230,9 @@ mod tests {
         sys.insert("i".into(), json!("0"));
         sys.insert("j".into(), json!(0));
         sys.insert("k".into(), json!("garbage"));
+        sys.insert("l".into(), json!(u64::MAX));
         let opts = EngineOptions::from_config(&sys, &Map::new());
-        for k in ["a", "b", "c", "d", "e"] {
+        for k in ["a", "b", "c", "d", "e", "l"] {
             assert_eq!(opts.get_bool(k), Some(true), "{k}");
         }
         for k in ["f", "g", "h", "i", "j"] {
@@ -1239,6 +1240,28 @@ mod tests {
         }
         assert_eq!(opts.get_bool("k"), None);
         assert_eq!(opts.get_bool("missing"), None);
+    }
+
+    #[test]
+    fn json_bool_matches_value_as_bool() {
+        for v in [
+            json!(" TRUE "),
+            json!("On"),
+            json!("yes"),
+            json!(-1),
+            json!(2),
+        ] {
+            assert_eq!(json_bool(&v), Some(true), "{v}");
+            assert!(value_as_bool(&v), "{v}");
+        }
+        for v in [json!(" False"), json!("OFF"), json!("no"), json!(0)] {
+            assert_eq!(json_bool(&v), Some(false), "{v}");
+            assert!(!value_as_bool(&v), "{v}");
+        }
+        for v in [json!("maybe"), json!(1.5), json!(null), json!([true])] {
+            assert_eq!(json_bool(&v), None, "{v}");
+            assert!(!value_as_bool(&v), "{v}");
+        }
     }
 
     #[test]

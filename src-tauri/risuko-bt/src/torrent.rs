@@ -16,7 +16,7 @@ use rand::RngExt;
 use sha1::{Digest, Sha1};
 
 use super::blocklist::BlockList;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -80,6 +80,8 @@ const OUR_UT_HOLEPUNCH_ID: u8 = 5;
 const MAX_PEX_SOURCE_ENTRIES: usize = 4096;
 const META_PIECE_SIZE: usize = 16 * 1024;
 const MAX_FAST_PIECES: usize = 10;
+/// Concurrent disk-backed BEP 52 leaf-hash replies per torrent
+const MAX_LEAF_HASH_JOBS: usize = 4;
 const MAX_SUGGESTED_PIECES: usize = 64;
 const WEBSEED_MAX_WORKERS: usize = 4;
 const WEBSEED_MAX_PIECES_PER_JOB: usize = 8;
@@ -154,6 +156,24 @@ impl GenerationToken {
 struct PeerEnvelope {
     generation: u64,
     candidate: PeerCandidate,
+    /// Peer from a BEP 8 obfuscated tracker, assumed to support MSE
+    mse_first: bool,
+}
+
+/// Cap on remembered MSE-capable peers
+const MAX_MSE_FIRST_ADDRS: usize = 4096;
+
+/// MSE-capable peers under the Prefer policy are dialled encrypted first
+fn dial_policy(
+    policy: crate::peer::EncryptionPolicy,
+    mse_capable: bool,
+) -> crate::peer::EncryptionPolicy {
+    use crate::peer::EncryptionPolicy;
+    if mse_capable && policy == EncryptionPolicy::Prefer {
+        EncryptionPolicy::PreferEncrypted
+    } else {
+        policy
+    }
 }
 
 fn peer_source_allowed(
@@ -175,10 +195,17 @@ pub enum TorrentCommand {
         reserved: [u8; 8],
         peer_id: Id20,
         io_abort: AbortHandle,
+        encrypted: bool,
+        utp: bool,
     },
     AddTrackers {
         urls: Vec<String>,
         ack: oneshot::Sender<usize>,
+    },
+    /// Replace the file selection (`None` = every file)
+    SetOnlyFiles {
+        files: Option<Vec<usize>>,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     Pause(oneshot::Sender<()>),
     Unpause(oneshot::Sender<()>),
@@ -238,6 +265,79 @@ impl ManagedTorrent {
     pub(crate) fn cmd_tx(&self) -> mpsc::Sender<TorrentCommand> {
         self.cmd_tx.clone()
     }
+
+    /// Download only `files` (indices into the torrent's file list), or everything for `None`; errors name selected files left unselected because their part-file data could not move
+    pub async fn set_only_files(&self, files: Option<Vec<usize>>) -> Result<(), String> {
+        let (ack, done) = oneshot::channel();
+        self.cmd_tx
+            .send(TorrentCommand::SetOnlyFiles { files, ack })
+            .await
+            .map_err(|e| e.to_string())?;
+        done.await.map_err(|e| e.to_string())?
+    }
+}
+
+/// Pieces overlapping a selected file; all pieces without a selection
+fn wanted_pieces(layout: &FileSet, lengths: &Lengths, only_files: Option<&[usize]>) -> Vec<bool> {
+    let total = lengths.total_pieces() as usize;
+    let Some(only_files) = only_files else {
+        return vec![true; total];
+    };
+    let mut wanted = vec![false; total];
+    let piece_length = lengths.piece_length() as u64;
+    for &idx in only_files {
+        let Some(file) = layout.files().get(idx) else {
+            continue;
+        };
+        if file.padding || file.length == 0 {
+            continue;
+        }
+        let first = (file.offset / piece_length) as usize;
+        let last = ((file.offset + file.length - 1) / piece_length) as usize;
+        for flag in wanted.iter_mut().take(last.min(total - 1) + 1).skip(first) {
+            *flag = true;
+        }
+    }
+    wanted
+}
+
+fn selected_file_set(only_files: Option<&[usize]>) -> Option<HashSet<usize>> {
+    only_files.map(|files| files.iter().copied().collect())
+}
+
+async fn apply_storage_selection(
+    storage: &FilesystemStorage,
+    only_files: Option<Vec<usize>>,
+) -> (Option<Vec<usize>>, Result<(), String>) {
+    let selected = selected_file_set(only_files.as_deref());
+    let mut failed = HashSet::new();
+    let mut errors = Vec::new();
+    for idx in storage.set_selection(selected.as_ref()).await {
+        if let Err(e) = storage.promote_file(idx).await {
+            let path = &storage.layout().files()[idx].path;
+            errors.push(format!("{} ({e})", path.display()));
+            failed.insert(idx);
+        }
+    }
+    if failed.is_empty() {
+        return (only_files, Ok(()));
+    }
+    let in_effect = match only_files {
+        Some(files) => files
+            .into_iter()
+            .filter(|idx| !failed.contains(idx))
+            .collect(),
+        None => (0..storage.layout().files().len())
+            .filter(|idx| !failed.contains(idx))
+            .collect(),
+    };
+    (
+        Some(in_effect),
+        Err(format!(
+            "part-file data could not move, left unselected: {}",
+            errors.join("; ")
+        )),
+    )
 }
 
 pub async fn spawn(
@@ -246,19 +346,20 @@ pub async fn spawn(
     our_peer_id: Id20,
     listen_port: u16,
 ) -> std::io::Result<Arc<ManagedTorrent>> {
-    // `only_files` reaches TorrentInit, but the scheduler still fetches every piece; warn so callers don't think a subset-only download is active
-    if init.only_files.is_some() {
-        tracing::warn!(
-            "torrent {id}: selective download (only_files) is not yet supported; \
-             downloading all files"
-        );
-    }
     let info_hash = init.meta.info_hash;
     let name = Some(init.meta.info.name.clone());
     let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCommand>(64);
     let file_lens: Vec<u64> = init.meta.info.iter_file_details().map(|f| f.len).collect();
+    // Selection-aware until the loop rescans local pieces
+    let wanted = wanted_pieces(
+        &FileSet::from_meta(&init.meta.info, &init.root_dir),
+        &init.lengths,
+        init.only_files.as_deref(),
+    );
+    let left_bytes = PieceTracker::bytes_of(&init.lengths, |i| wanted[i]);
     let stats = Arc::new(Mutex::new(TorrentStats::initial(
         init.lengths.total_length(),
+        left_bytes,
         file_lens,
     )));
     let meta_arc = Arc::new(init.meta.clone());
@@ -266,11 +367,13 @@ pub async fn spawn(
     let ext_handshake_builder: crate::peer::ExtHandshakeBuilder = {
         let metadata_size = init.meta.info_bytes.len() as u64;
         let private_torrent = init.meta.info.private;
+        let prefers_encryption = init.encryption != super::peer::EncryptionPolicy::PlaintextOnly;
         std::sync::Arc::new(move |peer_ip: std::net::IpAddr| {
             let mut hs =
                 ExtHandshake::new_outgoing(OUR_UT_METADATA_ID, OUR_UT_PEX_ID, Some(metadata_size))
                     .with_yourip(peer_ip)
-                    .with_port(listen_port);
+                    .with_port(listen_port)
+                    .with_encryption_preference(prefers_encryption);
             if private_torrent {
                 hs.supported.remove(b"ut_pex".as_slice());
             } else {
@@ -309,6 +412,22 @@ pub async fn spawn(
     Ok(handle)
 }
 
+/// How a peer connection is carried, as reported by the connection layer
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerLink {
+    encrypted: bool,
+    utp: bool,
+}
+
+/// BEP 11 `added.f` bits
+mod pex_flag {
+    pub const ENCRYPTION: u8 = 0x01;
+    pub const SEED: u8 = 0x02;
+    pub const UTP: u8 = 0x04;
+    pub const HOLEPUNCH: u8 = 0x08;
+    pub const REACHABLE: u8 = 0x10;
+}
+
 struct Peer {
     addr: SocketAddr,
     cmd_tx: mpsc::Sender<PeerCommand>,
@@ -344,6 +463,13 @@ struct Peer {
     optimistic_unchoke: bool,
     their_ut_pex_id: Option<u8>,
     pex_sent: HashSet<SocketAddr>,
+    /// Dialable endpoint gossiped over PEX: `addr` when outbound, else `addr.ip()` with the extended-handshake `p` port
+    listen_addr: Option<SocketAddr>,
+    link: PeerLink,
+    /// BEP 10 `e`: the peer prefers MSE-encrypted connections
+    prefers_encryption: bool,
+    /// BEP 21 `upload_only`, or a complete bitfield
+    upload_only: bool,
     outbound: bool,
     supports_fast: bool,
     initial_availability: Option<InitialAvailability>,
@@ -363,6 +489,27 @@ enum InitialAvailability {
 }
 
 impl Peer {
+    /// BEP 11 flags describing this peer to others
+    fn pex_flags(&self, total_pieces: usize) -> u8 {
+        let mut flags = 0;
+        if self.link.encrypted || self.prefers_encryption {
+            flags |= pex_flag::ENCRYPTION;
+        }
+        if self.upload_only || peer_bitfield_is_full(&self.bitfield, total_pieces) {
+            flags |= pex_flag::SEED;
+        }
+        if self.link.utp {
+            flags |= pex_flag::UTP;
+        }
+        if self.their_ut_holepunch_id.is_some() {
+            flags |= pex_flag::HOLEPUNCH;
+        }
+        if self.outbound {
+            flags |= pex_flag::REACHABLE;
+        }
+        flags
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn connected(
         addr: SocketAddr,
@@ -408,6 +555,10 @@ impl Peer {
             optimistic_unchoke: false,
             their_ut_pex_id: None,
             pex_sent: HashSet::new(),
+            listen_addr: outbound.then_some(addr),
+            link: PeerLink::default(),
+            prefers_encryption: false,
+            upload_only: false,
             outbound,
             supports_fast,
             initial_availability: None,
@@ -533,8 +684,10 @@ async fn torrent_loop(
         }
     };
     let serve_v2_layers = supports_v2 && hash_tables.is_some();
+    let leaf_hash_jobs = Arc::new(Semaphore::new(MAX_LEAF_HASH_JOBS));
     let advertise_v2 = init.advertise_v2 && serve_v2_layers;
-    advertise_v2_flag.store(advertise_v2, Ordering::Relaxed);
+    // Inbound handshakes pick the bit per info-hash from this (see `known_infohashes`)
+    advertise_v2_flag.store(serve_v2_layers, Ordering::Relaxed);
 
     let (pipeline_floor, pipeline_cap) = pipeline_bounds(init.max_outstanding_per_peer);
     let max_peers = init.max_peers.unwrap_or(DEFAULT_MAX_PEERS).max(1);
@@ -547,20 +700,38 @@ async fn torrent_loop(
         TORRENT_REQUEST_BUDGET,
         max_peers
     );
-    let storage = Arc::new(FilesystemStorage::new(&info, &init.root_dir));
+    let storage = Arc::new(
+        FilesystemStorage::new(&info, &init.root_dir).with_parts_dir(
+            super::storage::parts_dir_for(&init.root_dir, &info_hash.to_hex()),
+        ),
+    );
     let mut piece_tracker = PieceTracker::new(lengths);
+    let (mut only_files, applied) =
+        apply_storage_selection(&storage, init.only_files.clone()).await;
+    if let Err(e) = applied {
+        tracing::warn!("file selection for {info_hash}: {e}");
+    }
+    piece_tracker.set_wanted(wanted_pieces(
+        storage.layout(),
+        &lengths,
+        only_files.as_deref(),
+    ));
     let mut chunk_tracker = ChunkTracker::new(lengths);
     let mut piece_assemblies: HashMap<u32, PieceAssembly> = HashMap::new();
     if storage.has_existing_payload_files().await {
         scan_existing_pieces(&verifier, &storage, &lengths, &mut piece_tracker).await;
     }
-    if let Err(e) = storage.preallocate().await {
+    if let Err(e) = storage
+        .preallocate_selected(selected_file_set(only_files.as_deref()).as_ref())
+        .await
+    {
         tracing::warn!("preallocate failed for {info_hash}: {e}");
     }
     {
         let mut s = stats.lock();
         s.file_progress = compute_file_progress(&piece_tracker, &lengths, storage.layout());
         s.progress_bytes = s.file_progress.iter().sum();
+        s.left_bytes = piece_tracker.bytes_left();
         s.finished = piece_tracker.is_complete();
     }
 
@@ -571,7 +742,10 @@ async fn torrent_loop(
     };
     let generation = GenerationToken::new();
     let (peer_src_tx, mut peer_addr_rx) = mpsc::channel::<PeerEnvelope>(256);
-    let mut tracker_tiers = collect_tracker_tiers(&init.meta);
+    // BEP 8: obfuscated trackers first, the regular list only once they all fail
+    let mut tracker_tiers = collect_obfuscated_tiers(&init.meta);
+    let obfuscated_tiers = tracker_tiers.len();
+    tracker_tiers.extend(collect_tracker_tiers(&init.meta));
     let mut tracker_urls = flatten_tracker_tiers(&tracker_tiers);
     let tracker_info_hashes = announce_hashes.clone();
     let tracker_key = rand::rng().random::<u32>();
@@ -590,6 +764,7 @@ async fn torrent_loop(
         private_torrent.then_some(tracker_tier_tx.clone()),
         init.tracker_source_addr,
         generation.clone(),
+        obfuscated_tiers,
     );
 
     let (peer_event_tx, mut peer_event_rx) = mpsc::channel::<(u32, PeerEvent)>(8192);
@@ -601,6 +776,7 @@ async fn torrent_loop(
     // BEP-55
     let mut pex_source: HashMap<SocketAddr, u32> = HashMap::new();
     let mut holepunch_attempted: HashSet<SocketAddr> = HashSet::new();
+    let mut mse_first_addrs: HashSet<SocketAddr> = HashSet::new();
     let mut pending_dials: HashMap<u32, SocketAddr> = HashMap::new();
     let mut peer_backlog: VecDeque<SocketAddr> = VecDeque::new();
     let mut priority_backlog: VecDeque<SocketAddr> = VecDeque::new();
@@ -697,6 +873,7 @@ async fn torrent_loop(
                             &mut known_addrs,
                             &useful_peers,
                             &holepunch_attempted,
+                            &mse_first_addrs,
                             &mut next_pid,
                             peers.len(),
                             max_peers,
@@ -717,7 +894,7 @@ async fn torrent_loop(
                         );
                     }
                 }
-                TorrentCommand::AddInboundPeer { addr, cmd_tx, event_rx, reserved, peer_id, io_abort } => {
+                TorrentCommand::AddInboundPeer { addr, cmd_tx, event_rx, reserved, peer_id, io_abort, encrypted, utp } => {
                     if blocklist.read().contains(addr.ip())
                         || !peer_source_allowed(
                             private_torrent,
@@ -750,6 +927,7 @@ async fn torrent_loop(
                             Some(peer_id),
                             io_abort,
                             info_hash,
+                            PeerLink { encrypted, utp },
                         )
                         .await;
                     } else {
@@ -867,6 +1045,7 @@ async fn torrent_loop(
                             private_torrent.then_some(tracker_tier_tx.clone()),
                             init.tracker_source_addr,
                             generation.clone(),
+                            obfuscated_tiers,
                         );
                     }
                     if dht_poll_handle.is_none() {
@@ -890,6 +1069,7 @@ async fn torrent_loop(
                         &mut known_addrs,
                         &useful_peers,
                         &holepunch_attempted,
+                        &mse_first_addrs,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -964,8 +1144,26 @@ async fn torrent_loop(
                     }
                     // The manager normally sends this command while paused;
                     // defer new announces until the matching Unpause so the
-                    // route swap cannot race a stale peer dial.
+                    // route swap cannot race a stale peer dial
                     let _ = ack.send(());
+                }
+                TorrentCommand::SetOnlyFiles { files, ack } => {
+                    let applied;
+                    (only_files, applied) = apply_storage_selection(&storage, files).await;
+                    piece_tracker.set_wanted(wanted_pieces(
+                        storage.layout(),
+                        &lengths,
+                        only_files.as_deref(),
+                    ));
+                    {
+                        let mut s = stats.lock();
+                        s.left_bytes = piece_tracker.bytes_left();
+                        s.finished = piece_tracker.is_complete();
+                    }
+                    for peer in peers.values_mut() {
+                        refresh_interest(peer, &mut piece_tracker).await;
+                    }
+                    let _ = ack.send(applied);
                 }
                 TorrentCommand::AddTrackers { urls, ack } => {
                     let new_urls = normalize_tracker_urls(urls, &tracker_urls);
@@ -998,6 +1196,7 @@ async fn torrent_loop(
                                     private_torrent.then_some(tracker_tier_tx.clone()),
                                     init.tracker_source_addr,
                                     generation.clone(),
+                                    obfuscated_tiers,
                                 );
                             }
                         } else {
@@ -1016,6 +1215,7 @@ async fn torrent_loop(
                                     private_torrent.then_some(tracker_tier_tx.clone()),
                                     init.tracker_source_addr,
                                     generation.clone(),
+                                    obfuscated_tiers,
                                 );
                             }
                         }
@@ -1057,6 +1257,9 @@ async fn torrent_loop(
                     continue;
                 }
                 let PeerCandidate { addr, source } = envelope.candidate;
+                if envelope.mse_first && mse_first_addrs.len() < MAX_MSE_FIRST_ADDRS {
+                    mse_first_addrs.insert(addr);
+                }
                 if source == PeerSource::Tracker {
                     tracker_authorized.insert(addr);
                 }
@@ -1082,6 +1285,7 @@ async fn torrent_loop(
                         &mut known_addrs,
                         &useful_peers,
                         &holepunch_attempted,
+                        &mse_first_addrs,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -1141,6 +1345,7 @@ async fn torrent_loop(
                     &verifier,
                     &info_bytes,
                     hash_tables.as_deref().map(|v| &**v),
+                    &leaf_hash_jobs,
                     pipeline_floor,
                     pipeline_cap,
                     max_peers,
@@ -1212,6 +1417,7 @@ async fn torrent_loop(
                         &mut known_addrs,
                         &useful_peers,
                         &holepunch_attempted,
+                        &mse_first_addrs,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -1356,21 +1562,29 @@ async fn torrent_loop(
                 }
                 if !private_torrent && now.duration_since(last_pex) >= PEX_INTERVAL {
                     last_pex = now;
-                    let current: HashSet<SocketAddr> = peers.values().map(|p| p.addr).collect();
+                    let total_pieces = lengths.total_pieces() as usize;
+                    let current: HashMap<SocketAddr, u8> = peers
+                        .values()
+                        .filter_map(|p| p.listen_addr.map(|a| (a, p.pex_flags(total_pieces))))
+                        .collect();
                     for p in peers.values_mut() {
                         let Some(pex_id) = p.their_ut_pex_id else {
                             continue;
                         };
-                        let added: Vec<SocketAddr> = current
+                        let added: Vec<(SocketAddr, u8)> = current
                             .iter()
-                            .filter(|a| **a != p.addr && !p.pex_sent.contains(a))
+                            .filter(|(a, _)| {
+                                **a != p.addr
+                                    && Some(**a) != p.listen_addr
+                                    && !p.pex_sent.contains(a)
+                            })
                             .take(MAX_PEX_ADDED_PER_MSG)
-                            .copied()
+                            .map(|(a, flags)| (*a, *flags))
                             .collect();
                         let dropped: Vec<SocketAddr> = p
                             .pex_sent
                             .iter()
-                            .filter(|a| !current.contains(a))
+                            .filter(|a| !current.contains_key(a))
                             .take(MAX_PEX_ADDED_PER_MSG)
                             .copied()
                             .collect();
@@ -1380,7 +1594,7 @@ async fn torrent_loop(
                         for a in &dropped {
                             p.pex_sent.remove(a);
                         }
-                        p.pex_sent.extend(added.iter().copied());
+                        p.pex_sent.extend(added.iter().map(|(a, _)| *a));
                         let payload = super::wire::extended::build_ut_pex(&added, &dropped);
                         let _ = p.cmd_tx.try_send(PeerCommand::Send(Message::Extended {
                             ext_id: pex_id,
@@ -1493,6 +1707,7 @@ async fn torrent_loop(
                         &mut known_addrs,
                         &useful_peers,
                         &holepunch_attempted,
+                        &mse_first_addrs,
                         &mut next_pid,
                         peers.len(),
                         max_peers,
@@ -1615,6 +1830,7 @@ fn spawn_dht_poller(
                             addr,
                             source: PeerSource::Dht,
                         },
+                        mse_first: false,
                     })
                     .await
                     .is_err()
@@ -1639,8 +1855,14 @@ mod peer_registry {
         io_abort: Option<AbortHandle>,
     }
 
-    type PeerCmdRegistry = StdMutex<HashMap<(usize, u32), RegistryEntry>>;
+    /// Keyed by session scope too, since torrent ids restart in every `Session`
+    type RegistryKey = (usize, usize, u32);
+    type PeerCmdRegistry = StdMutex<HashMap<RegistryKey, RegistryEntry>>;
     static REG: LazyLock<PeerCmdRegistry> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+    fn key(scope: &Arc<()>, torrent_id: usize, pid: u32) -> RegistryKey {
+        (Arc::as_ptr(scope) as usize, torrent_id, pid)
+    }
 
     pub fn put(
         torrent_id: usize,
@@ -1651,7 +1873,7 @@ mod peer_registry {
         io_abort: Option<AbortHandle>,
     ) {
         REG.lock().unwrap().insert(
-            (torrent_id, pid),
+            key(scope, torrent_id, pid),
             RegistryEntry {
                 scope: scope.clone(),
                 tx,
@@ -1666,27 +1888,14 @@ mod peer_registry {
         pid: u32,
         scope: &Arc<()>,
     ) -> Option<(mpsc::Sender<PeerCommand>, SocketAddr, Option<AbortHandle>)> {
-        let mut reg = REG.lock().unwrap();
-        let key = (torrent_id, pid);
-        if !reg
-            .get(&key)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.scope, scope))
-        {
-            return None;
-        }
-        reg.remove(&key)
+        REG.lock()
+            .unwrap()
+            .remove(&key(scope, torrent_id, pid))
             .map(|entry| (entry.tx, entry.addr, entry.io_abort))
     }
 
     pub fn remove(torrent_id: usize, pid: u32, scope: &Arc<()>) {
-        let mut reg = REG.lock().unwrap();
-        let key = (torrent_id, pid);
-        if reg
-            .get(&key)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.scope, scope))
-        {
-            reg.remove(&key);
-        }
+        REG.lock().unwrap().remove(&key(scope, torrent_id, pid));
     }
 
     pub fn drain_scope(
@@ -1699,17 +1908,20 @@ mod peer_registry {
         Option<AbortHandle>,
     )> {
         let mut reg = REG.lock().unwrap();
+        let scope_key = Arc::as_ptr(scope) as usize;
         let keys = reg
             .iter()
-            .filter_map(|(&(entry_torrent_id, pid), entry)| {
-                (entry_torrent_id == torrent_id && Arc::ptr_eq(&entry.scope, scope))
-                    .then_some((entry_torrent_id, pid))
+            .filter(|(&(entry_scope, entry_torrent_id, _), entry)| {
+                entry_scope == scope_key
+                    && entry_torrent_id == torrent_id
+                    && Arc::ptr_eq(&entry.scope, scope)
             })
+            .map(|(key, _)| *key)
             .collect::<Vec<_>>();
         keys.into_iter()
             .filter_map(|key| {
                 reg.remove(&key)
-                    .map(|entry| (key.1, entry.tx, entry.addr, entry.io_abort))
+                    .map(|entry| (key.2, entry.tx, entry.addr, entry.io_abort))
             })
             .collect()
     }
@@ -1916,6 +2128,7 @@ async fn adopt_inbound_peer(
     peer_id: Option<Id20>,
     io_abort: AbortHandle,
     info_hash: Id20,
+    link: PeerLink,
 ) {
     let supports_fast = fast_bit(&reserved);
     let mut peer = Peer::connected(
@@ -1929,6 +2142,7 @@ async fn adopt_inbound_peer(
         peer_id,
     );
     peer.io_abort = Some(io_abort);
+    peer.link = link;
     peers.insert(pid, peer);
     let bf = piece_tracker.bitfield();
     send_initial_availability(&cmd_tx, &bf, lengths.total_pieces(), supports_fast).await;
@@ -1980,6 +2194,7 @@ async fn process_peer_event(
     verifier: &PieceVerifier,
     info_bytes: &Arc<Vec<u8>>,
     hash_tables: Option<&[MerkleProofTable]>,
+    leaf_hash_jobs: &Arc<Semaphore>,
     pipeline_floor: usize,
     pipeline_cap: usize,
     max_peers: usize,
@@ -2011,6 +2226,7 @@ async fn process_peer_event(
             encrypted,
             reserved,
             peer_id,
+            utp,
             ..
         } => {
             if !peers.contains_key(&pid) {
@@ -2086,6 +2302,7 @@ async fn process_peer_event(
                         Some(peer_id),
                     );
                     peer.io_abort = io_abort;
+                    peer.link = PeerLink { encrypted, utp };
                     peers.insert(pid, peer);
                     let bf = piece_tracker.bitfield();
                     send_initial_availability(&cmd_tx, &bf, lengths.total_pieces(), supports_fast)
@@ -2498,15 +2715,34 @@ async fn process_peer_event(
                     length,
                     proof_layers,
                 } => {
-                    let response = build_hash_response(
-                        hash_tables,
-                        pieces_root,
-                        base_layer,
-                        index,
-                        length,
-                        proof_layers,
-                    );
-                    let _ = peer.cmd_tx.try_send(PeerCommand::Send(response));
+                    if base_layer == 0 {
+                        // Leaf hashes need piece data from disk
+                        let request = LeafHashRequest {
+                            pieces_root,
+                            index,
+                            length,
+                            proof_layers,
+                        };
+                        serve_leaf_hash_request(
+                            request,
+                            hash_tables,
+                            leaf_hash_jobs,
+                            storage,
+                            piece_tracker,
+                            lengths,
+                            peer.cmd_tx.clone(),
+                        );
+                    } else {
+                        let response = build_hash_response(
+                            hash_tables,
+                            pieces_root,
+                            base_layer,
+                            index,
+                            length,
+                            proof_layers,
+                        );
+                        let _ = peer.cmd_tx.try_send(PeerCommand::Send(response));
+                    }
                 }
                 Message::Hashes { .. } | Message::HashReject { .. } => {
                     // Discard: no outstanding HASH_REQUEST to correlate
@@ -2518,6 +2754,13 @@ async fn process_peer_event(
                             peer.their_ut_metadata_id = peer_ext.ut_metadata_id();
                             peer.their_ut_holepunch_id = peer_ext.ut_holepunch_id();
                             peer.their_ut_pex_id = peer_ext.ut_pex_id();
+                            peer.prefers_encryption = peer_ext.prefers_encryption;
+                            peer.upload_only = peer_ext.upload_only;
+                            if let (false, Some(port)) = (peer.outbound, peer_ext.port) {
+                                if port != 0 {
+                                    peer.listen_addr = Some(SocketAddr::new(peer.addr.ip(), port));
+                                }
+                            }
                             if peer.client.is_none() {
                                 peer.client = peer_ext.client;
                             }
@@ -2566,12 +2809,13 @@ async fn process_peer_event(
                                         addr,
                                         source: PeerSource::Pex,
                                     },
+                                    mse_first: false,
                                 });
                             }
                         }
                     } else if ext_id == OUR_UT_HOLEPUNCH_ID && !private_torrent {
-                        // BEP-55 hole punching
-                        let from_addr = peer.addr;
+                        // BEP-55 hole punching, identifying the initiator by its dialable endpoint
+                        let from_addr = peer.listen_addr.unwrap_or(peer.addr);
                         let from_hp_id = peer.their_ut_holepunch_id;
                         let from_cmd = peer.cmd_tx.clone();
                         if let Some(hp) = parse_holepunch(&payload) {
@@ -2702,6 +2946,7 @@ async fn process_verify_result(
         if became_local {
             add_piece_progress(&mut s, lengths, storage.layout(), vpi);
         }
+        s.left_bytes = piece_tracker.bytes_left();
         s.finished = piece_tracker.is_complete();
     } else {
         tracing::debug!("piece {} verify failed", vr.piece_index);
@@ -2722,10 +2967,7 @@ fn build_webseed_client(
         .pool_max_idle_per_host(WEBSEED_MAX_WORKERS);
     #[cfg(not(test))]
     let builder = builder.direct_address_filter(super::webseed::is_allowed_destination);
-    let mut builder = builder
-        .gzip(false)
-        .brotli(false)
-        .deflate(false);
+    let mut builder = builder.gzip(false).brotli(false).deflate(false);
     if let Some(proxy) = proxy {
         if let Some(route) = proxy.proxy() {
             builder = builder.proxy(route.clone());
@@ -2805,6 +3047,11 @@ async fn fetch_webseed_batch(ctx: WebSeedContext, piece_indices: Vec<u32>) -> We
         let mut mirror_ok = true;
         for (file_idx, file_offset, span_len) in &spans {
             let file = &ctx.layout.files()[*file_idx];
+            if file.padding {
+                // BEP 47 padding isn't on the web seed; `batch` already holds its zeros
+                cursor = cursor.saturating_add(*span_len as usize);
+                continue;
+            }
             let url = match super::webseed::build_file_url(
                 &ctx.bases[mirror_idx],
                 &ctx.info.name,
@@ -3041,7 +3288,8 @@ fn handle_holepunch(
             }
             let active_addrs = peers
                 .values()
-                .map(|peer| peer.addr)
+                .flat_map(|peer| [Some(peer.addr), peer.listen_addr])
+                .flatten()
                 .chain(pending_dials.values().copied())
                 .collect::<HashSet<_>>();
             if promote_holepunch_candidate(
@@ -3071,7 +3319,10 @@ fn handle_holepunch(
             } else if !super::magnet::is_dialable_peer_addr(hp.addr) {
                 Relay::Err(holepunch_err::NO_SUCH_PEER)
             } else {
-                match peers.values().find(|p| p.addr == hp.addr) {
+                match peers
+                    .values()
+                    .find(|p| p.addr == hp.addr || p.listen_addr == Some(hp.addr))
+                {
                     Some(t) => match t.their_ut_holepunch_id {
                         Some(thp) => Relay::Connect(t.cmd_tx.clone(), thp),
                         None => Relay::Err(holepunch_err::NO_SUPPORT),
@@ -3316,6 +3567,7 @@ fn drain_peer_backlog(
     known_addrs: &mut HashSet<SocketAddr>,
     useful_peers: &HashMap<SocketAddr, usize>,
     holepunch_targets: &HashSet<SocketAddr>,
+    mse_first: &HashSet<SocketAddr>,
     next_pid: &mut u32,
     live_peers: usize,
     max_peers: usize,
@@ -3372,7 +3624,7 @@ fn drain_peer_backlog(
             info_hash,
             our_peer_id,
             peer_event_tx.clone(),
-            encryption,
+            dial_policy(encryption, mse_first.contains(&addr)),
             advertise_v2,
             advertise_dht,
             Some(ext_handshake_builder.clone()),
@@ -3487,6 +3739,21 @@ async fn send_interested_if_useful(peer: &mut Peer, piece_tracker: &mut PieceTra
             .send(PeerCommand::Send(Message::Interested))
             .await;
     }
+}
+
+/// Re-evaluate interest after the wanted pieces changed
+async fn refresh_interest(peer: &mut Peer, piece_tracker: &mut PieceTracker) {
+    let useful = piece_tracker.choose_piece(&peer.bitfield).is_some();
+    if useful == peer.am_interested {
+        return;
+    }
+    peer.am_interested = useful;
+    let message = if useful {
+        Message::Interested
+    } else {
+        Message::NotInterested
+    };
+    let _ = peer.cmd_tx.send(PeerCommand::Send(message)).await;
 }
 
 async fn broadcast_have(peers: &mut HashMap<u32, Peer>, piece_index: u32) {
@@ -4239,8 +4506,38 @@ fn collect_tracker_tiers(meta: &TorrentMeta) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Distinct tracker URLs in tier order
 fn flatten_tracker_tiers(tiers: &[Vec<String>]) -> Vec<String> {
-    tiers.iter().flatten().cloned().collect()
+    let mut seen = HashSet::new();
+    tiers
+        .iter()
+        .flatten()
+        .filter(|url| seen.insert(url.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// BEP 8 tiers: HTTP(S) entries of `obfuscate-announce-list`, as UDP can't carry `sha_ih`
+fn collect_obfuscated_tiers(meta: &TorrentMeta) -> Vec<Vec<String>> {
+    let mut seen = HashSet::new();
+    meta.obfuscate_announce_list
+        .iter()
+        .map(|tier| {
+            let mut urls: Vec<String> = tier
+                .iter()
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .filter(|url| seen.insert((*url).clone()))
+                .cloned()
+                .collect();
+            let mut rng = rand::rng();
+            for i in (1..urls.len()).rev() {
+                let j = (rand::RngExt::random::<u64>(&mut rng) as usize) % (i + 1);
+                urls.swap(i, j);
+            }
+            urls
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
 }
 
 struct TrackerPollers {
@@ -4320,6 +4617,7 @@ fn tracker_event_after_success(sent: AnnounceEvent, sent_completed: &mut bool) -
     AnnounceEvent::None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tracker_request(
     info_hash: Id20,
     peer_id: Id20,
@@ -4328,14 +4626,11 @@ fn tracker_request(
     stats: &Arc<Mutex<TorrentStats>>,
     event: AnnounceEvent,
     num_want: u32,
+    obfuscate: bool,
 ) -> AnnounceRequest {
     let (uploaded, downloaded, left) = {
         let stats = stats.lock();
-        (
-            stats.uploaded_bytes,
-            stats.progress_bytes,
-            stats.total_bytes.saturating_sub(stats.progress_bytes),
-        )
+        (stats.uploaded_bytes, stats.progress_bytes, stats.left_bytes)
     };
     AnnounceRequest {
         info_hash,
@@ -4347,6 +4642,7 @@ fn tracker_request(
         left,
         event,
         num_want,
+        obfuscate,
     }
 }
 
@@ -4436,6 +4732,7 @@ async fn run_tracker_tier_poller(
     tier_change_tx: Option<mpsc::Sender<()>>,
     tracker_source_addr: Option<SocketAddr>,
     generation: GenerationToken,
+    obfuscated_tiers: usize,
 ) {
     if tiers.is_empty() {
         return;
@@ -4465,8 +4762,10 @@ async fn run_tracker_tier_poller(
                 .min_by_key(|(_, entry)| entry.next_at)
                 .expect("non-empty tracker tier");
             state.active_url = index;
-            selected.clone()
+            // BEP 8: the leading tiers come from `obfuscate-announce-list`
+            (selected.clone(), state.active_tier < obfuscated_tiers)
         };
+        let (selected, obfuscate) = selected;
         let wait = selected.next_at.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             tokio::select! {
@@ -4485,7 +4784,7 @@ async fn run_tracker_tier_poller(
         } else {
             AnnounceEvent::None
         };
-        let req = tracker_request(info_hash, peer_id, key, port, &stats, event, 200);
+        let req = tracker_request(info_hash, peer_id, key, port, &stats, event, 200, obfuscate);
         let request_generation = generation.current();
         let result = tokio::select! {
             biased;
@@ -4535,6 +4834,7 @@ async fn run_tracker_tier_poller(
                         sent = tx.send(PeerEnvelope {
                             generation: request_generation,
                             candidate: PeerCandidate { addr, source: PeerSource::Tracker },
+                            mse_first: obfuscate,
                         }) => sent,
                     };
                     if sent.is_err() {
@@ -4590,11 +4890,15 @@ async fn run_tracker_tier_poller(
         .run_state(info_hash, &tiers)
         .tiers
         .iter()
-        .flatten()
-        .filter(|state| state.started_sent)
-        .cloned()
+        .enumerate()
+        .flat_map(|(tier, states)| {
+            states
+                .iter()
+                .filter(|state| state.started_sent)
+                .map(move |state| (state.clone(), tier < obfuscated_tiers))
+        })
         .collect::<Vec<_>>();
-    for state in started {
+    for (state, obfuscate) in started {
         let stopped = tracker_request(
             info_hash,
             peer_id,
@@ -4603,6 +4907,7 @@ async fn run_tracker_tier_poller(
             &stats,
             AnnounceEvent::Stopped,
             0,
+            obfuscate,
         );
         match super::tracker::announce_with_proxy_and_source(
             &state.url,
@@ -4651,6 +4956,7 @@ fn spawn_tracker_pollers(
         None,
         None,
         GenerationToken::new(),
+        0,
     )
 }
 
@@ -4668,6 +4974,7 @@ fn spawn_tracker_tier_pollers(
     tier_change_tx: Option<mpsc::Sender<()>>,
     tracker_source_addr: Option<SocketAddr>,
     generation: GenerationToken,
+    obfuscated_tiers: usize,
 ) -> TrackerPollers {
     let (shutdown_tx, shutdown_rx) = watch::channel(None);
     let mut tasks = tokio::task::JoinSet::new();
@@ -4687,6 +4994,7 @@ fn spawn_tracker_tier_pollers(
                 tier_change_tx.clone(),
                 tracker_source_addr,
                 generation.clone(),
+                obfuscated_tiers,
             ));
         }
     }
@@ -4716,6 +5024,125 @@ fn release_peer_scheduler_state(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LeafHashRequest {
+    pieces_root: [u8; 32],
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+}
+
+impl LeafHashRequest {
+    fn reject(self) -> Message {
+        Message::HashReject {
+            pieces_root: self.pieces_root,
+            base_layer: 0,
+            index: self.index,
+            length: self.length,
+            proof_layers: self.proof_layers,
+        }
+    }
+}
+
+/// Torrent offset of the v2 file with `root`, matching v2 files to non-padding, non-empty layout entries in order (v2 lists no empty files)
+fn v2_file_offset(
+    tables: &[MerkleProofTable],
+    layout: &FileSet,
+    root: super::core::Id32,
+) -> Option<(usize, u64)> {
+    let k = tables.iter().position(|t| t.file_root == root)?;
+    let file = layout
+        .files()
+        .iter()
+        .filter(|f| !f.padding && f.length > 0)
+        .nth(k)?;
+    let table = &tables[k];
+    (file.length == table.file_length && file.offset.is_multiple_of(table.piece_length as u64))
+        .then_some((k, file.offset))
+}
+
+/// Answer a BEP 52 leaf-layer request from local piece data, or reject it
+fn serve_leaf_hash_request(
+    request: LeafHashRequest,
+    tables: Option<&[MerkleProofTable]>,
+    jobs: &Arc<Semaphore>,
+    storage: &Arc<FilesystemStorage>,
+    piece_tracker: &PieceTracker,
+    lengths: &Lengths,
+    cmd_tx: mpsc::Sender<PeerCommand>,
+) {
+    let plan = (|| {
+        let tables = tables?;
+        let (k, file_offset) = v2_file_offset(
+            tables,
+            storage.layout(),
+            super::core::Id32(request.pieces_root),
+        )?;
+        let table = &tables[k];
+        let pieces =
+            table.leaf_request_pieces(request.index, request.length, request.proof_layers)?;
+        let first_global = (file_offset / table.piece_length as u64) as u32;
+        // Hashes are only proof of data we have and announced
+        let all_local = pieces.iter().all(|p| {
+            lengths
+                .validate_piece(first_global + p)
+                .is_ok_and(|vpi| piece_tracker.has_local(vpi))
+        });
+        all_local.then(|| (table.clone(), file_offset, pieces))
+    })();
+    // Reject past the cap so flooded requests can't pile up disk reads and rehashing
+    let permit = plan
+        .as_ref()
+        .and_then(|_| Arc::clone(jobs).try_acquire_owned().ok());
+    let (Some((table, file_offset, pieces)), Some(permit)) = (plan, permit) else {
+        let _ = cmd_tx.try_send(PeerCommand::Send(request.reject()));
+        return;
+    };
+    let storage = Arc::clone(storage);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut piece_blocks = HashMap::with_capacity(pieces.len());
+        for p in pieces {
+            let start = p as u64 * table.piece_length as u64;
+            let len = (table.file_length - start).min(table.piece_length as u64) as usize;
+            let mut data = vec![0u8; len];
+            if storage
+                .read_at(file_offset + start, &mut data)
+                .await
+                .is_err()
+            {
+                let _ = cmd_tx.send(PeerCommand::Send(request.reject())).await;
+                return;
+            }
+            let blocks = tokio::task::spawn_blocking(move || {
+                data.chunks(super::core::merkle::BLOCK_SIZE as usize)
+                    .map(super::core::merkle::hash_block)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            piece_blocks.insert(p, blocks);
+        }
+        let message = match table.answer_leaf_request(
+            request.index,
+            request.length,
+            request.proof_layers,
+            &piece_blocks,
+        ) {
+            Some(hashes) => Message::Hashes {
+                pieces_root: request.pieces_root,
+                base_layer: 0,
+                index: request.index,
+                length: request.length,
+                proof_layers: request.proof_layers,
+                hashes: Bytes::from(hashes),
+            },
+            None => request.reject(),
+        };
+        let _ = cmd_tx.send(PeerCommand::Send(message)).await;
+    });
+}
+
 /// Build a `HASHES` / `HashReject` reply for an inbound BEP 52 `HASH_REQUEST`
 fn build_hash_response(
     tables: Option<&[MerkleProofTable]>,
@@ -4737,19 +5164,12 @@ fn build_hash_response(
         return reject();
     };
 
-    // Only support the "entire piece layer at once, no proof" shape
-    if index != 0 || proof_layers != 0 {
-        return reject();
-    }
-
     let root = super::core::Id32(pieces_root);
     let Some(table) = tables.iter().find(|t| t.file_root == root) else {
         return reject();
     };
-    if base_layer != table.piece_layer_base() || length != table.piece_layer_padded_len() {
-        return reject();
-    }
-    let Some(payload) = table.serve_full_piece_layer() else {
+    // Leaf-layer requests are answered elsewhere from piece data
+    let Some(payload) = table.hashes_for_request(base_layer, index, length, proof_layers) else {
         return reject();
     };
     Message::Hashes {
@@ -4803,7 +5223,9 @@ fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::merkle::{compute_root, hash_block, MerkleProofTable, BLOCK_SIZE};
+    use crate::core::merkle::{
+        compute_root, hash_block, piece_layer_root, MerkleProofTable, BLOCK_SIZE,
+    };
     use crate::core::Id32;
     use crate::core::TorrentMetaInfo;
     use crate::core::ValidatedTorrentMetaV1Info;
@@ -5037,6 +5459,244 @@ mod tests {
     }
 
     #[test]
+    fn mse_capable_peers_are_dialed_encrypted_first() {
+        use crate::peer::EncryptionPolicy;
+        assert_eq!(
+            dial_policy(EncryptionPolicy::Prefer, true),
+            EncryptionPolicy::PreferEncrypted
+        );
+        assert_eq!(
+            dial_policy(EncryptionPolicy::Prefer, false),
+            EncryptionPolicy::Prefer
+        );
+        // Explicit user choices are never overridden
+        assert_eq!(
+            dial_policy(EncryptionPolicy::PlaintextOnly, true),
+            EncryptionPolicy::PlaintextOnly
+        );
+        assert_eq!(
+            dial_policy(EncryptionPolicy::RequireEncryption, true),
+            EncryptionPolicy::RequireEncryption
+        );
+    }
+
+    #[test]
+    fn obfuscated_trackers_form_the_leading_tiers() {
+        use crate::bencode::{encode_to_vec, Value};
+        let tier = |urls: &[&str]| {
+            Value::List(
+                urls.iter()
+                    .map(|u| Value::Bytes(u.as_bytes().to_vec()))
+                    .collect(),
+            )
+        };
+        let torrent = encode_to_vec(&Value::Dict(vec![
+            (
+                b"announce-list".to_vec(),
+                Value::List(vec![tier(&["http://a/announce", "udp://c:80"])]),
+            ),
+            (
+                b"info".to_vec(),
+                Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(1)),
+                    (b"name".to_vec(), Value::Bytes(b"x".to_vec())),
+                    (b"piece length".to_vec(), Value::Int(16384)),
+                    (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
+                ]),
+            ),
+            (
+                b"obfuscate-announce-list".to_vec(),
+                Value::List(vec![tier(&["http://a/announce", "udp://b:80"])]),
+            ),
+        ]));
+        let meta = crate::core::metainfo::parse_torrent(&torrent).unwrap();
+        let obfuscated = collect_obfuscated_tiers(&meta);
+        // UDP can't carry sha_ih, so only the HTTP entry is obfuscated
+        assert_eq!(obfuscated, vec![vec!["http://a/announce".to_string()]]);
+        let mut tiers = obfuscated;
+        tiers.extend(collect_tracker_tiers(&meta));
+        assert_eq!(tiers.len(), 2);
+        // Listed once although it sits in both lists
+        assert_eq!(
+            flatten_tracker_tiers(&tiers)
+                .iter()
+                .filter(|u| u.as_str() == "http://a/announce")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn wanted_pieces_cover_selected_files_only() {
+        let info = ValidatedTorrentMetaV1Info {
+            name: "sel".into(),
+            piece_length: 10,
+            pieces: vec![0u8; 3 * 20],
+            private: false,
+            files: vec![
+                TorrentMetaInfo {
+                    path: vec!["a".into()],
+                    length: 15,
+                    padding: false,
+                },
+                TorrentMetaInfo {
+                    path: vec![".pad".into(), "5".into()],
+                    length: 5,
+                    padding: true,
+                },
+                TorrentMetaInfo {
+                    path: vec!["b".into()],
+                    length: 10,
+                    padding: false,
+                },
+            ],
+            single_file_mode: false,
+        };
+        let lengths = Lengths::new(30, 10).unwrap();
+        let layout = FileSet::from_meta(&info, Path::new("/tmp"));
+        assert_eq!(wanted_pieces(&layout, &lengths, None), vec![true; 3]);
+        assert_eq!(
+            wanted_pieces(&layout, &lengths, Some(&[2])),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            wanted_pieces(&layout, &lengths, Some(&[0])),
+            vec![true, true, false]
+        );
+        // Padding and out-of-range indices select nothing
+        assert_eq!(
+            wanted_pieces(&layout, &lengths, Some(&[1, 9])),
+            vec![false; 3]
+        );
+        let wanted = wanted_pieces(&layout, &lengths, Some(&[2]));
+        assert_eq!(PieceTracker::bytes_of(&lengths, |i| wanted[i]), 10);
+        assert_eq!(info.selectable_file_indices(), vec![0, 2]);
+    }
+
+    #[tokio::test]
+    async fn files_whose_part_file_data_cannot_move_stay_unselected() {
+        let info = ValidatedTorrentMetaV1Info {
+            name: "root".into(),
+            piece_length: 10,
+            pieces: vec![0; 20 * 3],
+            private: false,
+            files: vec![
+                TorrentMetaInfo {
+                    path: vec!["a".into()],
+                    length: 15,
+                    padding: false,
+                },
+                TorrentMetaInfo {
+                    path: vec!["sub".into(), "b".into()],
+                    length: 15,
+                    padding: false,
+                },
+            ],
+            single_file_mode: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let storage = FilesystemStorage::new(&info, &root)
+            .with_parts_dir(crate::storage::parts_dir_for(&root, "abcd"));
+        let (in_effect, applied) = apply_storage_selection(&storage, Some(vec![0])).await;
+        assert_eq!(in_effect, Some(vec![0]));
+        assert!(applied.is_ok());
+
+        // A file where b's directory belongs makes promoting b fail
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sub"), b"").unwrap();
+        let (in_effect, applied) = apply_storage_selection(&storage, None).await;
+        assert_eq!(in_effect, Some(vec![0]));
+        let err = applied.unwrap_err();
+        assert!(
+            err.contains(&root.join("sub").join("b").display().to_string()),
+            "error names the file path: {err}"
+        );
+        // b's own piece is not fetched into its part file
+        let lengths = Lengths::new(30, 10).unwrap();
+        assert_eq!(
+            wanted_pieces(storage.layout(), &lengths, in_effect.as_deref()),
+            vec![true, true, false]
+        );
+
+        // Selecting again retries the move
+        std::fs::remove_file(root.join("sub")).unwrap();
+        let (in_effect, applied) = apply_storage_selection(&storage, None).await;
+        assert_eq!(in_effect, None);
+        assert!(applied.is_ok());
+    }
+
+    #[test]
+    fn pex_flags_describe_the_connection() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut peer = Peer::connected(test_peer(14_020), tx, 1, 1, 1, true, false, None);
+        assert_eq!(peer.pex_flags(8), pex_flag::REACHABLE);
+        peer.link = PeerLink {
+            encrypted: true,
+            utp: true,
+        };
+        peer.their_ut_holepunch_id = Some(5);
+        peer.bitfield = vec![0xff];
+        assert_eq!(
+            peer.pex_flags(8),
+            pex_flag::ENCRYPTION
+                | pex_flag::SEED
+                | pex_flag::UTP
+                | pex_flag::HOLEPUNCH
+                | pex_flag::REACHABLE
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let mut inbound = Peer::connected(test_peer(14_021), tx, 1, 1, 1, false, false, None);
+        inbound.prefers_encryption = true;
+        inbound.upload_only = true;
+        assert_eq!(inbound.pex_flags(8), pex_flag::ENCRYPTION | pex_flag::SEED);
+    }
+
+    #[test]
+    fn holepunch_rendezvous_reaches_inbound_peer_by_listen_addr() {
+        // Inbound target, known by its listen port rather than its ephemeral source port
+        let target_listen = test_peer(14_011);
+        let (target_tx, mut target_rx) = mpsc::channel(4);
+        let mut target = Peer::connected(test_peer(51_000), target_tx, 1, 1, 1, false, false, None);
+        target.listen_addr = Some(target_listen);
+        target.their_ut_holepunch_id = Some(9);
+        let peers = HashMap::from([(1u32, target)]);
+        let initiator = SocketAddr::from(([198, 51, 100, 7], 14_012));
+        let (from_cmd, mut from_rx) = mpsc::channel(4);
+
+        handle_holepunch(
+            HolepunchMsg {
+                msg_type: holepunch_type::RENDEZVOUS,
+                addr: target_listen,
+                err_code: 0,
+            },
+            initiator,
+            Some(7),
+            &from_cmd,
+            &peers,
+            &HashMap::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut VecDeque::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &RwLock::new(BlockList::default()),
+        );
+
+        let connect_to = |cmd: PeerCommand, ext: u8| match cmd {
+            PeerCommand::Send(Message::Extended { ext_id, payload }) if ext_id == ext => {
+                let msg = parse_holepunch(&payload).expect("holepunch payload");
+                assert_eq!(msg.msg_type, holepunch_type::CONNECT);
+                msg.addr
+            }
+            other => panic!("expected holepunch CONNECT, got {other:?}"),
+        };
+        assert_eq!(connect_to(target_rx.try_recv().unwrap(), 9), initiator);
+        assert_eq!(connect_to(from_rx.try_recv().unwrap(), 7), target_listen);
+    }
+
+    #[test]
     fn holepunch_connect_marks_target_for_utp_first_dial() {
         let target = test_peer(14_003);
         let (from_cmd, _rx) = mpsc::channel(1);
@@ -5259,7 +5919,7 @@ mod tests {
         let file_root = if piece_roots.len() == 1 {
             piece_roots[0]
         } else {
-            compute_root(&piece_roots)
+            piece_layer_root(&piece_roots, blocks_per_piece)
         };
         let mut layer_bytes = Vec::with_capacity(piece_roots.len() * 32);
         for r in &piece_roots {
@@ -5269,6 +5929,91 @@ mod tests {
             MerkleProofTable::from_layer_bytes(file_root, total, piece_length, &layer_bytes)
                 .expect("build table");
         (vec![table], file_root)
+    }
+
+    #[test]
+    fn v2_file_offset_skips_empty_v1_entries() {
+        let piece_length = BLOCK_SIZE;
+        let (mut tables, _) = make_v2_tables(2, piece_length);
+        let (second, second_root) = make_v2_tables(3, piece_length);
+        tables.extend(second);
+        let file = |name: &str, length: u64| TorrentMetaInfo {
+            path: vec![name.into()],
+            length,
+            padding: false,
+        };
+        let info = ValidatedTorrentMetaV1Info {
+            name: "hybrid".into(),
+            piece_length,
+            pieces: vec![0; 20 * 5],
+            private: false,
+            // Empty files have no v2 table
+            files: vec![
+                file("a", 2 * piece_length as u64),
+                file("empty", 0),
+                file("b", 3 * piece_length as u64),
+            ],
+            single_file_mode: false,
+        };
+        let layout = FileSet::from_meta(&info, Path::new("/tmp"));
+        assert_eq!(
+            v2_file_offset(&tables, &layout, second_root),
+            Some((1, 2 * piece_length as u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_hash_requests_past_the_job_cap_are_rejected() {
+        let piece_length = BLOCK_SIZE;
+        let (tables, root) = make_v2_tables(2, piece_length);
+        let info = ValidatedTorrentMetaV1Info {
+            name: "leaf.bin".into(),
+            piece_length,
+            pieces: vec![0; 20 * 2],
+            private: false,
+            files: vec![TorrentMetaInfo {
+                path: vec!["leaf.bin".into()],
+                length: 2 * piece_length as u64,
+                padding: false,
+            }],
+            single_file_mode: true,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
+        let lengths = Lengths::new(2 * piece_length as u64, piece_length).unwrap();
+        let mut tracker = PieceTracker::new(lengths);
+        for i in 0..2 {
+            tracker.set_local(lengths.validate_piece(i).unwrap(), true);
+        }
+        let request = LeafHashRequest {
+            pieces_root: root.0,
+            index: 0,
+            length: 2,
+            proof_layers: 0,
+        };
+        let jobs = Arc::new(Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel(4);
+        let serve = |tx| {
+            serve_leaf_hash_request(
+                request,
+                Some(&tables),
+                &jobs,
+                &storage,
+                &tracker,
+                &lengths,
+                tx,
+            )
+        };
+
+        // The worker holds the only permit until it runs
+        serve(tx.clone());
+        assert_eq!(jobs.available_permits(), 0);
+        assert!(rx.try_recv().is_err());
+        serve(tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PeerCommand::Send(Message::HashReject { .. }))
+        ));
     }
 
     fn two_file_layout() -> (Lengths, FileSet) {
@@ -5281,10 +6026,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["a".into()],
                     length: 15,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 15,
+                    padding: false,
                 },
             ],
             single_file_mode: false,
@@ -5342,6 +6089,7 @@ mod tests {
         let (lengths, layout) = two_file_layout();
         let mut stats = TorrentStats::initial(
             lengths.total_length(),
+            lengths.total_length(),
             layout.files().iter().map(|f| f.length).collect(),
         );
         let mut tracker = PieceTracker::new(lengths);
@@ -5373,6 +6121,30 @@ mod tests {
 
         assert!(peer_registry::take(torrent_id, pid, &scope_b).is_none());
         assert!(peer_registry::take(torrent_id, pid, &scope_a).is_some());
+    }
+
+    #[test]
+    fn peer_registry_sessions_with_equal_ids_do_not_clobber_each_other() {
+        // Two sessions in one process use the same ids
+        let (torrent_id, pid) = (7_001, 0);
+        let scope_a = Arc::new(());
+        let scope_b = Arc::new(());
+        let addr_a: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:6002".parse().unwrap();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+
+        peer_registry::put(torrent_id, pid, &scope_a, tx_a, addr_a, None);
+        peer_registry::put(torrent_id, pid, &scope_b, tx_b, addr_b, None);
+
+        assert_eq!(
+            peer_registry::take(torrent_id, pid, &scope_a).map(|(_, addr, _)| addr),
+            Some(addr_a)
+        );
+        assert_eq!(
+            peer_registry::take(torrent_id, pid, &scope_b).map(|(_, addr, _)| addr),
+            Some(addr_b)
+        );
     }
 
     #[test]
@@ -5772,10 +6544,15 @@ mod tests {
     #[test]
     fn build_hash_response_rejects_partial_request() {
         let (tables, root) = make_v2_tables(4, 64 * 1024);
-        // proof_layers > 0 → reject
-        match build_hash_response(Some(&tables), root.0, 2, 0, 4, 1) {
+        // 4 pieces: the whole layer already reaches the root
+        match build_hash_response(Some(&tables), root.0, 2, 0, 4, 2) {
             Message::HashReject { .. } => {}
-            _ => panic!("expected HashReject for proof_layers != 0"),
+            _ => panic!("expected HashReject for proofs past the root"),
+        }
+        // A half-layer range with its one uncle is served
+        match build_hash_response(Some(&tables), root.0, 2, 2, 2, 1) {
+            Message::Hashes { hashes, .. } => assert_eq!(hashes.len(), 3 * 32),
+            other => panic!("expected Hashes for a proven range, got {other:?}"),
         }
         // wrong base_layer → reject
         match build_hash_response(Some(&tables), root.0, 99, 0, 4, 0) {
@@ -5886,7 +6663,7 @@ mod tests {
     #[tokio::test]
     async fn add_trackers_after_shutdown_uses_a_fresh_poller_set() {
         let (tx, _rx) = mpsc::channel(8);
-        let stats = Arc::new(Mutex::new(TorrentStats::initial(0, vec![])));
+        let stats = Arc::new(Mutex::new(TorrentStats::initial(0, 0, vec![])));
         let peer_id = Id20::new([0; 20]);
         let hashes = vec![Id20::new([1; 20])];
         let mut pollers = spawn_tracker_pollers(
@@ -5899,7 +6676,7 @@ mod tests {
             None,
         );
         // Keep a subscriber so shutdown can latch; an empty set drops the
-        // original receiver before send() otherwise.
+        // original receiver before send() otherwise
         let _keep_alive = pollers.shutdown_tx.subscribe();
         pollers.shutdown(false).await;
         assert!(pollers.is_empty());
@@ -5930,10 +6707,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["first.bin".into()],
                     length: 5,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["second.bin".into()],
                     length: 7,
+                    padding: false,
                 },
             ],
             single_file_mode: false,
@@ -5962,6 +6741,7 @@ mod tests {
             files: vec![TorrentMetaInfo {
                 path: vec!["payload.bin".into()],
                 length: payload.len() as u64,
+                padding: false,
             }],
             single_file_mode: true,
         });
@@ -6036,10 +6816,12 @@ mod tests {
                 TorrentMetaInfo {
                     path: vec!["a".into()],
                     length: 15,
+                    padding: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 15,
+                    padding: false,
                 },
             ],
             single_file_mode: false,
