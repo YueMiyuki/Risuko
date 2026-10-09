@@ -205,7 +205,7 @@ pub enum TorrentCommand {
     /// Replace the file selection (`None` = every file)
     SetOnlyFiles {
         files: Option<Vec<usize>>,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     Pause(oneshot::Sender<()>),
     Unpause(oneshot::Sender<()>),
@@ -273,7 +273,7 @@ impl ManagedTorrent {
             .send(TorrentCommand::SetOnlyFiles { files, ack })
             .await
             .map_err(|e| e.to_string())?;
-        done.await.map_err(|e| e.to_string())
+        done.await.map_err(|e| e.to_string())?
     }
 }
 
@@ -305,13 +305,25 @@ fn selected_file_set(only_files: Option<&[usize]>) -> Option<HashSet<usize>> {
     only_files.map(|files| files.iter().copied().collect())
 }
 
-/// Route unselected files to part files and move newly selected ones out
-async fn apply_storage_selection(storage: &FilesystemStorage, only_files: Option<&[usize]>) {
+/// Route unselected files to part files and move newly selected ones out; errors name files left shadowed
+async fn apply_storage_selection(
+    storage: &FilesystemStorage,
+    only_files: Option<&[usize]>,
+) -> Result<(), String> {
     let selected = selected_file_set(only_files);
+    let mut failed = Vec::new();
     for idx in storage.set_selection(selected.as_ref()).await {
         if let Err(e) = storage.promote_file(idx).await {
-            tracing::warn!("moving part-file data into file {idx} failed: {e}");
+            failed.push(format!("file {idx}: {e}"));
         }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "moving part-file data failed ({})",
+            failed.join("; ")
+        ))
     }
 }
 
@@ -682,7 +694,9 @@ async fn torrent_loop(
     );
     let mut piece_tracker = PieceTracker::new(lengths);
     let mut only_files = init.only_files.clone();
-    apply_storage_selection(&storage, only_files.as_deref()).await;
+    if let Err(e) = apply_storage_selection(&storage, only_files.as_deref()).await {
+        tracing::warn!("file selection for {info_hash}: {e}");
+    }
     piece_tracker.set_wanted(wanted_pieces(
         storage.layout(),
         &lengths,
@@ -1121,7 +1135,7 @@ async fn torrent_loop(
                 }
                 TorrentCommand::SetOnlyFiles { files, ack } => {
                     only_files = files;
-                    apply_storage_selection(&storage, only_files.as_deref()).await;
+                    let applied = apply_storage_selection(&storage, only_files.as_deref()).await;
                     piece_tracker.set_wanted(wanted_pieces(
                         storage.layout(),
                         &lengths,
@@ -1135,7 +1149,7 @@ async fn torrent_loop(
                     for peer in peers.values_mut() {
                         refresh_interest(peer, &mut piece_tracker).await;
                     }
-                    let _ = ack.send(());
+                    let _ = ack.send(applied);
                 }
                 TorrentCommand::AddTrackers { urls, ack } => {
                     let new_urls = normalize_tracker_urls(urls, &tracker_urls);
