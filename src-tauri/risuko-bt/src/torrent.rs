@@ -266,7 +266,7 @@ impl ManagedTorrent {
         self.cmd_tx.clone()
     }
 
-    /// Download only `files` (indices into the torrent's file list), or everything for `None`
+    /// Download only `files` (indices into the torrent's file list), or everything for `None`; errors name selected files left unselected because their part-file data could not move
     pub async fn set_only_files(&self, files: Option<Vec<usize>>) -> Result<(), String> {
         let (ack, done) = oneshot::channel();
         self.cmd_tx
@@ -305,26 +305,39 @@ fn selected_file_set(only_files: Option<&[usize]>) -> Option<HashSet<usize>> {
     only_files.map(|files| files.iter().copied().collect())
 }
 
-/// Route unselected files to part files and move newly selected ones out; errors name files left shadowed
 async fn apply_storage_selection(
     storage: &FilesystemStorage,
-    only_files: Option<&[usize]>,
-) -> Result<(), String> {
-    let selected = selected_file_set(only_files);
-    let mut failed = Vec::new();
+    only_files: Option<Vec<usize>>,
+) -> (Option<Vec<usize>>, Result<(), String>) {
+    let selected = selected_file_set(only_files.as_deref());
+    let mut failed = HashSet::new();
+    let mut errors = Vec::new();
     for idx in storage.set_selection(selected.as_ref()).await {
         if let Err(e) = storage.promote_file(idx).await {
-            failed.push(format!("file {idx}: {e}"));
+            let path = &storage.layout().files()[idx].path;
+            errors.push(format!("{} ({e})", path.display()));
+            failed.insert(idx);
         }
     }
     if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "moving part-file data failed ({})",
-            failed.join("; ")
-        ))
+        return (only_files, Ok(()));
     }
+    let in_effect = match only_files {
+        Some(files) => files
+            .into_iter()
+            .filter(|idx| !failed.contains(idx))
+            .collect(),
+        None => (0..storage.layout().files().len())
+            .filter(|idx| !failed.contains(idx))
+            .collect(),
+    };
+    (
+        Some(in_effect),
+        Err(format!(
+            "part-file data could not move, left unselected: {}",
+            errors.join("; ")
+        )),
+    )
 }
 
 pub async fn spawn(
@@ -693,8 +706,9 @@ async fn torrent_loop(
         ),
     );
     let mut piece_tracker = PieceTracker::new(lengths);
-    let mut only_files = init.only_files.clone();
-    if let Err(e) = apply_storage_selection(&storage, only_files.as_deref()).await {
+    let (mut only_files, applied) =
+        apply_storage_selection(&storage, init.only_files.clone()).await;
+    if let Err(e) = applied {
         tracing::warn!("file selection for {info_hash}: {e}");
     }
     piece_tracker.set_wanted(wanted_pieces(
@@ -1134,8 +1148,8 @@ async fn torrent_loop(
                     let _ = ack.send(());
                 }
                 TorrentCommand::SetOnlyFiles { files, ack } => {
-                    only_files = files;
-                    let applied = apply_storage_selection(&storage, only_files.as_deref()).await;
+                    let applied;
+                    (only_files, applied) = apply_storage_selection(&storage, files).await;
                     piece_tracker.set_wanted(wanted_pieces(
                         storage.layout(),
                         &lengths,
@@ -5557,6 +5571,59 @@ mod tests {
         let wanted = wanted_pieces(&layout, &lengths, Some(&[2]));
         assert_eq!(PieceTracker::bytes_of(&lengths, |i| wanted[i]), 10);
         assert_eq!(info.selectable_file_indices(), vec![0, 2]);
+    }
+
+    #[tokio::test]
+    async fn files_whose_part_file_data_cannot_move_stay_unselected() {
+        let info = ValidatedTorrentMetaV1Info {
+            name: "root".into(),
+            piece_length: 10,
+            pieces: vec![0; 20 * 3],
+            private: false,
+            files: vec![
+                TorrentMetaInfo {
+                    path: vec!["a".into()],
+                    length: 15,
+                    padding: false,
+                },
+                TorrentMetaInfo {
+                    path: vec!["sub".into(), "b".into()],
+                    length: 15,
+                    padding: false,
+                },
+            ],
+            single_file_mode: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let storage = FilesystemStorage::new(&info, &root)
+            .with_parts_dir(crate::storage::parts_dir_for(&root, "abcd"));
+        let (in_effect, applied) = apply_storage_selection(&storage, Some(vec![0])).await;
+        assert_eq!(in_effect, Some(vec![0]));
+        assert!(applied.is_ok());
+
+        // A file where b's directory belongs makes promoting b fail
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sub"), b"").unwrap();
+        let (in_effect, applied) = apply_storage_selection(&storage, None).await;
+        assert_eq!(in_effect, Some(vec![0]));
+        let err = applied.unwrap_err();
+        assert!(
+            err.contains(&root.join("sub").join("b").display().to_string()),
+            "error names the file path: {err}"
+        );
+        // b's own piece is not fetched into its part file
+        let lengths = Lengths::new(30, 10).unwrap();
+        assert_eq!(
+            wanted_pieces(storage.layout(), &lengths, in_effect.as_deref()),
+            vec![true, true, false]
+        );
+
+        // Selecting again retries the move
+        std::fs::remove_file(root.join("sub")).unwrap();
+        let (in_effect, applied) = apply_storage_selection(&storage, None).await;
+        assert_eq!(in_effect, None);
+        assert!(applied.is_ok());
     }
 
     #[test]
