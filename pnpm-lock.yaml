@@ -152,6 +152,9 @@ importers:
       '@risuko/js-linux-x64-gnu':
         specifier: 0.7.1
         version: 0.7.1
+      '@risuko/js-win32-arm64-msvc':
+        specifier: 0.7.1
+        version: 0.7.1
       '@risuko/js-win32-x64-msvc':
         specifier: 0.7.1
         version: 0.7.1
@@ -290,6 +293,11 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [glibc]
+
+  '@risuko/js-win32-arm64-msvc@0.7.1':
+    resolution: {integrity: sha512-P3XKQJTlgYm4dyum8DiVEKlkvkd5Snglg4Ef1Hor+wTKycVg8nlt0vX/1T7r+1/pIyevdVuuqLMwyDHZccnJXg==}
+    cpu: [arm64]
+    os: [win32]
 
   '@risuko/js-win32-x64-msvc@0.7.1':
     resolution: {integrity: sha512-W7lsErIqHZzrnx8ZR2xv9OTpF2PF531ruieY3UOrRSd3jDbzfeTbu4/IVuV8Bsz+VlP0ULdl7/gz53vPEdKd1w==}
@@ -1627,6 +1635,9 @@ snapshots:
     optional: true
 
   '@risuko/js-linux-x64-gnu@0.7.1':
+    optional: true
+
+  '@risuko/js-win32-arm64-msvc@0.7.1':
     optional: true
 
   '@risuko/js-win32-x64-msvc@0.7.1':
