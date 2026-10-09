@@ -1,24 +1,24 @@
 {
-	"name": "@risuko/js-win32-x64-msvc",
-	"version": "0.7.0",
-	"description": "Risuko JS native module for Windows x64",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/YueMiyuki/Risuko.git",
-		"directory": "packages/risuko-js/npm/win32-x64-msvc"
-	},
-	"license": "MIT",
-	"os": [
-		"win32"
-	],
-	"cpu": [
-		"x64"
-	],
-	"main": "risuko.win32-x64-msvc.node",
-	"scripts": {
-		"prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
-	},
-	"files": [
-		"risuko.win32-x64-msvc.node"
-	]
+  "name": "@risuko/js-win32-x64-msvc",
+  "version": "0.7.1",
+  "description": "Risuko JS native module for Windows x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YueMiyuki/Risuko.git",
+    "directory": "packages/risuko-js/npm/win32-x64-msvc"
+  },
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "risuko.win32-x64-msvc.node",
+  "scripts": {
+    "prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
+  },
+  "files": [
+    "risuko.win32-x64-msvc.node"
+  ]
 }

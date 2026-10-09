@@ -1,28 +1,28 @@
 {
-	"name": "@risuko/app",
-	"version": "0.7.0",
-	"description": "Risuko download manager — launches the desktop app, downloading it from GitHub Releases on first run",
-	"license": "MIT",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/YueMiyuki/Risuko.git"
-	},
-	"keywords": [
-		"download",
-		"torrent",
-		"bittorrent",
-		"ed2k",
-		"m3u8",
-		"ftp",
-		"download-manager"
-	],
-	"bin": {
-		"risuko-app": "bin.js"
-	},
-	"files": [
-		"bin.js"
-	],
-	"engines": {
-		"node": ">=22.0.0"
-	}
+  "name": "@risuko/app",
+  "version": "0.7.1",
+  "description": "Risuko download manager — launches the desktop app, downloading it from GitHub Releases on first run",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YueMiyuki/Risuko.git"
+  },
+  "keywords": [
+    "download",
+    "torrent",
+    "bittorrent",
+    "ed2k",
+    "m3u8",
+    "ftp",
+    "download-manager"
+  ],
+  "bin": {
+    "risuko-app": "bin.js"
+  },
+  "files": [
+    "bin.js"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  }
 }

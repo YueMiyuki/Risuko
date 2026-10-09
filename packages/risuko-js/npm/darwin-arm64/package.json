@@ -1,24 +1,24 @@
 {
-	"name": "@risuko/js-darwin-arm64",
-	"version": "0.7.0",
-	"description": "Risuko JS native module for macOS ARM64",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/YueMiyuki/Risuko.git",
-		"directory": "packages/risuko-js/npm/darwin-arm64"
-	},
-	"license": "MIT",
-	"os": [
-		"darwin"
-	],
-	"cpu": [
-		"arm64"
-	],
-	"main": "risuko.darwin-arm64.node",
-	"scripts": {
-		"prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
-	},
-	"files": [
-		"risuko.darwin-arm64.node"
-	]
+  "name": "@risuko/js-darwin-arm64",
+  "version": "0.7.1",
+  "description": "Risuko JS native module for macOS ARM64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YueMiyuki/Risuko.git",
+    "directory": "packages/risuko-js/npm/darwin-arm64"
+  },
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "risuko.darwin-arm64.node",
+  "scripts": {
+    "prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
+  },
+  "files": [
+    "risuko.darwin-arm64.node"
+  ]
 }

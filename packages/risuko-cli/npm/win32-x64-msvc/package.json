@@ -1,23 +1,23 @@
 {
-	"name": "@risuko/cli-win32-x64-msvc",
-	"version": "0.7.0",
-	"description": "Risuko CLI binary for Windows x64",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/YueMiyuki/Risuko.git",
-		"directory": "packages/risuko-cli/npm/win32-x64-msvc"
-	},
-	"license": "MIT",
-	"os": [
-		"win32"
-	],
-	"cpu": [
-		"x64"
-	],
-	"scripts": {
-		"prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
-	},
-	"files": [
-		"risuko.exe"
-	]
+  "name": "@risuko/cli-win32-x64-msvc",
+  "version": "0.7.1",
+  "description": "Risuko CLI binary for Windows x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YueMiyuki/Risuko.git",
+    "directory": "packages/risuko-cli/npm/win32-x64-msvc"
+  },
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "scripts": {
+    "prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
+  },
+  "files": [
+    "risuko.exe"
+  ]
 }
