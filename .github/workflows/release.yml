@@ -4,6 +4,7 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: write
@@ -13,7 +14,7 @@ env:
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   meta:
@@ -162,6 +163,7 @@ jobs:
           ANDROID_API_LEVEL: 24
 
       - name: Sign Android release APKs
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: pnpm android:sign
         env:
           ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
@@ -175,6 +177,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           abis="${{ needs.meta.outputs.android_abis }}"
+          suffix="${{ github.event.pull_request.head.repo.fork && '-unsigned' || '' }}"
           mkdir -p dist/android
           declare -A labels=(
             [arm]=arm
@@ -183,7 +186,7 @@ jobs:
             [x86_64]=x64
           )
           for abi in $abis; do
-            src="src-tauri/gen/android/app/build/outputs/apk/${abi}/release/app-${abi}-release.apk"
+            src="src-tauri/gen/android/app/build/outputs/apk/${abi}/release/app-${abi}-release${suffix}.apk"
             if [[ ! -f "$src" ]]; then
               echo "::error::Signed Android APK not found: $src"
               find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print || true
@@ -204,7 +207,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Android APK artifacts (manual builds)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-android
@@ -311,7 +314,7 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.apple_app_specific_password }}
 
       - name: Build release artifacts (manual)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         run: pnpm tauri build --target ${{ matrix.target }} ${{ matrix.tauri_args }}
 
       - name: Verify local bundle output exists
@@ -393,7 +396,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload standardized app bundle artifact (manual builds)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-${{ env.APP_PLATFORM_LABEL }}
@@ -420,7 +423,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Windows portable exe artifact (manual builds)
-        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch'
+        if: runner.os == 'Windows' && github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-portable-${{ env.APP_PLATFORM_LABEL }}
@@ -470,7 +473,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload risuko-cli artifact (manual builds)
-        if: github.event_name == 'workflow_dispatch' && matrix.target != 'i686-pc-windows-msvc'
+        if: github.event_name != 'release' && matrix.target != 'i686-pc-windows-msvc'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: risuko-cli-${{ matrix.target }}
