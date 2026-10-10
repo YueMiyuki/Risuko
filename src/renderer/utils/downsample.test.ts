@@ -42,6 +42,17 @@ test("buckets follow time rather than item position", () => {
 	assert.deepEqual(filled[20].items, [minute(100000)]);
 });
 
+test("dense buckets sit at the midpoint of their samples", () => {
+	const items = Array.from({ length: 40 }, (_, i) => minute(i));
+	const buckets = bucketByTime(items, 10, 60, (value) => value);
+	for (const bucket of buckets) {
+		const first = bucket.items[0];
+		const last = bucket.items[bucket.items.length - 1];
+		assert.equal(bucket.time, (first + last) / 2);
+	}
+	assert.ok(buckets[0].time > items[0]);
+});
+
 test("idle gaps are bracketed by empty buckets", () => {
 	const items = [0, 1, 500, 501].map(minute);
 	const buckets = bucketByTime(items, 1000, 60, (value) => value);

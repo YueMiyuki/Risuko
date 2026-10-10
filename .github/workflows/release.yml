@@ -161,9 +161,10 @@ jobs:
           ANDROID_TARGETS: ${{ needs.meta.outputs.android_targets }}
           ANDROID_NDK_VERSION: 27.2.12479018
           ANDROID_API_LEVEL: 24
+          RISUKO_ANDROID_APPLICATION_ID: ${{ github.event_name == 'pull_request' && 'app.risuko.preview.mobile' || '' }}
 
       - name: Sign Android release APKs
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: github.event_name != 'pull_request'
         run: pnpm android:sign
         env:
           ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
@@ -171,13 +172,34 @@ jobs:
           ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
 
+      - name: Sign Android preview APKs with the debug key
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$ANDROID_SIGNING_KEYSTORE_BASE64" ]]; then
+            unset ANDROID_SIGNING_KEYSTORE_BASE64
+            export ANDROID_SIGNING_KEYSTORE_PATH="$RUNNER_TEMP/debug.keystore"
+            keytool -genkeypair -noprompt \
+              -keystore "$ANDROID_SIGNING_KEYSTORE_PATH" -storetype PKCS12 \
+              -storepass "$ANDROID_SIGNING_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_SIGNING_KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          pnpm android:sign
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_KEYSTORE_PASSWORD: android
+          ANDROID_SIGNING_KEY_ALIAS: androiddebugkey
+
       - name: Package Android APKs with standardized names
         shell: bash
         run: |
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           abis="${{ needs.meta.outputs.android_abis }}"
-          suffix="${{ github.event.pull_request.head.repo.fork && '-unsigned' || '' }}"
+          suffix="${{ github.event_name == 'pull_request' && '-preview' || '' }}"
           mkdir -p dist/android
           declare -A labels=(
             [arm]=arm
@@ -186,13 +208,13 @@ jobs:
             [x86_64]=x64
           )
           for abi in $abis; do
-            src="src-tauri/gen/android/app/build/outputs/apk/${abi}/release/app-${abi}-release${suffix}.apk"
+            src="src-tauri/gen/android/app/build/outputs/apk/${abi}/release/app-${abi}-release.apk"
             if [[ ! -f "$src" ]]; then
               echo "::error::Signed Android APK not found: $src"
               find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print || true
               exit 1
             fi
-            dest="dist/android/Risuko_${version}_android_${labels[$abi]}.apk"
+            dest="dist/android/Risuko_${version}_android_${labels[$abi]}${suffix}.apk"
             cp "$src" "$dest"
             echo "packaged: $dest"
           done

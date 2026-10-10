@@ -287,7 +287,7 @@ import { computed, ref, watch } from "vue";
 import api from "@/api";
 import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
 import { flushDownloadStatsMinute } from "@/store/task";
-import { bucketByTime } from "@/utils/downsample";
+import { bucketByTime, type TimeBucket } from "@/utils/downsample";
 
 defineOptions({ name: "StatsPage" });
 
@@ -584,35 +584,36 @@ const speedXTicks = computed(() => {
 	}));
 });
 
-const pointValue = (
-	point: SpeedPoint,
-	protocol: string,
-	metric: SpeedMetric,
+const bucketPeaks = (
+	buckets: TimeBucket<SpeedPoint>[],
+	protocols: string[],
 ) => {
-	let sum = 0;
-	for (const item of point.protocols) {
-		if (protocol === "overall" || item.protocol === protocol) {
-			sum += Number(
-				metric === "download" ? item.downloadSpeed : item.uploadSpeed,
-			);
+	const slots = new Map(protocols.map((protocol, index) => [protocol, index]));
+	const overall = slots.get("overall");
+	const peaks = protocols.map(() => ({
+		download: new Array<number>(buckets.length).fill(0),
+		upload: new Array<number>(buckets.length).fill(0),
+	}));
+	const down = new Array<number>(protocols.length);
+	const up = new Array<number>(protocols.length);
+	buckets.forEach((bucket, index) => {
+		for (const point of bucket.items) {
+			down.fill(0);
+			up.fill(0);
+			for (const item of point.protocols) {
+				const slot = overall ?? slots.get(item.protocol);
+				if (slot !== undefined) {
+					down[slot] += Number(item.downloadSpeed);
+					up[slot] += Number(item.uploadSpeed);
+				}
+			}
+			peaks.forEach((peak, slot) => {
+				peak.download[index] = Math.max(peak.download[index], down[slot]);
+				peak.upload[index] = Math.max(peak.upload[index], up[slot]);
+			});
 		}
-	}
-	return sum;
-};
-
-const bucketPeak = (
-	items: SpeedPoint[],
-	protocol: string,
-	metric: SpeedMetric,
-) => {
-	let peak = 0;
-	for (const point of items) {
-		const value = pointValue(point, protocol, metric);
-		if (value > peak) {
-			peak = value;
-		}
-	}
-	return peak;
+	});
+	return peaks;
 };
 
 const makePath = (values: number[], xs: number[], max: number) => {
@@ -641,16 +642,15 @@ const speedLines = computed<SpeedLine[]>(() => {
 		splitMode.value === "overall" ? ["overall"] : visibleProtocols.value;
 	const metrics: SpeedMetric[] =
 		seriesMode.value === "both" ? ["download", "upload"] : [seriesMode.value];
-	const raw = protocols.flatMap((protocol) =>
+	const peaks = bucketPeaks(buckets, protocols);
+	const raw = protocols.flatMap((protocol, slot) =>
 		metrics.map((metric) => ({
 			key: `${protocol}:${metric}`,
 			label: `${protocolLabel(protocol)} ${metric === "download" ? "Down" : "Up"}`,
 			metric,
 			protocol,
 			color: colorForSpeedLine(protocol, metric),
-			values: buckets.map((bucket) =>
-				bucketPeak(bucket.items, protocol, metric),
-			),
+			values: peaks[slot][metric],
 			path: "",
 		})),
 	);

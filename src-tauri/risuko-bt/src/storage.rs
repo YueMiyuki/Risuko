@@ -144,6 +144,7 @@ impl FilesystemStorage {
         let ranges = boundary_ranges(file.offset, file.length, self.piece_length);
         let real = self.handle(idx, true).await?;
         let copy_from = shadow_path.clone();
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         task::spawn_blocking(move || -> io::Result<()> {
             let Ok(shadow) = std::fs::File::open(&copy_from) else {
                 return Ok(());
@@ -162,7 +163,6 @@ impl FilesystemStorage {
         })
         .await
         .map_err(|e| io::Error::other(e.to_string()))??;
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         self.shadowed.lock()[idx] = false;
         self.shadow_handles.lock()[idx] = None;
         let parts_dir = self.parts_dir.clone();

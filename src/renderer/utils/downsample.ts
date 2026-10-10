@@ -23,14 +23,18 @@ export function bucketByTime<T>(
 			: 0;
 	const buckets: TimeBucket<T>[] = [];
 	let slot = -1;
+	let first = 0;
 	for (const item of items) {
 		const at = time(item);
 		const next = dense ? slotOf(at) : slot + 1;
 		if (next !== slot) {
 			buckets.push({ time: at, items: [] });
 			slot = next;
+			first = at;
 		}
-		buckets[buckets.length - 1].items.push(item);
+		const bucket = buckets[buckets.length - 1];
+		bucket.items.push(item);
+		bucket.time = (first + at) / 2;
 	}
 	const filled: TimeBucket<T>[] = [];
 	for (const bucket of buckets) {

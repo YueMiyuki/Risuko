@@ -19,7 +19,7 @@ android {
     namespace = "app.risuko.mobile"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "app.risuko.mobile"
+        applicationId = providers.environmentVariable("RISUKO_ANDROID_APPLICATION_ID").orNull?.ifBlank { null } ?: "app.risuko.mobile"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
