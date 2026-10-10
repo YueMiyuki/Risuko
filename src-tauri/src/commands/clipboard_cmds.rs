@@ -1,8 +1,8 @@
-//! Clipboard Watcher
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
 
+#[cfg(not(target_os = "android"))]
 pub fn is_download_candidate(uri: &str, exts: &[String]) -> bool {
     use risuko_engine::engine;
     let uri = uri.trim();
@@ -31,6 +31,7 @@ pub fn is_download_candidate(uri: &str, exts: &[String]) -> bool {
     false
 }
 
+#[cfg(not(target_os = "android"))]
 fn path_has_allowed_ext(uri: &str, exts: &[String]) -> bool {
     let after_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
     let path = after_scheme.split(['?', '#']).next().unwrap_or("");
@@ -46,22 +47,35 @@ fn path_has_allowed_ext(uri: &str, exts: &[String]) -> bool {
         .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(&ext))
 }
 
+#[cfg(not(target_os = "android"))]
+const MAX_CLIPBOARD_BYTES: usize = 8 * 1024;
+
+#[cfg(not(target_os = "android"))]
+fn config_value<'a>(
+    cfg: &'a risuko_engine::config::ConfigManager,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    cfg.get_user_config()
+        .get(key)
+        .or_else(|| cfg.get_system_config().get(key))
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn watch_enabled(state: &AppState) -> bool {
     let Ok(cfg) = state.config.lock() else {
         return false;
     };
-    cfg.get_merged_config()
-        .get("clipboard-watch")
+    config_value(&cfg, "clipboard-watch")
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
 }
 
+#[cfg(not(target_os = "android"))]
 fn watch_exts(state: &AppState) -> Vec<String> {
     let Ok(cfg) = state.config.lock() else {
         return Vec::new();
     };
-    cfg.get_merged_config()
-        .get("clipboard-watch-extensions")
+    config_value(&cfg, "clipboard-watch-extensions")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -87,10 +101,11 @@ pub fn on_clipboard_update(app: &AppHandle) {
     let Ok(text) = clipboard.read_text() else {
         return;
     };
-    let text = text.trim().to_string();
-    if text.is_empty() {
+    let text = text.trim();
+    if text.is_empty() || text.len() > MAX_CLIPBOARD_BYTES {
         return;
     }
+    let text = text.to_string();
     if let Ok(mut sw) = state.last_clipboard_self_write.lock() {
         if sw.as_deref() == Some(text.as_str()) {
             *sw = None;
@@ -217,7 +232,6 @@ mod tests {
         assert!(!is_download_candidate("just some copied text", &e));
         assert!(!is_download_candidate("", &e));
         assert!(!is_download_candidate("https://example.com/page.html", &e));
-        // empty list: scheme-based links still match, extension-based don't
         assert!(is_download_candidate("magnet:?xt=urn:btih:0123abc", &[]));
         assert!(!is_download_candidate(
             "https://mirror.example.com/ubuntu.iso",

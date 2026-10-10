@@ -1,5 +1,3 @@
-//! BEP-14 Local Service Discovery: announces info-hashes over UDP multicast on the local link so LAN peers find each other without trackers; IPv4 (`239.192.152.143:6771`) and IPv6 (`ff15::efc0:988f:6771`) groups are supported and a bind failure on one family downgrades to a warning; messages are HTTP-like `BT-SEARCH * HTTP/1.1` with `Host`, `Port`, one or more `Infohash`, and `cookie` headers
-
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -16,13 +14,11 @@ use super::core::Id20;
 
 const LSD_PORT: u16 = 6771;
 const LSD_V4: Ipv4Addr = Ipv4Addr::new(239, 192, 152, 143);
-// ff15::efc0:988f (link-local scope not used; BEP-14 specifies site-local "15")
 const LSD_V6: Ipv6Addr = Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f);
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_DATAGRAM: usize = 1280;
 
-/// Running LSD service; output arrives on the `Receiver` returned by [`LocalServiceDiscovery::spawn`], and dropping [`LocalServiceDiscovery`] cancels all background tasks
 pub struct LocalServiceDiscovery {
     inner: Arc<LsdInner>,
     join_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -32,15 +28,13 @@ struct LsdInner {
     cookie: String,
     announce_port: u16,
     info_hashes: Mutex<HashSet<Id20>>,
-    // Per-source rate limiter keyed by (info_hash, ip)
+    pending: Mutex<Vec<Id20>>,
     rate: Mutex<HashMap<(Id20, IpAddr), Instant>>,
     tx_out: mpsc::Sender<(Id20, SocketAddr)>,
-    // Wake the announcer immediately on add_infohash
     wake_tx: mpsc::Sender<()>,
 }
 
 impl LocalServiceDiscovery {
-    /// Spawn the service; returns the handle and a receiver yielding `(info_hash, peer_addr)` for every valid incoming announce
     #[allow(clippy::type_complexity)]
     pub fn spawn(
         announce_port: u16,
@@ -54,6 +48,7 @@ impl LocalServiceDiscovery {
             cookie,
             announce_port,
             info_hashes: Mutex::new(info_hashes.into_iter().collect()),
+            pending: Mutex::new(Vec::new()),
             rate: Mutex::new(HashMap::new()),
             tx_out,
             wake_tx,
@@ -106,12 +101,14 @@ impl LocalServiceDiscovery {
     pub fn add_infohash(&self, ih: Id20) {
         let added = self.inner.info_hashes.lock().insert(ih);
         if added {
+            self.inner.pending.lock().push(ih);
             let _ = self.inner.wake_tx.try_send(());
         }
     }
 
     pub fn remove_infohash(&self, ih: Id20) {
         self.inner.info_hashes.lock().remove(&ih);
+        self.inner.pending.lock().retain(|h| *h != ih);
     }
 }
 
@@ -123,8 +120,6 @@ impl Drop for LocalServiceDiscovery {
     }
 }
 
-// Socket setup
-
 fn bind_v4() -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
@@ -133,7 +128,6 @@ fn bind_v4() -> std::io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     sock.bind(&SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, LSD_PORT)).into())?;
     sock.join_multicast_v4(&LSD_V4, &Ipv4Addr::UNSPECIFIED)?;
-    // Restrict multicast to the LAN
     sock.set_multicast_ttl_v4(1)?;
     sock.set_multicast_loop_v4(false)?;
     UdpSocket::from_std(sock.into())
@@ -153,7 +147,54 @@ fn bind_v6() -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(sock.into())
 }
 
-// Announce loop
+const WAKE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct LanIfaces {
+    v4: Vec<Ipv4Addr>,
+    v6: Vec<u32>,
+}
+
+impl LanIfaces {
+    fn refresh(&mut self, v4: Option<&UdpSocket>, v6: Option<&UdpSocket>) {
+        use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+        let mut found4 = Vec::new();
+        let mut found6 = Vec::new();
+        for nic in NetworkInterface::show().unwrap_or_default() {
+            for addr in &nic.addr {
+                match addr {
+                    Addr::V4(a) if !a.ip.is_loopback() && !found4.contains(&a.ip) => {
+                        found4.push(a.ip)
+                    }
+                    Addr::V6(a)
+                        if !a.ip.is_loopback()
+                            && nic.index != 0
+                            && !found6.contains(&nic.index) =>
+                    {
+                        found6.push(nic.index)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(sock) = v4 {
+            for ip in &found4 {
+                if !self.v4.contains(ip) {
+                    let _ = socket2::SockRef::from(sock).join_multicast_v4(&LSD_V4, ip);
+                }
+            }
+        }
+        if let Some(sock) = v6 {
+            for idx in &found6 {
+                if !self.v6.contains(idx) {
+                    let _ = socket2::SockRef::from(sock).join_multicast_v6(&LSD_V6, *idx);
+                }
+            }
+        }
+        self.v4 = found4;
+        self.v6 = found6;
+    }
+}
 
 async fn announce_loop(
     v4: Option<Arc<UdpSocket>>,
@@ -163,27 +204,45 @@ async fn announce_loop(
 ) {
     let mut tick = tokio::time::interval(ANNOUNCE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Announce immediately on start
     let _ = tick.tick().await;
+    let mut ifaces = LanIfaces::default();
+    let mut full = true;
     loop {
-        do_announce(v4.as_deref(), v6.as_deref(), &inner).await;
+        ifaces.refresh(v4.as_deref(), v6.as_deref());
+        let hashes: Vec<Id20> = if full {
+            inner.pending.lock().clear();
+            inner.info_hashes.lock().iter().copied().collect()
+        } else {
+            std::mem::take(&mut *inner.pending.lock())
+        };
+        do_announce(v4.as_deref(), v6.as_deref(), &inner, &ifaces, &hashes).await;
+        let last = Instant::now();
         tokio::select! {
-            _ = tick.tick() => {}
+            _ = tick.tick() => full = true,
             _ = wake.recv() => {
-                // De-bounce: the wake might be a batch; flush any more
+                full = false;
+                let due = last + WAKE_MIN_INTERVAL;
+                tokio::select! {
+                    _ = tokio::time::sleep_until(due.into()) => {}
+                    _ = tick.tick() => full = true,
+                }
                 while wake.try_recv().is_ok() {}
             }
         }
     }
 }
 
-async fn do_announce(v4: Option<&UdpSocket>, v6: Option<&UdpSocket>, inner: &LsdInner) {
-    let hashes: Vec<Id20> = inner.info_hashes.lock().iter().copied().collect();
+async fn do_announce(
+    v4: Option<&UdpSocket>,
+    v6: Option<&UdpSocket>,
+    inner: &LsdInner,
+    ifaces: &LanIfaces,
+    hashes: &[Id20],
+) {
     if hashes.is_empty() {
         return;
     }
-    // Chunk info-hash lists so each datagram stays within a typical MTU
-    let chunk = 20; // 20 hashes ~ 900 bytes of Infohash headers
+    let chunk = 20;
     for slice in hashes.chunks(chunk) {
         if let Some(sock) = v4 {
             let msg = build_announce(
@@ -193,16 +252,31 @@ async fn do_announce(v4: Option<&UdpSocket>, v6: Option<&UdpSocket>, inner: &Lsd
                 &inner.cookie,
             );
             if msg.len() <= MAX_DATAGRAM {
-                let _ = sock
-                    .send_to(msg.as_bytes(), SocketAddrV4::new(LSD_V4, LSD_PORT))
-                    .await;
+                let target = SocketAddrV4::new(LSD_V4, LSD_PORT);
+                let sock_ref = socket2::SockRef::from(sock);
+                if ifaces.v4.is_empty() {
+                    let _ = sock.send_to(msg.as_bytes(), target).await;
+                }
+                for ip in &ifaces.v4 {
+                    if sock_ref.set_multicast_if_v4(ip).is_ok() {
+                        let _ = sock.send_to(msg.as_bytes(), target).await;
+                    }
+                }
             }
         }
         if let Some(sock) = v6 {
             let target = SocketAddrV6::new(LSD_V6, LSD_PORT, 0, 0);
             let msg = build_announce(target.into(), inner.announce_port, slice, &inner.cookie);
             if msg.len() <= MAX_DATAGRAM {
-                let _ = sock.send_to(msg.as_bytes(), target).await;
+                let sock_ref = socket2::SockRef::from(sock);
+                if ifaces.v6.is_empty() {
+                    let _ = sock.send_to(msg.as_bytes(), target).await;
+                }
+                for idx in &ifaces.v6 {
+                    if sock_ref.set_multicast_if_v6(*idx).is_ok() {
+                        let _ = sock.send_to(msg.as_bytes(), target).await;
+                    }
+                }
             }
         }
     }
@@ -224,8 +298,6 @@ fn build_announce(host: SocketAddr, port: u16, hashes: &[Id20], cookie: &str) ->
     s
 }
 
-// Receive loop
-
 async fn recv_loop(sock: Arc<UdpSocket>, inner: Arc<LsdInner>) {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -235,7 +307,6 @@ async fn recv_loop(sock: Arc<UdpSocket>, inner: Arc<LsdInner>) {
         let Some(parsed) = parse_announce(&buf[..n]) else {
             continue;
         };
-        // Drop own announces via cookie
         if parsed.cookie.as_deref() == Some(&inner.cookie) {
             continue;
         }
@@ -244,7 +315,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, inner: Arc<LsdInner>) {
             continue;
         }
         let peer_addr = SocketAddr::new(from.ip(), port);
-        // Snapshot only tracked hashes under the lock, then send outside it
+        // Snapshot under the lock, send outside it
         let matched: Vec<Id20> = {
             let our = inner.info_hashes.lock();
             parsed
@@ -254,16 +325,13 @@ async fn recv_loop(sock: Arc<UdpSocket>, inner: Arc<LsdInner>) {
                 .collect()
         };
         for ih in matched {
-            // Rate limit 1 peer per (info_hash, ip) per second
             let key = (ih, from.ip());
             let now = Instant::now();
             {
                 let mut rate = inner.rate.lock();
-                // Garbage-collect stale entries opportunistically
                 if rate.len() > 4096 {
                     rate.retain(|_, t| now.duration_since(*t) < RATE_LIMIT_WINDOW * 4);
                 }
-                // Hard cap: reject if still over limit after GC
                 if rate.len() > 8192 {
                     continue;
                 }
@@ -287,7 +355,6 @@ struct AnnounceMsg {
 }
 
 fn parse_announce(buf: &[u8]) -> Option<AnnounceMsg> {
-    // httparse expects a request line like "GET / HTTP/1.1"; BT-SEARCH fits
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
     req.parse(buf).ok()?;

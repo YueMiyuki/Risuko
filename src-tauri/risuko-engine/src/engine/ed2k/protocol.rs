@@ -2,7 +2,8 @@ use super::types::*;
 use bytes::{Buf, BytesMut};
 use std::io;
 
-/// An ed2k packet: protocol byte + opcode + payload
+pub const MAX_FRAME_LEN: usize = 2_000_000;
+
 #[derive(Debug, Clone)]
 pub struct Ed2kPacket {
     pub protocol: u8,
@@ -19,9 +20,7 @@ impl Ed2kPacket {
         }
     }
 
-    /// Encode this packet into bytes for sending over the wire
     pub fn encode(&self) -> Vec<u8> {
-        // Format: [protocol:1][length:4(LE)][opcode:1][payload:N]; length = 1 (opcode) + payload.len()
         let data_len = 1 + self.payload.len();
         let mut buf = Vec::with_capacity(5 + data_len);
         buf.push(self.protocol);
@@ -31,19 +30,30 @@ impl Ed2kPacket {
         buf
     }
 
-    /// Try to decode a packet from a byte buffer. Returns None if not enough data
     pub fn decode(buf: &mut BytesMut) -> Result<Option<Self>, io::Error> {
         if buf.len() < 5 {
             return Ok(None);
         }
 
         let protocol = buf[0];
+        if !matches!(protocol, PROTO_EDONKEY | PROTO_EMULE | PROTO_PACKED) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unknown ed2k protocol byte",
+            ));
+        }
         let data_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
 
         if data_len == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Zero-length ed2k packet",
+            ));
+        }
+        if data_len > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Oversized ed2k packet",
             ));
         }
 
@@ -67,9 +77,6 @@ impl Ed2kPacket {
     }
 }
 
-// -- Packet builders --
-
-/// Build a Hello Server packet (opcode 0x01): client_hash(16) + client_id(4) + port(2) + meta_tags
 pub fn build_hello_server(
     client_hash: &[u8; 16],
     client_port: u16,
@@ -77,13 +84,12 @@ pub fn build_hello_server(
 ) -> Ed2kPacket {
     let mut payload = Vec::with_capacity(64);
     payload.extend_from_slice(client_hash);
-    payload.extend_from_slice(&0u32.to_le_bytes()); // client_id = 0 (connecting)
+    payload.extend_from_slice(&0u32.to_le_bytes());
     payload.extend_from_slice(&client_port.to_le_bytes());
 
-    // Meta tags: name, version, port
     let mut tags = vec![
         MetaTag::string(TAG_NAME, "Risuko"),
-        MetaTag::u32(TAG_VERSION, 0x3c), // version 60
+        MetaTag::u32(TAG_VERSION, 0x3c),
         MetaTag::u32(TAG_PORT, client_port as u32),
     ];
     if let Some(port) = kad_udp_port {
@@ -99,21 +105,16 @@ pub fn build_hello_server(
     Ed2kPacket::new(PROTO_EDONKEY, OP_HELLO_SERVER, payload)
 }
 
-/// Build a Get Sources packet (opcode 0x19)
 pub fn build_get_sources(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_GET_SOURCES, file_hash.to_vec())
 }
 
-/// Build an Offer Files packet (opcode 0x15) — empty file list
 pub fn build_offer_files_empty() -> Ed2kPacket {
     let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_le_bytes()); // 0 files
+    payload.extend_from_slice(&0u32.to_le_bytes());
     Ed2kPacket::new(PROTO_EDONKEY, OP_OFFER_FILES, payload)
 }
 
-// -- Packet parsers --
-
-/// Parse ID Change packet (opcode 0x40): returns client_id
 pub fn parse_id_change(payload: &[u8]) -> Result<u32, String> {
     if payload.len() < 4 {
         return Err("ID Change packet too short".to_string());
@@ -123,7 +124,6 @@ pub fn parse_id_change(payload: &[u8]) -> Result<u32, String> {
     ]))
 }
 
-/// Parse Server Status packet (opcode 0x34): returns (users, files)
 pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), String> {
     if payload.len() < 8 {
         return Err("Server Status packet too short".to_string());
@@ -133,7 +133,6 @@ pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), String> {
     Ok((users, files))
 }
 
-/// Parse Server Message packet (opcode 0x38): returns message string
 pub fn parse_server_message(payload: &[u8]) -> Result<String, String> {
     if payload.len() < 2 {
         return Err("Server Message packet too short".to_string());
@@ -146,7 +145,6 @@ pub fn parse_server_message(payload: &[u8]) -> Result<String, String> {
         .map_err(|_| "Server Message contains invalid UTF-8".to_string())
 }
 
-/// Parse Found Sources packet (opcode 0x42): returns (file_hash, list of (ip:u32, port:u16))
 pub fn parse_found_sources(payload: &[u8]) -> Result<([u8; 16], Vec<(u32, u16)>), String> {
     if payload.len() < 17 {
         return Err("Found Sources packet too short".to_string());
@@ -178,7 +176,6 @@ pub fn parse_found_sources(payload: &[u8]) -> Result<([u8; 16], Vec<(u32, u16)>)
     Ok((hash, sources))
 }
 
-/// Parse Hashset Answer (opcode 0x52): returns (file_hash, chunk_hashes)
 pub fn parse_hashset_answer(payload: &[u8]) -> Result<([u8; 16], Vec<[u8; 16]>), String> {
     if payload.len() < 18 {
         return Err("Hashset Answer too short".to_string());
@@ -205,7 +202,6 @@ pub fn parse_hashset_answer(payload: &[u8]) -> Result<([u8; 16], Vec<[u8; 16]>),
     Ok((file_hash, hashes))
 }
 
-/// Parse File Status (opcode 0x50): returns (file_hash, part_bitmap)
 pub fn parse_file_status(payload: &[u8]) -> Result<([u8; 16], Vec<bool>), String> {
     if payload.len() < 18 {
         return Err("File Status too short".to_string());
@@ -231,7 +227,6 @@ pub fn parse_file_status(payload: &[u8]) -> Result<([u8; 16], Vec<bool>), String
     Ok((file_hash, parts))
 }
 
-/// Parse Sending Part header (opcode 0x46): returns (file_hash, start_offset, end_offset)
 pub fn parse_sending_part_header(payload: &[u8]) -> Result<([u8; 16], u32, u32), String> {
     if payload.len() < 24 {
         return Err("Sending Part header too short".to_string());
@@ -246,9 +241,6 @@ pub fn parse_sending_part_header(payload: &[u8]) -> Result<([u8; 16], u32, u32),
     Ok((file_hash, start, end))
 }
 
-// -- Meta Tags --
-
-/// A simple meta tag for the ed2k protocol
 #[derive(Debug, Clone)]
 pub enum MetaTag {
     String { name_id: u8, value: String },
@@ -270,16 +262,16 @@ impl MetaTag {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             Self::String { name_id, value } => {
-                buf.push(0x02); // string tag type
-                buf.extend_from_slice(&1u16.to_le_bytes()); // name length
+                buf.push(0x02);
+                buf.extend_from_slice(&1u16.to_le_bytes());
                 buf.push(*name_id);
                 let bytes = value.as_bytes();
                 buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
             Self::U32 { name_id, value } => {
-                buf.push(0x03); // u32 tag type
-                buf.extend_from_slice(&1u16.to_le_bytes()); // name length
+                buf.push(0x03);
+                buf.extend_from_slice(&1u16.to_le_bytes());
                 buf.push(*name_id);
                 buf.extend_from_slice(&value.to_le_bytes());
             }
@@ -287,9 +279,6 @@ impl MetaTag {
     }
 }
 
-// -- Client-to-Client packet builders --
-
-/// Build Hello Client packet (opcode 0x01)
 pub fn build_hello_client(
     client_hash: &[u8; 16],
     client_id: u32,
@@ -298,7 +287,7 @@ pub fn build_hello_client(
     server_port: u16,
 ) -> Ed2kPacket {
     let mut payload = Vec::with_capacity(64);
-    payload.push(0x10); // hash size (16)
+    payload.push(0x10);
     payload.extend_from_slice(client_hash);
     payload.extend_from_slice(&client_id.to_le_bytes());
     payload.extend_from_slice(&client_port.to_le_bytes());
@@ -307,6 +296,9 @@ pub fn build_hello_client(
         MetaTag::string(TAG_NAME, "Risuko"),
         MetaTag::u32(TAG_VERSION, 0x3c),
         MetaTag::u32(TAG_PORT, client_port as u32),
+        MetaTag::u32(CT_EMULE_VERSION, OUR_EMULE_VERSION),
+        MetaTag::u32(CT_EMULE_MISCOPTIONS1, OUR_MISC_OPTIONS1),
+        MetaTag::u32(CT_EMULE_MISCOPTIONS2, OUR_MISC_OPTIONS2),
     ];
 
     let tag_count = tags.len() as u32;
@@ -315,54 +307,189 @@ pub fn build_hello_client(
         tag.encode(&mut payload);
     }
 
-    // Server address
     payload.extend_from_slice(&server_ip.to_le_bytes());
     payload.extend_from_slice(&server_port.to_le_bytes());
 
     Ed2kPacket::new(PROTO_EDONKEY, OP_HELLO_CLIENT, payload)
 }
 
-/// Build File Request (opcode 0x58)
 pub fn build_file_request(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_REQUEST, file_hash.to_vec())
 }
 
-/// Build File Status Request (opcode 0x4f)
 pub fn build_file_status_request(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_STATUS_REQUEST, file_hash.to_vec())
 }
 
-/// Build Hashset Request (opcode 0x51)
 pub fn build_hashset_request(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_HASHSET_REQUEST, file_hash.to_vec())
 }
 
-/// Build Slot Request (opcode 0x54)
 pub fn build_slot_request(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_SLOT_REQUEST, file_hash.to_vec())
 }
 
-/// Build Request Parts (opcode 0x47): request up to 3 ranges
-pub fn build_request_parts(file_hash: &[u8; 16], ranges: &[(u32, u32)]) -> Ed2kPacket {
-    let mut payload = Vec::with_capacity(16 + 24);
+pub fn build_request_parts(
+    file_hash: &[u8; 16],
+    ranges: &[(u64, u64)],
+    large: bool,
+) -> Result<Ed2kPacket, String> {
+    if ranges.len() > 3 {
+        return Err("at most 3 ranges per request".to_string());
+    }
+    let width = if large { 8 } else { 4 };
+    let mut payload = Vec::with_capacity(16 + 6 * width);
     payload.extend_from_slice(file_hash);
 
-    // 3 start offsets, then 3 end offsets
-    for i in 0..3 {
-        let start = ranges.get(i).map(|r| r.0).unwrap_or(0);
-        payload.extend_from_slice(&start.to_le_bytes());
-    }
-    for i in 0..3 {
-        let end = ranges.get(i).map(|r| r.1).unwrap_or(0);
-        payload.extend_from_slice(&end.to_le_bytes());
+    for field in [0usize, 1] {
+        for i in 0..3 {
+            let r = ranges.get(i).copied().unwrap_or((0, 0));
+            let v = if field == 0 { r.0 } else { r.1 };
+            if large {
+                payload.extend_from_slice(&v.to_le_bytes());
+            } else {
+                let v = u32::try_from(v)
+                    .map_err(|_| "range needs a peer with large-file support".to_string())?;
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
     }
 
-    Ed2kPacket::new(PROTO_EDONKEY, OP_REQUEST_PARTS, payload)
+    Ok(if large {
+        Ed2kPacket::new(PROTO_EMULE, OP_REQUEST_PARTS_I64, payload)
+    } else {
+        Ed2kPacket::new(PROTO_EDONKEY, OP_REQUEST_PARTS, payload)
+    })
+}
+
+pub fn parse_sending_part_header_i64(payload: &[u8]) -> Result<([u8; 16], u64, u64), String> {
+    if payload.len() < 32 {
+        return Err("Sending Part I64 header too short".to_string());
+    }
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[0..16]);
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&payload[16..24]);
+    let start = u64::from_le_bytes(word);
+    word.copy_from_slice(&payload[24..32]);
+    let end = u64::from_le_bytes(word);
+    Ok((file_hash, start, end))
+}
+
+pub const OUR_EMULE_VERSION: u32 = (0xff << 24) | (50 << 10);
+pub const OUR_MISC_OPTIONS1: u32 = 0;
+pub const OUR_MISC_OPTIONS2: u32 = MISC2_LARGE_FILES;
+
+pub fn new_user_hash() -> [u8; 16] {
+    let mut hash: [u8; 16] = rand::random();
+    hash[5] = 14;
+    hash[14] = 111;
+    hash
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerCaps {
+    pub emule_version: Option<u32>,
+    pub misc_options1: u32,
+    pub misc_options2: u32,
+}
+
+impl PeerCaps {
+    pub fn large_files(&self) -> bool {
+        self.misc_options2 & MISC2_LARGE_FILES != 0
+    }
+}
+
+pub fn parse_hello_answer_caps(payload: &[u8]) -> PeerCaps {
+    let mut caps = PeerCaps::default();
+    let Some(rest) = payload.get(22..) else {
+        return caps;
+    };
+    let Some((count, mut rest)) = rest.split_first_chunk::<4>() else {
+        return caps;
+    };
+    for _ in 0..u32::from_le_bytes(*count) {
+        let Some((id, value, tail)) = read_tag(rest) else {
+            break;
+        };
+        rest = tail;
+        match (id, value) {
+            (Some(CT_EMULE_VERSION), Some(v)) => caps.emule_version = Some(v),
+            (Some(CT_EMULE_MISCOPTIONS1), Some(v)) => caps.misc_options1 = v,
+            (Some(CT_EMULE_MISCOPTIONS2), Some(v)) => caps.misc_options2 = v,
+            _ => {}
+        }
+    }
+    caps
+}
+
+type TagRead<'a> = (Option<u8>, Option<u32>, &'a [u8]);
+
+fn read_tag(buf: &[u8]) -> Option<TagRead<'_>> {
+    let (&ty, buf) = buf.split_first()?;
+    let (id, buf) = if ty & 0x80 != 0 {
+        let (&id, buf) = buf.split_first()?;
+        (Some(id), buf)
+    } else {
+        let (len, buf) = buf.split_first_chunk::<2>()?;
+        let len = u16::from_le_bytes(*len) as usize;
+        let name = buf.get(..len)?;
+        let id = (len == 1).then(|| name[0]);
+        (id, &buf[len..])
+    };
+    let take = |n: usize| -> Option<(&[u8], &[u8])> { (buf.len() >= n).then(|| buf.split_at(n)) };
+    let int = |n: usize| -> Option<(Option<u32>, &[u8])> {
+        let (b, tail) = take(n)?;
+        let mut w = [0u8; 8];
+        w[..n].copy_from_slice(b);
+        Some((u32::try_from(u64::from_le_bytes(w)).ok(), tail))
+    };
+    let (value, tail) = match ty & 0x7f {
+        0x01 => (None, take(16)?.1),
+        0x02 => {
+            let (l, t) = take(2)?;
+            let len = u16::from_le_bytes([l[0], l[1]]) as usize;
+            (None, t.get(len..)?)
+        }
+        0x03 => int(4)?,
+        0x04 => (None, take(4)?.1),
+        0x05 | 0x09 => int(1)?,
+        0x06 => {
+            let (l, t) = take(2)?;
+            let bits = u16::from_le_bytes([l[0], l[1]]) as usize;
+            (None, t.get(bits.div_ceil(8)..)?)
+        }
+        0x07 => {
+            let (l, t) = take(4)?;
+            let len = u32::from_le_bytes([l[0], l[1], l[2], l[3]]) as usize;
+            (None, t.get(len..)?)
+        }
+        0x08 => int(2)?,
+        0x0a => {
+            let (l, t) = take(1)?;
+            (None, t.get(l[0] as usize..)?)
+        }
+        0x0b => int(8)?,
+        t @ 0x11..=0x20 => (None, take((t - 0x10) as usize)?.1),
+        _ => return None,
+    };
+    Some((id, value, tail))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_rejects_oversized_and_unknown_frames() {
+        let mut oversized = BytesMut::from(&[PROTO_EDONKEY, 0xff, 0xff, 0xff, 0xff][..]);
+        assert!(Ed2kPacket::decode(&mut oversized).is_err());
+        let mut http = BytesMut::from(&b"HTTP/1.1 200 OK"[..]);
+        assert!(Ed2kPacket::decode(&mut http).is_err());
+        let mut ok = BytesMut::from(&Ed2kPacket::new(PROTO_EDONKEY, 0x42, vec![1, 2]).encode()[..]);
+        let packet = Ed2kPacket::decode(&mut ok).unwrap().unwrap();
+        assert_eq!((packet.opcode, packet.payload), (0x42, vec![1, 2]));
+    }
 
     #[test]
     fn server_hello_advertises_kad_udp_port_only_when_kad_is_running() {
@@ -386,5 +513,121 @@ mod tests {
             .payload
             .windows(kad_tag.len())
             .any(|window| window == kad_tag));
+    }
+
+    const BIG: u64 = 6_000_000_000;
+
+    #[test]
+    fn request_parts_uses_32_bit_form_for_plain_peers() {
+        let p = build_request_parts(&[9; 16], &[(1, 2), (3, 4)], false).unwrap();
+        assert_eq!(
+            (p.protocol, p.opcode, p.payload.len()),
+            (PROTO_EDONKEY, OP_REQUEST_PARTS, 40)
+        );
+        assert_eq!(&p.payload[16..20], &1u32.to_le_bytes());
+        assert_eq!(&p.payload[28..32], &2u32.to_le_bytes());
+        assert!(build_request_parts(&[9; 16], &[(BIG, BIG + 1)], false).is_err());
+    }
+
+    #[test]
+    fn request_parts_i64_encodes_wide_offsets() {
+        let p = build_request_parts(&[9; 16], &[(BIG, BIG + 184_320), (7, 8)], true).unwrap();
+        assert_eq!(
+            (p.protocol, p.opcode, p.payload.len()),
+            (PROTO_EMULE, OP_REQUEST_PARTS_I64, 64)
+        );
+        assert_eq!(&p.payload[16..24], &BIG.to_le_bytes());
+        assert_eq!(&p.payload[24..32], &7u64.to_le_bytes());
+        assert_eq!(&p.payload[40..48], &(BIG + 184_320).to_le_bytes());
+        assert!(build_request_parts(&[9; 16], &[(0, 1); 4], true).is_err());
+        let mut buf = BytesMut::from(&p.encode()[..]);
+        let back = Ed2kPacket::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            (back.opcode, back.payload),
+            (OP_REQUEST_PARTS_I64, p.payload)
+        );
+    }
+
+    #[test]
+    fn sending_part_i64_header_roundtrip() {
+        let mut payload = vec![5u8; 16];
+        payload.extend_from_slice(&BIG.to_le_bytes());
+        payload.extend_from_slice(&(BIG + 10).to_le_bytes());
+        assert_eq!(
+            parse_sending_part_header_i64(&payload).unwrap(),
+            ([5; 16], BIG, BIG + 10)
+        );
+        assert!(parse_sending_part_header_i64(&payload[..31]).is_err());
+    }
+
+    fn answer_with(tags: &[MetaTag]) -> Vec<u8> {
+        let mut payload = vec![0u8; 22];
+        payload.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for t in tags {
+            t.encode(&mut payload);
+        }
+        payload
+    }
+
+    #[test]
+    fn hello_advertises_only_large_file_support() {
+        let hello = build_hello_client(&[0; 16], 0, 4662, 0, 0);
+        let caps = parse_hello_answer_caps(&hello.payload[1..]);
+        assert!(caps.large_files());
+        assert_eq!(caps.misc_options1, 0);
+        assert_eq!(caps.misc_options2, MISC2_LARGE_FILES);
+        assert_eq!(caps.emule_version, Some(OUR_EMULE_VERSION));
+    }
+
+    #[test]
+    fn caps_parse_from_answer_tags() {
+        let payload = answer_with(&[
+            MetaTag::string(TAG_NAME, "peer"),
+            MetaTag::u32(CT_EMULE_MISCOPTIONS1, 0x1234),
+            MetaTag::u32(CT_EMULE_MISCOPTIONS2, 0x10 | 0x3),
+            MetaTag::u32(CT_EMULE_VERSION, 0x4200),
+        ]);
+        let caps = parse_hello_answer_caps(&payload);
+        assert_eq!(
+            caps,
+            PeerCaps {
+                emule_version: Some(0x4200),
+                misc_options1: 0x1234,
+                misc_options2: 0x13
+            }
+        );
+        let without =
+            parse_hello_answer_caps(&answer_with(&[MetaTag::u32(CT_EMULE_MISCOPTIONS2, 3)]));
+        assert!(!without.large_files());
+    }
+
+    #[test]
+    fn caps_parse_tolerates_short_names_and_garbage() {
+        let mut payload = vec![0u8; 22];
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(&[0x12, 0x07, b'x']);
+        payload.extend_from_slice(&[0x83, CT_EMULE_MISCOPTIONS2]);
+        payload.extend_from_slice(&MISC2_LARGE_FILES.to_le_bytes());
+        assert!(!parse_hello_answer_caps(&payload).large_files());
+
+        let mut ok = vec![0u8; 22];
+        ok.extend_from_slice(&2u32.to_le_bytes());
+        ok.extend_from_slice(&[0x91, 0x07, b'x']);
+        ok.extend_from_slice(&[0x83, CT_EMULE_MISCOPTIONS2]);
+        ok.extend_from_slice(&MISC2_LARGE_FILES.to_le_bytes());
+        assert!(parse_hello_answer_caps(&ok).large_files());
+        assert_eq!(parse_hello_answer_caps(&[1, 2, 3]), PeerCaps::default());
+        let mut bad = vec![0u8; 22];
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&[0xff, 0x01]);
+        assert_eq!(parse_hello_answer_caps(&bad), PeerCaps::default());
+    }
+
+    #[test]
+    fn user_hash_carries_emule_markers() {
+        for _ in 0..8 {
+            let h = new_user_hash();
+            assert_eq!((h[5], h[14]), (14, 111));
+        }
     }
 }

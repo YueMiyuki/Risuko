@@ -1,6 +1,3 @@
-//! ADC / DC URI parsing and shared types
-
-/// Errors emitted by the ADC / NMDC pipeline
 #[derive(Debug, thiserror::Error)]
 pub enum AdcError {
     #[error("invalid URI: {0}")]
@@ -9,41 +6,33 @@ pub enum AdcError {
     Io(#[from] std::io::Error),
     #[error("protocol: {0}")]
     Protocol(String),
-    #[error("hub disconnect: {0}")]
-    HubDisconnect(String),
     #[error("peer error: {0}")]
     Peer(String),
     #[error("no source has the requested file")]
     NoSource,
 }
 
-/// Parsed connection target for a hub
 #[derive(Debug, Clone)]
 pub struct HubInfo {
     pub host: String,
     pub port: u16,
     pub tls: bool,
-    /// Wire dialect: "adc" or "nmdc"
     pub dialect: HubDialect,
 }
 
-/// Wire-format dialect for an ADC/DC hub: `Adc` speaks the modern binary command set, `Nmdc` the legacy line-text DC++ protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubDialect {
     Adc,
     Nmdc,
 }
 
-/// One result row from a hub search: file name, size, and optional TTH
 #[derive(Debug, Clone, Default)]
 pub struct FileEntry {
     pub file_name: String,
     pub file_size: u64,
-    /// 39-char base32-encoded Tiger Tree Hash
     pub tth: Option<String>,
 }
 
-/// True for any DC-family scheme this engine recognises
 pub fn is_adc_uri(uri: &str) -> bool {
     let lower = uri.trim().to_ascii_lowercase();
     lower.starts_with("adc://")
@@ -52,10 +41,8 @@ pub fn is_adc_uri(uri: &str) -> bool {
         || lower.starts_with("nmdc://")
 }
 
-/// Parse a hub-only URI of the form `<scheme>://host[:port][/]`; returns `Err` with a human-readable reason when malformed
 pub fn parse_adc_hub_uri(uri: &str) -> Result<HubInfo, AdcError> {
     let trimmed = uri.trim();
-    // Detect the scheme case-insensitively but keep the rest of the URI in original case (only the scheme is case-insensitive; a future path/query must not be silently lowercased)
     let scheme_end = trimmed.find("://").map(|i| i + 3).unwrap_or(0);
     let scheme_lower = trimmed[..scheme_end].to_ascii_lowercase();
     let (dialect, tls, rest) = if let Some(len) = scheme_prefix_len(&scheme_lower, "adcs://") {
@@ -70,7 +57,6 @@ pub fn parse_adc_hub_uri(uri: &str) -> Result<HubInfo, AdcError> {
         return Err(AdcError::InvalidUri(format!("unknown scheme: {uri}")));
     };
 
-    // Default ports per protocol
     let default_port = match dialect {
         HubDialect::Adc => {
             if tls {
@@ -82,7 +68,6 @@ pub fn parse_adc_hub_uri(uri: &str) -> Result<HubInfo, AdcError> {
         HubDialect::Nmdc => 411,
     };
 
-    // Strip path/query
     let host_port = rest.split(['/', '?']).next().unwrap_or("");
     if host_port.is_empty() {
         return Err(AdcError::InvalidUri("missing host".into()));
@@ -98,15 +83,12 @@ pub fn parse_adc_hub_uri(uri: &str) -> Result<HubInfo, AdcError> {
     })
 }
 
-/// Returns the byte length of `full_scheme` if `scheme` (already lowercased, including trailing `://`) starts with it
 fn scheme_prefix_len(scheme: &str, full_scheme: &str) -> Option<usize> {
     scheme.starts_with(full_scheme).then_some(full_scheme.len())
 }
 
-/// Split a `host[:port]` authority into host and port, handling bracketed IPv6 literals like `[::1]:411` so the port is only taken after the closing `]`
 fn split_host_port(host_port: &str, default_port: u16) -> Result<(String, u16), AdcError> {
     if let Some(rest) = host_port.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[addr]` or `[addr]:port`
         let close = rest
             .find(']')
             .ok_or_else(|| AdcError::InvalidUri("unterminated IPv6 host".into()))?;
@@ -143,7 +125,13 @@ fn split_host_port(host_port: &str, default_port: u16) -> Result<(String, u16), 
     }
 }
 
-/// Parse a direct-file URI carrying TTH+size+name in the query string; returns `None` when required parameters are missing
+fn normalize_tth(v: &str) -> Option<String> {
+    (v.len() == 39
+        && v.bytes()
+            .all(|b| matches!(b.to_ascii_uppercase(), b'A'..=b'Z' | b'2'..=b'7')))
+    .then(|| v.to_ascii_uppercase())
+}
+
 pub fn parse_dchub_file_uri(uri: &str) -> Option<FileEntry> {
     let trimmed = uri.trim();
     let qpos = trimmed.find('?')?;
@@ -156,14 +144,14 @@ pub fn parse_dchub_file_uri(uri: &str) -> Option<FileEntry> {
         let k = it.next().unwrap_or("");
         let v = it.next().unwrap_or("");
         match k.to_ascii_lowercase().as_str() {
-            "tth" | "kt" => {
-                tth = Some(v.to_string());
+            "tth" => {
+                tth = normalize_tth(v);
             }
             "xl" | "size" => {
                 size = v.parse().unwrap_or(0);
             }
             "dn" | "name" => {
-                name = urlencoding_decode(v);
+                name = crate::engine::gnutella::types::url_decode(v);
             }
             _ => {}
         }
@@ -176,13 +164,6 @@ pub fn parse_dchub_file_uri(uri: &str) -> Option<FileEntry> {
         file_size: size,
         tth,
     })
-}
-
-/// Minimal URL-encoded string decoder (handles %XX hex escapes and `+` -> space)
-fn urlencoding_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(&s.replace('+', " "))
-        .decode_utf8_lossy()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -235,14 +216,29 @@ mod tests {
     #[test]
     fn parses_dchub_file_uri() {
         let link = parse_dchub_file_uri(
-            "dchub://hub.example.com:411/?TTH=ABCDEF1234567890ABCDEF1234567890ABCDEF12&xl=1024&dn=my+file.bin",
+            "dchub://hub.example.com:411/?TTH=ABCDEFGHIJKLMNOPQRSTUVWXYZ2345ABCDEFGHI&xl=1024&dn=my+file.bin",
         )
         .unwrap();
         assert_eq!(link.file_name, "my file.bin");
         assert_eq!(link.file_size, 1024);
         assert_eq!(
             link.tth.as_deref(),
-            Some("ABCDEF1234567890ABCDEF1234567890ABCDEF12")
+            Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ2345ABCDEFGHI")
         );
+    }
+
+    #[test]
+    fn rejects_malformed_tth() {
+        for tth in [
+            "ABC",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ2345ABCDEFGH1",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ2345ABCDEFGHIJ",
+        ] {
+            let f = parse_dchub_file_uri(&format!("dchub://h/?tth={tth}&dn=a")).unwrap();
+            assert!(f.tth.is_none(), "{tth}");
+        }
+        let f = parse_dchub_file_uri("dchub://h/?kt=PLSTQHKO5F2F5OJG6DNCKEXNV6YLQ47APLSTQHK&dn=a")
+            .unwrap();
+        assert!(f.tth.is_none());
     }
 }

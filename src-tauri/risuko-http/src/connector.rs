@@ -1,5 +1,3 @@
-//! TCP / TLS / SOCKS5 / HTTP-proxy connector
-
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
@@ -23,11 +21,16 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 
 use crate::error::{Error, Result as HttpResult};
-use crate::proxy::{NoProxy, Proxy, ProxyScheme};
+use crate::proxy::{percent_decode_str, NoProxy, Proxy, ProxyScheme};
 use crate::resolver::{GlobalResolver, Resolve, SharedResolver};
+
+pub(crate) const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_RETRIES: u32 = 4;
 
 #[derive(Clone)]
 pub(crate) struct Connector {
@@ -97,17 +100,14 @@ impl ProxyConnector {
         }
     }
 
-    /// Construct a direct-only connector
     pub fn direct() -> Self {
         Self::new(None)
     }
 
-    /// Construct a connector for one proxy URL
     pub fn from_proxy(proxy: Proxy) -> Self {
         Self::new(Some(proxy))
     }
 
-    /// Return the configured proxy, if any
     pub fn proxy(&self) -> Option<Proxy> {
         self.inner.proxy.as_deref().cloned()
     }
@@ -120,7 +120,6 @@ impl ProxyConnector {
         self.inner.proxy.is_some() || self.udp_inner().proxy.is_some()
     }
 
-    /// Whether this route can carry UDP datagrams
     pub fn supports_udp(&self) -> bool {
         self.udp_inner()
             .proxy
@@ -128,7 +127,6 @@ impl ProxyConnector {
             .is_none_or(|proxy| !matches!(proxy.scheme(), ProxyScheme::Http))
     }
 
-    /// Return the configured bypass matcher, if any
     pub fn no_proxy(&self) -> Option<NoProxy> {
         self.inner.no_proxy.as_deref().cloned()
     }
@@ -137,7 +135,6 @@ impl ProxyConnector {
         self.udp_inner().no_proxy.as_deref().cloned()
     }
 
-    /// Replace the bypass matcher used for both TCP and UDP destinations
     pub fn with_no_proxy(mut self, no_proxy: NoProxy) -> Self {
         let no_proxy = Arc::new(no_proxy);
         self.inner.no_proxy = Some(no_proxy.clone());
@@ -147,21 +144,11 @@ impl ProxyConnector {
         self
     }
 
-    pub fn with_udp_no_proxy(mut self, no_proxy: NoProxy) -> Self {
-        if let Some(udp_inner) = self.udp_inner.as_mut() {
-            udp_inner.no_proxy = Some(Arc::new(no_proxy));
-        } else {
-            self.inner.no_proxy = Some(Arc::new(no_proxy));
-        }
-        self
-    }
-
     pub fn with_udp_proxy(mut self, udp: Option<ProxyConnector>) -> Self {
         self.udp_inner = udp.map(|connector| connector.udp_inner.unwrap_or(connector.inner));
         self
     }
 
-    /// Set the timeout for DNS/TCP/proxy handshakes
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.inner.connect_timeout = Some(timeout);
         if let Some(udp_inner) = self.udp_inner.as_mut() {
@@ -170,7 +157,6 @@ impl ProxyConnector {
         self
     }
 
-    /// Set TCP_NODELAY for direct and tunneled TCP streams
     pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
         self.inner.tcp_nodelay = enabled;
         if let Some(udp_inner) = self.udp_inner.as_mut() {
@@ -179,7 +165,6 @@ impl ProxyConnector {
         self
     }
 
-    /// Set TCP keepalive for direct and proxy control connections
     pub fn tcp_keepalive(mut self, keepalive: Option<Duration>) -> Self {
         self.inner.tcp_keepalive = keepalive;
         if let Some(udp_inner) = self.udp_inner.as_mut() {
@@ -200,7 +185,6 @@ impl ProxyConnector {
         self
     }
 
-    /// Use a shared resolver object
     pub fn resolver_arc(mut self, resolver: Arc<dyn Resolve>) -> Self {
         self.inner.resolver = resolver.clone();
         if let Some(udp_inner) = self.udp_inner.as_mut() {
@@ -314,6 +298,7 @@ fn normalize_target_host(host: &str) -> String {
 }
 
 pub struct ProxyDatagram {
+    primary_is_ipv6: bool,
     socket: Arc<UdpSocket>,
     secondary_socket: Option<Arc<UdpSocket>>,
     route: DatagramRoute,
@@ -328,8 +313,6 @@ pub enum ProxyDatagramSource {
     Host(String, u16),
 }
 
-/// Match a datagram source against the endpoint used for an outstanding
-/// request without resolving a proxy-supplied hostname locally
 pub fn datagram_source_matches(source: &ProxyDatagramSource, target: SocketAddr) -> bool {
     match source {
         ProxyDatagramSource::Ip(source) => *source == target,
@@ -382,7 +365,7 @@ enum DatagramRoute {
         relay: SocketAddr,
         no_proxy: NoProxy,
         resolve_locally: bool,
-        _control: Arc<Mutex<BoxedIo>>,
+        control: ControlGuard,
     },
     Blocked {
         connector: Connector,
@@ -391,10 +374,145 @@ enum DatagramRoute {
     },
 }
 
+struct ControlGuard {
+    closed: CancellationToken,
+    task: tokio::task::AbortHandle,
+}
+
+impl ControlGuard {
+    fn spawn(mut control: BoxedIo) -> Self {
+        let closed = CancellationToken::new();
+        let token = closed.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while matches!(control.read(&mut buf).await, Ok(n) if n > 0) {}
+            token.cancel();
+        });
+        Self {
+            closed,
+            task: task.abort_handle(),
+        }
+    }
+}
+
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+const ASSOCIATION_CLOSED: &str = "SOCKS5 UDP association closed";
+
+fn association_closed() -> Error {
+    Error::ProxyProtocol(ASSOCIATION_CLOSED.into())
+}
+
+impl Error {
+    pub fn is_udp_association_closed(&self) -> bool {
+        matches!(self, Error::ProxyProtocol(message) if message == ASSOCIATION_CLOSED)
+    }
+}
+
+const REBIND_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const REBIND_MAX_DELAY: Duration = Duration::from_secs(30);
+
+pub struct ProxyAssociation {
+    connector: ProxyConnector,
+    with_bypass: bool,
+    current: std::sync::RwLock<Arc<ProxyDatagram>>,
+}
+
+impl ProxyAssociation {
+    pub fn new(connector: ProxyConnector, with_bypass: bool, datagram: ProxyDatagram) -> Self {
+        Self {
+            connector,
+            with_bypass,
+            current: std::sync::RwLock::new(Arc::new(datagram)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<ProxyDatagram> {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn local_addr(&self) -> HttpResult<SocketAddr> {
+        self.current().local_addr()
+    }
+
+    pub async fn send_to(&self, payload: &[u8], target: SocketAddr) -> HttpResult<usize> {
+        self.current().send_to(payload, target).await
+    }
+
+    pub async fn send_to_host(&self, payload: &[u8], host: &str, port: u16) -> HttpResult<usize> {
+        self.current().send_to_host(payload, host, port).await
+    }
+
+    pub async fn recv_from_target(
+        &self,
+        buffer: &mut [u8],
+    ) -> HttpResult<(usize, ProxyDatagramSource)> {
+        loop {
+            let datagram = self.current();
+            match datagram.recv_from_target(buffer).await {
+                Err(error) if error.is_udp_association_closed() => {
+                    tracing::warn!("SOCKS5 UDP association closed; rebinding");
+                    self.rebind(&datagram).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn rebind(&self, stale: &Arc<ProxyDatagram>) {
+        let mut delay = REBIND_INITIAL_DELAY;
+        loop {
+            tokio::time::sleep(delay).await;
+            if !Arc::ptr_eq(&self.current(), stale) {
+                return;
+            }
+            let bound = if self.with_bypass {
+                self.connector.bind_udp_with_bypass().await
+            } else {
+                self.connector.bind_udp().await
+            };
+            match bound {
+                Ok(datagram) => {
+                    let mut current = self
+                        .current
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if Arc::ptr_eq(&current, stale) {
+                        *current = Arc::new(datagram);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!("SOCKS5 UDP rebind failed: {error}");
+                    delay = (delay * 2).min(REBIND_MAX_DELAY);
+                }
+            }
+        }
+    }
+}
+
+fn is_transient_udp_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(10040)
+}
+
 impl ProxyDatagram {
     async fn direct(connector: Connector) -> HttpResult<Self> {
         let (socket, secondary_socket) = bind_udp_socket_pair(false).await?;
         Ok(Self {
+            primary_is_ipv6: false,
             socket,
             secondary_socket,
             route: DatagramRoute::Direct { connector },
@@ -405,6 +523,7 @@ impl ProxyDatagram {
     async fn blocked(connector: Connector, no_proxy: NoProxy, error: Error) -> HttpResult<Self> {
         let (socket, secondary_socket) = bind_udp_socket_pair(false).await?;
         Ok(Self {
+            primary_is_ipv6: false,
             socket,
             secondary_socket,
             route: DatagramRoute::Blocked {
@@ -420,6 +539,7 @@ impl ProxyDatagram {
         let (control, relay, resolve_locally) = socks5_udp_associate(&connector, &proxy).await?;
         let (socket, secondary_socket) = bind_udp_socket_pair(relay.is_ipv6()).await?;
         Ok(Self {
+            primary_is_ipv6: relay.is_ipv6(),
             socket,
             secondary_socket,
             route: DatagramRoute::Socks5 {
@@ -427,19 +547,14 @@ impl ProxyDatagram {
                 relay,
                 no_proxy,
                 resolve_locally,
-                _control: Arc::new(Mutex::new(control)),
+                control: ControlGuard::spawn(control),
             },
             direct_targets: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
     fn socket_for_target(&self, target: SocketAddr) -> Arc<UdpSocket> {
-        let primary_is_ipv6 = self
-            .socket
-            .local_addr()
-            .map(|address| address.is_ipv6())
-            .unwrap_or(false);
-        if target.is_ipv6() == primary_is_ipv6 {
+        if target.is_ipv6() == self.primary_is_ipv6 {
             self.socket.clone()
         } else {
             self.secondary_socket
@@ -487,12 +602,43 @@ impl ProxyDatagram {
                 .is_ok_and(|targets| targets.contains(&source))
     }
 
-    /// Return the local UDP address
     pub fn local_addr(&self) -> HttpResult<SocketAddr> {
         self.socket.local_addr().map_err(Error::Io)
     }
 
-    /// Send a datagram to a resolved destination
+    async fn send_direct(&self, payload: &[u8], target: SocketAddr) -> HttpResult<usize> {
+        let sent = self
+            .socket_for_target(target)
+            .send_to(payload, target)
+            .await
+            .map_err(Error::Io)?;
+        self.remember_direct_target(target);
+        Ok(sent)
+    }
+
+    async fn send_via_relay(
+        &self,
+        control: &ControlGuard,
+        relay: SocketAddr,
+        payload: &[u8],
+        target: &ProxyTarget,
+    ) -> HttpResult<usize> {
+        if control.closed.is_cancelled() {
+            return Err(association_closed());
+        }
+        let frame = socks5_udp_frame(payload, target)?;
+        let n = self
+            .socket
+            .send_to(&frame, relay)
+            .await
+            .map_err(Error::Io)?;
+        if n == frame.len() {
+            Ok(payload.len())
+        } else {
+            Err(Error::ProxyProtocol("short SOCKS5 UDP write".into()))
+        }
+    }
+
     pub async fn send_to(&self, payload: &[u8], target: SocketAddr) -> HttpResult<usize> {
         match &self.route {
             DatagramRoute::Direct { .. } => self
@@ -501,43 +647,24 @@ impl ProxyDatagram {
                 .await
                 .map_err(Error::Io),
             DatagramRoute::Socks5 {
-                relay, no_proxy, ..
-            } if no_proxy.matches_host_port(&target.ip().to_string(), Some(target.port())) => self
-                .socket_for_target(target)
-                .send_to(payload, target)
-                .await
-                .inspect(|_| {
-                    self.remember_direct_target(target);
-                })
-                .map_err(Error::Io),
-            DatagramRoute::Socks5 { relay, .. } => {
-                let frame = socks5_udp_frame(payload, &ProxyTarget::Ip(target))?;
-                let n = self
-                    .socket
-                    .send_to(&frame, relay)
-                    .await
-                    .map_err(Error::Io)?;
-                if n == frame.len() {
-                    Ok(payload.len())
-                } else {
-                    Err(Error::ProxyProtocol("short SOCKS5 UDP write".into()))
+                relay,
+                no_proxy,
+                control,
+                ..
+            } => {
+                if no_proxy.matches_ip(target.ip(), Some(target.port())) {
+                    return self.send_direct(payload, target).await;
                 }
+                self.send_via_relay(control, *relay, payload, &ProxyTarget::Ip(target))
+                    .await
             }
             DatagramRoute::Blocked {
                 connector: _,
                 no_proxy,
                 error,
             } => {
-                if no_proxy.matches_host_port(&target.ip().to_string(), Some(target.port())) {
-                    let result = self
-                        .socket_for_target(target)
-                        .send_to(payload, target)
-                        .await
-                        .map_err(Error::Io);
-                    if result.is_ok() {
-                        self.remember_direct_target(target);
-                    }
-                    result
+                if no_proxy.matches_ip(target.ip(), Some(target.port())) {
+                    self.send_direct(payload, target).await
                 } else {
                     Err(clone_route_error(error))
                 }
@@ -560,19 +687,11 @@ impl ProxyDatagram {
                 relay,
                 no_proxy,
                 resolve_locally,
-                ..
+                control,
             } => {
                 if no_proxy.matches_host_port(&host, Some(port)) {
                     let target = resolve_first(connector, &host, port).await?;
-                    let result = self
-                        .socket_for_target(target)
-                        .send_to(payload, target)
-                        .await
-                        .map_err(Error::Io);
-                    if result.is_ok() {
-                        self.remember_direct_target(target);
-                    }
-                    return result;
+                    return self.send_direct(payload, target).await;
                 }
                 let target = if let Ok(ip) = host.parse::<IpAddr>() {
                     ProxyTarget::Ip(SocketAddr::new(ip, port))
@@ -581,17 +700,7 @@ impl ProxyDatagram {
                 } else {
                     ProxyTarget::Host(host, port)
                 };
-                let frame = socks5_udp_frame(payload, &target)?;
-                let n = self
-                    .socket
-                    .send_to(&frame, relay)
-                    .await
-                    .map_err(Error::Io)?;
-                if n == frame.len() {
-                    Ok(payload.len())
-                } else {
-                    Err(Error::ProxyProtocol("short SOCKS5 UDP write".into()))
-                }
+                self.send_via_relay(control, *relay, payload, &target).await
             }
             DatagramRoute::Blocked {
                 connector,
@@ -602,21 +711,9 @@ impl ProxyDatagram {
                     return Err(clone_route_error(error));
                 }
                 let target = resolve_first(connector, &host, port).await?;
-                let result = self
-                    .socket_for_target(target)
-                    .send_to(payload, target)
-                    .await
-                    .map_err(Error::Io);
-                if result.is_ok() {
-                    self.remember_direct_target(target);
-                }
-                result
+                self.send_direct(payload, target).await
             }
         }
-    }
-
-    pub async fn send_to_addr(&self, payload: &[u8], target: SocketAddr) -> HttpResult<usize> {
-        self.send_to(payload, target).await
     }
 
     pub async fn recv_from(&self, buffer: &mut [u8]) -> HttpResult<(usize, SocketAddr)> {
@@ -630,18 +727,32 @@ impl ProxyDatagram {
         Ok((n, source))
     }
 
-    /// Receive one datagram while preserving a domain-form SOCKS5 source
     pub async fn recv_from_target(
         &self,
         buffer: &mut [u8],
     ) -> HttpResult<(usize, ProxyDatagramSource)> {
         let mut packet = vec![0u8; buffer.len().saturating_add(SOCKS5_UDP_MAX_ADDRESS_OVERHEAD)];
-        let mut secondary_packet = vec![0u8; packet.len()];
+        let mut secondary_packet = if self.secondary_socket.is_some() {
+            vec![0u8; packet.len()]
+        } else {
+            Vec::new()
+        };
         loop {
-            let (n, from, primary) = self
-                .recv_from_any(&mut packet, &mut secondary_packet)
-                .await
-                .map_err(Error::Io)?;
+            let received = self.recv_from_any(&mut packet, &mut secondary_packet);
+            let received = match &self.route {
+                DatagramRoute::Socks5 { control, .. } => {
+                    tokio::select! {
+                        result = received => result,
+                        _ = control.closed.cancelled() => return Err(association_closed()),
+                    }
+                }
+                _ => received.await,
+            };
+            let (n, from, primary) = match received {
+                Ok(received) => received,
+                Err(error) if is_transient_udp_error(&error) => continue,
+                Err(error) => return Err(Error::Io(error)),
+            };
             let received = if primary {
                 &packet[..n]
             } else {
@@ -664,13 +775,19 @@ impl ProxyDatagram {
                     return Ok((copy_len, ProxyDatagramSource::Ip(from)));
                 }
                 DatagramRoute::Socks5 { .. } => {
-                    let (payload, target) = parse_socks5_udp_packet(received)?;
+                    let (offset, target) = match parse_socks5_udp_packet(received) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            tracing::trace!("dropping SOCKS5 UDP datagram: {error}");
+                            continue;
+                        }
+                    };
+                    let payload = &received[offset..];
                     if payload.len() > buffer.len() {
-                        return Err(Error::ProxyProtocol(
-                            "SOCKS5 UDP payload exceeds receive buffer".into(),
-                        ));
+                        tracing::trace!("dropping oversized SOCKS5 UDP payload");
+                        continue;
                     }
-                    buffer[..payload.len()].copy_from_slice(&payload);
+                    buffer[..payload.len()].copy_from_slice(payload);
                     return Ok((payload.len(), target));
                 }
                 DatagramRoute::Blocked { no_proxy, .. } => {
@@ -730,7 +847,11 @@ async fn socks5_udp_associate(
         .to_string();
     let pport = proxy.url().port().unwrap_or(1080);
     let stream = connector.direct(&phost, pport).await?;
-    connector.tune(&stream)?;
+    let control_connector = Connector {
+        tcp_keepalive: connector.tcp_keepalive.or(Some(DEFAULT_KEEPALIVE)),
+        ..connector.clone()
+    };
+    control_connector.tune(&stream)?;
     let peer = stream
         .peer_addr()
         .map_err(|error| Error::Connect(format!("proxy peer address: {error}")))?;
@@ -878,43 +999,13 @@ async fn socks5_negotiate_auth(
 
 fn socks5_udp_frame(payload: &[u8], target: &ProxyTarget) -> HttpResult<Vec<u8>> {
     let mut frame = Vec::with_capacity(payload.len() + 32);
-    frame.extend_from_slice(&[0, 0, 0]); // RSV, RSV, FRAG
-    match target {
-        ProxyTarget::Ip(addr) => match addr.ip() {
-            IpAddr::V4(ip) => {
-                frame.push(1);
-                frame.extend_from_slice(&ip.octets());
-            }
-            IpAddr::V6(ip) => {
-                frame.push(4);
-                frame.extend_from_slice(&ip.octets());
-            }
-        },
-        ProxyTarget::Host(host, _) => {
-            let host = normalize_target_host(host);
-            let bytes = host.as_bytes();
-            let len = u8::try_from(bytes.len())
-                .map_err(|_| Error::ProxyProtocol("SOCKS5 hostname exceeds 255 bytes".into()))?;
-            if bytes.is_empty() {
-                return Err(Error::ProxyProtocol(
-                    "empty SOCKS5 destination hostname".into(),
-                ));
-            }
-            frame.push(3);
-            frame.push(len);
-            frame.extend_from_slice(bytes);
-        }
-    }
-    let port = match target {
-        ProxyTarget::Ip(addr) => addr.port(),
-        ProxyTarget::Host(_, port) => *port,
-    };
-    frame.extend_from_slice(&port.to_be_bytes());
+    frame.extend_from_slice(&[0, 0, 0]);
+    append_socks_address(&mut frame, target)?;
     frame.extend_from_slice(payload);
     Ok(frame)
 }
 
-fn parse_socks5_udp_packet(packet: &[u8]) -> HttpResult<(Vec<u8>, ProxyDatagramSource)> {
+fn parse_socks5_udp_packet(packet: &[u8]) -> HttpResult<(usize, ProxyDatagramSource)> {
     if packet.len() < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
         return Err(Error::ProxyProtocol("invalid SOCKS5 UDP header".into()));
     }
@@ -928,7 +1019,7 @@ fn parse_socks5_udp_packet(packet: &[u8]) -> HttpResult<(Vec<u8>, ProxyDatagramS
         ProxyTarget::Ip(addr) => ProxyDatagramSource::Ip(addr),
         ProxyTarget::Host(host, port) => ProxyDatagramSource::Host(host, port),
     };
-    Ok((packet[cursor..].to_vec(), source))
+    Ok((cursor, source))
 }
 
 fn parse_socks_address(packet: &[u8], mut cursor: usize) -> HttpResult<(ProxyTarget, usize)> {
@@ -1094,7 +1185,6 @@ pub(crate) enum MaybeTls {
     Tls(Box<TlsStream<BoxedIo>>),
 }
 
-/// Type-erased AsyncRead+AsyncWrite stream so TLS sits on plain TCP or a SOCKS-tunneled TCP without enum gymnastics
 pub struct BoxedIo {
     inner: Box<dyn AsyncReadWrite + Send + Unpin>,
 }
@@ -1182,6 +1272,16 @@ impl AsyncWrite for BoxedIo {
     ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -1193,7 +1293,6 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
-/// Hyper-compatible IO wrapper around `MaybeTls`
 pub struct ConnIo {
     io: TokioIo<MaybeTls>,
     negotiated_h2: bool,
@@ -1229,6 +1328,16 @@ impl hyper::rt::Write for ConnIo {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        hyper::rt::Write::is_write_vectored(&self.io)
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io).poll_flush(cx)
     }
@@ -1259,6 +1368,22 @@ impl AsyncWrite for MaybeTls {
         match self.get_mut() {
             MaybeTls::Plain(s) => Pin::new(s).poll_write(cx, buf),
             MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTls::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            MaybeTls::Plain(s) => s.is_write_vectored(),
+            MaybeTls::Tls(s) => s.is_write_vectored(),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1295,7 +1420,11 @@ impl Connector {
         let scheme = dst.scheme_str().unwrap_or("http").to_string();
         let host = dst
             .host()
-            .ok_or_else(|| Error::Url("missing host".into()))?
+            .ok_or_else(|| Error::Url("missing host".into()))?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
             .to_string();
         let port = dst.port_u16().unwrap_or(match scheme.as_str() {
             "https" => 443,
@@ -1313,13 +1442,18 @@ impl Connector {
                 .proxy
                 .as_deref()
                 .is_some_and(|proxy| matches!(proxy.scheme(), ProxyScheme::Http));
-        let uses_proxy = self.proxy.is_some() && !bypass;
-        if !uses_proxy && self.direct_address_filter.is_some() {
-            self.validate_destination(&host).await?;
-        }
         let stream = match (self.proxy.as_deref(), bypass) {
             (Some(p), false) => self.via_proxy(p, &host, port, is_https).await?,
-            (None, _) | (Some(_), true) => BoxedIo::new(self.direct(&host, port).await?),
+            (None, _) | (Some(_), true) => {
+                let tcp = if self.direct_address_filter.is_some() {
+                    let addrs = self.resolve_addrs(&host).await?;
+                    self.validate_addrs(&host, &addrs)?;
+                    self.direct_to_addrs(&host, port, addrs).await?
+                } else {
+                    self.direct(&host, port).await?
+                };
+                BoxedIo::new(tcp)
+            }
         };
 
         let (final_io, negotiated_h2) = if is_https {
@@ -1347,6 +1481,9 @@ impl Connector {
     }
 
     async fn resolve_addrs(&self, host: &str) -> Result<Vec<SocketAddr>, Error> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, 0)]);
+        }
         let resolving = self.resolver.resolve(host);
         let addrs = match self.connect_timeout {
             Some(timeout) => tokio::time::timeout(timeout, resolving)
@@ -1357,10 +1494,13 @@ impl Connector {
         Ok(addrs.collect())
     }
 
-    async fn validate_destination(&self, host: &str) -> Result<(), Error> {
-        let addrs = self.resolve_addrs(host).await?;
-        let allowed = self.direct_address_filter.as_ref().expect("filter checked");
-        if addrs.is_empty() || addrs.iter().any(|addr| !allowed(addr.ip())) {
+    fn validate_addrs(&self, host: &str, addrs: &[SocketAddr]) -> Result<(), Error> {
+        let blocked = |addr: &SocketAddr| {
+            self.direct_address_filter
+                .as_ref()
+                .is_some_and(|allowed| !allowed(addr.ip()))
+        };
+        if addrs.is_empty() || addrs.iter().any(blocked) {
             return Err(Error::Connect(format!(
                 "destination {host} resolved to a blocked address"
             )));
@@ -1370,6 +1510,15 @@ impl Connector {
 
     async fn direct(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let addrs = self.resolve_addrs(host).await?;
+        self.direct_to_addrs(host, port, addrs).await
+    }
+
+    async fn direct_to_addrs(
+        &self,
+        host: &str,
+        port: u16,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<TcpStream, Error> {
         let addrs = addrs
             .into_iter()
             .filter(|addr| {
@@ -1378,7 +1527,6 @@ impl Connector {
                     .is_none_or(|filter| filter(addr.ip()))
             })
             .collect::<Vec<_>>();
-        // RFC 8305 (Happy Eyeballs v2)
         let ordered =
             interleave_by_family(addrs.into_iter().map(|a| SocketAddr::new(a.ip(), port)));
         if ordered.is_empty() {
@@ -1403,14 +1551,12 @@ impl Connector {
         }
     }
 
-    /// Staggered-parallel connect: each address starts `ATTEMPT_DELAY` after the previous, first to connect wins, rest dropped
     async fn happy_eyeballs(
         &self,
         host: &str,
         addrs: Vec<SocketAddr>,
         local_addr: Option<SocketAddr>,
     ) -> Result<TcpStream, Error> {
-        /// Connection Attempt Delay
         const ATTEMPT_DELAY: Duration = Duration::from_millis(300);
 
         let timeout = self.connect_timeout;
@@ -1421,7 +1567,6 @@ impl Connector {
         let mut remaining = addrs.into_iter();
         let mut last: Option<io::Error> = None;
 
-        // Prime the first attempt
         if let Some(addr) = remaining.next() {
             in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
         }
@@ -1430,7 +1575,6 @@ impl Connector {
         tokio::pin!(stagger);
 
         loop {
-            // Wait for whichever comes first: next in-flight attempt finishing or the stagger timer firing
             tokio::select! {
                 biased;
                 finished = in_flight.next(), if !in_flight.is_empty() => {
@@ -1445,7 +1589,6 @@ impl Connector {
                         }
                         Some(Err(e)) => {
                             last = Some(e);
-                            // That attempt failed
                             if in_flight.is_empty() {
                                 if let Some(addr) = remaining.next() {
                                     in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
@@ -1455,7 +1598,6 @@ impl Connector {
                             }
                         }
                         None => {
-                            // No attempts in flight and the stream drained
                             if let Some(addr) = remaining.next() {
                                 in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
                             } else {
@@ -1465,7 +1607,6 @@ impl Connector {
                     }
                 }
                 _ = &mut stagger => {
-                    // Stagger elapsed without a winner
                     if let Some(addr) = remaining.next() {
                         in_flight.push(connect_one(addr, timeout, local_addr, bind_lock.clone()));
                     } else if in_flight.is_empty() {
@@ -1488,7 +1629,10 @@ impl Connector {
         }
         if let Some(d) = self.tcp_keepalive {
             let sock = socket2::SockRef::from(s);
-            let ka = socket2::TcpKeepalive::new().with_time(d);
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(d)
+                .with_interval(KEEPALIVE_INTERVAL)
+                .with_retries(KEEPALIVE_RETRIES);
             let _ = sock.set_tcp_keepalive(&ka);
         }
         Ok(())
@@ -1523,7 +1667,6 @@ impl Connector {
                     .ok_or_else(|| Error::Url("proxy missing host".into()))?
                     .to_string();
                 let pport = proxy.url().port().unwrap_or(1080);
-                // Percent-decode URL creds (RFC 3986) before SOCKS5 user/pass auth or HTTP `Basic` so `@`, `:`, spaces authenticate correctly
                 let user_raw = proxy.url().username();
                 let pass_raw = proxy.url().password().unwrap_or("");
                 let user = percent_decode_str(user_raw);
@@ -1564,8 +1707,6 @@ impl Connector {
         }
     }
 
-    /// Proxy control connections intentionally do not inherit a direct
-    /// destination source address. A proxy chooses the tracker-facing source
     async fn direct_proxy_connection(&self, host: &str, port: u16) -> Result<TcpStream, Error> {
         let mut connector = self.clone();
         connector.local_addr = None;
@@ -1661,7 +1802,6 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
         .map(|pos| pos + 4)
 }
 
-/// Connect to a single address with the optional per-attempt timeout
 async fn connect_one(
     addr: SocketAddr,
     timeout: Option<Duration>,
@@ -1694,35 +1834,29 @@ async fn connect_one(
     Ok((stream, addr))
 }
 
-/// Interleave addresses by family with IPv6 first
 fn interleave_by_family(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let mut v6: std::collections::VecDeque<SocketAddr> = std::collections::VecDeque::new();
     let mut v4: std::collections::VecDeque<SocketAddr> = std::collections::VecDeque::new();
+    let mut first_is_v6 = None;
     for a in addrs {
+        first_is_v6.get_or_insert(a.is_ipv6());
         if a.is_ipv6() {
             v6.push_back(a);
         } else {
             v4.push_back(a);
         }
     }
-    let mut out = Vec::with_capacity(v6.len() + v4.len());
-    // IPv6 first, then alternate families
-    while !v6.is_empty() || !v4.is_empty() {
-        if let Some(a) = v6.pop_front() {
-            out.push(a);
-        }
-        if let Some(a) = v4.pop_front() {
-            out.push(a);
-        }
+    let (first, second) = if first_is_v6.unwrap_or(true) {
+        (&mut v6, &mut v4)
+    } else {
+        (&mut v4, &mut v6)
+    };
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        out.extend(first.pop_front());
+        out.extend(second.pop_front());
     }
     out
-}
-
-/// Percent-decode a URL component (lossy on invalid UTF-8): `Url::username()`/`password()` return raw encoded, proxy auth needs decoded bytes
-fn percent_decode_str(s: &str) -> String {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8_lossy()
-        .into_owned()
 }
 
 fn format_socket_endpoint(host: &str, port: u16) -> String {
@@ -1734,7 +1868,6 @@ fn format_socket_endpoint(host: &str, port: u16) -> String {
     }
 }
 
-/// SOCKS5 connect over an already-established proxy stream
 async fn socks5_connect(
     mut stream: TcpStream,
     host: &str,
@@ -1772,7 +1905,7 @@ async fn socks5_connect(
     };
 
     let mut request = Vec::with_capacity(7 + host.len());
-    request.extend_from_slice(&[5, 1, 0]); // VER, CONNECT, RSV
+    request.extend_from_slice(&[5, 1, 0]);
     append_socks_address(&mut request, &target)?;
     stream
         .write_all(&request)
@@ -1810,6 +1943,7 @@ fn append_socks_address(frame: &mut Vec<u8>, target: &ProxyTarget) -> HttpResult
             }
         },
         ProxyTarget::Host(host, _) => {
+            let host = normalize_target_host(host);
             let bytes = host.as_bytes();
             let len = u8::try_from(bytes.len())
                 .map_err(|_| Error::ProxyProtocol("SOCKS5 hostname exceeds 255 bytes".into()))?;
@@ -1864,11 +1998,14 @@ mod tests {
     }
 
     #[test]
-    fn interleave_puts_ipv6_first() {
+    fn interleave_starts_with_first_resolved_family() {
+        let input = vec![v6(1), v4(1), v6(2), v4(2)];
+        let out = interleave_by_family(input.into_iter());
+        assert_eq!(out, vec![v6(1), v4(1), v6(2), v4(2)]);
+
         let input = vec![v4(1), v4(2), v6(1), v6(2)];
         let out = interleave_by_family(input.into_iter());
-        // v6, v4, v6, v4
-        assert_eq!(out, vec![v6(1), v4(1), v6(2), v4(2)]);
+        assert_eq!(out, vec![v4(1), v6(1), v4(2), v6(2)]);
     }
 
     #[test]
@@ -1887,7 +2024,6 @@ mod tests {
 
     #[test]
     fn interleave_uneven_drains_remainder() {
-        // More v6 than v4: after the pair runs out, remaining v6 trail
         let input = vec![v6(1), v6(2), v6(3), v4(1)];
         let out = interleave_by_family(input.into_iter());
         assert_eq!(out, vec![v6(1), v4(1), v6(2), v6(3)]);
@@ -2182,8 +2318,6 @@ mod tests {
             response.extend_from_slice(b"pong");
             relay.send_to(&response, source).await.unwrap();
 
-            // Keep the association control stream alive while the caller reads
-            // the relayed response
             let mut one = [0u8; 1];
             let _ = control.read(&mut one).await;
         });
@@ -2213,8 +2347,8 @@ mod tests {
         let frame = socks5_udp_frame(&payload, &ProxyTarget::Host(host.clone(), 65535)).unwrap();
         assert_eq!(frame.len(), payload.len() + SOCKS5_UDP_MAX_ADDRESS_OVERHEAD);
 
-        let (decoded, source) = parse_socks5_udp_packet(&frame).unwrap();
-        assert_eq!(decoded, payload);
+        let (offset, source) = parse_socks5_udp_packet(&frame).unwrap();
+        assert_eq!(&frame[offset..], payload.as_slice());
         assert_eq!(source, ProxyDatagramSource::Host(host, 65535));
     }
 
@@ -2474,8 +2608,8 @@ mod tests {
         packet.extend_from_slice(&6881u16.to_be_bytes());
         packet.extend_from_slice(b"payload");
 
-        let (payload, source) = parse_socks5_udp_packet(&packet).unwrap();
-        assert_eq!(payload, b"payload");
+        let (offset, source) = parse_socks5_udp_packet(&packet).unwrap();
+        assert_eq!(&packet[offset..], b"payload");
         assert_eq!(
             source,
             ProxyDatagramSource::Host("relay.test".to_string(), 6881)
@@ -2580,8 +2714,6 @@ mod tests {
     #[tokio::test]
     async fn http_proxy_udp_ipv6_bypass_uses_opposite_family_socket() {
         let Ok(destination) = UdpSocket::bind("[::1]:0").await else {
-            // Some CI hosts disable IPv6; the dual-family path is covered on
-            // hosts where an IPv6 loopback socket is available
             return;
         };
         let destination_addr = destination.local_addr().unwrap();
@@ -2626,5 +2758,141 @@ mod tests {
         .expect("hostname bypass response timed out")
         .unwrap();
         assert_eq!(&response[..n], b"pong");
+    }
+
+    async fn mock_udp_proxy() -> (SocketAddr, tokio::task::JoinHandle<(UdpSocket, TcpStream)>) {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port().to_be_bytes();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut control, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            control.read_exact(&mut greeting).await.unwrap();
+            control.write_all(&[5, 0]).await.unwrap();
+            let mut associate = [0u8; 10];
+            control.read_exact(&mut associate).await.unwrap();
+            control
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, relay_port[0], relay_port[1]])
+                .await
+                .unwrap();
+            (relay, control)
+        });
+        (proxy_addr, task)
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_drops_bad_relay_datagrams_instead_of_failing() {
+        let (proxy_addr, server) = mock_udp_proxy().await;
+        let connector =
+            ProxyConnector::from_proxy(Proxy::all(format!("socks5h://{proxy_addr}")).unwrap())
+                .connect_timeout(Duration::from_secs(2));
+        let datagram = connector.bind_udp().await.unwrap();
+        datagram.send_to(b"hi", v4(1)).await.unwrap();
+        let (relay, _control) = server.await.unwrap();
+        let mut scratch = [0u8; 64];
+        let (_, client) = relay.recv_from(&mut scratch).await.unwrap();
+
+        relay
+            .send_to(&[0, 0, 1, 1, 1, 2, 3, 4, 0, 80, b'x'], client)
+            .await
+            .unwrap();
+        relay.send_to(&[9, 9], client).await.unwrap();
+        let mut oversized = vec![0, 0, 0, 1, 1, 2, 3, 4, 0, 80];
+        oversized.extend_from_slice(&[7u8; 40]);
+        relay.send_to(&oversized, client).await.unwrap();
+        let mut good = vec![0, 0, 0, 1, 1, 2, 3, 4, 0, 80];
+        good.extend_from_slice(b"fine");
+        relay.send_to(&good, client).await.unwrap();
+
+        let mut buffer = [0u8; 16];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), datagram.recv_from(&mut buffer))
+            .await
+            .expect("receive stalled")
+            .unwrap();
+        assert_eq!(&buffer[..n], b"fine");
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_reports_closed_association() {
+        let (proxy_addr, server) = mock_udp_proxy().await;
+        let connector =
+            ProxyConnector::from_proxy(Proxy::all(format!("socks5h://{proxy_addr}")).unwrap())
+                .connect_timeout(Duration::from_secs(2));
+        let datagram = connector.bind_udp().await.unwrap();
+        let (_relay, control) = server.await.unwrap();
+        drop(control);
+
+        let mut buffer = [0u8; 16];
+        let error = tokio::time::timeout(Duration::from_secs(2), datagram.recv_from(&mut buffer))
+            .await
+            .expect("receive did not observe the closed association")
+            .unwrap_err();
+        assert!(error.to_string().contains("association closed"), "{error}");
+        let error = datagram.send_to(b"x", v4(1)).await.unwrap_err();
+        assert!(error.to_string().contains("association closed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn association_rebinds_after_the_proxy_closes_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (assoc_tx, mut assoc_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut control, _) = listener.accept().await.unwrap();
+                let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let relay_port = relay.local_addr().unwrap().port().to_be_bytes();
+                let mut greeting = [0u8; 3];
+                control.read_exact(&mut greeting).await.unwrap();
+                control.write_all(&[5, 0]).await.unwrap();
+                let mut associate = [0u8; 10];
+                control.read_exact(&mut associate).await.unwrap();
+                control
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, relay_port[0], relay_port[1]])
+                    .await
+                    .unwrap();
+                let _ = assoc_tx.send((relay, control));
+            }
+        });
+        let connector =
+            ProxyConnector::from_proxy(Proxy::all(format!("socks5h://{proxy_addr}")).unwrap())
+                .connect_timeout(Duration::from_secs(2));
+        let datagram = connector.bind_udp().await.unwrap();
+        let association = Arc::new(ProxyAssociation::new(connector, false, datagram));
+        let (_first_relay, first_control) = assoc_rx.recv().await.unwrap();
+
+        let reader = {
+            let association = association.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 16];
+                let (n, _) = association.recv_from_target(&mut buffer).await.unwrap();
+                buffer[..n].to_vec()
+            })
+        };
+        drop(first_control);
+
+        let (second_relay, _second_control) =
+            tokio::time::timeout(Duration::from_secs(5), assoc_rx.recv())
+                .await
+                .expect("association was not rebuilt")
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while association.send_to(b"hi", v4(1)).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("send never recovered");
+        let mut scratch = [0u8; 64];
+        let (_, client) = second_relay.recv_from(&mut scratch).await.unwrap();
+        let mut good = vec![0, 0, 0, 1, 1, 2, 3, 4, 0, 80];
+        good.extend_from_slice(b"back");
+        second_relay.send_to(&good, client).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("reader stalled")
+            .unwrap();
+        assert_eq!(received, b"back");
     }
 }

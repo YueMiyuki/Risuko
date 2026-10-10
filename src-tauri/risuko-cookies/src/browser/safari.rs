@@ -1,15 +1,21 @@
-// Safari cookie extraction
-
 use crate::browser::chromium::Cookie;
+use crate::utils::host::cookie_covers_host;
 use crate::utils::{paths, time};
 use eyre::{bail, Result};
 
-pub fn extract_cookies(host: Option<&str>) -> Result<Vec<Cookie>> {
-    let cookie_db = paths::find_first_existing(&[
+pub fn is_available() -> bool {
+    find_cookie_file().is_some()
+}
+
+fn find_cookie_file() -> Option<std::path::PathBuf> {
+    paths::find_first_existing(&[
         "~/Library/Cookies/Cookies.binarycookies",
         "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
-    ]);
-    let cookie_db = match cookie_db {
+    ])
+}
+
+pub fn extract_cookies(host: Option<&str>) -> Result<Vec<Cookie>> {
+    let cookie_db = match find_cookie_file() {
         Some(p) => p,
         None => bail!("safari cookie file not found"),
     };
@@ -112,9 +118,11 @@ fn parse_page(page: &[u8], cookies: &mut Vec<RawSafariCookie>) -> Result<()> {
         let off = 8 + i * 4;
         let cookie_offset = u32::from_be_bytes(page[off..off + 4].try_into().unwrap()) as usize;
         if cookie_offset >= page.len() {
-            bail!("cookie offset out of bounds");
+            continue;
         }
-        parse_cookie(&page[cookie_offset..], cookies)?;
+        if let Err(e) = parse_cookie(&page[cookie_offset..], cookies) {
+            tracing::debug!(target: "risuko_cookies", "safari: skipping cookie record: {}", e);
+        }
     }
 
     Ok(())
@@ -163,38 +171,19 @@ fn read_cstr(data: &[u8], offset: usize) -> Result<String> {
     Ok(String::from_utf8_lossy(&data[offset..offset + end]).to_string())
 }
 
-fn cookie_covers_host(request_host: &str, cookie_domain: &str) -> bool {
-    let r = request_host.to_lowercase();
-    let c = cookie_domain.to_lowercase();
-
-    if let Some(domain) = c.strip_prefix('.') {
-        // Older Safari: domain cookie with explicit leading dot
-        r == domain || r.ends_with(&format!(".{domain}"))
-    } else {
-        // Modern Safari: bare domain is a domain cookie (covers subdomains)
-        r == c || r.ends_with(&format!(".{c}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::cookie_covers_host;
+    use super::parse_page;
 
     #[test]
-    fn domain_cookie_covers_subdomain() {
-        assert!(cookie_covers_host("www.spigotmc.org", "spigotmc.org"));
-        assert!(cookie_covers_host("dl.spigotmc.org", "spigotmc.org"));
-        assert!(cookie_covers_host("spigotmc.org", "spigotmc.org"));
-    }
-
-    #[test]
-    fn old_domain_cookie_with_dot() {
-        assert!(cookie_covers_host("www.spigotmc.org", ".spigotmc.org"));
-    }
-
-    #[test]
-    fn no_false_match() {
-        assert!(!cookie_covers_host("notspigotmc.org", "spigotmc.org"));
-        assert!(!cookie_covers_host("www.spigotmc.org", "example.com"));
+    fn bad_record_does_not_abort_page() {
+        let mut page = vec![0u8; 8];
+        page[4..8].copy_from_slice(&2u32.to_be_bytes());
+        page.extend_from_slice(&999u32.to_be_bytes());
+        page.extend_from_slice(&16u32.to_be_bytes());
+        page.extend_from_slice(&[0u8; 4]);
+        let mut out = Vec::new();
+        assert!(parse_page(&page, &mut out).is_ok());
+        assert!(out.is_empty());
     }
 }

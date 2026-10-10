@@ -10,6 +10,7 @@ use tauri::AppHandle;
 
 const MAX_TORRENT_PREVIEW_FILES: usize = 2_000;
 const MAX_TORRENT_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TORRENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_TORRENT_PREVIEW_PAGE_SIZE: usize = 300;
 const MAX_TORRENT_PREVIEW_PAGE_SIZE: usize = 2_000;
 const TEMP_DOWNLOAD_SUFFIX: &str = ".part";
@@ -100,7 +101,6 @@ fn ensure_torrent_extension(path: &Path) -> Result<(), String> {
 pub fn reveal_in_folder(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        // Hand the raw path to Kotlin. `MainActivity.revealFolder` builds the SAF document URI on the UI thread, tries several intent shapes (chooser/no-chooser × dirmime/no-mime), and returns the first that resolves — it can call `queryIntentActivities` to skip hopeless attempts and catch `ActivityNotFoundException`, both awkward through raw JNI from a Tauri worker thread
         let _ = handle;
         return crate::commands::android_intent::reveal_folder(&path);
     }
@@ -135,14 +135,12 @@ pub fn reveal_in_folder(handle: AppHandle, path: String) -> Result<(), String> {
             use std::os::windows::process::CommandExt;
             let _ = handle;
 
-            // Normalize separators so explorer.exe parses the path reliably
             let normalized_path = path.replace('/', "\\");
 
             if is_dir {
-                // Use ShellExecute via `open` to avoid explorer.exe quirks (e.g. non-zero exit codes, race conditions when an Explorer window is already focused on the same directory)
                 open::that(&normalized_path).map_err(|e| e.to_string())?;
             } else {
-                // explorer.exe parses its command line manually and expects the form: /select,"<path>". Rust's standard argument escaping mangles the embedded quotes, so use raw_arg to pass the command line through verbatim
+                // explorer.exe parses its own command line; raw_arg avoids Rust's quote escaping
                 let raw = format!("/select,\"{}\"", normalized_path);
                 std::process::Command::new("explorer")
                     .raw_arg(raw)
@@ -179,7 +177,7 @@ pub async fn select_android_directory() -> Result<Option<String>, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stage_android_share_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
     #[cfg(target_os = "android")]
     {
@@ -199,7 +197,6 @@ pub fn stage_android_share_paths(paths: Vec<String>) -> Result<Vec<String>, Stri
 pub fn open_path(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        // URI in, intent out For real file paths, guess the MIME type first so Android shows useful viewers
         let _ = handle;
         let mime = guess_android_mime(&path);
         return crate::commands::android_intent::open_file(&path, &mime);
@@ -211,7 +208,6 @@ pub fn open_path(handle: AppHandle, path: String) -> Result<(), String> {
     }
 }
 
-/// Map a filename extension to a MIME type Android understands Fall back to `*/*` so unknown files still get a chooser
 #[cfg(target_os = "android")]
 fn guess_android_mime(path: &str) -> String {
     let ext = std::path::Path::new(path)
@@ -220,7 +216,6 @@ fn guess_android_mime(path: &str) -> String {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     let mime: &str = match ext.as_str() {
-        // Video
         "mp4" | "m4v" => "video/mp4",
         "mkv" => "video/x-matroska",
         "webm" => "video/webm",
@@ -229,20 +224,17 @@ fn guess_android_mime(path: &str) -> String {
         "wmv" => "video/x-ms-wmv",
         "flv" => "video/x-flv",
         "ts" => "video/mp2t",
-        // Audio
         "mp3" => "audio/mpeg",
         "m4a" | "aac" => "audio/aac",
         "ogg" | "opus" => "audio/ogg",
         "wav" => "audio/wav",
         "flac" => "audio/flac",
-        // Image
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "svg" => "image/svg+xml",
-        // Documents / archives
         "pdf" => "application/pdf",
         "txt" | "log" | "md" => "text/plain",
         "zip" => "application/zip",
@@ -250,16 +242,14 @@ fn guess_android_mime(path: &str) -> String {
         "gz" | "tgz" => "application/gzip",
         "rar" => "application/vnd.rar",
         "7z" => "application/x-7z-compressed",
-        // Subtitles
         "srt" => "application/x-subrip",
         "vtt" => "text/vtt",
-        // Fallback for generic handlers
         _ => "*/*",
     };
     mime.to_string()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn trash_item(path: String) -> Result<bool, String> {
     let p = std::path::Path::new(&path);
     let existed = p.exists();
@@ -268,14 +258,13 @@ pub fn trash_item(path: String) -> Result<bool, String> {
     } else {
         tracing::debug!("trash_item: path does not exist, skipped: {}", path);
     }
-    // Clean up multi-chunk resume sidecar alongside .part file
     if path.ends_with(TEMP_DOWNLOAD_SUFFIX) {
         let _ = std::fs::remove_file(format!("{}{}", path, CHUNK_META_SUFFIX));
     }
     Ok(existed)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_path(from_path: String, to_path: String) -> Result<(), String> {
     let from_path = from_path.trim();
     let to_path = to_path.trim();
@@ -299,7 +288,6 @@ pub fn rename_path(from_path: String, to_path: String) -> Result<(), String> {
         return Err("Source path does not exist".to_string());
     }
 
-    // Limit rename_path to in-place temporary suffix finalization to avoid arbitrary moves
     let from_parent = canonicalize_parent_path(&from)?;
     let to_parent = canonicalize_parent_path(&to)?;
     if from_parent != to_parent {
@@ -343,7 +331,6 @@ fn as_length(value: Option<&bencode::Value>) -> i64 {
     }
 }
 
-/// BEP 47 padding entry, hidden like the engine does so `select-file` indices match
 fn is_padding_entry(item: &bencode::Value) -> bool {
     item.get(b"attr")
         .and_then(bencode::Value::as_bytes)
@@ -455,8 +442,29 @@ fn encode_index_ranges(ranges: &[(usize, usize)]) -> Option<String> {
     }
 }
 
+fn torrent_file_segments(raw_files: &[&bencode::Value]) -> Vec<Vec<String>> {
+    let mut all: Vec<Vec<String>> = raw_files
+        .iter()
+        .map(|item| {
+            dict_get_first(item, &[b"path.utf-8", b"path"])
+                .and_then(bencode::Value::as_list)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .map(as_string)
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    risuko_bt::dedupe_paths(&mut all, &[]);
+    all
+}
+
 fn collect_direct_children(
     raw_files: &[&bencode::Value],
+    all_segments: &[Vec<String>],
     normalized_root_name: &str,
     parent_segments: &[String],
 ) -> Vec<ResolvedTorrentItem> {
@@ -465,16 +473,7 @@ fn collect_direct_children(
     let mut folder_index_ranges: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
 
     for (file_index, item) in raw_files.iter().enumerate() {
-        let segments = dict_get_first(item, &[b"path.utf-8", b"path"])
-            .and_then(bencode::Value::as_list)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .map(as_string)
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let segments = &all_segments[file_index];
         if segments.is_empty() {
             continue;
         }
@@ -624,10 +623,16 @@ fn resolve_torrent_from_bytes(
                 });
             }
 
+            let all_segments = torrent_file_segments(raw_files);
+
             if force_preview {
                 let parent_segments = normalize_parent_segments(parent_path, &normalized_root_name);
-                let items =
-                    collect_direct_children(raw_files, &normalized_root_name, &parent_segments);
+                let items = collect_direct_children(
+                    raw_files,
+                    &all_segments,
+                    &normalized_root_name,
+                    &parent_segments,
+                );
                 let items_total = items.len();
                 let safe_offset = offset.min(items_total);
                 let paged_items = items
@@ -648,22 +653,12 @@ fn resolve_torrent_from_bytes(
             }
 
             let mut files = Vec::with_capacity(file_count);
-            for item in raw_files {
+            for (item, segments) in raw_files.iter().zip(all_segments.iter()) {
                 if item.as_dict().is_none() {
                     continue;
                 }
 
                 let length = as_length(item.get(b"length"));
-                let segments = dict_get_first(item, &[b"path.utf-8", b"path"])
-                    .and_then(bencode::Value::as_list)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .map(as_string)
-                            .filter(|part| !part.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
 
                 let relative_path = normalize_torrent_path(&segments.join("/"));
                 let full_path = if relative_path.is_empty() {
@@ -755,7 +750,7 @@ fn resolve_torrent_from_bytes(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_torrent_path(
     path: String,
     file_name: Option<String>,
@@ -765,6 +760,12 @@ pub fn resolve_torrent_path(
     limit: Option<usize>,
 ) -> Result<ResolvedTorrentPayload, String> {
     let resolved_path = resolve_torrent_fs_path(&path)?;
+    let len = std::fs::metadata(&resolved_path)
+        .map_err(|e| e.to_string())?
+        .len();
+    if len > MAX_TORRENT_FILE_BYTES {
+        return Err("Torrent file too large".to_string());
+    }
     let bytes = std::fs::read(&resolved_path).map_err(|e| e.to_string())?;
     let fallback_name = file_name
         .map(|name| name.trim().to_string())
@@ -854,25 +855,6 @@ fn normalize_info_hash(raw: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .collect()
-}
-
-fn generated_torrent_hex_stem(file_name: &str) -> Option<String> {
-    let lower = file_name.to_ascii_lowercase();
-    if !lower.ends_with(".torrent") {
-        return None;
-    }
-
-    let stem = lower.strip_suffix(".torrent")?;
-    let stem = stem.strip_prefix("[metadata]").unwrap_or(stem);
-    let is_hex = stem.chars().all(|c| c.is_ascii_hexdigit());
-    if !is_hex {
-        return None;
-    }
-    if stem.len() != 40 && stem.len() != 64 {
-        return None;
-    }
-
-    Some(stem.to_string())
 }
 
 fn bytes_to_lower_hex(bytes: &[u8]) -> String {
@@ -1030,37 +1012,20 @@ fn resolve_task_candidate_dirs(task: &Value) -> Vec<String> {
 }
 
 fn trash_generated_torrent_sidecars_in_dir(dir: &Path, normalized_info_hash: Option<&str>) -> u32 {
-    // Without a target info-hash we cannot tell this task's generated sidecar apart from unrelated .torrent files, so match nothing
     let Some(hash) = normalized_info_hash else {
         return 0;
     };
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return 0,
-    };
-
     let mut deleted = 0u32;
-
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !file_name.to_ascii_lowercase().ends_with(".torrent") {
-            continue;
-        }
-        let matched = generated_torrent_hex_stem(file_name).as_deref() == Some(hash);
-
-        if matched && delete_file_best_effort(&path) {
+    for name in [
+        format!("{hash}.torrent"),
+        format!("[metadata]{hash}.torrent"),
+    ] {
+        let path = dir.join(name);
+        let is_file = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if is_file && delete_file_best_effort(&path) {
             deleted += 1;
         }
     }
@@ -1085,23 +1050,26 @@ pub async fn cleanup_generated_torrent_sidecars_for_task(task: Value) -> Result<
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
-        let mut deleted = 0u32;
-        for dir in &dirs {
-            let path = PathBuf::from(dir);
-            let Ok(path) = canonicalize_path(&path) else {
-                continue;
-            };
-            if !path.is_dir() {
-                continue;
+        let round_dirs = dirs.clone();
+        let round_hash = normalized_info_hash.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            let mut deleted = 0u32;
+            for dir in &round_dirs {
+                let Ok(path) = canonicalize_path(&PathBuf::from(dir)) else {
+                    continue;
+                };
+                if !path.is_dir() {
+                    continue;
+                }
+                deleted += trash_generated_torrent_sidecars_in_dir(&path, round_hash.as_deref());
             }
-
-            deleted +=
-                trash_generated_torrent_sidecars_in_dir(&path, normalized_info_hash.as_deref());
-        }
+            deleted
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
         total_deleted = total_deleted.saturating_add(deleted);
 
-        // The retries exist to catch a sidecar the engine writes slightly after task removal; once we've deleted one there's nothing left to wait for, so stop early instead of re-scanning and sleeping needlessly
         if deleted > 0 {
             break;
         }
@@ -1115,8 +1083,6 @@ mod tests {
     use sha1::{Digest, Sha1};
 
     use super::*;
-
-    // -- strip_temp_download_suffix --
 
     #[test]
     fn strip_suffix_removes_part() {
@@ -1145,8 +1111,6 @@ mod tests {
         assert_eq!(strip_temp_download_suffix("a.par"), None);
     }
 
-    // -- push_index_to_ranges --
-
     #[test]
     fn push_index_ignores_zero() {
         let mut ranges = Vec::new();
@@ -1174,8 +1138,6 @@ mod tests {
         push_index_to_ranges(&mut ranges, 5);
         assert_eq!(ranges, vec![(1, 3), (5, 5)]);
     }
-
-    // -- padding files --
 
     #[test]
     fn torrent_preview_hides_padding_files() {
@@ -1211,7 +1173,6 @@ mod tests {
         let names: Vec<&str> = listed.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["a.txt", "b.txt"]);
 
-        // Indices count visible files, as `select-file` does
         let paged = resolve_torrent_from_bytes(&torrent, "t.torrent", true, None, 0, 50).unwrap();
         let mut indices: Vec<(String, Option<usize>)> = paged
             .items
@@ -1227,8 +1188,6 @@ mod tests {
             ]
         );
     }
-
-    // -- encode_index_ranges --
 
     #[test]
     fn encode_ranges_empty() {
@@ -1251,8 +1210,6 @@ mod tests {
         assert_eq!(encode_index_ranges(&ranges), Some("1-3,5,7-9".to_string()));
     }
 
-    // -- normalize_torrent_path --
-
     #[test]
     fn normalize_path_backslashes() {
         assert_eq!(
@@ -1273,8 +1230,6 @@ mod tests {
     fn normalize_path_already_clean() {
         assert_eq!(normalize_torrent_path("folder/file.txt"), "folder/file.txt");
     }
-
-    // -- normalize_info_hash --
 
     #[test]
     fn info_hash_sha1_hex() {
@@ -1297,13 +1252,10 @@ mod tests {
 
     #[test]
     fn info_hash_base32_decode() {
-        // 20 bytes of 0x61 ("aaaa...") = base32 "MFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLB"
         let base32 = "MFQWCYLBMFQWCYLBMFQWCYLBMFQWCYLB";
         let expected = "6161616161616161616161616161616161616161";
         assert_eq!(normalize_info_hash(base32), expected);
     }
-
-    // -- percent_decode_lossy --
 
     #[test]
     fn decode_space() {
@@ -1312,7 +1264,6 @@ mod tests {
 
     #[test]
     fn decode_utf8_multibyte() {
-        // "中" is U+4E2D, UTF-8: E4 B8 AD
         assert_eq!(percent_decode_lossy("%E4%B8%AD"), "中");
     }
 
@@ -1328,12 +1279,9 @@ mod tests {
 
     #[test]
     fn decode_strict_rejects_invalid_utf8() {
-        // %FF%FE is not valid UTF-8 -> strict decode yields "" (old urlencoding::decode(..).unwrap_or_default() behaviour)
         assert_eq!(percent_decode_strict("%FF%FE"), "");
         assert_eq!(percent_decode_strict("%E4%B8%AD"), "中");
     }
-
-    // -- inspect_torrent_metadata --
 
     #[test]
     fn inspect_empty_bytes() {
@@ -1358,7 +1306,6 @@ mod tests {
 
     #[test]
     fn inspect_fallback_name() {
-        // Torrent with info dict but no name key
         let bytes = b"d4:infod6:lengthi100eee";
         let (_, name) = inspect_torrent_metadata(bytes, "my_fallback").unwrap();
         assert_eq!(name, "my_fallback");
@@ -1402,5 +1349,34 @@ mod tests {
         std::fs::write(&path, b"d4:infod6:lengthi1eee").unwrap();
         assert_eq!(trash_generated_torrent_sidecars_in_dir(dir.path(), None), 0);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn preview_names_colliding_files_like_the_download() {
+        let file = |name: &[u8]| {
+            bencode::Value::Dict(vec![
+                (b"length".to_vec(), bencode::Value::Int(5)),
+                (
+                    b"path".to_vec(),
+                    bencode::Value::List(vec![bencode::Value::Bytes(name.to_vec())]),
+                ),
+            ])
+        };
+        let info = bencode::Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                bencode::Value::List(vec![file(b"a\xfe"), file(b"a\xff")]),
+            ),
+            (b"name".to_vec(), bencode::Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), bencode::Value::Int(16384)),
+        ]);
+        let top = bencode::Value::Dict(vec![(b"info".to_vec(), info)]);
+        let bytes = bencode::encode_to_vec(&top);
+        let payload = resolve_torrent_from_bytes(&bytes, "x", false, None, 0, 100).unwrap();
+        let paths: Vec<&str> = payload.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["root/a\u{fffd}", "root/a\u{fffd} (1)"]);
+        let payload = resolve_torrent_from_bytes(&bytes, "x", true, None, 0, 100).unwrap();
+        let names: Vec<&str> = payload.items.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a\u{fffd}", "a\u{fffd} (1)"]);
     }
 }

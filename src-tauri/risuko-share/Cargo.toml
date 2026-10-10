@@ -13,3 +13,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 anyhow = "1"
 irpc = "0.17"
+risuko-engine = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

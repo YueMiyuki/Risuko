@@ -1,5 +1,3 @@
-//! Magnet URI parser (BEP-9 / BEP-52 / BEP-53 subset): `btih` and SHA-256 `btmh` hashes, `tr=`, `dn=`, `x.pe=` and `so=`
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -9,9 +7,7 @@ use futures_util::{future, stream, Stream, StreamExt};
 
 use super::hash::{Id20, Id32};
 
-/// Per-hostname DNS budget for `x.pe` peers
 const PEER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Concurrent `x.pe` hostname lookups
 const MAX_CONCURRENT_PEER_LOOKUPS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +22,6 @@ pub enum MagnetError {
     Parse(String),
 }
 
-/// A `x.pe` peer: an IP literal or a hostname
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MagnetPeer {
     Addr(SocketAddr),
@@ -41,14 +36,12 @@ impl MagnetPeer {
         }
         let (host, port) = raw.rsplit_once(':')?;
         let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
-        // Brackets or colons mean a malformed IPv6 literal
         if host.is_empty() || host.contains([':', '[', ']', '/', ' ']) {
             return None;
         }
         Some(Self::Host(host.to_ascii_lowercase(), port))
     }
 
-    /// Resolve to socket addresses; IP literals resolve to themselves, a lookup that fails or outlasts [`PEER_LOOKUP_TIMEOUT`] to nothing
     pub async fn resolve(&self) -> Vec<SocketAddr> {
         match self {
             Self::Addr(addr) => vec![*addr],
@@ -67,31 +60,24 @@ impl MagnetPeer {
 
 #[derive(Debug, Clone)]
 pub struct Magnet {
-    /// Wire infohash: v1 SHA-1 if present, else truncated SHA-256
     info_hash: Id20,
-    /// Optional v1 SHA-1 (None for pure-v2 magnets)
     info_hash_v1: Option<Id20>,
-    /// Optional v2 SHA-256 (None for pure-v1 magnets)
     info_hash_v2: Option<Id32>,
     pub trackers: Vec<String>,
     pub display_name: Option<String>,
     pub select_only: Option<Vec<usize>>,
-    /// BEP-9 `x.pe` peers to contact directly
     pub peers: Vec<MagnetPeer>,
 }
 
 impl Magnet {
-    /// Wire infohash used for BEP-3 handshakes / trackers / v1 DHT; for pure-v2 magnets this is the leading 20 bytes of the SHA-256 hash
     pub fn info_hash(&self) -> Id20 {
         self.info_hash
     }
 
-    /// v1 (SHA-1) infohash if present
     pub fn info_hash_v1(&self) -> Option<Id20> {
         self.info_hash_v1
     }
 
-    /// v2 (SHA-256) infohash if present
     pub fn info_hash_v2(&self) -> Option<Id32> {
         self.info_hash_v2
     }
@@ -122,7 +108,7 @@ impl Magnet {
         let mut info_hash_v2: Option<Id32> = None;
         let mut trackers = Vec::new();
         let mut display_name: Option<String> = None;
-        let mut select_only: Option<Vec<usize>> = None;
+        let mut select_only: Vec<usize> = Vec::new();
         let mut peers: Vec<MagnetPeer> = Vec::new();
 
         for (k, v) in url.query_pairs() {
@@ -133,7 +119,6 @@ impl Magnet {
                             .map_err(|_| MagnetError::BadInfoHash(rest.into()))?;
                         info_hash_v1 = Some(id);
                     } else if let Some(rest) = v.strip_prefix("urn:btmh:") {
-                        // BEP 52 multihash hex: byte 0 = hash function code (0x12 = SHA-256), byte 1 = digest length (0x20 = 32 bytes), remaining = digest
                         let raw = hex::decode(rest.trim())
                             .map_err(|_| MagnetError::BadInfoHash(rest.into()))?;
                         if raw.len() != 34 || raw[0] != 0x12 || raw[1] != 0x20 {
@@ -150,7 +135,6 @@ impl Magnet {
                 "tr" => trackers.push(v.into_owned()),
                 "dn" => display_name = Some(v.into_owned()),
                 "x.pe" => {
-                    // Bounded so an untrusted URI can't trigger unbounded DNS lookups
                     const MAX_MAGNET_PEERS: usize = 64;
                     if peers.len() < MAX_MAGNET_PEERS {
                         if let Some(peer) = MagnetPeer::parse(&v) {
@@ -161,8 +145,7 @@ impl Magnet {
                     }
                 }
                 "so" => {
-                    // BEP-53 encoding: comma-separated indices or ranges a-b
-                    let mut indices = Vec::new();
+                    const MAX_SO_TOTAL: usize = 100_000;
                     for part in v.split(',') {
                         let part = part.trim();
                         if part.is_empty() {
@@ -176,27 +159,31 @@ impl Magnet {
                                 let b: usize = b.parse().map_err(|_| {
                                     MagnetError::Parse(format!("bad so range {part}"))
                                 })?;
-                                // Cap range expansion to prevent DoS from untrusted input
                                 const MAX_SO_RANGE: usize = 100_000;
                                 if b < a || b.saturating_sub(a) >= MAX_SO_RANGE {
                                     return Err(MagnetError::Parse(format!(
                                         "so range too large: {part}"
                                     )));
                                 }
-                                for i in a..=b {
-                                    indices.push(i);
+                                if select_only.len().saturating_add(b - a + 1) > MAX_SO_TOTAL {
+                                    return Err(MagnetError::Parse(
+                                        "so selection too large".into(),
+                                    ));
                                 }
+                                select_only.extend(a..=b);
                             }
                             None => {
                                 let i: usize = part
                                     .parse()
                                     .map_err(|_| MagnetError::Parse(format!("bad so {part}")))?;
-                                indices.push(i);
+                                if select_only.len() >= MAX_SO_TOTAL {
+                                    return Err(MagnetError::Parse(
+                                        "so selection too large".into(),
+                                    ));
+                                }
+                                select_only.push(i);
                             }
                         }
-                    }
-                    if !indices.is_empty() {
-                        select_only = Some(indices);
                     }
                 }
                 _ => {}
@@ -215,12 +202,11 @@ impl Magnet {
             info_hash_v2,
             trackers,
             display_name,
-            select_only,
+            select_only: (!select_only.is_empty()).then_some(select_only),
             peers,
         })
     }
 
-    /// Resolve every `x.pe` entry with bounded concurrency, yielding deduplicated addresses as each lookup finishes so one slow host never holds back the rest
     pub fn resolve_peers(&self) -> impl Stream<Item = SocketAddr> + Send + 'static {
         let mut seen = HashSet::new();
         stream::iter(self.peers.clone())
@@ -249,7 +235,6 @@ mod tests {
 
     #[test]
     fn parse_base32() {
-        // Base32 of 20 zero bytes
         let m = Magnet::parse("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
         assert_eq!(m.info_hash.0, [0u8; 20]);
     }
@@ -289,12 +274,10 @@ mod tests {
              &x.pe=203.0.113.5:6881&x.pe=127.0.0.1:7000&x.pe=localhost:7000",
         )
         .unwrap();
-        // Parsing drops repeated entries, so add a host that resolves to a listed literal without DNS
         m.peers.push(MagnetPeer::Host("127.0.0.1".into(), 7000));
         let addrs: Vec<SocketAddr> = m.resolve_peers().collect().await;
         let loopback: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         assert!(addrs.contains(&"203.0.113.5:6881".parse().unwrap()));
-        // Neither the added host nor `localhost` may repeat 127.0.0.1
         assert_eq!(addrs.iter().filter(|a| **a == loopback).count(), 1);
     }
 
@@ -314,7 +297,6 @@ mod tests {
 
     #[test]
     fn parse_v2_btmh() {
-        // 0x12 0x20 + 32 zero bytes
         let mut multihash = vec![0x12u8, 0x20];
         multihash.extend_from_slice(&[0u8; 32]);
         let hex = hex::encode(multihash);
@@ -322,7 +304,6 @@ mod tests {
         assert!(m.info_hash_v1().is_none());
         let v2 = m.info_hash_v2().unwrap();
         assert_eq!(v2.0, [0u8; 32]);
-        // wire infohash for pure-v2 = truncated v2
         assert_eq!(m.info_hash().0, [0u8; 20]);
     }
 
@@ -336,19 +317,44 @@ mod tests {
         let v1 = m.info_hash_v1().unwrap();
         assert_eq!(v1.to_hex(), v1hex);
         assert_eq!(m.info_hash_v2().unwrap().0, [0xabu8; 32]);
-        // Hybrid wire infohash prefers v1
         assert_eq!(m.info_hash(), v1);
     }
 
     #[test]
     fn reject_btmh_wrong_multihash_code() {
-        // 0x11 = SHA-1 multihash code; we only accept 0x12 (SHA-256)
-        let mut bad = vec![0x11u8, 0x14]; // sha1, 20 bytes
+        let mut bad = vec![0x11u8, 0x14];
         bad.extend_from_slice(&[0u8; 20]);
         let hex = hex::encode(bad);
         assert!(matches!(
             Magnet::parse(&format!("magnet:?xt=urn:btmh:{hex}")),
             Err(MagnetError::BadInfoHash(_)),
         ));
+    }
+
+    #[test]
+    fn so_total_is_capped() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let many = ["0-99998"; 3].join(",");
+        assert!(Magnet::parse(&format!("{base}&so={many}")).is_err());
+        assert!(Magnet::parse(&format!("{base}&so=0-99998")).is_ok());
+    }
+
+    #[test]
+    fn so_total_is_capped_across_repeated_fields() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        assert!(Magnet::parse(&format!("{base}&so=0-99998&so=0-99998")).is_err());
+        let spam = "&so=0-99998".repeat(50);
+        assert!(Magnet::parse(&format!("{base}{spam}")).is_err());
+    }
+
+    #[test]
+    fn repeated_so_fields_are_merged() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let m = Magnet::parse(&format!("{base}&so=0,2&so=&so=5-6")).unwrap();
+        assert_eq!(m.select_only.as_deref(), Some(&[0usize, 2, 5, 6][..]));
+        assert!(Magnet::parse(&format!("{base}&so="))
+            .unwrap()
+            .select_only
+            .is_none());
     }
 }

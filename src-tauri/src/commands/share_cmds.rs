@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use risuko_share::{FileMeta, SendInfo, ShareManager};
 
-/// Managed state holding the P2P share manager
 pub struct ShareState {
     manager: Arc<ShareManager>,
 }
@@ -16,7 +15,6 @@ impl ShareState {
     }
 }
 
-/// Prepare a send
 #[tauri::command]
 pub async fn share_start_send(
     id: String,
@@ -33,7 +31,6 @@ pub async fn share_start_send(
         .map_err(|e| e.to_string())
 }
 
-/// Join a share by ticket and download its file(s) into `destDir`
 #[tauri::command]
 pub async fn share_start_receive(
     id: String,
@@ -50,7 +47,6 @@ pub async fn share_start_receive(
         .map_err(|e| e.to_string())
 }
 
-/// Cancel an active transfer (send or receive) and free its resources
 #[tauri::command]
 pub async fn share_cancel(id: String, state: tauri::State<'_, ShareState>) -> Result<(), String> {
     let manager = state.manager.clone();

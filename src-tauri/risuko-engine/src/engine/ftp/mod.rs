@@ -28,7 +28,6 @@ pub struct FtpUri {
     pub path: String,
 }
 
-/// Check if a URI uses ftp://, ftps://, or sftp:// scheme
 pub fn is_ftp_uri(uri: &str) -> bool {
     detect_ftp_protocol(uri).is_some()
 }
@@ -46,7 +45,6 @@ pub fn detect_ftp_protocol(uri: &str) -> Option<FtpProtocol> {
     }
 }
 
-/// Parse an FTP/FTPS/SFTP URI into components. Supports `ftp://host/path`, `ftp://user:pass@host:21/path`, `sftp://host/path`, `ftps://host/path`
 pub fn parse_ftp_uri(uri: &str) -> Result<FtpUri, String> {
     let protocol = detect_ftp_protocol(uri).ok_or("Not an FTP/FTPS/SFTP URI")?;
 
@@ -92,7 +90,6 @@ pub fn parse_ftp_uri(uri: &str) -> Result<FtpUri, String> {
     })
 }
 
-/// Main dispatcher: calls FTP/FTPS or SFTP worker based on protocol
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ftp_download(
     uri: &str,
@@ -145,9 +142,76 @@ pub async fn run_ftp_download(
     }
 }
 
+pub(crate) struct PartClaim(PathBuf);
+
+static ACTIVE_PARTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn claim_key(path: &std::path::Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    match (parent.canonicalize(), path.file_name()) {
+        (Ok(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+impl PartClaim {
+    pub(crate) fn acquire(path: &std::path::Path) -> Result<Self, String> {
+        let key = claim_key(path);
+        let mut active = ACTIVE_PARTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(key.clone()) {
+            return Err(format!(
+                "Another active download is already writing {}",
+                path.display()
+            ));
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for PartClaim {
+    fn drop(&mut self) {
+        ACTIVE_PARTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn part_claim_refuses_a_second_writer_until_released() {
+        let path = PathBuf::from("/claim-test/file.bin.part");
+        let first = PartClaim::acquire(&path).unwrap();
+        assert!(PartClaim::acquire(&path).is_err());
+        assert!(PartClaim::acquire(&PathBuf::from("/claim-test/other.part")).is_ok());
+        drop(first);
+        assert!(PartClaim::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn part_claim_treats_equivalent_paths_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("downloads");
+        std::fs::create_dir(&sub).unwrap();
+        let direct = sub.join("file.bin.part");
+        let dotted = sub.join("..").join("downloads").join("file.bin.part");
+        let first = PartClaim::acquire(&direct).unwrap();
+        assert!(PartClaim::acquire(&dotted).is_err());
+        drop(first);
+        let second = PartClaim::acquire(&dotted).unwrap();
+        assert!(PartClaim::acquire(&direct).is_err());
+        drop(second);
+        assert!(PartClaim::acquire(&direct).is_ok());
+    }
 
     #[test]
     fn test_detect_ftp_protocol() {

@@ -32,8 +32,3 @@ pub async fn export_download_stats(state: State<'_, AppState>) -> Result<Value, 
 pub async fn merge_download_stats(state: State<'_, AppState>, data: Value) -> Result<(), String> {
     state.stats.merge(data).await
 }
-
-#[tauri::command]
-pub async fn clear_download_stats(state: State<'_, AppState>) -> Result<(), String> {
-    state.stats.clear().await
-}

@@ -1,14 +1,10 @@
-//! Usenet provider commands
-
 use fs4::FileExt;
 use risuko_engine::engine::options::EngineOptions;
 use risuko_engine::engine::usenet::{UsenetCredentialResolver, UsenetProviderProfile};
 use risuko_engine::engine::usenet_transport::NntpConnection;
 use serde_json::{json, Map, Value};
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::State;
 
@@ -41,28 +37,36 @@ impl risuko_engine::engine::usenet::UsenetCredentialResolver for VaultCredential
         &self,
         profile_id: &str,
     ) -> Result<Option<risuko_engine::engine::usenet::UsenetCredentials>, String> {
-        if self.vault.enabled() {
-            match self.vault.get(&credential_key(profile_id)) {
-                Ok(Some(value)) => {
-                    let username = value
-                        .get("username")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
-                    let password = value
-                        .get("password")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
-                    return Ok(Some(risuko_engine::engine::usenet::UsenetCredentials {
-                        username,
-                        password,
-                    }));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        "Failed to load Usenet credentials for {profile_id}: {error}; trying fallback"
-                    );
-                }
+        let lookup = {
+            let vault = self.vault.clone();
+            let key = credential_key(profile_id);
+            tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get(&key))).await
+        };
+        match lookup {
+            Ok(Some(Ok(Some(value)))) => {
+                let username = value
+                    .get("username")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let password = value
+                    .get("password")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                return Ok(Some(risuko_engine::engine::usenet::UsenetCredentials {
+                    username,
+                    password,
+                }));
+            }
+            Ok(Some(Ok(None))) | Ok(None) => {}
+            Ok(Some(Err(error))) => {
+                tracing::warn!(
+                    "Failed to load Usenet credentials for {profile_id}: {error}; trying fallback"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Usenet credential lookup for {profile_id} did not complete: {error}; trying fallback"
+                );
             }
         }
         self.fallback.resolve(profile_id).await
@@ -79,7 +83,6 @@ fn load_fallback(path: &Path) -> Result<Map<String, Value>, String> {
 
 static FALLBACK_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-static FALLBACK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn with_fallback_lock<T>(
     path: &Path,
@@ -97,7 +100,6 @@ fn with_fallback_lock<T>(
             .and_then(|name| name.to_str())
             .unwrap_or("credentials")
     ));
-    // Lock file contents are irrelevant; never truncate so concurrent lockers are unaffected
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -112,60 +114,11 @@ fn with_fallback_lock<T>(
 }
 
 fn write_fallback_atomic(path: &Path, data: &str) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("credentials.json");
-    let temp_path = parent.join(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        FALLBACK_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp_path).map_err(|e| e.to_string())?;
-        file.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        drop(file);
-        set_owner_only_permissions(&temp_path)?;
-        replace_fallback_file(&temp_path, path)?;
-        sync_fallback_parent(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-#[cfg(unix)]
-fn sync_fallback_parent(parent: &Path) -> Result<(), String> {
-    OpenOptions::new()
-        .read(true)
-        .open(parent)
-        .and_then(|directory| directory.sync_all())
-        .or_else(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-            ) {
-                return Ok(());
-            }
-            Err(error)
-        })
-        .map_err(|error| format!("sync credential fallback directory: {error}"))
-}
-
-#[cfg(not(unix))]
-fn sync_fallback_parent(_parent: &Path) -> Result<(), String> {
-    Ok(())
+    risuko_engine::traits::write_file_atomically_with(
+        path,
+        data.as_bytes(),
+        set_owner_only_permissions,
+    )
 }
 
 #[cfg(unix)]
@@ -194,42 +147,6 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), String> {
 #[cfg(not(any(unix, windows)))]
 fn set_owner_only_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
-}
-
-#[cfg(windows)]
-fn replace_fallback_file(temp: &Path, path: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source = temp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error().to_string())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_fallback_file(temp: &Path, path: &Path) -> Result<(), String> {
-    std::fs::rename(temp, path).map_err(|e| e.to_string())
 }
 
 fn save_fallback(path: &Path, profile_id: &str, credentials: &Value) -> Result<(), String> {
@@ -271,7 +188,7 @@ fn resolver_for_state(state: &AppState) -> Result<VaultCredentialResolver, Strin
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn usenet_save_credentials(
     state: State<'_, AppState>,
     profile_id: String,
@@ -310,7 +227,7 @@ pub fn usenet_save_credentials(
     save_fallback(&fallback_path, &profile_id, &credentials)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn usenet_remove_credentials(
     state: State<'_, AppState>,
     profile_id: String,
@@ -334,7 +251,7 @@ pub fn usenet_remove_credentials(
     fallback_result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn usenet_has_credentials(
     state: State<'_, AppState>,
     profile_id: String,

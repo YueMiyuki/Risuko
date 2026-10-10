@@ -1,6 +1,4 @@
-//! Bencode codec (BEP-3)
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +29,6 @@ pub enum Error {
     Io(#[from] io::Error),
 }
 
-/// A bencode value
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),
@@ -125,7 +122,6 @@ pub fn decode_external(input: &[u8], limits: DecodeLimits) -> Result<Decoded, Er
     p.parse_value(0)
 }
 
-/// Decode one bounded network value, allowing only trailing ASCII whitespace
 pub fn decode_all_external(input: &[u8], limits: DecodeLimits) -> Result<Value, Error> {
     let d = decode_external(input, limits)?;
     if !input[d.span.end..]
@@ -136,6 +132,8 @@ pub fn decode_all_external(input: &[u8], limits: DecodeLimits) -> Result<Value, 
     }
     Ok(d.value)
 }
+
+const MAX_STRICT_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DictMode {
@@ -192,6 +190,11 @@ impl<'a> Parser<'a> {
                     max: limits.max_values,
                 });
             }
+        } else if depth > MAX_STRICT_DEPTH {
+            return Err(Error::DepthLimit {
+                pos: self.pos,
+                max: MAX_STRICT_DEPTH,
+            });
         }
         self.values = self.values.saturating_add(1);
         Ok(())
@@ -227,9 +230,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let digits = &self.buf[start..self.pos];
-        // skip 'e'
         self.pos += 1;
-        // Reject "i-0e" and leading zeros like "i01e" / "i-01e" per BEP-3
         if digits.is_empty() {
             return Err(Error::BadInteger {
                 pos: start,
@@ -278,7 +279,6 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let digits = &self.buf[start..self.pos];
-        // skip ':'
         self.pos += 1;
         if digits.len() > 1 && digits[0] == b'0' {
             return Err(Error::BadLength {
@@ -294,7 +294,6 @@ impl<'a> Parser<'a> {
             pos: start,
             reason: "parse",
         })?;
-        // Guard against pathological lengths on untrusted input
         if len > (isize::MAX as u64) {
             return Err(Error::StringTooLong { pos: start, len });
         }
@@ -326,6 +325,7 @@ impl<'a> Parser<'a> {
         debug_assert_eq!(self.buf[self.pos], b'd');
         self.pos += 1;
         let mut items: Vec<(Vec<u8>, Value)> = Vec::new();
+        let mut seen: Option<HashSet<Vec<u8>>> = None;
         while self.peek()? != b'e' {
             let key_pos = self.pos;
             let key_val = self.parse_value(depth.saturating_add(1))?.value;
@@ -334,9 +334,18 @@ impl<'a> Parser<'a> {
                 _ => return Err(Error::NonStringDictKey(key_pos)),
             };
             if self.dict_mode == DictMode::Canonical {
-                if let Some((prev, _)) = items.last() {
-                    if prev.as_slice() >= key.as_slice() {
+                if let Some(set) = seen.as_mut() {
+                    if !set.insert(key.clone()) {
                         return Err(Error::BadDictOrder(key_pos));
+                    }
+                } else if let Some((prev, _)) = items.last() {
+                    if prev.as_slice() >= key.as_slice() {
+                        let mut set: HashSet<Vec<u8>> =
+                            items.iter().map(|(k, _)| k.clone()).collect();
+                        if !set.insert(key.clone()) {
+                            return Err(Error::BadDictOrder(key_pos));
+                        }
+                        seen = Some(set);
                     }
                 }
             }
@@ -348,7 +357,44 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Look up a top-level dict value and return both the decoded value and its raw byte span within `input`; useful for hashing the `info` dict
+pub fn top_level_field_span(input: &[u8], key: &[u8]) -> Option<std::ops::Range<usize>> {
+    fn skip(input: &[u8], pos: usize) -> Option<usize> {
+        match *input.get(pos)? {
+            b'i' => Some(pos + input.get(pos..)?.iter().position(|&b| b == b'e')? + 1),
+            b'l' | b'd' => {
+                let mut p = pos + 1;
+                while *input.get(p)? != b'e' {
+                    p = skip(input, p)?;
+                }
+                Some(p + 1)
+            }
+            b'0'..=b'9' => {
+                let colon = pos + input.get(pos..)?.iter().position(|&b| b == b':')?;
+                let len: usize = std::str::from_utf8(&input[pos..colon]).ok()?.parse().ok()?;
+                let end = (colon + 1).checked_add(len)?;
+                (end <= input.len()).then_some(end)
+            }
+            _ => None,
+        }
+    }
+    if *input.first()? != b'd' {
+        return None;
+    }
+    let mut p = 1;
+    while *input.get(p)? != b'e' {
+        let key_end = skip(input, p)?;
+        let colon = p + input.get(p..)?.iter().position(|&b| b == b':')?;
+        let found = input.get(colon + 1..key_end)? == key;
+        let val_end = skip(input, key_end)?;
+        if found {
+            return Some(key_end..val_end);
+        }
+        p = val_end;
+    }
+    None
+}
+
+#[cfg(test)]
 pub fn decode_dict_field_raw<'a>(
     input: &'a [u8],
     key: &[u8],
@@ -376,8 +422,6 @@ pub fn decode_dict_field_raw<'a>(
     Ok(None)
 }
 
-// -- Encoder --
-
 pub fn encode_to_vec(v: &Value) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     encode_to_writer(v, &mut out).expect("Vec write is infallible");
@@ -401,7 +445,6 @@ pub fn encode_to_writer<W: Write>(v: &Value, w: &mut W) -> Result<(), Error> {
             w.write_all(b"e")?;
         }
         Value::Dict(items) => {
-            // Sort into a BTreeMap to enforce canonical key order, rejecting duplicates explicitly instead of silently dropping them
             let mut sorted: BTreeMap<&[u8], &Value> = BTreeMap::new();
             for (k, vv) in items {
                 if sorted.insert(k.as_slice(), vv).is_some() {
@@ -419,8 +462,6 @@ pub fn encode_to_writer<W: Write>(v: &Value, w: &mut W) -> Result<(), Error> {
     }
     Ok(())
 }
-
-// -- Tests --
 
 #[cfg(test)]
 mod tests {
@@ -464,9 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_unsorted_dict() {
-        assert!(decode_all(b"d3:fooi1e3:bari2ee").is_err());
+    fn reject_duplicate_keys_accept_unsorted() {
         assert!(decode_all(b"d3:fooi1e3:fooi2ee").is_err());
+        assert!(decode_all(b"d3:fooi1e3:bari2e3:fooi3ee").is_err());
+        let v = decode_all(b"d3:fooi1e3:bari2ee").unwrap();
+        assert_eq!(v.get(b"bar").and_then(Value::as_int), Some(2));
     }
 
     #[test]
@@ -491,6 +534,14 @@ mod tests {
             decode_all_external(b"i7ejunk", limits),
             Err(Error::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn strict_decode_rejects_deep_nesting() {
+        let deep = [b"l".repeat(100_000), b"e".repeat(100_000)].concat();
+        assert!(matches!(decode_all(&deep), Err(Error::DepthLimit { .. })));
+        let ok = [b"l".repeat(200), b"e".repeat(200)].concat();
+        assert!(decode_all(&ok).is_ok());
     }
 
     #[test]
@@ -549,5 +600,14 @@ mod tests {
         let input = b"l4:spami42ee";
         let d = decode(input).unwrap();
         assert_eq!(d.span, 0..input.len());
+    }
+
+    #[test]
+    fn field_span_matches_raw_decode() {
+        let input = b"d3:bar4:spam4:infod1:ai1e1:bl3:xyzee3:zzzi5ee";
+        let span = top_level_field_span(input, b"info").unwrap();
+        let (_, raw) = decode_dict_field_raw(input, b"info").unwrap().unwrap();
+        assert_eq!(&input[span], raw);
+        assert!(top_level_field_span(input, b"nope").is_none());
     }
 }

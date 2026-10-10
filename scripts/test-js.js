@@ -1,7 +1,3 @@
-// cd src-tauri && cargo build --release -p risuko-napi
-// cp src-tauri/target/release/librisuko_napi.dylib packages/risuko-js/risuko.darwin-arm64.node
-// codesign -s - packages/risuko-js/risuko.darwin-arm64.node
-
 import risuko from "../packages/risuko-js/index.js";
 
 (async () => {

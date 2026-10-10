@@ -37,7 +37,6 @@ export default {
 	"category-directories": "目录",
 	"category-download": "下载行为",
 	"category-media": "媒体格式",
-	"category-rss": "RSS",
 	"category-stats": "统计",
 	"category-task-routing": "任务路由",
 	"category-notifications": "通知",

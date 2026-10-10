@@ -1,5 +1,3 @@
-//! Archive path and resource-limit validation shared by extraction workers
-
 use serde_json::Value;
 use std::path::{Component, Path};
 
@@ -167,22 +165,10 @@ pub fn validate_member_path(path: &str) -> Result<(), ArchiveSafetyError> {
     if path.chars().any(|ch| ch.is_control()) {
         return Err(ArchiveSafetyError::UnsafePath);
     }
-    if path.split('/').any(is_reserved_windows_name) {
+    if path.split('/').any(super::util::is_windows_device_name) {
         return Err(ArchiveSafetyError::UnsafePath);
     }
     Ok(())
-}
-
-fn is_reserved_windows_name(part: &str) -> bool {
-    let stem = part
-        .split('.')
-        .next()
-        .unwrap_or(part)
-        .trim_end_matches([' ', '.'])
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem[3..].parse::<u8>().is_ok_and(|n| (1..=9).contains(&n)))
 }
 
 pub fn check_limits(

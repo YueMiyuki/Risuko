@@ -1,5 +1,3 @@
-//! Piece & chunk accounting used by the active download state
-
 pub mod chunk_tracker;
 pub mod piece_tracker;
 

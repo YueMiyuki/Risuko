@@ -31,8 +31,6 @@ fn apply_engine_overrides(global: &mut Map<String, Value>, user: &Map<String, Va
     }
 }
 
-/// Default global options and per-task option management, mapping aria2 option names to internal config values
-
 #[derive(Debug, Clone)]
 pub struct PbhRpcConfig {
     pub port: u16,
@@ -41,16 +39,13 @@ pub struct PbhRpcConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineOptions {
-    /// Global options (applied to all new tasks as defaults)
     pub global: Map<String, Value>,
 }
 
 impl EngineOptions {
     pub fn from_config(system: &Map<String, Value>, user: &Map<String, Value>) -> Self {
-        // Relevant system config becomes the global engine options
         let mut global = system.clone();
 
-        // Apply user overrides that affect engine behavior
         for key in [
             "rpc-host",
             "m3u8-output-format",
@@ -77,7 +72,6 @@ impl EngineOptions {
             }
         }
 
-        // Escape hatch: users can supply arbitrary engine keys from the UI via `engine-overrides` so new backend options work without dedicated form fields
         apply_engine_overrides(&mut global, user);
 
         if let Some(proxy) = user.get("proxy") {
@@ -203,7 +197,6 @@ impl EngineOptions {
         })
     }
 
-    /// Coerce common boolean representations: native bools, "true"/"false" strings, "1"/"0" strings, and numeric 0/1
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.global.get(key).and_then(json_bool)
     }
@@ -236,6 +229,13 @@ impl EngineOptions {
             .unwrap_or(0)
     }
 
+    pub fn max_overall_upload_limit(&self) -> u64 {
+        self.global
+            .get("max-overall-upload-limit")
+            .map(parse_speed_limit)
+            .unwrap_or(0)
+    }
+
     pub fn rpc_listen_port(&self) -> u16 {
         self.get_u64("rpc-listen-port").unwrap_or(16800) as u16
     }
@@ -257,25 +257,7 @@ impl EngineOptions {
             return Ok(DEFAULT_PBH_LISTEN_PORT);
         };
 
-        let parsed = match value {
-            Value::Number(number) => number.as_u64().ok_or_else(|| {
-                format!("invalid pbh-listen-port value {number}: expected an integer")
-            }),
-            Value::String(text) => text.trim().parse::<u64>().map_err(|_| {
-                format!("invalid pbh-listen-port value {text:?}: expected an integer in 1..=65535")
-            }),
-            other => Err(format!(
-                "invalid pbh-listen-port value {other}: expected an integer in 1..=65535"
-            )),
-        }?;
-
-        if parsed == 0 || parsed > u16::MAX as u64 {
-            return Err(format!(
-                "invalid pbh-listen-port value {parsed}: expected an integer in 1..=65535"
-            ));
-        }
-
-        Ok(parsed as u16)
+        parse_port(value, "pbh-listen-port")
     }
 
     pub fn pbh_listen_port(&self) -> u16 {
@@ -318,34 +300,56 @@ impl EngineOptions {
         self.get_u64("seed-time").unwrap_or(0)
     }
 
-    /// Keep seeding until the user stops manually, overriding seed-time/seed-ratio enforcement (those only apply when this is false)
     pub fn keep_seeding(&self) -> bool {
         self.get_bool("keep-seeding").unwrap_or(false)
     }
 
-    /// Max outstanding chunk requests per peer. 0 or missing = use crate default
     pub fn bt_max_outstanding_per_peer(&self) -> Option<usize> {
         self.get_u64("bt-max-outstanding-per-peer")
             .filter(|&v| v != 0)
             .map(|v| v as usize)
     }
 
-    /// Max concurrent peer connections per torrent. 0 or missing = use crate default
     pub fn bt_max_peers_per_torrent(&self) -> Option<usize> {
         self.get_u64("bt-max-peers-per-torrent")
             .filter(|&v| v != 0)
             .map(|v| v as usize)
     }
-    pub fn bt_upload_rate_limit(&self) -> Option<u64> {
-        self.get_u64("bt-upload-rate-limit").filter(|&v| v != 0)
+
+    pub fn bt_max_connections(&self) -> usize {
+        self.get_u64("bt-max-connections")
+            .map_or(400, |v| v.clamp(20, 5000) as usize)
     }
 
-    /// UPnP IGD port forwarding for the BitTorrent listener. Defaults to on
+    pub fn bt_hash_fail_ban_strikes(&self) -> Option<u8> {
+        if !self.get_bool("bt-ban-corrupt-peers").unwrap_or(true) {
+            return None;
+        }
+        let strikes = self
+            .get_u64("bt-ban-corrupt-strikes")
+            .filter(|&v| v != 0)
+            .unwrap_or(3);
+        Some(strikes.min(u64::from(u8::MAX)) as u8)
+    }
+
+    pub fn bt_upload_rate_limit(&self) -> Option<u64> {
+        self.global
+            .get("bt-upload-rate-limit")
+            .map(parse_speed_limit)
+            .filter(|&v| v != 0)
+    }
+
+    pub fn effective_bt_upload_limit(&self) -> u64 {
+        risuko_bt::limiter::tightest(
+            self.bt_upload_rate_limit().unwrap_or(0),
+            self.max_overall_upload_limit(),
+        )
+    }
+
     pub fn bt_enable_upnp(&self) -> bool {
         self.get_bool("bt-enable-upnp").unwrap_or(true)
     }
 
-    /// UPnP mapping lease duration in seconds. 0 or missing = use crate default (300)
     pub fn bt_upnp_lease(&self) -> Option<std::time::Duration> {
         self.get_u64("bt-upnp-lease")
             .filter(|&v| v != 0)
@@ -355,21 +359,31 @@ impl EngineOptions {
         match self.get_str("bt-encryption-policy").unwrap_or("prefer") {
             "plaintext" => "plaintext",
             "require" => "require",
+            _ if self.get_bool("bt-force-encryption").unwrap_or(false) => "require",
             _ => "prefer",
         }
     }
 
-    /// Also bind an IPv6 TCP listener. Defaults to off
+    pub fn bt_listen_port(&self) -> Option<u16> {
+        let raw = match self.global.get("listen-port")? {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            _ => return None,
+        };
+        raw.split([',', '-'])
+            .next()
+            .and_then(|first| first.trim().parse::<u16>().ok())
+            .filter(|&port| port != 0)
+    }
+
     pub fn bt_listen_v6(&self) -> bool {
         self.get_bool("bt-listen-v6").unwrap_or(false)
     }
 
-    /// BEP-14 Local Service Discovery. Defaults to on
     pub fn bt_enable_lsd(&self) -> bool {
         self.get_bool("bt-enable-lsd").unwrap_or(true)
     }
 
-    /// Purge completed/stopped download records when the engine starts
     pub fn purge_record_on_start(&self) -> bool {
         self.get_bool("purge-record-on-start").unwrap_or(false)
     }
@@ -390,45 +404,23 @@ impl EngineOptions {
             .unwrap_or(DEFAULT_ED2K_PORT)
     }
 
-    /// Whether eMule Kad source discovery starts with the engine; Kad is intentionally separate from the BitTorrent DHT settings
     pub fn ed2k_enable_kad(&self) -> bool {
         self.get_bool("ed2k-enable-kad").unwrap_or(true)
     }
 
-    /// Parse the configured Kad UDP port without narrowing or silently accepting an invalid value: a missing setting uses the protocol default, while an explicit zero, out-of-range, or non-numeric value returns an error so startup can report the misconfiguration instead of binding an unrelated port
     pub fn ed2k_kad_port_checked(&self) -> Result<u16, String> {
         let Some(value) = self.global.get("ed2k-kad-port") else {
             return Ok(DEFAULT_ED2K_KAD_PORT);
         };
 
-        let parsed = match value {
-            Value::Number(number) => number.as_u64().ok_or_else(|| {
-                format!("invalid ed2k-kad-port value {number}: expected an integer")
-            }),
-            Value::String(text) => text.trim().parse::<u64>().map_err(|_| {
-                format!("invalid ed2k-kad-port value {text:?}: expected an integer in 1..=65535")
-            }),
-            other => Err(format!(
-                "invalid ed2k-kad-port value {other}: expected an integer in 1..=65535"
-            )),
-        }?;
-
-        if parsed == 0 || parsed > u16::MAX as u64 {
-            return Err(format!(
-                "invalid ed2k-kad-port value {parsed}: expected an integer in 1..=65535"
-            ));
-        }
-
-        Ok(parsed as u16)
+        parse_port(value, "ed2k-kad-port")
     }
 
-    /// Compatibility accessor for callers that cannot propagate a startup error; new startup code should use [`Self::ed2k_kad_port_checked`] so invalid configuration surfaces to health diagnostics
     pub fn ed2k_kad_port(&self) -> u16 {
         self.ed2k_kad_port_checked()
             .unwrap_or(DEFAULT_ED2K_KAD_PORT)
     }
 
-    /// User-defined task routing rules (pattern -> tag + directory)
     pub fn task_routing_rules(&self) -> Vec<super::routing::TaskRoutingRule> {
         self.global
             .get("task-routing-rules")
@@ -436,7 +428,6 @@ impl EngineOptions {
             .unwrap_or_default()
     }
 
-    /// Legacy file-category → directory map (e.g. { music: "/Music" })
     pub fn file_category_dirs(&self) -> std::collections::HashMap<String, String> {
         self.global
             .get("file-category-dirs")
@@ -456,7 +447,6 @@ impl EngineOptions {
             .unwrap_or_default()
     }
 
-    /// Merge per-task options over global defaults, returning a combined map
     pub fn merge_task_options(&self, task_opts: &Map<String, Value>) -> Map<String, Value> {
         let mut merged = self.global.clone();
         for (k, v) in task_opts {
@@ -620,8 +610,6 @@ impl EngineOptions {
                 }
             }
         }
-        // A task-level TCP P2P override applies to UDP as well unless it has
-        // explicitly supplied a separate UDP route
         if task_has_p2p_route
             && !task_proxy_has_nested_p2p_udp
             && !task_opts.contains_key("p2p-udp-proxy")
@@ -641,8 +629,7 @@ impl EngineOptions {
     }
 }
 
-/// JSON bool, integer (non-zero = true), or a trimmed, case-insensitive `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` string
-pub(crate) fn json_bool(value: &Value) -> Option<bool> {
+pub fn json_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
         Value::Number(n) => n
@@ -656,6 +643,29 @@ pub(crate) fn json_bool(value: &Value) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+fn parse_port(value: &Value, key: &str) -> Result<u16, String> {
+    let parsed = match value {
+        Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| format!("invalid {key} value {number}: expected an integer")),
+        Value::String(text) => text
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {key} value {text:?}: expected an integer in 1..=65535")),
+        other => Err(format!(
+            "invalid {key} value {other}: expected an integer in 1..=65535"
+        )),
+    }?;
+
+    if parsed == 0 || parsed > u16::MAX as u64 {
+        return Err(format!(
+            "invalid {key} value {parsed}: expected an integer in 1..=65535"
+        ));
+    }
+
+    Ok(parsed as u16)
 }
 
 fn value_as_bool(value: &Value) -> bool {
@@ -704,6 +714,20 @@ pub(crate) fn build_p2p_proxy_connector(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_bt_upload_limit_takes_the_smaller_non_zero() {
+        let mut opts = EngineOptions::from_config(&Map::new(), &Map::new());
+        assert_eq!(opts.effective_bt_upload_limit(), 0);
+        opts.set("max-overall-upload-limit".into(), json!("1M"));
+        assert_eq!(opts.effective_bt_upload_limit(), 1024 * 1024);
+        opts.set("bt-upload-rate-limit".into(), json!(512 * 1024));
+        assert_eq!(opts.effective_bt_upload_limit(), 512 * 1024);
+        opts.set("bt-upload-rate-limit".into(), json!("2M"));
+        assert_eq!(opts.effective_bt_upload_limit(), 1024 * 1024);
+        opts.set("max-overall-upload-limit".into(), json!(0));
+        assert_eq!(opts.effective_bt_upload_limit(), 2 * 1024 * 1024);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -723,12 +747,9 @@ mod tests {
         let mut m = Map::new();
         m.insert("rpc-host".into(), json!("0.0.0.0"));
         m.insert("m3u8-output-format".into(), json!("mp4"));
-        // This key should be ignored (not in the allow list)
         m.insert("dir".into(), json!("/user-override"));
         m
     }
-
-    // -- from_config --
 
     #[test]
     fn from_config_copies_system_keys() {
@@ -742,7 +763,6 @@ mod tests {
         let opts = EngineOptions::from_config(&make_system(), &make_user());
         assert_eq!(opts.rpc_host(), "0.0.0.0");
         assert_eq!(opts.get_str("m3u8-output-format"), Some("mp4"));
-        // dir should NOT be overridden from user config
         assert_eq!(opts.dir(), "/downloads");
     }
 
@@ -855,8 +875,6 @@ mod tests {
         assert_eq!(opts.get_str("all-proxy"), Some(""));
         assert_eq!(opts.get_str("no-proxy"), Some(""));
     }
-
-    // -- getters with defaults --
 
     #[test]
     fn getter_defaults_when_empty() {
@@ -986,6 +1004,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_aria2_keys_are_kept_and_settable() {
+        let mut sys = Map::new();
+        sys.insert("continue".into(), json!(false));
+        sys.insert("follow-torrent".into(), json!("mem"));
+        let mut opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.get_bool("continue"), Some(false));
+        assert_eq!(opts.get_str("follow-torrent"), Some("mem"));
+        opts.set("allow-overwrite".into(), json!(true));
+        opts.set("bt-enable-lpd".into(), json!(false));
+        assert_eq!(opts.get_bool("allow-overwrite"), Some(true));
+        assert_eq!(opts.get_bool("bt-enable-lpd"), Some(false));
+    }
+
+    #[test]
     fn kad_options_parse_and_validate_port() {
         let mut sys = Map::new();
         sys.insert("ed2k-enable-kad".into(), json!(false));
@@ -1056,16 +1088,12 @@ mod tests {
         assert_eq!(opts.rpc_listen_port(), 9999);
     }
 
-    // -- set --
-
     #[test]
     fn set_overrides_value() {
         let mut opts = EngineOptions::from_config(&make_system(), &Map::new());
         opts.set("dir".into(), json!("/new"));
         assert_eq!(opts.dir(), "/new");
     }
-
-    // -- merge_task_options --
 
     #[test]
     fn merge_task_options_overrides_globals() {
@@ -1077,7 +1105,6 @@ mod tests {
         let merged = opts.merge_task_options(&task);
         assert_eq!(merged.get("dir").unwrap(), "/task-dir");
         assert_eq!(merged.get("out").unwrap(), "file.zip");
-        // Original global key preserved
         assert_eq!(merged.get("rpc-secret").unwrap(), "secret123");
     }
 
@@ -1214,8 +1241,6 @@ mod tests {
         assert_eq!(merged.get("p2p-no-proxy"), Some(&json!("")));
     }
 
-    // -- BT accessors --
-
     #[test]
     fn get_bool_accepts_native_strings_and_numbers() {
         let mut sys = Map::new();
@@ -1240,6 +1265,17 @@ mod tests {
         }
         assert_eq!(opts.get_bool("k"), None);
         assert_eq!(opts.get_bool("missing"), None);
+    }
+
+    #[test]
+    fn parse_port_rejects_out_of_range_and_non_integers() {
+        assert_eq!(parse_port(&json!("6800"), "k"), Ok(6800));
+        assert_eq!(parse_port(&json!(65535), "k"), Ok(65535));
+        assert!(parse_port(&json!(0), "k").is_err());
+        assert!(parse_port(&json!(70000), "k").is_err());
+        assert!(parse_port(&json!("x"), "k").is_err());
+        assert!(parse_port(&json!(1.5), "k").is_err());
+        assert!(parse_port(&json!(true), "k").is_err());
     }
 
     #[test]
@@ -1275,6 +1311,43 @@ mod tests {
     }
 
     #[test]
+    fn bt_hash_fail_ban_defaults_on_and_can_be_disabled() {
+        let opts = EngineOptions::from_config(&Map::new(), &Map::new());
+        assert_eq!(opts.bt_hash_fail_ban_strikes(), Some(3));
+        let mut sys = Map::new();
+        sys.insert("bt-ban-corrupt-strikes".into(), json!(5));
+        let opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.bt_hash_fail_ban_strikes(), Some(5));
+        sys.insert("bt-ban-corrupt-strikes".into(), json!(1000));
+        let opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.bt_hash_fail_ban_strikes(), Some(u8::MAX));
+        sys.insert("bt-ban-corrupt-peers".into(), json!(false));
+        let opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.bt_hash_fail_ban_strikes(), None);
+    }
+
+    #[test]
+    fn bt_max_connections_defaults_and_clamps() {
+        let opts = EngineOptions::from_config(&Map::new(), &Map::new());
+        assert_eq!(opts.bt_max_connections(), 400);
+        for (input, want) in [
+            (json!(250), 250),
+            (json!("250"), 250),
+            (json!(0), 20),
+            (json!(5), 20),
+            (json!(20), 20),
+            (json!(5000), 5000),
+            (json!(1_000_000), 5000),
+            (json!("junk"), 400),
+        ] {
+            let mut sys = Map::new();
+            sys.insert("bt-max-connections".into(), input);
+            let opts = EngineOptions::from_config(&sys, &Map::new());
+            assert_eq!(opts.bt_max_connections(), want);
+        }
+    }
+
+    #[test]
     fn bt_upnp_lease_zero_means_default() {
         let opts = EngineOptions::from_config(&Map::new(), &Map::new());
         assert_eq!(opts.bt_upnp_lease(), None);
@@ -1300,13 +1373,38 @@ mod tests {
             ("prefer", "prefer"),
             ("require", "require"),
             ("nonsense", "prefer"),
-            ("REQUIRE", "prefer"), // case sensitive on purpose
+            ("REQUIRE", "prefer"),
         ] {
             let mut sys = Map::new();
             sys.insert("bt-encryption-policy".into(), json!(set));
             let opts = EngineOptions::from_config(&sys, &Map::new());
             assert_eq!(opts.bt_encryption_policy(), want, "set={set}");
         }
+    }
+
+    #[test]
+    fn bt_force_encryption_upgrades_prefer_to_require() {
+        let mut sys = Map::new();
+        sys.insert("bt-force-encryption".into(), json!(true));
+        let opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.bt_encryption_policy(), "require");
+        sys.insert("bt-encryption-policy".into(), json!("plaintext"));
+        let opts = EngineOptions::from_config(&sys, &Map::new());
+        assert_eq!(opts.bt_encryption_policy(), "plaintext");
+    }
+
+    #[test]
+    fn bt_listen_port_parses_numbers_and_ranges() {
+        let port = |v: Value| {
+            let mut sys = Map::new();
+            sys.insert("listen-port".into(), v);
+            EngineOptions::from_config(&sys, &Map::new()).bt_listen_port()
+        };
+        assert_eq!(port(json!(21301)), Some(21301));
+        assert_eq!(port(json!("6881-6999")), Some(6881));
+        assert_eq!(port(json!("6881,6890")), Some(6881));
+        assert_eq!(port(json!("0")), None);
+        assert_eq!(port(json!("junk")), None);
     }
 
     #[test]

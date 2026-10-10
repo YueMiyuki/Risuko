@@ -650,9 +650,6 @@ export default {
 				}
 			});
 		},
-		// WebKitGTK denies navigator.clipboard.readText() (NotAllowedError, no DOM paste
-		// access), so Linux also reads through the Rust plugin; its command runs on the
-		// async runtime, and the race in tryFillFromClipboard bounds an unanswered read
 		readClipboardText(): Promise<string> {
 			return readText();
 		},

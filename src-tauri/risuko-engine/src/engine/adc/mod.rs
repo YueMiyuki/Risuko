@@ -1,4 +1,3 @@
-//! ADC / Direct Connect (NMDC + ADC dialects)
 pub mod download;
 pub mod types;
 

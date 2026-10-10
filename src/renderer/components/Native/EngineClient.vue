@@ -18,7 +18,7 @@ import api from "@/api";
 import is from "@/shims/platform";
 import { useAppStore } from "@/store/app";
 import { usePreferenceStore } from "@/store/preference";
-import { useTaskStore } from "@/store/task";
+import { flushDownloadStatsMinute, useTaskStore } from "@/store/task";
 import {
 	findHttpSourceUrl,
 	getErrorCodeReferenceUrl,
@@ -35,6 +35,52 @@ const RETRY_STRATEGY_EXPONENTIAL = "exponential";
 const AUTO_RETRY_MAX_DELAY_MS = 15 * 60 * 1000;
 const LOW_SPEED_RECOVERY_COOLDOWN_MS = 30 * 1000;
 const LOW_SPEED_RESTART_WAIT_MS = 500;
+const HIDDEN_POLL_INTERVAL = 5000;
+const EVENT_SESSION_SAVE_DELAY_MS = 250;
+const ACTIVE_POLL_KEYS = [
+	"gid",
+	"status",
+	"downloadSpeed",
+	"uploadSpeed",
+	"totalLength",
+	"completedLength",
+	"seeder",
+	"bittorrent",
+	"ed2kLink",
+	"kind",
+];
+
+let listRefreshInFlight = false;
+let listRefreshQueued = false;
+let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+const requestListRefresh = () => {
+	if (listRefreshInFlight) {
+		listRefreshQueued = true;
+		return;
+	}
+	listRefreshInFlight = true;
+	useTaskStore()
+		.fetchList()
+		.catch(() => {})
+		.finally(() => {
+			listRefreshInFlight = false;
+			if (listRefreshQueued) {
+				listRefreshQueued = false;
+				requestListRefresh();
+			}
+		});
+};
+
+const requestSessionSave = () => {
+	if (sessionSaveTimer !== null) {
+		return;
+	}
+	sessionSaveTimer = setTimeout(() => {
+		sessionSaveTimer = null;
+		useTaskStore().saveSession();
+	}, EVENT_SESSION_SAVE_DELAY_MS);
+};
 
 const normalizePositiveNumber = (
 	value: unknown,
@@ -521,10 +567,10 @@ export default {
 		},
 		onDownloadStart(payload: { gid: string }) {
 			const taskStore = useTaskStore();
-			taskStore.fetchList();
+			requestListRefresh();
 			useAppStore().resetInterval();
 			this.ensurePolling();
-			taskStore.saveSession();
+			requestSessionSave();
 			const { gid } = payload;
 			this.clearAutoRetryState(gid);
 			if (taskStore.currentTaskItem?.gid === gid) {
@@ -543,23 +589,6 @@ export default {
 				usePreferenceStore().recordHistoryDirectory(dir);
 				const taskName = getTaskName(task);
 				const message = this.$t("task.download-start-message", { taskName });
-				this.$msg.info(message);
-			});
-		},
-		onDownloadPause(payload: { gid: string }) {
-			const { gid } = payload;
-			this.clearAutoRetryState(gid);
-			const { seedingList } = this;
-			if (seedingList.includes(gid)) {
-				return;
-			}
-
-			this.fetchTaskItem({ gid }).then((task) => {
-				if (!task) {
-					return;
-				}
-				const taskName = getTaskName(task);
-				const message = this.$t("task.download-pause-message", { taskName });
 				this.$msg.info(message);
 			});
 		},
@@ -679,7 +708,7 @@ export default {
 		},
 		onDownloadComplete(payload: { gid: string }) {
 			const taskStore = useTaskStore();
-			taskStore.fetchList();
+			requestListRefresh();
 			this.ensurePolling();
 			const { gid } = payload;
 			this.clearAutoRetryState(gid);
@@ -694,7 +723,7 @@ export default {
 		},
 		onBtDownloadComplete(payload: { gid: string }) {
 			const taskStore = useTaskStore();
-			taskStore.fetchList();
+			requestListRefresh();
 			this.ensurePolling();
 			const { gid } = payload;
 			this.clearAutoRetryState(gid);
@@ -891,7 +920,13 @@ export default {
 				if (this.isDestroyed || this.timer === null) {
 					return;
 				}
-				this.timer = setTimeout(loop, this.interval);
+				clearTimeout(this.timer);
+				this.timer = setTimeout(
+					loop,
+					document.hidden
+						? Math.max(this.interval, HIDDEN_POLL_INTERVAL)
+						: this.interval,
+				);
 			};
 
 			this.timer = setTimeout(loop, this.interval);
@@ -979,57 +1014,33 @@ export default {
 			this.isPolling = true;
 
 			try {
+				const appStore = useAppStore();
+				const taskStore = useTaskStore();
+				let activeTasksForLowSpeedCheck: DownloadTask[] = [];
 				const jobs: Array<Promise<unknown>> = [
-					useAppStore().fetchGlobalStat(),
-					useAppStore().fetchProgress(),
-					useTaskStore().sampleActiveSpeeds(),
+					appStore.fetchGlobalStat(),
+					api
+						.fetchActiveTaskList({ keys: ACTIVE_POLL_KEYS })
+						.then((tasks) => {
+							activeTasksForLowSpeedCheck = tasks;
+							return Promise.all([
+								appStore.fetchProgress(tasks),
+								taskStore.sampleActiveSpeeds(tasks),
+							]);
+						})
+						.catch((err) => {
+							logger.warn(
+								"[Risuko] poll fetch active tasks failed:",
+								err?.message || err,
+							);
+						}),
 				];
-				let activeTasksForLowSpeedCheck: Pick<
-					DownloadTask,
-					| "gid"
-					| "status"
-					| "downloadSpeed"
-					| "totalLength"
-					| "completedLength"
-					| "seeder"
-					| "bittorrent"
-					| "ed2kLink"
-					| "kind"
-				>[] = [];
 
-				if (!document.hidden || this.taskDetailVisible) {
+				if (!document.hidden) {
 					jobs.push(useTaskStore().fetchList());
 				}
 
-				if (this.autoDetectLowSpeedTasks) {
-					jobs.push(
-						api
-							.fetchActiveTaskList({
-								keys: [
-									"gid",
-									"status",
-									"downloadSpeed",
-									"totalLength",
-									"completedLength",
-									"seeder",
-									"bittorrent",
-									"ed2kLink",
-									"kind",
-								],
-							})
-							.then((tasks) => {
-								activeTasksForLowSpeedCheck = Array.isArray(tasks) ? tasks : [];
-							})
-							.catch((err) => {
-								logger.warn(
-									"[Risuko] low speed detection fetch active tasks failed:",
-									err?.message || err,
-								);
-							}),
-					);
-				}
-
-				if (this.taskDetailVisible && this.currentTaskGid) {
+				if (!document.hidden && this.taskDetailVisible && this.currentTaskGid) {
 					jobs.push(useTaskStore().fetchItem(this.currentTaskGid));
 				}
 
@@ -1042,15 +1053,23 @@ export default {
 			}
 
 			const stat = useAppStore().stat;
-			const derivedPaused = useTaskStore().taskList.filter(
-				(task) => task.status === "paused",
-			).length;
-			const nonPausedWaiting = (stat.numWaiting || 0) - derivedPaused;
-			if (stat.numActive === 0 && nonPausedWaiting === 0) {
+			const pending = (stat.numWaiting || 0) - (stat.numPaused || 0);
+			if (stat.numActive === 0 && pending <= 0) {
 				this.stopPolling();
+				flushDownloadStatsMinute();
 				if (this.shutdownWhenComplete) {
 					this.armShutdownCountdown();
 				}
+			}
+		},
+		onVisibilityChange() {
+			if (document.hidden) {
+				flushDownloadStatsMinute();
+				return;
+			}
+			if (this.timer !== null) {
+				this.startPolling();
+				this.polling().catch(() => {});
 			}
 		},
 		stopPolling() {
@@ -1112,6 +1131,7 @@ export default {
 		});
 	},
 	mounted() {
+		document.addEventListener("visibilitychange", this.onVisibilityChange);
 		this.initTimer = setTimeout(() => {
 			const appStore = useAppStore();
 			appStore.fetchEngineInfo();
@@ -1125,7 +1145,13 @@ export default {
 	},
 	beforeUnmount() {
 		this.isDestroyed = true;
+		document.removeEventListener("visibilitychange", this.onVisibilityChange);
+		if (sessionSaveTimer !== null) {
+			clearTimeout(sessionSaveTimer);
+			sessionSaveTimer = null;
+		}
 		useTaskStore().saveSession();
+		flushDownloadStatsMinute();
 		clearTimeout(this.initTimer);
 		this.initTimer = null;
 

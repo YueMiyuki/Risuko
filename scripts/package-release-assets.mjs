@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 import {
 	appendFileSync,
 	copyFileSync,
@@ -155,13 +154,6 @@ function copyLinuxPackage(bundleDir, outputDir, version, arch, extension, extraA
 	if (signature) extraAssets.push(signature);
 }
 
-/**
- * Copy intentional desktop bundles into canonical release filenames
- *
- * Tagged builds preserve the Tauri-produced updater payload and its detached
- * signature. Manual builds produce the same Actions artifacts as before but
- * do not need updater signatures or package-manager bundles
- */
 export function packageReleaseAssets(options = {}) {
 	const root = resolve(options.root ?? ROOT);
 	const platform = options.platform ?? process.env.MATRIX_PLATFORM;

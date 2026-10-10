@@ -240,12 +240,21 @@ export default {
 				return;
 			}
 			const taskStore = useTaskStore();
-			taskStore.fetchItemWithPeers(this.gid);
-			this.peersTimer = setInterval(() => {
-				if (this.gid) {
-					taskStore.fetchItemWithPeers(this.gid);
+			let inFlight = false;
+			const tick = async () => {
+				if (inFlight || document.hidden || !this.gid) {
+					return;
 				}
-			}, PEERS_POLL_INTERVAL);
+				inFlight = true;
+				try {
+					await taskStore.fetchItemWithPeers(this.gid);
+				} catch {
+				} finally {
+					inFlight = false;
+				}
+			};
+			tick();
+			this.peersTimer = setInterval(tick, PEERS_POLL_INTERVAL);
 		},
 		stopPeersPolling() {
 			if (this.peersTimer !== null) {

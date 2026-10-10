@@ -1,11 +1,13 @@
 use std::net::SocketAddrV4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 
 use super::protocol::*;
 use super::types::*;
 
-/// Events emitted by the server connection
+const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub enum ServerEvent {
     Connected {
         client_id: u32,
@@ -23,7 +25,6 @@ pub enum ServerEvent {
     Disconnected(Option<String>),
 }
 
-/// A TCP connection to an ed2k server
 pub struct ServerConnection {
     addr: SocketAddrV4,
     client_hash: [u8; 16],
@@ -33,7 +34,6 @@ pub struct ServerConnection {
     proxy: risuko_http::ProxyConnector,
 }
 
-/// Errors from processing a single server packet
 enum ServerPacketError {
     Parse(String),
     ChannelClosed,
@@ -44,21 +44,6 @@ impl ServerConnection {
         let msg = format!("opcode 0x{opcode:02x}: {err}");
         tracing::warn!("[ed2k] Server packet parse error: {}", msg);
         ServerPacketError::Parse(msg)
-    }
-
-    pub fn new(
-        addr: SocketAddrV4,
-        client_hash: [u8; 16],
-        client_port: u16,
-        kad_udp_port: Option<u16>,
-    ) -> Self {
-        Self::new_with_proxy(
-            addr,
-            client_hash,
-            client_port,
-            kad_udp_port,
-            risuko_http::ProxyConnector::direct(),
-        )
     }
 
     pub fn new_with_proxy(
@@ -78,26 +63,26 @@ impl ServerConnection {
         }
     }
 
-    /// Connect and run the server loop, returning an event receiver and a sender to queue outgoing packets
     pub async fn connect(
         &mut self,
     ) -> Result<(mpsc::Receiver<ServerEvent>, mpsc::Sender<Ed2kPacket>), String> {
-        let stream = self
-            .proxy
-            .connect_tcp(&self.addr.ip().to_string(), self.addr.port())
-            .await
-            .map_err(|e| format!("Failed to connect to {}: {}", self.addr, e))?;
+        let stream = timeout(
+            SERVER_CONNECT_TIMEOUT,
+            self.proxy
+                .connect_tcp(&self.addr.ip().to_string(), self.addr.port()),
+        )
+        .await
+        .map_err(|_| format!("Timed out connecting to {}", self.addr))?
+        .map_err(|e| format!("Failed to connect to {}: {}", self.addr, e))?;
 
         let (read_half, mut write_half) = tokio::io::split(stream);
 
-        // Send hello
         let hello = build_hello_server(&self.client_hash, self.client_port, self.kad_udp_port);
         write_half
             .write_all(&hello.encode())
             .await
             .map_err(|e| format!("Failed to send hello: {}", e))?;
 
-        // Offer empty file list
         let offer = build_offer_files_empty();
         write_half
             .write_all(&offer.encode())
@@ -108,7 +93,6 @@ impl ServerConnection {
         let (packet_tx, mut packet_rx) = mpsc::channel::<Ed2kPacket>(32);
         self.tx = Some(packet_tx.clone());
 
-        // Writer task
         tokio::spawn(async move {
             while let Some(packet) = packet_rx.recv().await {
                 if write_half.write_all(&packet.encode()).await.is_err() {
@@ -117,7 +101,6 @@ impl ServerConnection {
             }
         });
 
-        // Reader task
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let mut reader = read_half;
@@ -128,20 +111,28 @@ impl ServerConnection {
                         let _ = event_tx_clone.send(ServerEvent::Disconnected(None)).await;
                         break;
                     }
-                    Ok(_) => {
-                        while let Ok(Some(packet)) = Ed2kPacket::decode(&mut buf) {
-                            match Self::handle_server_packet(&event_tx_clone, &packet).await {
-                                Ok(()) => {}
-                                Err(ServerPacketError::Parse(message)) => {
-                                    tracing::debug!(
-                                        "[ed2k] Ignoring malformed server packet: {}",
-                                        message
-                                    );
-                                }
-                                Err(ServerPacketError::ChannelClosed) => break 'outer,
+                    Ok(_) => loop {
+                        let packet = match Ed2kPacket::decode(&mut buf) {
+                            Ok(Some(packet)) => packet,
+                            Ok(None) => break,
+                            Err(e) => {
+                                let _ = event_tx_clone
+                                    .send(ServerEvent::Disconnected(Some(e.to_string())))
+                                    .await;
+                                break 'outer;
                             }
+                        };
+                        match Self::handle_server_packet(&event_tx_clone, &packet).await {
+                            Ok(()) => {}
+                            Err(ServerPacketError::Parse(message)) => {
+                                tracing::debug!(
+                                    "[ed2k] Ignoring malformed server packet: {}",
+                                    message
+                                );
+                            }
+                            Err(ServerPacketError::ChannelClosed) => break 'outer,
                         }
-                    }
+                    },
                     Err(e) => {
                         let _ = event_tx_clone
                             .send(ServerEvent::Disconnected(Some(e.to_string())))
@@ -184,7 +175,7 @@ impl ServerConnection {
                 }
             }
             OP_SERVER_LIST => ServerEvent::ServerList,
-            _ => return Ok(()), // Ignore unknown opcodes
+            _ => return Ok(()),
         };
 
         tx.send(event)
@@ -192,7 +183,6 @@ impl ServerConnection {
             .map_err(|_| ServerPacketError::ChannelClosed)
     }
 
-    /// Send a GetSources request for a file
     pub async fn request_sources(&self, file_hash: &[u8; 16]) -> Result<(), String> {
         let tx = self.tx.as_ref().ok_or("Not connected")?;
         let packet = build_get_sources(file_hash);

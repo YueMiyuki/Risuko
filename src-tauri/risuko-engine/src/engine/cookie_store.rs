@@ -1,5 +1,3 @@
-//! Domain-keyed cookie / User-Agent store: persists imported browser credentials to one JSON file in the engine config dir, consumed by the HTTP downloader (auto-applies a saved entry when a task URL matches by host) and the IPC layer (surfaces entries in the "Saved domain credentials" pane with delete controls); thin by design (no encryption, no scheduled refresh) — entries leave on user delete, on the downloader re-detecting a Cloudflare challenge for a saved host (logic in `manager.rs`), or when the store exceeds `MAX_ENTRIES` and the oldest by `last_validated_at` is evicted
-
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,6 +7,7 @@ use crate::engine::util::now_secs;
 
 const STORE_FILE: &str = "browser_cookies.json";
 const MAX_ENTRIES: usize = 200;
+const TOUCH_MIN_INTERVAL_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct StoredCookie {
@@ -47,7 +46,6 @@ impl CookieStore {
         let state = match load_from_disk(&path) {
             Ok(s) => s,
             Err(err) => {
-                // A corrupt/unreadable file would be silently overwritten by the next write if treated as empty; rename it with a timestamped `.corrupt-N` suffix so the user can recover it manually, then start with an empty in-memory store
                 tracing::warn!(
                     "cookie store load failed for {}: {err}. Backing up to .corrupt and starting empty",
                     path.display()
@@ -60,7 +58,6 @@ impl CookieStore {
                             path.display(),
                             backup.display()
                         );
-                        // Last-resort safety: if we can't move the file aside, don't risk clobbering it — return a store whose path points elsewhere so writes can't destroy the original
                         return Self {
                             path: backup,
                             state: RwLock::new(StoreFile::default()),
@@ -77,14 +74,12 @@ impl CookieStore {
         }
     }
 
-    /// Find an entry whose host matches `target_url`; tries an exact match first, then a suffix match so `example.com` covers `dl.example.com`
     pub fn find_for_url(&self, target_url: &str) -> Option<CookieEntry> {
         let host = host_of(target_url)?;
         let s = self.state.read();
         if let Some(entry) = s.entries.get(&host) {
             return Some(entry.clone());
         }
-        // Suffix match for subdomains
         let mut best: Option<&CookieEntry> = None;
         for entry in s.entries.values() {
             if host_matches(&host, &entry.host) {
@@ -97,7 +92,6 @@ impl CookieStore {
         best.cloned()
     }
 
-    /// Insert or replace by host. Bumps `last_validated_at` and persists
     pub fn upsert(&self, mut entry: CookieEntry) -> Result<(), String> {
         let now = now_secs();
         if entry.imported_at == 0 {
@@ -105,7 +99,6 @@ impl CookieStore {
         }
         entry.last_validated_at = now;
 
-        // Lowercase host keys so exact lookup, remove, and touch share one form, keeping `entry.host` aligned with the map key so a listed entry's `host` round-trips back to the same slot on remove/touch
         let key = entry.host.to_ascii_lowercase();
         entry.host = key.clone();
         let mut s = self.state.write();
@@ -126,13 +119,15 @@ impl CookieStore {
         write_to_disk(&self.path, &s)
     }
 
-    /// Bump `last_validated_at` for an entry that's still working; called from the HTTP downloader after a successful task start
     pub fn touch(&self, host: &str) {
         let host = host.to_ascii_lowercase();
         let mut s = self.state.write();
         if let Some(entry) = s.entries.get_mut(&host) {
-            entry.last_validated_at = now_secs();
-            // Best-effort persist; a write failure isn't fatal
+            let now = now_secs();
+            if now.saturating_sub(entry.last_validated_at) < TOUCH_MIN_INTERVAL_SECS {
+                return;
+            }
+            entry.last_validated_at = now;
             let _ = write_to_disk(&self.path, &s);
         }
     }
@@ -162,7 +157,6 @@ impl CookieStore {
 }
 
 fn host_of(target_url: &str) -> Option<String> {
-    // Use ASCII-only lowercasing to match the key normalization in `upsert` (`to_ascii_lowercase`); Unicode `to_lowercase` can fold characters differently, making exact-match lookups miss an entry whose key was stored ASCII-lowercased
     if let Ok(url) = url::Url::parse(target_url) {
         return url.host_str().map(|s| s.to_ascii_lowercase());
     }
@@ -183,7 +177,6 @@ fn host_matches(request_host: &str, entry_host: &str) -> bool {
     if r == e {
         return true;
     }
-    // entry_host as suffix, with dot boundary
     r.ends_with(&format!(".{e}"))
 }
 
@@ -197,16 +190,10 @@ fn load_from_disk(path: &Path) -> Result<StoreFile, String> {
 }
 
 fn write_to_disk(path: &Path, state: &StoreFile) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create cookie store dir failed: {e}"))?;
-    }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| format!("serialize cookie store failed: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("write cookie store failed: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename cookie store failed: {e}"))?;
-    Ok(())
+    crate::traits::write_file_atomically(path, json.as_bytes())
+        .map_err(|e| format!("write cookie store failed: {e}"))
 }
 
 pub fn eligible_cookies(cookies: &[StoredCookie]) -> Vec<&StoredCookie> {
@@ -226,7 +213,6 @@ pub fn cookies_to_header(cookies: &[StoredCookie]) -> String {
         .join("; ")
 }
 
-/// A cookie name/value is safe to serialize into a `Cookie:` header only if it carries no control characters (including CR/LF used for header injection) and no `;` separator that would split it into extra pairs
 fn is_safe_cookie_field(s: &str) -> bool {
     !s.chars().any(|c| c.is_control() || c == ';')
 }
@@ -280,7 +266,6 @@ mod tests {
         let store = CookieStore::new(dir.path());
         store.upsert(dummy_entry("example.com")).unwrap();
         assert!(store.find_for_url("https://attacker.com/foo").is_none());
-        // suffix-but-not-dot-bounded
         assert!(store.find_for_url("https://notexample.com/foo").is_none());
     }
 
@@ -309,14 +294,11 @@ mod tests {
     fn lru_eviction() {
         let dir = TempDir::new().unwrap();
         let store = CookieStore::new(dir.path());
-        // Fill to MAX with synthetic timestamps so eviction is deterministic
         for i in 0..(MAX_ENTRIES + 5) {
             let mut e = dummy_entry(&format!("h{i}.example.com"));
             e.last_validated_at = i as u64;
             e.imported_at = i as u64;
-            // Bypass touch() in upsert by constructing low timestamp first
             store.upsert(e).unwrap();
-            // Manually backdate to make ordering meaningful
             store.state.write().entries.values_mut().for_each(|e| {
                 if e.host == format!("h{i}.example.com") {
                     e.last_validated_at = i as u64;
@@ -325,7 +307,6 @@ mod tests {
         }
         let listed = store.list();
         assert!(listed.len() <= MAX_ENTRIES);
-        // The oldest (h0..h4) should be evicted. h0 specifically should not exist
         assert!(store.find_for_url("https://h0.example.com").is_none());
     }
 
@@ -350,19 +331,16 @@ mod tests {
     fn cookies_to_header_drops_injection_and_expired() {
         let now = now_secs();
         let cs = vec![
-            // CRLF + a smuggled header in the value must be dropped entirely
             StoredCookie {
                 name: "evil".into(),
                 value: "x\r\nX-Injected: 1".into(),
                 ..Default::default()
             },
-            // A stray `;` would forge a second cookie pair; drop it too
             StoredCookie {
                 name: "split".into(),
                 value: "a; admin=1".into(),
                 ..Default::default()
             },
-            // Already-expired cookies must not be sent
             StoredCookie {
                 name: "stale".into(),
                 value: "1".into(),
@@ -390,10 +368,8 @@ mod tests {
     fn corrupted_store_is_backed_up_not_overwritten() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(STORE_FILE);
-        // Plant garbage so serde_json::from_str returns an error
         std::fs::write(&path, b"{not valid json").unwrap();
 
-        // Loading must NOT silently default: the corrupt file should be moved aside and a sibling .corrupt-* file should now exist
         let store = CookieStore::new(dir.path());
         assert!(store.list().is_empty());
         assert!(
@@ -412,9 +388,41 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1, "expected exactly one .corrupt-* backup");
 
-        // A subsequent upsert should write a fresh, valid file at the canonical path without touching the backup
         store.upsert(dummy_entry("example.com")).unwrap();
         assert!(path.exists());
         assert!(backups[0].path().exists());
+    }
+
+    #[test]
+    fn touch_only_restamps_stale_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = CookieStore::new(dir.path());
+        store.upsert(dummy_entry("example.com")).unwrap();
+        let stamp =
+            |store: &CookieStore| store.state.read().entries["example.com"].last_validated_at;
+        let fresh = stamp(&store);
+        store
+            .state
+            .write()
+            .entries
+            .get_mut("example.com")
+            .unwrap()
+            .last_validated_at = fresh - 10;
+        store.touch("example.com");
+        assert_eq!(
+            stamp(&store),
+            fresh - 10,
+            "fresh stamp must not be rewritten"
+        );
+
+        store
+            .state
+            .write()
+            .entries
+            .get_mut("example.com")
+            .unwrap()
+            .last_validated_at = fresh - 2 * TOUCH_MIN_INTERVAL_SECS;
+        store.touch("example.com");
+        assert!(stamp(&store) >= fresh);
     }
 }

@@ -1,10 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
   workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: write
@@ -14,48 +14,88 @@ env:
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  create-release:
-    name: Prepare GitHub release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+  meta:
+    name: Resolve version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      desktop_matrix: ${{ steps.targets.outputs.desktop_matrix }}
+      android_targets: ${{ steps.targets.outputs.android_targets }}
+      android_rust_targets: ${{ steps.targets.outputs.android_rust_targets }}
+      android_abis: ${{ steps.targets.outputs.android_abis }}
     steps:
-      - name: Create tagged release once
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve version
+        id: version
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists."
-            exit 0
+          if [[ "$GITHUB_EVENT_NAME" == "release" ]]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="v$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
           fi
-
-          args=(
-            release create "$TAG"
-            --repo "$GITHUB_REPOSITORY"
-            --verify-tag
-            --title "Risuko $TAG"
-            --notes "See the assets for this release."
-          )
-          if [[ "$TAG" == *-* ]]; then
-            args+=(--prerelease)
-          fi
-          if ! gh "${args[@]}"; then
-            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "Release $TAG was created concurrently."
-              exit 0
-            fi
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$tag' is not of the form vX.Y.Z or vX.Y.Z-pre"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (tag $tag)"
+          printf '{"tag":"%s","version":"%s"}\n' "$tag" "$version" > release-meta.json
+
+      - name: Select build targets
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          all='[
+            {"platform":"darwin/x64","os":"macos-latest","target":"x86_64-apple-darwin","tauri_args":"--config src-tauri/tauri.darwin.x64.conf.json"},
+            {"platform":"darwin/arm64","os":"macos-latest","target":"aarch64-apple-darwin","tauri_args":"--config src-tauri/tauri.darwin.arm64.conf.json"},
+            {"platform":"linux/x64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","tauri_args":"--config src-tauri/tauri.linux.x64.conf.json"},
+            {"platform":"linux/arm64","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","tauri_args":"--config src-tauri/tauri.linux.arm64.conf.json"},
+            {"platform":"win32/x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","tauri_args":"--config src-tauri/tauri.win32.x64.conf.json"},
+            {"platform":"win32/ia32","os":"windows-latest","target":"i686-pc-windows-msvc","tauri_args":"--config src-tauri/tauri.win32.ia32.conf.json"}
+          ]'
+          if [[ "$GITHUB_EVENT_NAME" == "release" ]]; then
+            platforms='["darwin/x64","darwin/arm64","linux/x64","linux/arm64","win32/x64","win32/ia32"]'
+            android_targets=""
+            android_rust_targets="aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android"
+            android_abis="arm arm64 x86 x86_64"
+          else
+            platforms='["darwin/x64","win32/x64"]'
+            android_targets="--target aarch64"
+            android_rust_targets="aarch64-linux-android"
+            android_abis="arm64"
+          fi
+          matrix=$(jq -c --argjson p "$platforms" '{include: [.[] | select(.platform as $x | $p | index($x))]}' <<< "$all")
+          echo "desktop_matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "android_targets=$android_targets" >> "$GITHUB_OUTPUT"
+          echo "android_rust_targets=$android_rust_targets" >> "$GITHUB_OUTPUT"
+          echo "android_abis=$android_abis" >> "$GITHUB_OUTPUT"
+          echo "Desktop: $(jq -r '[.include[].platform] | join(", ")' <<< "$matrix"); Android: $android_abis"
+
+      - name: Upload release metadata
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-meta
+          path: release-meta.json
 
   android-release:
     name: Release (android)
-    needs: create-release
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
+    needs: meta
     runs-on: ubuntu-22.04
     steps:
       - name: Check out Git repository
@@ -74,6 +114,9 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Stamp release version
+        run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -85,6 +128,8 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android SDK packages
         shell: bash
@@ -98,7 +143,7 @@ jobs:
       - name: Setup Rust Android targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: ${{ needs.meta.outputs.android_rust_targets }}
 
       - name: Cache Rust (cargo registry + build artifacts)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
@@ -110,12 +155,16 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Android release APKs
-        run: pnpm android:build
+        shell: bash
+        run: pnpm android:build $ANDROID_TARGETS
         env:
+          ANDROID_TARGETS: ${{ needs.meta.outputs.android_targets }}
           ANDROID_NDK_VERSION: 27.2.12479018
           ANDROID_API_LEVEL: 24
+          RISUKO_ANDROID_APPLICATION_ID: ${{ github.event_name == 'pull_request' && 'app.risuko.preview.mobile' || '' }}
 
       - name: Sign Android release APKs
+        if: github.event_name != 'pull_request'
         run: pnpm android:sign
         env:
           ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
@@ -123,15 +172,34 @@ jobs:
           ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
 
+      - name: Sign Android preview APKs with the debug key
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$ANDROID_SIGNING_KEYSTORE_BASE64" ]]; then
+            unset ANDROID_SIGNING_KEYSTORE_BASE64
+            export ANDROID_SIGNING_KEYSTORE_PATH="$RUNNER_TEMP/debug.keystore"
+            keytool -genkeypair -noprompt \
+              -keystore "$ANDROID_SIGNING_KEYSTORE_PATH" -storetype PKCS12 \
+              -storepass "$ANDROID_SIGNING_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_SIGNING_KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          pnpm android:sign
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_KEYSTORE_PASSWORD: android
+          ANDROID_SIGNING_KEY_ALIAS: androiddebugkey
+
       - name: Package Android APKs with standardized names
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            version="${{ github.ref_name }}"; version="${version#v}"
-          else
-            version=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          fi
+          version="${{ needs.meta.outputs.version }}"
+          abis="${{ needs.meta.outputs.android_abis }}"
+          suffix="${{ github.event_name == 'pull_request' && '-preview' || '' }}"
           mkdir -p dist/android
           declare -A labels=(
             [arm]=arm
@@ -139,29 +207,29 @@ jobs:
             [x86]=x86
             [x86_64]=x64
           )
-          for abi in arm arm64 x86 x86_64; do
+          for abi in $abis; do
             src="src-tauri/gen/android/app/build/outputs/apk/${abi}/release/app-${abi}-release.apk"
             if [[ ! -f "$src" ]]; then
               echo "::error::Signed Android APK not found: $src"
               find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print || true
               exit 1
             fi
-            dest="dist/android/Risuko_${version}_android_${labels[$abi]}.apk"
+            dest="dist/android/Risuko_${version}_android_${labels[$abi]}${suffix}.apk"
             cp "$src" "$dest"
             echo "packaged: $dest"
           done
 
       - name: Upload Android APKs to GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           files: dist/android/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Android APK artifacts (manual builds)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-android
@@ -169,37 +237,11 @@ jobs:
 
   release:
     name: Release (${{ matrix.platform }})
-    needs: create-release
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
+    needs: meta
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: darwin/x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            tauri_args: --config src-tauri/tauri.darwin.x64.conf.json
-          - platform: darwin/arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            tauri_args: --config src-tauri/tauri.darwin.arm64.conf.json
-          - platform: linux/x64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            tauri_args: --config src-tauri/tauri.linux.x64.conf.json
-          - platform: linux/arm64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            tauri_args: --config src-tauri/tauri.linux.arm64.conf.json
-          - platform: win32/x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            tauri_args: --config src-tauri/tauri.win32.x64.conf.json
-          - platform: win32/ia32
-            os: windows-latest
-            target: i686-pc-windows-msvc
-            tauri_args: --config src-tauri/tauri.win32.ia32.conf.json
+      matrix: ${{ fromJSON(needs.meta.outputs.desktop_matrix) }}
 
     steps:
       - name: Check out Git repository
@@ -217,6 +259,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+
+      - name: Stamp release version
+        run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -249,8 +294,6 @@ jobs:
             patchelf \
             xdg-utils \
             file
-          # linuxdeploy-plugin-gtk does `ln -s` without -f; flattened
-          # im-*.so names then abort with "File exists".
           mkdir -p "$HOME/.cache/tauri"
           plugin="$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
           source_plugin="$HOME/.cache/tauri/linuxdeploy-plugin-gtk.upstream.sh"
@@ -273,14 +316,14 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Inject updater public key from secrets
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         run: |
           node -e "const fs=require('node:fs');const p='src-tauri/tauri.conf.json';const key=(process.env.TAURI_UPDATER_PUBKEY||'').trim();if(!key){console.error('TAURI_UPDATER_PUBKEY secret is required for tagged releases');process.exit(1);}const c=JSON.parse(fs.readFileSync(p,'utf8'));c.plugins??={};c.plugins.updater??={};c.plugins.updater.pubkey=key;c.bundle??={};c.bundle.createUpdaterArtifacts=true;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n');console.log('Enabled updater artifacts + injected pubkey into tauri.conf.json for this workflow run.');"
         env:
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
 
       - name: Build release artifacts (tag)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         with:
           args: --target ${{ matrix.target }} ${{ matrix.tauri_args }}
@@ -293,7 +336,7 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.apple_app_specific_password }}
 
       - name: Build release artifacts (manual)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         run: pnpm tauri build --target ${{ matrix.target }} ${{ matrix.tauri_args }}
 
       - name: Verify local bundle output exists
@@ -308,8 +351,6 @@ jobs:
           fi
           find "$bundle_dir" -maxdepth 3 -type f | sed 's/^/built: /'
 
-      # The helper is the sole owner of canonical filenames. It copies Tauri's
-      # exact signed updater payloads and keeps additional installer formats.
       - name: Package canonical desktop assets
         shell: bash
         env:
@@ -317,7 +358,7 @@ jobs:
           MATRIX_TARGET: ${{ matrix.target }}
           GITHUB_REF: ${{ github.ref }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
-          RELEASE_TAGGED: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          RELEASE_TAGGED: ${{ github.event_name == 'release' }}
         run: node scripts/package-release-assets.mjs
 
       - name: Write app bundle SHA-256 sidecar
@@ -327,16 +368,14 @@ jobs:
           node scripts/write-sha256-sidecar.mjs "$APP_ASSET"
 
       - name: Write plain Linux AppImage SHA-256 sidecar
-        if: runner.os == 'Linux' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && env.PLAIN_APPIMAGE_ASSET != ''
+        if: runner.os == 'Linux' && github.event_name == 'release' && env.PLAIN_APPIMAGE_ASSET != ''
         shell: bash
         run: |
           set -euo pipefail
           node scripts/write-sha256-sidecar.mjs "$PLAIN_APPIMAGE_ASSET"
 
-      # Record this platform's updater entry (key + asset + signature) for the
-      # aggregation job that assembles latest.json across all matrix jobs.
       - name: Emit updater manifest fragment
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         shell: bash
         env:
           MATRIX_TARGET: ${{ matrix.target }}
@@ -345,7 +384,7 @@ jobs:
         run: |
           set -euo pipefail
           triple="$MATRIX_TARGET"
-          arch="${triple%%-*}"   # x86_64 | aarch64 | i686
+          arch="${triple%%-*}"
           case "$triple" in
             *apple-darwin) tos=darwin ;;
             *windows*)     tos=windows ;;
@@ -359,17 +398,17 @@ jobs:
           echo "fragment: fragments/${key}.json -> $APP_ASSET"
 
       - name: Upload updater fragment
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: updater-fragment-${{ matrix.target }}
           path: fragments/*.json
 
       - name: Upload standardized app bundle to GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           files: |
             ${{ env.APP_ASSET }}
             ${{ env.APP_ASSET }}.sha256
@@ -379,7 +418,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload standardized app bundle artifact (manual builds)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-${{ env.APP_PLATFORM_LABEL }}
@@ -395,10 +434,10 @@ jobs:
           node scripts/write-sha256-sidecar.mjs "$PORTABLE_ASSET"
 
       - name: Upload Windows portable exe to GitHub Release
-        if: runner.os == 'Windows' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: runner.os == 'Windows' && github.event_name == 'release'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           files: |
             ${{ env.PORTABLE_ASSET }}
             ${{ env.PORTABLE_ASSET }}.sha256
@@ -406,7 +445,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Windows portable exe artifact (manual builds)
-        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch'
+        if: runner.os == 'Windows' && github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: app-portable-${{ env.APP_PLATFORM_LABEL }}
@@ -414,7 +453,6 @@ jobs:
             ${{ env.PORTABLE_ASSET }}
             ${{ env.PORTABLE_ASSET }}.sha256
 
-      # ── Build standalone risuko-cli binary ──
       - name: Build risuko-cli binary
         if: matrix.target != 'i686-pc-windows-msvc'
         working-directory: src-tauri
@@ -427,7 +465,6 @@ jobs:
           set -euo pipefail
           bin="src-tauri/target/${{ matrix.target }}/release/risuko"
           chmod +x "$bin"
-          # Derive a short platform label: darwin-arm64, linux-x64, etc.
           case "${{ matrix.platform }}" in
             darwin/arm64) label="darwin-arm64" ;;
             darwin/x64)   label="darwin-x64" ;;
@@ -449,16 +486,16 @@ jobs:
           echo "CLI_ASSET=risuko-cli-${label}.zip" >> $env:GITHUB_ENV
 
       - name: Upload risuko-cli to GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && matrix.target != 'i686-pc-windows-msvc'
+        if: github.event_name == 'release' && matrix.target != 'i686-pc-windows-msvc'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.meta.outputs.tag }}
           files: ${{ env.CLI_ASSET }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload risuko-cli artifact (manual builds)
-        if: github.event_name == 'workflow_dispatch' && matrix.target != 'i686-pc-windows-msvc'
+        if: github.event_name != 'release' && matrix.target != 'i686-pc-windows-msvc'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: risuko-cli-${{ matrix.target }}
@@ -489,8 +526,8 @@ jobs:
 
   updater-manifest:
     name: Build updater latest.json
-    needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [meta, release]
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Check out Git repository
@@ -514,11 +551,76 @@ jobs:
         shell: bash
         run: node scripts/build-updater-manifest.mjs fragments latest.json
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.meta.outputs.version }}
           REPO: ${{ github.repository }}
 
       - name: Upload latest.json to GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" latest.json --clobber --repo "${{ github.repository }}"
+        run: gh release upload "${{ needs.meta.outputs.tag }}" latest.json --clobber --repo "${{ github.repository }}"
+
+  homebrew:
+    name: Bump Homebrew tap
+    needs: [meta, release, updater-manifest]
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    uses: ./.github/workflows/bump-homebrew-tap.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  sync-version:
+    name: Commit version bump
+    needs: [meta, release, android-release, updater-manifest]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Resolve release branch
+        id: branch
+        shell: bash
+        env:
+          TARGET: ${{ github.event.release.target_commitish }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/branches/$TARGET" >/dev/null 2>&1; then
+            echo "name=$TARGET" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Release target '$TARGET' is not a branch; skipping the version bump commit"
+          fi
+
+      - name: Check out release branch
+        if: steps.branch.outputs.name != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+
+      - name: Commit and push the version bump
+        if: steps.branch.outputs.name != ''
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/set-version.mjs "$VERSION"
+          if git diff --quiet; then
+            echo "Manifests already at $VERSION"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v$VERSION"
+          if git push origin "HEAD:$BRANCH"; then
+            exit 0
+          fi
+          pr_branch="release/v$VERSION"
+          git push --force origin "HEAD:refs/heads/$pr_branch"
+          gh pr create --base "$BRANCH" --head "$pr_branch" \
+            --title "chore(release): v$VERSION" \
+            --body "Version bump for the v$VERSION release, opened because the direct push to $BRANCH was rejected."

@@ -1,32 +1,26 @@
-//! `UploadSink` trait - protocol-specific upload backend interface; each protocol (WebDAV, S3, SFTP, FTP) implements it once, the manager owns boxed instances, and adding a protocol means a new file under `engine/upload/<proto>.rs` wired in `manager::build_sink_runtime`
-
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// One-shot description of a file the manager wants the sink to deliver
 #[derive(Debug, Clone)]
 pub struct UploadFile {
-    /// Absolute path to the source file on disk
     pub local_path: PathBuf,
-    /// Path component to use under the sink's configured base — relative, uses `/` separators, never starts with `/`; the sink creates any necessary parent directories
     pub remote_relative: String,
-    /// Size in bytes
     pub size: u64,
 }
 
-/// Live progress reporter the sink writes to during upload
 #[derive(Debug, Clone)]
 pub struct UploadProgress {
     pub uploaded: u64,
     pub total: u64,
 }
 
-/// Cancellation + progress channel passed to the sink
 #[derive(Clone)]
 pub struct UploadControl {
     pub cancel: CancellationToken,
@@ -39,7 +33,57 @@ impl UploadControl {
     }
 }
 
-/// Per-sink protocol-specific configuration, stored verbatim in user config; discriminated by `kind` for serde compatibility with the TS-side type
+pub(super) const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Debug)]
+pub(super) struct Heartbeat {
+    start: Instant,
+    last_ms: AtomicU64,
+}
+
+impl Heartbeat {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        })
+    }
+
+    pub(super) fn touch(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.last_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let now = self.start.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+pub(super) async fn run_with_stall<F, T>(
+    fut: F,
+    hb: &Heartbeat,
+    stall: Duration,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::pin!(fut);
+    loop {
+        let idle = hb.idle();
+        if idle >= stall {
+            return Err(format!(
+                "upload stalled: no data moved for {}s",
+                stall.as_secs()
+            ));
+        }
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = tokio::time::sleep(stall - idle) => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SinkConfig {
@@ -52,42 +96,29 @@ pub enum SinkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WebdavConfig {
-    /// Base endpoint URL — e.g. `https://example.com/remote.php/dav/files/me`
     pub endpoint: String,
-    /// Optional sub-folder under the endpoint
     #[serde(default)]
     pub base_path: String,
-    /// Optional basic-auth username
     #[serde(default)]
     pub username: String,
-    /// Optional basic-auth password; not persisted to disk — the frontend must re-supply on engine restart
     #[serde(default, skip_serializing)]
     pub password: String,
-    /// Skip TLS verification (self-signed homelab servers)
     #[serde(default)]
     pub insecure: bool,
 }
 
-/// S3-compatible object storage; works with AWS S3, MinIO, Backblaze B2 (S3 API), Cloudflare R2, Wasabi, Garage, etc., using SigV4 single-PUT
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Config {
-    /// Endpoint URL — e.g. `https://s3.amazonaws.com` or `http://minio.local:9000`; trailing slash is tolerated
     pub endpoint: String,
-    /// Region — used for SigV4 signing scope
     #[serde(default)]
     pub region: String,
-    /// Bucket name
     pub bucket: String,
-    /// Access key ID
     pub access_key_id: String,
-    /// Secret access key; not persisted to disk — the frontend must re-supply on engine restart
     #[serde(default, skip_serializing)]
     pub secret_access_key: String,
-    /// Optional key prefix prepended to every object key
     #[serde(default)]
     pub prefix: String,
-    /// Use bucket-in-path URLs (`/{bucket}/{key}`) instead of virtual-host style (`{bucket}.host/{key}`); required for MinIO and most self-hosted
     #[serde(default)]
     pub force_path_style: bool,
 }
@@ -99,13 +130,10 @@ pub struct SftpConfig {
     #[serde(default = "default_sftp_port")]
     pub port: u16,
     pub username: String,
-    /// Password auth, used if non-empty (otherwise tries the private key); not persisted to disk — the frontend must re-supply on engine restart
     #[serde(default, skip_serializing)]
     pub password: String,
-    /// PEM-encoded OpenSSH or PKCS#1 private key. Not persisted to disk
     #[serde(default, skip_serializing)]
     pub private_key: String,
-    /// Remote base directory (defaults to login home if empty)
     #[serde(default)]
     pub base_path: String,
 }
@@ -122,16 +150,12 @@ pub struct FtpConfig {
     pub port: u16,
     #[serde(default)]
     pub username: String,
-    /// Not persisted to disk — the frontend must re-supply on engine restart
     #[serde(default, skip_serializing)]
     pub password: String,
-    /// Remote base directory (created on demand)
     #[serde(default)]
     pub base_path: String,
-    /// Use explicit FTPS (AUTH TLS) on the control channel
     #[serde(default)]
     pub secure: bool,
-    /// Skip TLS verification (self-signed homelab servers)
     #[serde(default)]
     pub insecure: bool,
 }
@@ -140,7 +164,6 @@ fn default_ftp_port() -> u16 {
     21
 }
 
-/// What the manager should do with the local file once the sink reports success
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
@@ -148,11 +171,9 @@ pub enum PostUploadAction {
     #[default]
     Keep,
     Trash,
-    /// Move into a configured directory (path resolved at action time)
     Move,
 }
 
-/// Persisted sink record — what the user added in Preferences; holds the runtime config plus identity / display metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadSinkRecord {
@@ -161,7 +182,6 @@ pub struct UploadSinkRecord {
     pub config: SinkConfig,
     #[serde(default)]
     pub post_action: PostUploadAction,
-    /// Optional move-target directory when post_action == Move
     #[serde(default)]
     pub move_target: Option<PathBuf>,
     pub created_at: u64,
@@ -169,17 +189,13 @@ pub struct UploadSinkRecord {
     pub last_used_at: Option<u64>,
 }
 
-/// Per-sink protocol implementation; implementations should be cheap to construct (configs are passed by value) — the manager builds an instance for the duration of a single job
 #[async_trait]
 pub trait UploadSink: Send + Sync {
-    /// Upload `file` to the sink's destination, reporting progress and honouring cancellation; returns the canonical remote URL on success (best-effort — empty string is acceptable when the sink can't construct one, e.g. SFTP without a public URL)
     async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String>;
 
-    /// Test connectivity / authentication. Should be a quick round-trip
     async fn test(&self) -> Result<(), String>;
 }
 
-/// Helper alias: a fresh boxed sink built from a `SinkConfig`
 pub type BoxedSink = Arc<dyn UploadSink>;
 
 #[cfg(test)]
@@ -192,12 +208,10 @@ mod tests {
             endpoint: "https://dav.example.com".into(),
             base_path: "uploads".into(),
             username: "u".into(),
-            // password is skip_serializing; use empty so round-trip equality holds
             password: String::new(),
             insecure: true,
         });
         let json = serde_json::to_string(&cfg).unwrap();
-        // Discriminant + camelCase fields
         assert!(json.contains("\"kind\":\"webdav\""));
         assert!(json.contains("\"basePath\":\"uploads\""));
         let back: SinkConfig = serde_json::from_str(&json).unwrap();
@@ -211,7 +225,6 @@ mod tests {
             region: "us-west-2".into(),
             bucket: "mybucket".into(),
             access_key_id: "AKIA".into(),
-            // secret_access_key is skip_serializing; use empty for round-trip equality
             secret_access_key: String::new(),
             prefix: "folder".into(),
             force_path_style: true,
@@ -226,7 +239,6 @@ mod tests {
 
     #[test]
     fn sftp_default_port_22() {
-        // Omit `port` from the JSON — should default to 22
         let json = r#"{"kind":"sftp","host":"h","username":"u"}"#;
         let cfg: SinkConfig = serde_json::from_str(json).unwrap();
         match cfg {
@@ -310,5 +322,28 @@ mod tests {
         let snap = rx.borrow().clone();
         assert_eq!(snap.uploaded, 50);
         assert_eq!(snap.total, 100);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_stall_fails_when_idle() {
+        let hb = Heartbeat::new();
+        let r: Result<(), String> =
+            run_with_stall(std::future::pending(), &hb, Duration::from_secs(10)).await;
+        assert!(r.unwrap_err().contains("stalled"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_stall_survives_while_progressing() {
+        let hb = Heartbeat::new();
+        let hb2 = hb.clone();
+        let work = async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                hb2.touch();
+            }
+            Ok::<_, String>(7)
+        };
+        let r = run_with_stall(work, &hb, Duration::from_secs(10)).await;
+        assert_eq!(r.unwrap(), 7);
     }
 }

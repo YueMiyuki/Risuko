@@ -1,5 +1,3 @@
-//! Per-connection µTP state machine and the [`UtpStream`] `AsyncRead`/`AsyncWrite` handle: each connection is driven by a single background task ([`drive`]) that owns the connection's slice of the shared UDP socket's traffic (fed by the socket router over an mpsc channel) and is the only thing that touches the wire for this connection; the [`UtpStream`] handle shares a [`Mutex<ConnState>`] with the driver (reads drain `recv_ready`, writes append to `send_buf`, a [`Notify`] nudges the driver) and the driver wakes the stream's stored wakers when data arrives or buffer space frees up. Reliability model: in-order byte delivery with a reorder buffer for out-of-order data, cumulative + selective acknowledgements, RFC-6298-style RTO retransmission (Karn's algorithm for RTT sampling), and LEDBAT-lite delay-based congestion control bounded by the peer's advertised window
-
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
@@ -13,7 +11,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use risuko_http::{Error as HttpError, ProxyDatagram};
+use risuko_http::{Error as HttpError, ProxyAssociation};
 
 use super::dontfrag::{is_message_too_big, UdpSender};
 use super::now_micros;
@@ -22,28 +20,18 @@ use super::socket::{
     remove_connection_registration, remove_proxy_connection_registration, ConnKey, ConnRegistry,
     ConnectionToken, ProxyConnRegistry,
 };
-/// Initial IPv4 payload per packet, before path-MTU discovery
 const MSS: usize = 1200;
-/// uTP header plus the largest SACK extension we send
 const UTP_OVERHEAD: usize = HEADER_LEN + 2 + MAX_SACK_BYTES;
-/// UDP payload guaranteed by the IPv6 minimum MTU (1280)
 const MIN_DATAGRAM_V6: usize = 1232;
-/// UDP payload guaranteed by the IPv4 minimum MTU (576)
 const MIN_DATAGRAM_V4: usize = 548;
-/// Path-MTU search ceilings for a 1500-byte link
 const MAX_DATAGRAM_V4: usize = 1472;
 const MAX_DATAGRAM_V6: usize = 1452;
-/// Stop probing once floor and ceiling are this close
 const MTU_SEARCH_GRANULARITY: usize = 16;
-/// Raise the ceiling again this often in case the path improved
 const MTU_REPROBE_INTERVAL: Duration = Duration::from_secs(600);
 const RECV_BUF_MAX: usize = 1024 * 1024;
 const SEND_BUF_MAX: usize = 512 * 1024;
-/// BEP 29 CCONTROL_TARGET: queuing delay uTP accepts on the uplink
 const TARGET_MICROS: f64 = 100_000.0;
-/// BEP 29 MAX_CWND_INCREASE_PACKETS_PER_RTT, expressed in bytes as libutp does
 const MAX_CWND_INCREASE_BYTES_PER_RTT: f64 = 3000.0;
-/// BEP 29 smallest packet size: the window a timeout collapses to
 const MIN_WINDOW: usize = 150;
 const MAX_CWND: usize = 2 * 1024 * 1024;
 const INITIAL_CWND: usize = 3 * MSS;
@@ -54,34 +42,29 @@ const MAX_RETRANSMITS: u32 = 8;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_SEND_RETRIES: u32 = 8;
 const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
-/// Packets handled per wakeup before acking
 const ACK_BATCH: usize = 64;
-/// Duplicate acks (or packets SACKed past a hole) that declare a packet lost
 const DUP_ACK_THRESHOLD: usize = 3;
-/// SACK bitmask cap in bytes (256 packets past the cumulative ack)
 const MAX_SACK_BYTES: usize = 32;
-/// Packets further than this past `ack_nr` are dropped rather than buffered
 const MAX_REORDER_DISTANCE: u16 = 2048;
-/// Base delay is the minimum over the last two minutes (BEP 29), tracked in one-minute buckets that count the active one (RFC 6817 BASE_HISTORY, libutp DELAY_BASE_HISTORY)
 const BASE_DELAY_BUCKET: Duration = Duration::from_secs(60);
 const BASE_DELAY_BUCKETS: usize = 2;
-/// Current delay is the minimum of the last few samples (libutp CUR_DELAY_SIZE)
 const CUR_DELAY_SAMPLES: usize = 3;
-/// Wait before forcing one packet through a zero receive window
 const MIN_ZERO_WINDOW_PROBE: Duration = Duration::from_secs(1);
+const MIN_BURST_PACKETS: usize = 16;
+const MIN_PACE_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_PACE_INTERVAL: Duration = Duration::from_millis(100);
+const MAXED_OUT_WINDOW_MEMORY: Duration = Duration::from_secs(1);
+pub(crate) const INCOMING_QUEUE_PACKETS: usize = 1024;
 
-/// `a` is strictly after `b` in 16-bit sequence space (within half the ring)
 fn seq_after(a: u16, b: u16) -> bool {
     let d = a.wrapping_sub(b);
     d != 0 && d < 0x8000
 }
 
-/// `a < b` for 32-bit microsecond timestamps that wrap every ~71 minutes
 fn wrapping_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 
-/// Datagram size used before path-MTU discovery proves anything larger
 fn initial_datagram(remote: SocketAddr) -> usize {
     if remote.is_ipv6() {
         MIN_DATAGRAM_V6
@@ -114,23 +97,18 @@ enum State {
     Closed,
 }
 
-/// A packet we've transmitted that is awaiting acknowledgement; stored un-encoded so retransmissions carry fresh timestamps / ack_nr / window
 struct OutPacket {
     packet_type: PacketType,
     seq_nr: u16,
     payload: Vec<u8>,
     sent_at: Instant,
     transmissions: u32,
-    /// Lost to a timeout and waiting for window room; not counted as in flight
     need_resend: bool,
-    /// Already fast-retransmitted for this loss episode
     fast_resent: bool,
 }
 
-/// LEDBAT one-way delay tracking
 #[derive(Default)]
 struct DelayHistory {
-    /// Minimum of each completed bucket, oldest first
     history: VecDeque<u32>,
     bucket_min: Option<u32>,
     bucket_start: Option<Instant>,
@@ -138,7 +116,6 @@ struct DelayHistory {
 }
 
 impl DelayHistory {
-    /// Record a delay sample and return the queuing delay (`our_delay`) in microseconds
     fn add_sample(&mut self, sample: u32, now: Instant) -> u32 {
         match (self.bucket_start, self.bucket_min) {
             (Some(start), Some(min)) if now.duration_since(start) >= BASE_DELAY_BUCKET => {
@@ -182,15 +159,11 @@ pub(crate) struct ConnState {
     remote: SocketAddr,
     conn_id_send: u16,
     is_initiator: bool,
-    /// Payload bytes per normal packet, derived from `mtu_floor`
     packet_size: usize,
-    /// Path-MTU discovery bounds in UDP payload bytes: the floor is proven, the ceiling not yet ruled out
     pmtud: bool,
     mtu_floor: usize,
     mtu_ceiling: usize,
-    /// Outstanding probe: sequence number and datagram size
     mtu_probe: Option<(u16, usize)>,
-    /// Encoded probe waiting to be sent with don't-fragment set
     probe_out: Option<(u16, Vec<u8>)>,
     mtu_reprobe_at: Instant,
 
@@ -199,29 +172,29 @@ pub(crate) struct ConnState {
 
     send_buf: VecDeque<u8>,
     unacked: VecDeque<OutPacket>,
+    in_flight: usize,
+    resend_count: usize,
 
     recv_ready: VecDeque<u8>,
     reorder: BTreeMap<u16, Vec<u8>>,
+    reorder_bytes: usize,
 
     peer_wnd: u32,
     max_window: usize,
     slow_start: bool,
+    ss_thresh: usize,
     delay: DelayHistory,
 
     rtt: f64,
     rtt_var: f64,
     rto: Duration,
-    /// Retransmission timer start, restarted whenever an ack makes progress
     rto_base: Option<Instant>,
     reply_micros: u32,
 
-    /// Last cumulative ack received and how many pure acks repeated it
     last_ack: Option<u16>,
     dup_acks: usize,
-    /// Zero-window probe timer and the permission it grants once fired
     probe_at: Option<Instant>,
     probe_due: bool,
-    /// Last advertised receive window, to know when a window update is due
     last_advertised: std::cell::Cell<u32>,
 
     needs_ack: bool,
@@ -231,6 +204,9 @@ pub(crate) struct ConnState {
     error: Option<io::ErrorKind>,
 
     recovery_seq: Option<u16>,
+    last_maxed_out: Option<Instant>,
+    pace_at: Option<Instant>,
+    fin_acked_at: Option<Instant>,
 
     outbox: Vec<Vec<u8>>,
     send_retry_at: Option<Instant>,
@@ -242,9 +218,7 @@ pub(crate) struct ConnState {
 
 impl ConnState {
     fn advertised_window(&self) -> u32 {
-        // Out-of-order bytes in `reorder` also consume receive buffer, so count them in the advertised window
-        let reorder_bytes: usize = self.reorder.values().map(|b| b.len()).sum();
-        let used = self.recv_ready.len().saturating_add(reorder_bytes);
+        let used = self.recv_ready.len().saturating_add(self.reorder_bytes);
         RECV_BUF_MAX.saturating_sub(used) as u32
     }
 
@@ -263,9 +237,7 @@ impl ConnState {
         }
     }
 
-    /// Encode an outstanding packet with current ack/window/timestamps
     fn encode(&self, p: &OutPacket) -> Vec<u8> {
-        // The SYN is special-cased to carry our *receive* id (send-1); every other packet carries our send id
         let conn_id = if p.packet_type == PacketType::Syn {
             self.conn_id_send.wrapping_sub(1)
         } else {
@@ -275,41 +247,82 @@ impl ConnState {
             .encode(&p.payload)
     }
 
-    /// Standalone ST_STATE ack; carries the next seq without consuming it
     fn encode_state(&self) -> Vec<u8> {
         self.header(PacketType::State, self.conn_id_send, self.seq_nr)
             .encode(&[])
     }
 
-    /// SACK bitmask for buffered out-of-order packets; bit `i` (LSB-first) acks `ack_nr + 2 + i`
     fn build_selective_ack(&self) -> Option<Vec<u8>> {
+        if self.reorder.is_empty() {
+            return None;
+        }
         let base = self.ack_nr.wrapping_add(2);
         let max_bits = MAX_SACK_BYTES * 8;
-        let highest = self
-            .reorder
-            .keys()
-            .map(|&seq| seq.wrapping_sub(base) as usize)
-            .filter(|&bit| bit < max_bits)
-            .max()?;
-        let mut mask = vec![0u8; (highest / 32 + 1) * 4];
+        let mut mask = [0u8; MAX_SACK_BYTES];
+        let mut highest: Option<usize> = None;
         for &seq in self.reorder.keys() {
             let bit = seq.wrapping_sub(base) as usize;
-            if bit < mask.len() * 8 {
+            if bit < max_bits {
                 mask[bit / 8] |= 1 << (bit % 8);
+                highest = highest.max(Some(bit));
             }
         }
-        Some(mask)
+        Some(mask[..(highest? / 32 + 1) * 4].to_vec())
     }
 
     fn bytes_in_flight(&self) -> usize {
-        self.unacked
-            .iter()
-            .filter(|p| !p.need_resend)
-            .map(|p| p.payload.len())
-            .sum()
+        self.in_flight
     }
 
-    /// Whether `len` bytes fit both windows; an idle connection may exceed a tiny congestion window by one packet (BEP 29), but a zero receive window waits for a probe
+    fn account_removed(&mut self, p: &OutPacket) {
+        if p.need_resend {
+            self.resend_count = self.resend_count.saturating_sub(1);
+        } else {
+            self.in_flight = self.in_flight.saturating_sub(p.payload.len());
+        }
+    }
+
+    fn may_fast_resend(&self, p: &OutPacket) -> bool {
+        !p.fast_resent || p.sent_at.elapsed() >= self.rto
+    }
+
+    fn burst_limit(&self) -> usize {
+        if self.rtt <= 0.0 {
+            return usize::MAX;
+        }
+        let window_packets = (self.max_window / self.packet_size.max(1)).max(1) as f64;
+        let per_timer_tick = (window_packets * MIN_PACE_INTERVAL.as_secs_f64() / self.rtt).ceil();
+        (per_timer_tick as usize).max(MIN_BURST_PACKETS)
+    }
+
+    fn pace_interval(&self, burst: usize) -> Duration {
+        let window_packets = (self.max_window / self.packet_size.max(1)).max(1) as f64;
+        Duration::from_secs_f64(self.rtt * burst as f64 / window_packets)
+            .clamp(MIN_PACE_INTERVAL, MAX_PACE_INTERVAL)
+    }
+
+    fn note_cwnd_block(&mut self, len: usize) {
+        let in_flight = self.in_flight;
+        if in_flight > 0
+            && in_flight + len <= self.peer_wnd as usize
+            && in_flight + len > self.max_window
+        {
+            self.last_maxed_out = Some(Instant::now());
+        }
+    }
+
+    fn take_send(&mut self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let (head, tail) = self.send_buf.as_slices();
+        let first = head.len().min(n);
+        out.extend_from_slice(&head[..first]);
+        if first < n {
+            out.extend_from_slice(&tail[..n - first]);
+        }
+        self.send_buf.drain(..n);
+        out
+    }
+
     fn may_send(&self, len: usize) -> bool {
         let in_flight = self.bytes_in_flight();
         let fits_peer = in_flight + len <= self.peer_wnd as usize;
@@ -319,18 +332,34 @@ impl ConnState {
         fits_peer && in_flight + len <= self.max_window
     }
 
-    /// Resend timed-out packets, then packetize `send_buf`, while the windows allow
     fn fill_send_window(&mut self) {
         if self.state == State::SynSent || self.state == State::Closed {
             return;
         }
-        while let Some(idx) = self.unacked.iter().position(|p| p.need_resend) {
-            if !self.may_send(self.unacked[idx].payload.len()) {
+        if self.pace_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        self.pace_at = None;
+        let burst = self.burst_limit();
+        let mut sent = 0usize;
+        let mut paced = false;
+        while self.resend_count > 0 {
+            let Some(idx) = self.unacked.iter().position(|p| p.need_resend) else {
+                break;
+            };
+            let len = self.unacked[idx].payload.len();
+            if !self.may_send(len) {
+                self.note_cwnd_block(len);
+                break;
+            }
+            if sent >= burst {
+                paced = true;
                 break;
             }
             self.retransmit(idx);
+            sent += 1;
         }
-        if self.state == State::Connected {
+        if self.state == State::Connected && !paced {
             if !self.send_buf.is_empty() {
                 self.maybe_reopen_mtu_search();
             }
@@ -338,31 +367,40 @@ impl ConnState {
                 if self.should_probe() {
                     let payload = self.probe_payload();
                     if self.send_buf.len() >= payload && self.may_send(payload) {
-                        let payload: Vec<u8> = self.send_buf.drain(..payload).collect();
+                        let payload = self.take_send(payload);
                         self.transmit_probe(payload);
+                        sent += 1;
                         continue;
                     }
                 }
                 let take = self.send_buf.len().min(self.packet_size);
-                // Nagle: hold a partial packet while data is in flight
                 if take < self.packet_size && self.bytes_in_flight() > 0 && !self.want_fin {
                     break;
                 }
                 if !self.may_send(take) {
+                    self.note_cwnd_block(take);
                     break;
                 }
-                let payload: Vec<u8> = self.send_buf.drain(..take).collect();
+                if sent >= burst {
+                    paced = true;
+                    break;
+                }
+                let payload = self.take_send(take);
                 self.transmit_new(PacketType::Data, payload);
+                sent += 1;
             }
         }
-        // Nothing in flight will reopen a closed receive window, so schedule a probe
-        let blocked = !self.send_buf.is_empty() || self.unacked.iter().any(|p| p.need_resend);
+        if paced {
+            let now = Instant::now();
+            self.pace_at = Some(now + self.pace_interval(burst));
+            self.last_maxed_out = Some(now);
+        }
+        let blocked = !self.send_buf.is_empty() || self.resend_count > 0;
         if blocked && self.bytes_in_flight() == 0 && self.probe_at.is_none() && !self.probe_due {
             self.probe_at = Some(Instant::now() + self.rto.max(MIN_ZERO_WINDOW_PROBE));
         }
     }
 
-    /// Start the retransmission timer if it isn't running
     fn arm_rto(&mut self) {
         if self.rto_base.is_none() {
             self.rto_base = Some(Instant::now());
@@ -374,7 +412,6 @@ impl ConnState {
         self.packet_size = floor - UTP_OVERHEAD;
     }
 
-    /// Settle after a probe resolves; a floor above the ceiling means the path shrank, so search again from halfway down
     fn update_mtu_limits(&mut self) {
         if self.mtu_floor > self.mtu_ceiling {
             self.mtu_ceiling = self.mtu_floor;
@@ -384,7 +421,6 @@ impl ConnState {
         self.mtu_probe = None;
     }
 
-    /// Raise the ceiling again once the re-probe interval has passed, in case the path improved; only checked with data queued, since probing needs data
     fn maybe_reopen_mtu_search(&mut self) {
         if !self.pmtud {
             return;
@@ -396,7 +432,6 @@ impl ConnState {
         }
     }
 
-    /// Probe while the search is open and the window is wide enough to surround the probe with normal packets (libtorrent's rule)
     fn should_probe(&self) -> bool {
         self.pmtud
             && self.state == State::Connected
@@ -406,13 +441,11 @@ impl ConnState {
             && self.max_window > 3 * self.mtu_floor
     }
 
-    /// Probe payload: the midpoint datagram less the header and SACK extension its encoding adds, so the probe is exactly the midpoint
     fn probe_payload(&self) -> usize {
         let sack = self.build_selective_ack().map_or(0, |mask| 2 + mask.len());
         (self.mtu_floor + self.mtu_ceiling) / 2 - HEADER_LEN - sack
     }
 
-    /// Like [`Self::transmit_new`] for a probe, which is sent with don't-fragment set
     fn transmit_probe(&mut self, payload: Vec<u8>) {
         let p = OutPacket {
             packet_type: PacketType::Data,
@@ -424,6 +457,7 @@ impl ConnState {
             fast_resent: false,
         };
         self.seq_nr = self.seq_nr.wrapping_add(1);
+        self.in_flight += p.payload.len();
         let bytes = self.encode(&p);
         self.mtu_probe = Some((p.seq_nr, bytes.len()));
         self.probe_out = Some((p.seq_nr, bytes));
@@ -433,7 +467,6 @@ impl ConnState {
         self.needs_ack = false;
     }
 
-    /// The probe arrived: its size works
     fn on_mtu_probe_acked(&mut self, seq: u16) {
         if let Some((probe, size)) = self.mtu_probe {
             if probe == seq {
@@ -443,10 +476,8 @@ impl ConnState {
         }
     }
 
-    /// If `seq` is the probe, lower the ceiling and return true so its loss isn't treated as congestion
     fn on_mtu_probe_lost(&mut self, seq: u16) -> bool {
         match self.mtu_probe {
-            // No bigger than the proven floor, so the loss says nothing about size
             Some((probe, size)) if probe == seq && size <= self.mtu_floor => {
                 self.mtu_probe = None;
                 false
@@ -460,7 +491,6 @@ impl ConnState {
         }
     }
 
-    /// The OS refused the probe: EMSGSIZE lowers the ceiling, any other error only abandons the probe; either way it's resent without don't-fragment
     pub(crate) fn mtu_probe_send_failed(&mut self, seq: u16, too_big: bool) {
         if too_big {
             self.on_mtu_probe_lost(seq);
@@ -472,7 +502,6 @@ impl ConnState {
         }
     }
 
-    /// Assign a fresh sequence number to a DATA/FIN packet and queue it
     fn transmit_new(&mut self, packet_type: PacketType, payload: Vec<u8>) {
         let p = OutPacket {
             packet_type,
@@ -484,22 +513,25 @@ impl ConnState {
             fast_resent: false,
         };
         self.seq_nr = self.seq_nr.wrapping_add(1);
+        self.in_flight += p.payload.len();
         self.outbox.push(self.encode(&p));
         self.unacked.push_back(p);
         self.probe_due = false;
         self.arm_rto();
-        // A DATA/FIN packet carries our ack_nr, so it doubles as an ack
         self.needs_ack = false;
     }
 
-    /// Re-send the unacked packet at `idx` with fresh header fields
     fn retransmit(&mut self, idx: usize) {
         let Some(p) = self.unacked.get_mut(idx) else {
             return;
         };
         p.sent_at = Instant::now();
         p.transmissions += 1;
-        p.need_resend = false;
+        if p.need_resend {
+            p.need_resend = false;
+            self.resend_count = self.resend_count.saturating_sub(1);
+            self.in_flight += p.payload.len();
+        }
         let bytes = self.encode(&self.unacked[idx]);
         self.outbox.push(bytes);
         self.probe_due = false;
@@ -507,28 +539,29 @@ impl ConnState {
         self.needs_ack = false;
     }
 
-    /// Halve the congestion window once per loss episode
     fn on_loss(&mut self) {
         if self.recovery_seq.is_none() {
             self.recovery_seq = Some(self.seq_nr.wrapping_sub(1));
             self.max_window = (self.max_window / 2).max(MIN_WINDOW);
+            self.ss_thresh = self.max_window;
             self.slow_start = false;
         }
     }
 
-    /// Apply a cumulative ack and count duplicate acks; returns acked payload bytes
     fn process_ack(&mut self, header: &UtpHeader) -> usize {
         let ack_nr = header.ack_nr;
         let mut acked_bytes = 0usize;
         let mut acked_any = false;
         while let Some(front) = self.unacked.front() {
             if seq_after(front.seq_nr, ack_nr) {
-                break; // front is beyond the ack point
+                break;
             }
-            let p = self.unacked.pop_front().unwrap();
+            let Some(p) = self.unacked.pop_front() else {
+                break;
+            };
+            self.account_removed(&p);
             acked_any = true;
             acked_bytes += p.payload.len();
-            // Karn: only sample RTT from packets sent exactly once
             if p.transmissions == 1 {
                 self.update_rtt(p.sent_at.elapsed());
                 self.on_mtu_probe_acked(p.seq_nr);
@@ -536,7 +569,6 @@ impl ConnState {
         }
         if acked_any {
             self.dup_acks = 0;
-            // Recovery ends once its marker is cumulatively acked, re-arming decrease for the next loss
             if let Some(rseq) = self.recovery_seq {
                 if !seq_after(rseq, ack_nr) {
                     self.recovery_seq = None;
@@ -556,66 +588,77 @@ impl ConnState {
         acked_bytes
     }
 
-    /// Three duplicate acks: `ack_nr + 1` is presumed lost
     fn fast_retransmit_front(&mut self, ack_nr: u16) {
         let lost = ack_nr.wrapping_add(1);
-        if let Some(idx) = self
+        if self
             .unacked
-            .iter()
-            .position(|p| p.seq_nr == lost && !p.fast_resent)
+            .front()
+            .is_some_and(|p| p.seq_nr == lost && self.may_fast_resend(p))
         {
-            self.unacked[idx].fast_resent = true;
+            self.unacked[0].fast_resent = true;
             if !self.on_mtu_probe_lost(lost) {
                 self.on_loss();
             }
-            self.retransmit(idx);
+            self.retransmit(0);
         }
     }
 
-    /// Apply a selective ack, fast-retransmitting packets with three or more SACKed packets after them; returns acked payload bytes
     fn process_selective_ack(&mut self, ack_nr: u16, mask: &[u8]) -> usize {
-        let base = ack_nr.wrapping_add(2);
-        let mut sacked: Vec<u16> = Vec::new();
-        for (byte_idx, byte) in mask.iter().enumerate() {
-            for bit in 0..8 {
-                if byte & (1 << bit) != 0 {
-                    sacked.push(base.wrapping_add((byte_idx * 8 + bit) as u16));
-                }
-            }
-        }
-        if sacked.is_empty() {
+        let total: usize = mask.iter().map(|b| b.count_ones() as usize).sum();
+        if total == 0 {
             return 0;
         }
+        let base = ack_nr.wrapping_add(2);
+        let nbits = mask.len() * 8;
+        let bit_of = |seq: u16| seq.wrapping_sub(base) as usize;
+        let is_set = |bit: usize| bit < nbits && mask[bit / 8] & (1 << (bit % 8)) != 0;
         let mut acked_bytes = 0usize;
         let mut samples = Vec::new();
+        let (mut gone_in_flight, mut gone_resend) = (0usize, 0usize);
         self.unacked.retain(|p| {
-            if sacked.contains(&p.seq_nr) {
-                acked_bytes += p.payload.len();
-                if p.transmissions == 1 {
-                    samples.push((p.seq_nr, p.sent_at.elapsed()));
-                }
-                false
-            } else {
-                true
+            if !is_set(bit_of(p.seq_nr)) {
+                return true;
             }
+            acked_bytes += p.payload.len();
+            if p.need_resend {
+                gone_resend += 1;
+            } else {
+                gone_in_flight += p.payload.len();
+            }
+            if p.transmissions == 1 {
+                samples.push((p.seq_nr, p.sent_at.elapsed()));
+            }
+            false
         });
+        self.in_flight = self.in_flight.saturating_sub(gone_in_flight);
+        self.resend_count = self.resend_count.saturating_sub(gone_resend);
         for (seq, sample) in samples {
             self.update_rtt(sample);
             self.on_mtu_probe_acked(seq);
         }
-        let lost: Vec<usize> = self
-            .unacked
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                !p.fast_resent
-                    && sacked.iter().filter(|&&s| seq_after(s, p.seq_nr)).count()
-                        >= DUP_ACK_THRESHOLD
-            })
-            .map(|(idx, _)| idx)
-            .collect();
+        let mut lost: Vec<usize> = Vec::new();
+        let (mut cursor, mut set_below) = (0usize, 0usize);
+        for (idx, p) in self.unacked.iter().enumerate() {
+            if !self.may_fast_resend(p) {
+                continue;
+            }
+            let bit = bit_of(p.seq_nr);
+            let sacked_after = if bit >= 0x8000 {
+                total
+            } else if bit >= nbits {
+                0
+            } else {
+                while cursor <= bit {
+                    set_below += usize::from(is_set(cursor));
+                    cursor += 1;
+                }
+                total - set_below
+            };
+            if sacked_after >= DUP_ACK_THRESHOLD {
+                lost.push(idx);
+            }
+        }
         if !lost.is_empty() {
-            // A lost probe says "too big", not "congested"
             let mut congestion = false;
             for &idx in &lost {
                 let seq = self.unacked[idx].seq_nr;
@@ -645,12 +688,10 @@ impl ConnState {
         self.rto = rto.clamp(MIN_RTO, MAX_RTO);
     }
 
-    /// BEP 29 LEDBAT window update, grown only while the window is the limit; slow start runs until the delay target or a loss
-    fn update_cwnd(&mut self, their_delay: u32, acked_bytes: usize, in_flight_before: usize) {
+    fn update_cwnd(&mut self, their_delay: u32, acked_bytes: usize) {
         if acked_bytes == 0 {
             return;
         }
-        // A zero difference means the peer has no delay sample yet
         let delay_factor = if their_delay == 0 {
             0.0
         } else {
@@ -660,7 +701,9 @@ impl ConnState {
         let window = self.max_window.max(1) as f64;
         let window_factor = (acked_bytes as f64).min(window) / window.max(acked_bytes as f64);
         let mut gain = MAX_CWND_INCREASE_BYTES_PER_RTT * delay_factor * window_factor;
-        let window_limited = in_flight_before + self.packet_size > self.max_window;
+        let window_limited = self
+            .last_maxed_out
+            .is_some_and(|at| at.elapsed() < MAXED_OUT_WINDOW_MEMORY);
         if gain > 0.0 && !window_limited {
             gain = 0.0;
         }
@@ -668,26 +711,28 @@ impl ConnState {
             if delay_factor < 0.0 {
                 self.slow_start = false;
             } else if window_limited {
-                gain = gain.max(acked_bytes as f64);
+                let ss_gain = gain.max(acked_bytes as f64);
+                if self.max_window as f64 + ss_gain > self.ss_thresh as f64 {
+                    self.slow_start = false;
+                } else {
+                    gain = ss_gain;
+                }
             }
         }
         let next = self.max_window as f64 + gain;
         self.max_window = (next as i64).clamp(MIN_WINDOW as i64, MAX_CWND as i64) as usize;
     }
 
-    /// Process one incoming packet
     fn handle_packet(&mut self, header: &UtpHeader, payload: &[u8]) {
         if self.state == State::Closed {
             return;
         }
         if header.packet_type == PacketType::Syn {
-            // A retransmitted SYN means our handshake ack was lost; answer it again
             if !self.is_initiator {
                 self.needs_ack = true;
             }
             return;
         }
-        // An ack for a packet we never sent is forged or from a stale connection
         if seq_after(header.ack_nr, self.seq_nr.wrapping_sub(1)) {
             return;
         }
@@ -696,13 +741,10 @@ impl ConnState {
         if self.peer_wnd > previous_peer_wnd {
             self.probe_at = None;
         }
-        // Measure the one-way delay of *this* packet so we can echo it back
         self.reply_micros = now_micros().wrapping_sub(header.timestamp_micros);
 
-        // Handshake completion: first STATE after our SYN
         if self.state == State::SynSent && header.packet_type == PacketType::State {
             self.state = State::Connected;
-            // Peer's STATE carries its next-data seq; we've received nothing yet
             self.ack_nr = header.seq_nr.wrapping_sub(1);
             if let Some(tx) = self.connect_notify.take() {
                 let _ = tx.send(Ok(()));
@@ -710,14 +752,12 @@ impl ConnState {
             self.notify_write();
         }
 
-        let in_flight_before = self.bytes_in_flight();
         let unacked_before = self.unacked.len();
         let mut acked = self.process_ack(header);
         if let Some(mask) = &header.selective_ack {
             acked += self.process_selective_ack(header.ack_nr, mask);
         }
-        self.update_cwnd(header.timestamp_diff_micros, acked, in_flight_before);
-        // Wake on any acked packet: an acked FIN carries no payload but completes `shutdown`
+        self.update_cwnd(header.timestamp_diff_micros, acked);
         if self.unacked.len() < unacked_before {
             self.notify_write();
         }
@@ -733,7 +773,6 @@ impl ConnState {
             PacketType::State | PacketType::Syn => {}
         }
 
-        // After a FIN whose sequence we've now reached in order, signal EOF
         if let Some(fin) = self.peer_fin {
             if !seq_after(fin, self.ack_nr) {
                 self.eof = true;
@@ -743,30 +782,29 @@ impl ConnState {
         self.maybe_finish();
     }
 
-    /// Place a DATA/FIN payload in order, buffering out-of-order arrivals
     fn accept_inorder(&mut self, header: &UtpHeader, payload: &[u8]) {
-        // Ack every DATA/FIN, even when dropped
         self.needs_ack = true;
+        if self.fin_acked_at.is_some() {
+            self.fin_acked_at = Some(Instant::now());
+        }
         let distance = header.seq_nr.wrapping_sub(self.ack_nr);
         if distance == 0 || distance >= 0x8000 {
-            return; // duplicate / already acked
+            return;
         }
         if distance > MAX_REORDER_DISTANCE {
-            return; // far outside any window we advertised
+            return;
         }
-        // A sender ignoring our zero window: drop rather than buffer without bound
         if self.advertised_window() == 0 && !payload.is_empty() {
             return;
         }
         if distance == 1 {
             self.consume(header.packet_type, header.seq_nr, payload);
-            // Drain any contiguous reorder-buffer entries
             loop {
                 let next = self.ack_nr.wrapping_add(1);
                 let Some(buf) = self.reorder.remove(&next) else {
                     break;
                 };
-                // A buffered FIN is recorded; its (empty) payload adds nothing
+                self.reorder_bytes = self.reorder_bytes.saturating_sub(buf.len());
                 let ty = if Some(next) == self.peer_fin {
                     PacketType::Fin
                 } else {
@@ -775,28 +813,29 @@ impl ConnState {
                 self.consume(ty, next, &buf);
             }
         } else {
-            // Record an out-of-order FIN regardless of buffer room: it carries no payload, so it costs nothing, and dropping it could stall EOF until a retransmission refills the reorder buffer
+            // Record an out-of-order FIN even when the buffer is full, or EOF can stall
             if header.packet_type == PacketType::Fin {
                 self.peer_fin = Some(header.seq_nr);
             }
             if self.reorder.len() < RECV_BUF_MAX / self.packet_size {
-                self.reorder.insert(header.seq_nr, payload.to_vec());
+                if let Some(old) = self.reorder.insert(header.seq_nr, payload.to_vec()) {
+                    self.reorder_bytes = self.reorder_bytes.saturating_sub(old.len());
+                }
+                self.reorder_bytes += payload.len();
             }
         }
     }
 
-    /// Advance `ack_nr` past `seq`, delivering DATA bytes to the reader and recording a FIN
     fn consume(&mut self, ty: PacketType, seq: u16, payload: &[u8]) {
         self.ack_nr = seq;
         if ty == PacketType::Fin {
             self.peer_fin = Some(seq);
         } else if !payload.is_empty() {
-            self.recv_ready.extend(payload.iter().copied());
+            self.recv_ready.extend(payload);
             self.notify_read();
         }
     }
 
-    /// Fire due timers: the BEP 29 retransmission timeout and the zero-window probe
     fn check_timers(&mut self) {
         let now = Instant::now();
         if let Some(at) = self.probe_at {
@@ -804,6 +843,17 @@ impl ConnState {
                 self.probe_at = None;
                 self.probe_due = true;
             }
+        }
+        if self.state == State::FinSent
+            && self
+                .fin_acked_at
+                .is_some_and(|at| now >= at + LINGER_TIMEOUT)
+        {
+            self.eof = true;
+            self.state = State::Closed;
+            self.notify_read();
+            self.notify_write();
+            return;
         }
         let Some(base) = self.rto_base else {
             return;
@@ -823,17 +873,15 @@ impl ConnState {
             self.fail(io::ErrorKind::TimedOut);
             return;
         }
-        // A lone timed-out probe was too big, which isn't congestion
         if self.unacked.len() == 1 && self.on_mtu_probe_lost(self.unacked[0].seq_nr) {
             self.rto_base = None;
             self.retransmit(0);
             return;
         }
-        // Everything is resent without don't-fragment, so the probe can't prove anything
         self.mtu_probe = None;
-        // Timeout: collapse the window, back off, and resend everything as the window reopens
-        self.max_window = MIN_WINDOW;
-        self.slow_start = false;
+        self.ss_thresh = (self.max_window / 2).max(2 * self.packet_size);
+        self.max_window = self.packet_size.max(MIN_WINDOW);
+        self.slow_start = true;
         self.rto = (self.rto * 2).min(MAX_RTO);
         self.dup_acks = 0;
         self.recovery_seq = None;
@@ -841,11 +889,12 @@ impl ConnState {
             p.need_resend = true;
             p.fast_resent = false;
         }
+        self.in_flight = 0;
+        self.resend_count = self.unacked.len();
         self.rto_base = None;
         self.retransmit(0);
     }
 
-    /// Emit a FIN once the send buffer has drained, then mark FinSent
     fn maybe_send_fin(&mut self) {
         if self.want_fin && self.state == State::Connected && self.send_buf.is_empty() {
             self.transmit_new(PacketType::Fin, Vec::new());
@@ -853,14 +902,16 @@ impl ConnState {
         }
     }
 
-    /// Transition a half-closed connection to fully closed once our FIN is acked and we've seen the peer's FIN, so the driver can wind down
     fn maybe_finish(&mut self) {
-        if self.state == State::FinSent && self.unacked.is_empty() && self.eof {
-            self.state = State::Closed;
+        if self.state == State::FinSent && self.unacked.is_empty() {
+            if self.eof {
+                self.state = State::Closed;
+            } else if self.fin_acked_at.is_none() {
+                self.fin_acked_at = Some(Instant::now());
+            }
         }
     }
 
-    /// Send a window update once a reader drains a nearly full receive buffer
     fn note_window_update(&mut self) {
         let threshold = self.packet_size as u32;
         if self.last_advertised.get() < threshold && self.advertised_window() >= threshold {
@@ -868,16 +919,28 @@ impl ConnState {
         }
     }
 
-    /// Next instant the driver must wake to do timer work, if any
     fn next_deadline(&self) -> Option<Instant> {
         let retransmit_at = self
             .rto_base
             .filter(|_| !self.unacked.is_empty())
             .map(|base| base + self.rto);
-        [retransmit_at, self.probe_at, self.send_retry_at]
-            .into_iter()
-            .flatten()
-            .min()
+        let fin_wait = self
+            .fin_acked_at
+            .filter(|_| self.state == State::FinSent)
+            .map(|at| at + LINGER_TIMEOUT);
+        let pace = self
+            .pace_at
+            .filter(|_| matches!(self.state, State::Connected | State::FinSent));
+        [
+            retransmit_at,
+            self.probe_at,
+            self.send_retry_at,
+            fin_wait,
+            pace,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn schedule_send_retry(&mut self) -> bool {
@@ -908,10 +971,11 @@ impl ConnState {
         }
         self.state = State::Closed;
         self.eof = true;
-        self.unacked.clear();
+        self.clear_unacked();
         self.send_buf.clear();
         self.rto_base = None;
         self.probe_at = None;
+        self.pace_at = None;
         if let Some(tx) = self.connect_notify.take() {
             let _ = tx.send(Err(io::Error::from(kind)));
         }
@@ -919,21 +983,26 @@ impl ConnState {
         self.notify_write();
     }
 
-    /// Seed responder state from the initiating SYN: it consumed `syn.seq_nr`, so our first expected DATA is the next sequence number
     pub(crate) fn seed_responder(&mut self, syn: &UtpHeader) {
         self.ack_nr = syn.seq_nr;
         self.peer_wnd = syn.wnd_size;
         self.reply_micros = now_micros().wrapping_sub(syn.timestamp_micros);
     }
 
-    /// Abandon the connection immediately (e.g. on connect timeout) so the driver exits promptly instead of retransmitting to a dead peer
     pub(crate) fn force_close(&mut self) {
         self.state = State::Closed;
         self.error.get_or_insert(io::ErrorKind::TimedOut);
-        self.unacked.clear();
+        self.clear_unacked();
         self.send_buf.clear();
         self.rto_base = None;
         self.probe_at = None;
+        self.pace_at = None;
+    }
+
+    fn clear_unacked(&mut self) {
+        self.unacked.clear();
+        self.in_flight = 0;
+        self.resend_count = 0;
     }
 
     fn notify_read(&mut self) {
@@ -949,33 +1018,26 @@ impl ConnState {
     }
 }
 
-/// Shared between the [`UtpStream`] handle and its driver task
 pub(crate) struct Shared {
     pub(crate) state: Mutex<ConnState>,
-    /// Nudges the driver after the app writes / requests shutdown
     pub(crate) nudge: Notify,
 }
 
-/// Whether a freshly-created connection initiates (sends a SYN) or responds. Carries the establishment notifier for the initiator; consumed by [`drive`]
 pub(crate) enum Role {
-    /// Outgoing dial; the driver sends a SYN and reports establishment here
     Initiator(oneshot::Sender<io::Result<()>>),
-    /// Inbound connection accepted from a peer's SYN; already Connected
     Responder,
 }
 
-/// `Copy` view of [`Role`] used to pick a connection's initial state without consuming the (non-`Clone`) establishment notifier
 #[derive(Clone, Copy)]
 pub(crate) enum RoleKind {
     Initiator,
     Responder,
 }
 
-/// Configuration handed to a connection driver by the socket layer
 pub(crate) struct DriverConfig {
     pub transport: DatagramTransport,
     pub remote: SocketAddr,
-    pub incoming: mpsc::UnboundedReceiver<(UtpHeader, Bytes)>,
+    pub incoming: mpsc::Receiver<(UtpHeader, Bytes)>,
     pub registry: ConnRegistry,
     pub key: ConnKey,
     pub token: ConnectionToken,
@@ -984,12 +1046,10 @@ pub(crate) struct DriverConfig {
 
 #[derive(Clone)]
 pub(crate) enum DatagramTransport {
-    /// Shared UDP socket, with don't-fragment control where supported
     Direct(Arc<UdpSender>),
-    Proxy(Arc<ProxyDatagram>),
+    Proxy(Arc<ProxyAssociation>),
 }
 
-/// Create the shared state for a new connection
 pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) -> Arc<Shared> {
     let state = match kind {
         RoleKind::Initiator => State::SynSent,
@@ -1008,7 +1068,6 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
             mtu_probe: None,
             probe_out: None,
             mtu_reprobe_at: Instant::now() + MTU_REPROBE_INTERVAL,
-            // Initiator's SYN consumes seq 1, so the next DATA is seq 2. Responder picks a random initial sequence
             seq_nr: match kind {
                 RoleKind::Initiator => 2,
                 RoleKind::Responder => rand::random::<u16>() | 1,
@@ -1016,11 +1075,15 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
             ack_nr: 0,
             send_buf: VecDeque::new(),
             unacked: VecDeque::new(),
+            in_flight: 0,
+            resend_count: 0,
             recv_ready: VecDeque::new(),
             reorder: BTreeMap::new(),
+            reorder_bytes: 0,
             peer_wnd: RECV_BUF_MAX as u32,
             max_window: INITIAL_CWND,
             slow_start: true,
+            ss_thresh: usize::MAX,
             delay: DelayHistory::default(),
             rtt: 0.0,
             rtt_var: 0.0,
@@ -1038,6 +1101,9 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
             eof: false,
             error: None,
             recovery_seq: None,
+            last_maxed_out: None,
+            pace_at: None,
+            fin_acked_at: None,
             outbox: Vec::new(),
             send_retry_at: None,
             send_retry_count: 0,
@@ -1049,16 +1115,13 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
     })
 }
 
-/// The single task that owns a connection's wire traffic for its lifetime
 pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role) {
-    // Kick off the handshake / initial ack and arm the connect notifier
     {
         let mut st = shared.state.lock();
         st.pmtud =
             matches!(&cfg.transport, DatagramTransport::Direct(sender) if sender.can_probe());
         if let Role::Initiator(tx) = role {
             st.connect_notify = Some(tx);
-            // Send the SYN (seq 1). It lives in `unacked` for retransmission
             let syn = OutPacket {
                 packet_type: PacketType::Syn,
                 seq_nr: 1,
@@ -1073,7 +1136,6 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             st.unacked.push_back(syn);
             st.arm_rto();
         } else {
-            // Responder: ack_nr was set by the socket from the SYN; send STATE
             let state_bytes = st.encode_state();
             st.outbox.push(state_bytes);
         }
@@ -1081,6 +1143,8 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
     flush(&shared, &cfg).await;
 
     let mut closed_since: Option<Instant> = None;
+    let mut sleep = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
+    let mut armed: Option<Instant> = None;
     loop {
         let deadline = {
             let st = shared.state.lock();
@@ -1090,7 +1154,6 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             st.next_deadline()
         };
 
-        // Stop lingering once closed and drained
         if let Some(since) = closed_since {
             let drained = {
                 let st = shared.state.lock();
@@ -1101,17 +1164,19 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             }
         }
 
-        let sleep = async {
-            match deadline {
-                Some(d) => {
-                    let now = Instant::now();
-                    if d > now {
-                        tokio::time::sleep(d - now).await;
-                    }
-                }
-                None => std::future::pending::<()>().await,
-            }
+        let stale = match (armed, deadline) {
+            (None, None) => false,
+            (Some(a), Some(d)) => a.max(d) - a.min(d) > Duration::from_millis(1),
+            _ => true,
         };
+        if stale {
+            if let Some(d) = deadline {
+                sleep.as_mut().reset(
+                    tokio::time::Instant::now() + d.saturating_duration_since(Instant::now()),
+                );
+            }
+            armed = deadline;
+        }
 
         tokio::select! {
             pkt = cfg.incoming.recv() => {
@@ -1119,7 +1184,6 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
                     Some((header, payload)) => {
                         let mut st = shared.state.lock();
                         st.handle_packet(&header, &payload);
-                        // Drain whatever else already arrived so one ack covers the batch
                         for _ in 0..ACK_BATCH {
                             let Ok((header, payload)) = cfg.incoming.try_recv() else {
                                 break;
@@ -1128,7 +1192,6 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
                         }
                     }
                     None => {
-                        // Router dropped our channel; nothing more will arrive
                         shared.state.lock().fail(io::ErrorKind::ConnectionAborted);
                     }
                 }
@@ -1136,12 +1199,12 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             _ = shared.nudge.notified() => {
                 shared.state.lock().note_window_update();
             }
-            _ = sleep => {
+            _ = &mut sleep, if armed.is_some() => {
+                armed = None;
                 shared.state.lock().check_timers();
             }
         }
 
-        // Do per-iteration work: drain app writes, emit FIN if requested, send a standalone ack if we owe one
         {
             let mut st = shared.state.lock();
             st.fill_send_window();
@@ -1163,7 +1226,6 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
     }
 }
 
-/// Drain the outbox to the wire. Datagrams are collected under the lock and sent after releasing it so UDP I/O never blocks the state mutex
 async fn flush(shared: &Arc<Shared>, cfg: &DriverConfig) {
     let probe = {
         let mut st = shared.state.lock();
@@ -1182,7 +1244,6 @@ async fn flush(shared: &Arc<Shared>, cfg: &DriverConfig) {
             DatagramTransport::Proxy(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
         };
         if let Err(error) = sent {
-            // Only EMSGSIZE answers the probe; anything else leaves an ordinary resend to the send path below
             let too_big = is_message_too_big(&error);
             if !too_big {
                 tracing::debug!("µTP MTU probe to {} failed: {error}", cfg.remote);
@@ -1226,7 +1287,21 @@ fn proxy_error_to_io(error: HttpError) -> io::Error {
     }
 }
 
+const NO_BUFFER_CODES: &[i32] = if cfg!(windows) {
+    &[10055]
+} else if cfg!(any(target_os = "linux", target_os = "android")) {
+    &[105, 12]
+} else {
+    &[55, 12]
+};
+
 fn is_recoverable_send_error(error: &io::Error) -> bool {
+    if error
+        .raw_os_error()
+        .is_some_and(|code| NO_BUFFER_CODES.contains(&code))
+    {
+        return true;
+    }
     matches!(
         error.kind(),
         io::ErrorKind::WouldBlock
@@ -1239,7 +1314,6 @@ fn is_recoverable_send_error(error: &io::Error) -> bool {
     )
 }
 
-/// A µTP connection presented as an async byte stream. Plugs into the peer connection layer wherever a `TcpStream` would go
 pub struct UtpStream {
     shared: Arc<Shared>,
 }
@@ -1253,7 +1327,6 @@ impl UtpStream {
         self.shared.state.lock().remote
     }
 
-    /// Largest datagram proven to cross the path so far
     #[cfg(test)]
     pub(crate) fn mtu_floor(&self) -> usize {
         self.shared.state.lock().mtu_floor
@@ -1284,15 +1357,20 @@ impl AsyncRead for UtpStream {
                 buf.put_slice(&second[..n - first_n]);
             }
             st.recv_ready.drain(..n);
-            // Reading frees receive-buffer space; the peer learns the larger window on our next outgoing packet, so nudge a fresh ack
-            self.shared.nudge.notify_one();
+            let was_owed = st.needs_ack;
+            st.note_window_update();
+            let wake = st.needs_ack && !was_owed;
+            drop(st);
+            if wake {
+                self.shared.nudge.notify_one();
+            }
             return Poll::Ready(Ok(()));
         }
         if let Some(kind) = st.error {
             return Poll::Ready(Err(io::Error::from(kind)));
         }
         if st.eof {
-            return Poll::Ready(Ok(())); // clean EOF (empty read)
+            return Poll::Ready(Ok(()));
         }
         st.read_waker = Some(cx.waker().clone());
         Poll::Pending
@@ -1347,7 +1425,6 @@ impl AsyncWrite for UtpStream {
             return Poll::Ready(Ok(()));
         }
         st.want_fin = true;
-        // Shutdown completes once the FIN has been sent and acked (no more unacked packets) and the send buffer is empty
         if st.state == State::FinSent && st.unacked.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -1365,7 +1442,6 @@ impl Drop for UtpStream {
         st.read_waker = None;
         st.write_waker = None;
         drop(st);
-        // Wake the driver so it can emit a FIN and tear down cleanly
         self.shared.nudge.notify_one();
     }
 }
@@ -1379,7 +1455,6 @@ mod tests {
         assert!(seq_after(5, 4));
         assert!(!seq_after(4, 5));
         assert!(!seq_after(4, 4));
-        // Wraparound: 1 is after 65535
         assert!(seq_after(1, 65535));
         assert!(!seq_after(65535, 1));
     }
@@ -1464,7 +1539,6 @@ mod tests {
         }
     }
 
-    /// Queue `n` full DATA packets (seq 2..2+n) and clear the outbox
     fn send_packets(st: &mut ConnState, n: usize) {
         st.send_buf.extend(std::iter::repeat_n(7u8, n * MSS));
         st.fill_send_window();
@@ -1478,7 +1552,6 @@ mod tests {
         let mut st = shared.state.lock();
         send_packets(&mut st, 6);
         let window = st.max_window;
-        // seq 2 acked, seq 3 lost: the peer keeps acking 2
         st.handle_packet(&ack(2, None), &[]);
         assert!(st.outbox.is_empty());
         st.handle_packet(&ack(2, None), &[]);
@@ -1489,7 +1562,6 @@ mod tests {
         let (resent, _) = UtpHeader::decode(&st.outbox[0]).unwrap();
         assert_eq!(resent.seq_nr, 3);
         assert_eq!(st.max_window, window / 2);
-        // A further duplicate doesn't resend again or halve again
         st.outbox.clear();
         st.handle_packet(&ack(2, None), &[]);
         assert!(st.outbox.is_empty());
@@ -1501,11 +1573,9 @@ mod tests {
         let shared = connected_initiator();
         let mut st = shared.state.lock();
         send_packets(&mut st, 6);
-        // Bit i acks seq 3+i: with only seq 3 and 4 SACKed, seq 2 has two packets after it
         st.handle_packet(&ack(1, Some(vec![0b0000_0011, 0, 0, 0])), &[]);
         assert!(st.outbox.is_empty());
         assert_eq!(st.unacked.len(), 4);
-        // seq 5 SACKed too: three packets past seq 2, which is now presumed lost
         st.handle_packet(&ack(1, Some(vec![0b0000_0111, 0, 0, 0])), &[]);
         let resent: Vec<u16> = st
             .outbox
@@ -1520,7 +1590,6 @@ mod tests {
         let shared = connected_initiator();
         let mut st = shared.state.lock();
         send_packets(&mut st, 2);
-        // We sent seq 2 and 3; an ack of 500 is forged
         st.handle_packet(&ack(500, None), &[]);
         assert_eq!(st.unacked.len(), 2);
     }
@@ -1532,19 +1601,19 @@ mod tests {
         send_packets(&mut st, 4);
         st.rto_base = Some(Instant::now() - Duration::from_secs(5));
         st.check_timers();
-        assert_eq!(st.max_window, MIN_WINDOW);
+        assert_eq!(st.max_window, st.packet_size);
+        assert!(st.slow_start, "a timeout re-enters slow start");
+        assert!(st.ss_thresh >= 2 * st.packet_size);
         assert_eq!(st.rto, INITIAL_RTO * 2);
-        // Only the oldest is back in flight; the rest wait for the window
         assert_eq!(st.outbox.len(), 1);
         assert_eq!(st.bytes_in_flight(), MSS);
         assert!(st.unacked.iter().skip(1).all(|p| p.need_resend));
         st.outbox.clear();
         st.fill_send_window();
-        assert!(st.outbox.is_empty(), "a 150-byte window holds one packet");
-        // Ack of the resent packet lets the next one go
+        assert!(st.outbox.is_empty(), "a one-packet window holds one packet");
         st.handle_packet(&ack(2, None), &[]);
         st.fill_send_window();
-        assert_eq!(st.outbox.len(), 1);
+        assert_eq!(st.outbox.len(), 2);
         assert_eq!(UtpHeader::decode(&st.outbox[0]).unwrap().0.seq_nr, 3);
     }
 
@@ -1583,7 +1652,6 @@ mod tests {
         st.want_fin = true;
         st.maybe_send_fin();
         st.write_waker = Some(std::task::Waker::from(waker.clone()));
-        // The FIN (seq 2, no payload) is acked
         st.handle_packet(&ack(2, None), &[]);
         assert!(st.unacked.is_empty());
         assert_eq!(waker.wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1604,25 +1672,21 @@ mod tests {
     fn nagle_coalesces_small_writes_while_data_is_in_flight() {
         let shared = connected_initiator();
         let mut st = shared.state.lock();
-        // Nothing in flight: a small write goes out at once
         st.send_buf.extend([1u8; 10]);
         st.fill_send_window();
         assert_eq!(st.outbox.len(), 1);
         st.outbox.clear();
-        // With that packet unacked, further small writes wait and merge
         st.send_buf.extend([2u8; 10]);
         st.fill_send_window();
         st.send_buf.extend([3u8; 10]);
         st.fill_send_window();
         assert!(st.outbox.is_empty());
-        // The ack releases them as one packet
         st.handle_packet(&ack(2, None), &[]);
         st.fill_send_window();
         assert_eq!(st.outbox.len(), 1);
         let (_, payload) = UtpHeader::decode(&st.outbox[0]).unwrap();
         assert_eq!(payload.len(), 20);
         st.outbox.clear();
-        // A full packet is never held, and closing flushes a partial one
         st.send_buf.extend(std::iter::repeat_n(4u8, MSS + 5));
         st.fill_send_window();
         assert_eq!(st.outbox.len(), 1);
@@ -1631,7 +1695,6 @@ mod tests {
         assert_eq!(st.outbox.len(), 2);
     }
 
-    /// Connected initiator with path-MTU discovery on and a wide window
     fn probing_initiator() -> Arc<Shared> {
         let shared = connected_initiator();
         {
@@ -1653,7 +1716,6 @@ mod tests {
         let (probe_seq, probe_bytes) = st.probe_out.clone().expect("probe queued");
         assert_eq!(probe_seq, 2, "the first data packet is the probe");
         assert_eq!(probe_bytes.len(), (floor + ceiling) / 2);
-        // Normal packets keep the proven size while the probe is out
         assert!(st.outbox.iter().all(|d| d.len() <= floor));
         st.handle_packet(&ack(probe_seq, None), &[]);
         assert_eq!(st.mtu_floor, probe_bytes.len());
@@ -1670,7 +1732,6 @@ mod tests {
         let (probe_seq, probe_bytes) = st.probe_out.take().unwrap();
         st.outbox.clear();
         let window = st.max_window;
-        // SACK seq 3, 4 and 5
         st.handle_packet(&ack(1, Some(vec![0b0000_0111, 0, 0, 0])), &[]);
         assert_eq!(st.mtu_ceiling, probe_bytes.len() - 1);
         assert!(st.max_window >= window, "a lost probe isn't congestion");
@@ -1692,7 +1753,6 @@ mod tests {
         let shared = probing_initiator();
         let mut st = shared.state.lock();
         st.set_mtu_floor(500 + UTP_OVERHEAD);
-        // Exactly one probe's worth of data, so the probe is the only packet in flight
         let payload = st.probe_payload();
         st.send_buf.extend(std::iter::repeat_n(9u8, payload));
         st.fill_send_window();
@@ -1812,14 +1872,12 @@ mod tests {
     fn selective_ack_mask_grows_past_32_packets() {
         let shared = connected_initiator();
         let mut st = shared.state.lock();
-        // ack_nr = 100; buffer seq 102 and 102 + 70
         st.reorder.insert(102, vec![1]);
         st.reorder.insert(172, vec![1]);
         let mask = st.build_selective_ack().unwrap();
         assert_eq!(mask.len(), 12);
         assert_eq!(mask[0] & 1, 1);
         assert_ne!(mask[70 / 8] & (1 << (70 % 8)), 0);
-        // Packets past the 256-bit cap are left out
         st.reorder.insert(102 + 400, vec![1]);
         assert_eq!(st.build_selective_ack().unwrap().len(), 12);
     }
@@ -1853,7 +1911,6 @@ mod tests {
         let mut hist = DelayHistory::default();
         let t0 = Instant::now();
         assert_eq!(hist.add_sample(1_000, t0), 0);
-        // Queuing builds up on top of the 1 ms base
         assert_eq!(
             hist.add_sample(51_000, t0),
             0,
@@ -1861,10 +1918,8 @@ mod tests {
         );
         hist.add_sample(51_000, t0);
         assert_eq!(hist.add_sample(51_000, t0), 50_000);
-        // The 1 ms minimum still sets the base a minute on, and has aged out two minutes on
         assert_eq!(hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET), 19_000);
         assert_eq!(hist.add_sample(20_000, t0 + BASE_DELAY_BUCKET * 2), 0);
-        // Wrapping timestamps compare correctly
         assert!(wrapping_lt(u32::MAX - 5, 3));
     }
 
@@ -1873,20 +1928,161 @@ mod tests {
         let shared = connected_initiator();
         let mut st = shared.state.lock();
         let window = st.max_window;
-        // Window-limited with no queuing delay: grows by at most 3000 bytes
-        st.update_cwnd(1_000, window, window);
+        st.last_maxed_out = Some(Instant::now());
+        st.update_cwnd(1_000, window);
         assert!(st.max_window > window && st.max_window <= window + 3000);
-        // Sustained queuing above target shrinks it; one spike is filtered out
         let grown = st.max_window;
-        st.update_cwnd(400_000, grown, grown);
+        st.update_cwnd(400_000, grown);
         assert!(st.max_window >= grown, "one high sample is filtered");
         for _ in 0..CUR_DELAY_SAMPLES {
-            st.update_cwnd(400_000, grown, grown);
+            st.update_cwnd(400_000, grown);
         }
         assert!(st.max_window < grown);
-        // Not window-limited: no growth even below target
         let current = st.max_window;
-        st.update_cwnd(1_000, MSS, 0);
+        st.last_maxed_out = None;
+        st.update_cwnd(1_000, MSS);
         assert_eq!(st.max_window, current);
+    }
+
+    fn assert_counters(st: &ConnState) {
+        let flight: usize = st
+            .unacked
+            .iter()
+            .filter(|p| !p.need_resend)
+            .map(|p| p.payload.len())
+            .sum();
+        let resend = st.unacked.iter().filter(|p| p.need_resend).count();
+        assert_eq!(st.in_flight, flight);
+        assert_eq!(st.resend_count, resend);
+        let reorder: usize = st.reorder.values().map(Vec::len).sum();
+        assert_eq!(st.reorder_bytes, reorder);
+    }
+
+    #[test]
+    fn in_flight_counters_track_acks_sacks_and_timeouts() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        send_packets(&mut st, 40);
+        assert_counters(&st);
+        let mut mask = vec![0xFFu8; 8];
+        mask[0] &= !1;
+        st.handle_packet(&ack(1, Some(mask)), &[]);
+        assert_counters(&st);
+        let resent: Vec<u16> = st
+            .outbox
+            .iter()
+            .map(|d| UtpHeader::decode(d).unwrap().0.seq_nr)
+            .collect();
+        assert_eq!(resent, vec![2, 3], "only the two holes are resent");
+        assert!(st.unacked.len() <= 3);
+        st.rto_base = Some(Instant::now() - Duration::from_secs(5));
+        st.check_timers();
+        assert_counters(&st);
+        st.handle_packet(&ack(41, None), &[]);
+        assert_counters(&st);
+        assert_eq!(st.in_flight, 0);
+    }
+
+    #[test]
+    fn out_of_order_receive_tracks_buffered_bytes() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        let data = |seq: u16| {
+            let mut h = ack(1, None);
+            h.packet_type = PacketType::Data;
+            h.seq_nr = seq;
+            h
+        };
+        st.handle_packet(&data(103), b"cc");
+        st.handle_packet(&data(102), b"bbb");
+        st.handle_packet(&data(102), b"bbb");
+        assert_eq!(st.reorder_bytes, 5);
+        assert_counters(&st);
+        st.handle_packet(&data(101), b"a");
+        assert_eq!(st.reorder_bytes, 0);
+        assert_eq!(st.recv_ready.len(), 6);
+        assert_eq!(st.advertised_window() as usize, RECV_BUF_MAX - 6);
+    }
+
+    #[test]
+    fn window_growth_survives_ack_batching() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.slow_start = true;
+        st.max_window = 4 * MSS;
+        send_packets(&mut st, 4);
+        st.send_buf.extend(std::iter::repeat_n(7u8, 4 * MSS));
+        st.fill_send_window();
+        assert!(st.last_maxed_out.is_some());
+        let before = st.max_window;
+        for seq in 2..=5 {
+            st.handle_packet(&ack(seq, None), &[]);
+        }
+        assert!(st.max_window >= before + 4 * MSS, "{}", st.max_window);
+    }
+
+    #[test]
+    fn unacked_fin_acker_without_a_fin_times_out() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.want_fin = true;
+        st.maybe_send_fin();
+        st.handle_packet(&ack(2, None), &[]);
+        assert_eq!(st.state, State::FinSent);
+        assert!(st.fin_acked_at.is_some());
+        assert!(st.next_deadline().is_some());
+        st.check_timers();
+        assert_eq!(st.state, State::FinSent);
+        st.fin_acked_at = Some(Instant::now() - LINGER_TIMEOUT - Duration::from_secs(1));
+        st.check_timers();
+        assert_eq!(st.state, State::Closed);
+        assert!(st.eof);
+    }
+
+    #[test]
+    fn buffer_exhaustion_is_retriable() {
+        for code in NO_BUFFER_CODES {
+            assert!(is_recoverable_send_error(&io::Error::from_raw_os_error(
+                *code
+            )));
+        }
+    }
+
+    #[test]
+    fn large_windows_are_sent_in_paced_bursts() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.rtt = 0.1;
+        st.max_window = 800 * MSS;
+        st.send_buf.extend(std::iter::repeat_n(7u8, 100 * MSS));
+        st.fill_send_window();
+        let burst = st.burst_limit();
+        assert_eq!(burst, MIN_BURST_PACKETS);
+        assert_eq!(st.unacked.len(), burst);
+        assert!(st.pace_at.is_some() && st.next_deadline().is_some());
+        st.fill_send_window();
+        assert_eq!(st.unacked.len(), burst, "held until the pace timer fires");
+        st.pace_at = Some(Instant::now() - Duration::from_millis(1));
+        st.fill_send_window();
+        assert_eq!(st.unacked.len(), 2 * burst);
+        assert_counters(&st);
+        st.rtt = 0.0001;
+        assert!(st.burst_limit() > 800);
+    }
+
+    #[test]
+    fn a_lost_fast_retransmit_is_repaired_after_an_rto() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        send_packets(&mut st, 6);
+        let sack = Some(vec![0b0000_0111, 0, 0, 0]);
+        st.handle_packet(&ack(1, sack.clone()), &[]);
+        assert_eq!(st.outbox.len(), 1);
+        st.outbox.clear();
+        st.handle_packet(&ack(1, sack.clone()), &[]);
+        assert!(st.outbox.is_empty(), "not resent again straight away");
+        st.unacked[0].sent_at = Instant::now() - st.rto - Duration::from_millis(1);
+        st.handle_packet(&ack(1, sack), &[]);
+        assert_eq!(st.outbox.len(), 1);
     }
 }

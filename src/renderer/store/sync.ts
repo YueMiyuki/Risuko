@@ -1,4 +1,8 @@
-import { getCategoriesForKey, syncCategories } from "@shared/syncCategories";
+import {
+	getCategoriesForKey,
+	syncCategories,
+	syncCategoryIds,
+} from "@shared/syncCategories";
 import {
 	normalizeNetworkProxyConfig,
 	normalizeProxyConfig,
@@ -121,7 +125,9 @@ export const useSyncStore = defineStore("sync", {
 	actions: {
 		getSelectedCategories(): string[] {
 			const preferenceStore = usePreferenceStore();
-			return (preferenceStore.config.cloudSyncCategories as string[]) || [];
+			const selected =
+				(preferenceStore.config.cloudSyncCategories as string[]) || [];
+			return selected.filter((id) => syncCategoryIds.includes(id));
 		},
 
 		isAutoSyncEnabled(): boolean {

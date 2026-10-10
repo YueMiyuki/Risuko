@@ -21,7 +21,6 @@ pub fn get_app_config(handle: AppHandle, state: State<'_, AppState>) -> Result<V
         }
     }
 
-    // Inject app-log-path so the frontend can display it
     if let Some(map) = merged.as_object_mut() {
         map.insert(
             "app-log-path".into(),
@@ -337,7 +336,6 @@ pub fn prepare_preference_patch(params: Value) -> Result<Value, String> {
         map.insert("seed-ratio".to_string(), Value::from(0));
     }
 
-    // Sync use-remote-file-time user pref → remote-time system option
     if let Some(val) = map.get("use-remote-file-time").cloned() {
         let enabled = val
             .as_bool()
@@ -510,6 +508,7 @@ pub fn is_signed_updater_available(handle: AppHandle) -> bool {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn has_signed_updater_pubkey(config: Option<&Value>) -> bool {
     config
         .and_then(|config| config.get("pubkey"))
@@ -518,7 +517,7 @@ fn has_signed_updater_pubkey(config: Option<&Value>) -> bool {
 }
 
 const MAX_TRACKER_SOURCE_URLS: usize = 64;
-const MAX_TRACKER_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TRACKER_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKER_SOURCE_CONCURRENCY: usize = 8;
 
 #[tauri::command]
@@ -605,21 +604,16 @@ async fn fetch_one_tracker_source(
             response.status()
         ));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_TRACKER_SOURCE_BYTES)
-    {
-        return Err("Tracker source response is too large".to_string());
-    }
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Tracker source body read failed: {e}"))?;
-        if chunk.len() > (MAX_TRACKER_SOURCE_BYTES as usize).saturating_sub(bytes.len()) {
-            return Err("Tracker source response is too large".to_string());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = response
+        .bytes_limited(MAX_TRACKER_SOURCE_BYTES)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("exceeds") {
+                "Tracker source response is too large".to_string()
+            } else {
+                format!("Tracker source body read failed: {e}")
+            }
+        })?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -734,8 +728,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // -- normalize_proxy_bypass --
-
     #[test]
     fn normalize_proxy_bypass_empty() {
         assert_eq!(normalize_proxy_bypass(""), "");
@@ -776,8 +768,6 @@ mod tests {
         assert!(!value_as_bool(Some(&json!("false"))));
         assert!(!value_as_bool(None));
     }
-
-    // -- contains_download_scope --
 
     #[test]
     fn contains_download_scope_none() {
@@ -859,8 +849,6 @@ mod tests {
             Some(&json!("http://old.example:8080"))
         );
     }
-
-    // -- prepare_preference_patch --
 
     #[test]
     fn prepare_non_object_returns_empty_map() {
@@ -1276,7 +1264,7 @@ mod tests {
             let mut request = [0u8; 1024];
             let _ = socket.read(&mut request).await;
 
-            let payload = vec![b'x'; MAX_TRACKER_SOURCE_BYTES as usize + 1];
+            let payload = vec![b'x'; MAX_TRACKER_SOURCE_BYTES + 1];
             let _ = socket
                 .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .await;

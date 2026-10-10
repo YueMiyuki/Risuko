@@ -68,9 +68,10 @@ import { TASK_STATUS } from "@shared/constants";
 import type { DownloadTask } from "@shared/types/task";
 import {
 	bytesToSize,
-	calcProgress,
 	checkTaskIsBT,
-	checkTaskIsSeeder,
+	formatProgressPercent,
+	getDisplayDownloadSpeed,
+	getDisplayTaskStatus,
 	getTaskName,
 	isMagnetTask,
 } from "@shared/utils";
@@ -119,11 +120,8 @@ export default {
 		isBT(): boolean {
 			return checkTaskIsBT(this.task);
 		},
-		isSeeder(): boolean {
-			return checkTaskIsSeeder(this.task);
-		},
 		displayStatus(): string {
-			return this.isSeeder ? TASK_STATUS.SEEDING : this.task.status;
+			return getDisplayTaskStatus(this.task);
 		},
 		isActive(): boolean {
 			return (
@@ -132,21 +130,16 @@ export default {
 			);
 		},
 		displayDownloadSpeed(): number {
-			if (this.isSeeder) {
-				return 0;
-			}
-			return Number(this.task.downloadSpeed || 0);
+			return getDisplayDownloadSpeed(this.task);
 		},
 		displayUploadSpeed(): number {
 			return Number(this.task.uploadSpeed || 0);
 		},
 		progressPercent(): string {
-			const result = calcProgress(
+			return formatProgressPercent(
 				Number(this.task.totalLength),
 				Number(this.task.completedLength),
-				1,
 			);
-			return `${result}`.replace(/\.0$/, "");
 		},
 		kindIcon() {
 			if (this.isBT || isMagnetTask(this.task)) {

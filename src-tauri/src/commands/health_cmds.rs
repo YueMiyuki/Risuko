@@ -1,10 +1,8 @@
-//! Aggregated health checks surfaced by the `/health` panel
-
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -34,7 +32,7 @@ use crate::commands::event_cmds::sleep_inhibit_active;
 use crate::state::AppState;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const LOG_TAIL_BYTES: u64 = 1_048_576; // 1 MiB
+const LOG_TAIL_BYTES: u64 = 1_048_576;
 const MAX_LOG_FILES: usize = 60;
 const MAX_LOG_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LOG_READ_LINES: usize = 5_000;
@@ -170,7 +168,6 @@ pub async fn run_health_checks(
     slow_probes: Option<bool>,
 ) -> Result<HealthReport, String> {
     let slow = slow_probes.unwrap_or(false);
-    // Snapshot config + engine state up front so we don't hold locks across awaits
     let (system_cfg, user_cfg, log_dir) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         (
@@ -187,21 +184,31 @@ pub async fn run_health_checks(
     let engine_running = engine::engine_uptime().is_some();
     let snapshot = engine::startup_snapshot();
 
-    // Live BT snapshot (None when torrent engine isn't initialized)
-    let (bt_snapshot, tracker_urls, kad_snapshot) = if let Some(mgr) = engine::get_manager().await {
-        let snap = mgr.bt_health_snapshot().await;
-        let urls = mgr.list_active_tracker_urls().await;
-        let kad = mgr.kad_health_snapshot().await;
-        (snap, urls, Some(kad))
-    } else {
-        (None, Vec::new(), None)
-    };
-
     let want = |id: &str| {
         categories
             .as_ref()
             .map(|list| list.iter().any(|c| c == id))
             .unwrap_or(true)
+    };
+
+    let (bt_snapshot, tracker_urls, kad_snapshot) = match engine::get_manager().await {
+        Some(mgr) if want("bittorrent") || want("network") => {
+            let (snap, urls) = if want("bittorrent") {
+                (
+                    mgr.bt_health_snapshot().await,
+                    mgr.list_active_tracker_urls().await,
+                )
+            } else {
+                (None, Vec::new())
+            };
+            let kad = if want("network") {
+                Some(mgr.kad_health_snapshot().await)
+            } else {
+                None
+            };
+            (snap, urls, kad)
+        }
+        _ => (None, Vec::new(), None),
     };
 
     let mut cats: Vec<HealthCategory> = Vec::new();
@@ -225,10 +232,11 @@ pub async fn run_health_checks(
         ));
     }
     if want("disk") {
-        cats.push(HealthCategory::from_checks(
-            "disk",
-            check_disk(&options, &user_cfg),
-        ));
+        let (disk_options, disk_cfg) = (options.clone(), user_cfg.clone());
+        let checks = tokio::task::spawn_blocking(move || check_disk(&disk_options, &disk_cfg))
+            .await
+            .map_err(|e| e.to_string())?;
+        cats.push(HealthCategory::from_checks("disk", checks));
     }
     if want("system") {
         cats.push(HealthCategory::from_checks(
@@ -243,7 +251,11 @@ pub async fn run_health_checks(
         ));
     }
     if want("logs") {
-        cats.push(HealthCategory::from_checks("logs", check_logs(&log_dir)));
+        let dir = log_dir.clone();
+        let checks = tokio::task::spawn_blocking(move || check_logs(&dir))
+            .await
+            .map_err(|e| e.to_string())?;
+        cats.push(HealthCategory::from_checks("logs", checks));
     }
     if want("tools") && !cfg!(target_os = "android") {
         cats.push(HealthCategory::from_checks("tools", check_tools().await));
@@ -265,8 +277,6 @@ pub async fn run_health_checks(
         log_path: log_dir.to_string_lossy().to_string(),
     })
 }
-
-// General
 
 fn check_general(options: &EngineOptions, running: bool) -> Vec<HealthCheck> {
     let mut out = Vec::new();
@@ -324,8 +334,6 @@ fn parse_boolish(v: Option<&Value>, default: bool) -> bool {
         _ => default,
     }
 }
-
-// Network
 
 async fn check_network(
     options: &EngineOptions,
@@ -404,25 +412,35 @@ async fn check_network(
     } else {
         ""
     };
-    out.push(check_proxy_profile("proxy", "HTTP", http_proxy, http_bypass, slow).await);
-
     let p2p_proxy = options.get_str("p2p-proxy").unwrap_or("").trim();
     let p2p_bypass = options.get_str("p2p-no-proxy").unwrap_or("").trim();
-    out.push(check_proxy_profile("p2p-proxy", "P2P", p2p_proxy, p2p_bypass, slow).await);
     let p2p_udp_proxy = options.get_str("p2p-udp-proxy").unwrap_or("").trim();
     let p2p_udp_bypass = options.get_str("p2p-udp-no-proxy").unwrap_or("").trim();
-    if p2p_udp_proxy != p2p_proxy || p2p_udp_bypass != p2p_bypass {
-        out.push(
-            check_proxy_profile(
-                "p2p-udp-proxy",
-                "P2P UDP",
-                p2p_udp_proxy,
-                p2p_udp_bypass,
-                slow,
-            )
-            .await,
-        );
-    }
+    let udp_differs = p2p_udp_proxy != p2p_proxy || p2p_udp_bypass != p2p_bypass;
+
+    let (http, p2p, p2p_udp) = tokio::join!(
+        check_proxy_profile("proxy", "HTTP", http_proxy, http_bypass, slow),
+        check_proxy_profile("p2p-proxy", "P2P", p2p_proxy, p2p_bypass, slow),
+        async {
+            if udp_differs {
+                Some(
+                    check_proxy_profile(
+                        "p2p-udp-proxy",
+                        "P2P UDP",
+                        p2p_udp_proxy,
+                        p2p_udp_bypass,
+                        slow,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        }
+    );
+    out.push(http);
+    out.push(p2p);
+    out.extend(p2p_udp);
 
     out
 }
@@ -708,8 +726,6 @@ async fn probe_proxy_reachability(id: &str, label: &str, proxy_url: &str) -> Hea
     }
 }
 
-// Bittorrent
-
 async fn check_bittorrent(
     options: &EngineOptions,
     bt: Option<&BtHealthSnapshot>,
@@ -718,7 +734,6 @@ async fn check_bittorrent(
 ) -> Vec<HealthCheck> {
     let mut out = Vec::new();
 
-    // DHT needs ~30s after engine start to bootstrap. Treat the bootstrap window as "probing" rather than a warning. (UPnP uses its own attempt counter rather than a fixed window)
     const BOOTSTRAP_WINDOW_SECS: u64 = 60;
     let uptime_secs = engine::engine_uptime().map(|d| d.as_secs()).unwrap_or(0);
     let bootstrapping = uptime_secs < BOOTSTRAP_WINDOW_SECS;
@@ -728,7 +743,6 @@ async fn check_bittorrent(
         format!("Encryption: {}", options.bt_encryption_policy()),
     ));
 
-    // UPnP, combine config flag with live mapping count when available
     let upnp_cfg = options.bt_enable_upnp();
     match (upnp_cfg, bt) {
         (false, _) => out.push(HealthCheck::skipped(
@@ -760,7 +774,6 @@ async fn check_bittorrent(
         )),
     }
 
-    // LSD, combine config flag with live handle status
     let lsd_cfg = options.bt_enable_lsd();
     match (lsd_cfg, bt) {
         (false, _) => out.push(HealthCheck::skipped(
@@ -841,7 +854,6 @@ async fn check_bittorrent(
         })),
     );
 
-    // Tracker reachability, only when there are active torrents and the caller opted in to slow probes (each probe is 3s timeout-bound)
     if tracker_urls.is_empty() {
         out.push(HealthCheck::skipped(
             "trackers",
@@ -869,7 +881,6 @@ async fn probe_trackers(urls: &[String]) -> HealthCheck {
     use risuko_http::{ClientBuilder, Method};
     use tokio::task::JoinSet;
 
-    // Cap concurrent probes to avoid hammering the network in trackers-heavy setups. 8 in-flight is a sensible default
     const MAX_CONCURRENCY: usize = 8;
     const PER_TRACKER_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -905,7 +916,6 @@ async fn probe_trackers(urls: &[String]) -> HealthCheck {
             Ok(resp) => {
                 let s = resp.status();
                 if s.is_success() || s.is_redirection() || s.as_u16() == 400 {
-                    // for HEAD-on-announce (missing query)
                     "ok"
                 } else {
                     "warn"
@@ -918,7 +928,6 @@ async fn probe_trackers(urls: &[String]) -> HealthCheck {
     let mut counts = Counts::default();
     let mut iter = urls.iter().cloned();
     let mut set: JoinSet<&'static str> = JoinSet::new();
-    // Prime the pump
     for _ in 0..MAX_CONCURRENCY {
         if let Some(url) = iter.next() {
             let c = client.clone();
@@ -969,8 +978,6 @@ fn fmt_opt<T: std::fmt::Display>(v: Option<T>, fallback: &str) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| fallback.into())
 }
 
-// Disk
-
 fn check_disk(
     options: &EngineOptions,
     user_cfg: &serde_json::Map<String, Value>,
@@ -978,7 +985,7 @@ fn check_disk(
     let mut out = Vec::new();
 
     let dir = options.dir();
-    let dir_check = probe_dir("download-dir", &dir);
+    let dir_check = probe_dir("download-dir", &dir, true);
     out.push(dir_check);
 
     let alloc = options.get_str("file-allocation").unwrap_or("falloc");
@@ -987,20 +994,17 @@ fn check_disk(
         format!("File allocation: {}", alloc),
     ));
 
-    // Each entry in the recent-saved-paths history
     if let Some(arr) = user_cfg
         .get("recent-saved-paths")
         .and_then(|v| v.as_array())
     {
         for (i, v) in arr.iter().enumerate() {
             let Some(path) = v.as_str() else { continue };
-            // Skip the primary dir (already checked above)
             if path == dir.as_str() {
                 continue;
             }
             let id = format!("recent-dir-{}", i);
-            // Demote failures to warnings here
-            let mut probed = probe_dir(&id, path);
+            let mut probed = probe_dir(&id, path, false);
             if probed.status == HealthStatus::Fail {
                 probed.status = HealthStatus::Warn;
             }
@@ -1011,7 +1015,7 @@ fn check_disk(
     out
 }
 
-fn probe_dir(id: &str, path: &str) -> HealthCheck {
+fn probe_dir(id: &str, path: &str, write_test: bool) -> HealthCheck {
     if path.is_empty() {
         return HealthCheck::fail(
             id,
@@ -1035,13 +1039,18 @@ fn probe_dir(id: &str, path: &str) -> HealthCheck {
         );
     }
 
-    // Touch test: create, write, and auto-remove a unique temp file
-    let writable = tempfile::NamedTempFile::new_in(p)
-        .and_then(|mut probe| {
-            probe.write_all(b"probe")?;
-            probe.flush()
-        })
-        .is_ok();
+    let writable = if write_test {
+        tempfile::NamedTempFile::new_in(p)
+            .and_then(|mut probe| {
+                probe.write_all(b"probe")?;
+                probe.flush()
+            })
+            .is_ok()
+    } else {
+        p.metadata()
+            .map(|meta| !meta.permissions().readonly())
+            .unwrap_or(false)
+    };
     if !writable {
         return HealthCheck::fail(
             id,
@@ -1050,7 +1059,6 @@ fn probe_dir(id: &str, path: &str) -> HealthCheck {
         );
     }
 
-    // `fs4` wraps `statvfs` on unix and `GetDiskFreeSpaceExW` on windows
     let (free, total) = (fs4::available_space(p).ok(), fs4::total_space(p).ok());
     let mut details = serde_json::json!({ "path": path });
     if let (Some(free_b), Some(total_b)) = (free, total) {
@@ -1081,8 +1089,6 @@ fn probe_dir(id: &str, path: &str) -> HealthCheck {
 
     HealthCheck::ok(id, format!("{} writable (free space unknown)", path)).with_details(details)
 }
-
-// System
 
 fn check_system(autostart: bool, prevent_sleep_while_downloading: bool) -> Vec<HealthCheck> {
     let mut out = Vec::new();
@@ -1122,8 +1128,6 @@ fn autostart_enabled(handle: &AppHandle) -> bool {
         handle.autolaunch().is_enabled().unwrap_or(false)
     }
 }
-
-// Config
 
 fn check_config(
     system: &serde_json::Map<String, Value>,
@@ -1174,8 +1178,6 @@ fn check_config(
 
     out
 }
-
-// Logs
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1300,7 +1302,7 @@ fn open_authorized_log(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_log_files(state: State<'_, AppState>) -> Result<Vec<LogFileSummary>, String> {
     let root = std::fs::canonicalize(&state.log_dir)
         .map_err(|e| format!("Log directory unavailable: {e}"))?;
@@ -1345,7 +1347,7 @@ pub fn list_log_files(state: State<'_, AppState>) -> Result<Vec<LogFileSummary>,
     Ok(files)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_log_file(
     state: State<'_, AppState>,
     name: String,
@@ -1468,20 +1470,24 @@ fn parse_log_bytes(
 fn normalize_level(value: &str) -> Option<&'static str> {
     let value = value
         .trim()
-        .trim_matches(|c: char| !c.is_ascii_alphabetic())
-        .to_ascii_lowercase();
-    match value.as_str() {
-        "trace" => Some("trace"),
-        "debug" => Some("debug"),
-        "info" => Some("info"),
-        "warn" | "warning" => Some("warn"),
-        "error" | "err" => Some("error"),
-        "unknown" => Some("unknown"),
-        _ => None,
-    }
+        .trim_matches(|c: char| !c.is_ascii_alphabetic());
+    const LEVELS: [(&str, &str); 8] = [
+        ("trace", "trace"),
+        ("debug", "debug"),
+        ("info", "info"),
+        ("warn", "warn"),
+        ("warning", "warn"),
+        ("error", "error"),
+        ("err", "error"),
+        ("unknown", "unknown"),
+    ];
+    LEVELS
+        .iter()
+        .find(|(name, _)| value.eq_ignore_ascii_case(name))
+        .map(|(_, level)| *level)
 }
 
-fn parse_log_line(raw: &str) -> (Option<String>, String, String) {
+fn scan_log_line(raw: &str) -> (Option<&str>, &'static str, Option<usize>) {
     let mut timestamp = None;
     let mut level = "unknown";
     let mut level_end = None;
@@ -1492,7 +1498,7 @@ fn parse_log_line(raw: &str) -> (Option<String>, String, String) {
             && value.as_bytes().get(4) == Some(&b'-')
             && value.as_bytes().get(7) == Some(&b'-')
     }) {
-        timestamp = first.map(str::to_string);
+        timestamp = first;
     }
 
     let level_token = if timestamp.is_some() {
@@ -1503,18 +1509,22 @@ fn parse_log_line(raw: &str) -> (Option<String>, String, String) {
     if let Some(token) = level_token {
         if let Some(parsed) = normalize_level(token) {
             level = parsed;
-            // Compute the offset from the token's actual position in `raw` (str::split_whitespace yields sub-slices of `raw`), rather than re-searching, which could match an identical earlier substring
             let start = token.as_ptr() as usize - raw.as_ptr() as usize;
             level_end = Some(start + token.len());
         }
     }
+    (timestamp, level, level_end)
+}
+
+fn parse_log_line(raw: &str) -> (Option<String>, String, String) {
+    let (timestamp, level, level_end) = scan_log_line(raw);
     let message = level_end
         .and_then(|end| raw.get(end..))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(raw)
         .to_string();
-    (timestamp, level.to_string(), message)
+    (timestamp.map(str::to_string), level.to_string(), message)
 }
 
 fn check_logs(log_dir: &Path) -> Vec<HealthCheck> {
@@ -1584,56 +1594,99 @@ fn check_logs(log_dir: &Path) -> Vec<HealthCheck> {
     out
 }
 
-// Tools
+#[derive(Clone)]
+struct ToolFacts {
+    yt_dlp: Option<String>,
+    ffmpeg: Option<String>,
+}
 
-async fn check_tools() -> Vec<HealthCheck> {
-    let mut out = Vec::new();
+const TOOLS_CACHE_TTL: Duration = Duration::from_secs(300);
+const TOOLS_MISSING_RETRY: Duration = Duration::from_secs(10);
 
-    match media::check_yt_dlp_available().await {
-        Ok(()) => {
-            // Capture the version string for display
-            let version = tokio::process::Command::new("yt-dlp")
-                .arg("--version")
+static TOOLS_CACHE: std::sync::Mutex<Option<(Instant, ToolFacts)>> = std::sync::Mutex::new(None);
+
+fn cached_tool_facts() -> Option<ToolFacts> {
+    let cache = TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, facts) = cache.as_ref()?;
+    let ttl = if facts.yt_dlp.is_some() && facts.ffmpeg.is_some() {
+        TOOLS_CACHE_TTL
+    } else {
+        TOOLS_MISSING_RETRY
+    };
+    (at.elapsed() < ttl).then(|| facts.clone())
+}
+
+async fn probe_tool_facts() -> ToolFacts {
+    let yt_dlp = tokio::process::Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let version = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if version.is_empty() {
+                "unknown".to_string()
+            } else {
+                version
+            }
+        });
+
+    let ffmpeg = match media::find_ffmpeg().await {
+        Some(path) => Some(
+            tokio::process::Command::new(&path)
+                .arg("-version")
                 .output()
                 .await
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            out.push(
-                HealthCheck::ok("yt-dlp", format!("yt-dlp available ({})", version))
-                    .with_details(serde_json::json!({ "version": version })),
-            );
+                .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        None => None,
+    };
+    ToolFacts { yt_dlp, ffmpeg }
+}
+
+async fn check_tools() -> Vec<HealthCheck> {
+    let facts = match cached_tool_facts() {
+        Some(facts) => facts,
+        None => {
+            let facts = probe_tool_facts().await;
+            *TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((Instant::now(), facts.clone()));
+            facts
         }
-        Err(_) => {
-            out.push(HealthCheck::fail(
-                "yt-dlp",
-                "yt-dlp not found in PATH — media-site downloads will fail",
-                None,
-            ));
-        }
+    };
+    tool_checks(&facts)
+}
+
+fn tool_checks(facts: &ToolFacts) -> Vec<HealthCheck> {
+    let mut out = Vec::new();
+
+    match &facts.yt_dlp {
+        Some(version) => out.push(
+            HealthCheck::ok("yt-dlp", format!("yt-dlp available ({})", version))
+                .with_details(serde_json::json!({ "version": version })),
+        ),
+        None => out.push(HealthCheck::fail(
+            "yt-dlp",
+            "yt-dlp not found in PATH — media-site downloads will fail",
+            None,
+        )),
     }
 
-    if let Some(ffmpeg_path) = media::find_ffmpeg().await {
-        let version = tokio::process::Command::new(&ffmpeg_path)
-            .arg("-version")
-            .output()
-            .await
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-        out.push(
+    match &facts.ffmpeg {
+        Some(version) => out.push(
             HealthCheck::ok("ffmpeg", format!("ffmpeg available ({version})"))
                 .with_details(serde_json::json!({ "version": version })),
-        );
-    } else {
-        out.push(HealthCheck::warn(
+        ),
+        None => out.push(HealthCheck::warn(
             "ffmpeg",
             "ffmpeg not found in PATH — media downloads fall back to single-file \
              quality (no video+audio merge)",
             None,
-        ));
+        )),
     }
 
     out
@@ -1651,7 +1704,7 @@ fn tail_count_levels(path: &Path) -> std::io::Result<(usize, usize)> {
     let mut errors = 0usize;
     let mut warnings = 0usize;
     for line in text.lines() {
-        match parse_log_line(line).1.as_str() {
+        match scan_log_line(line).1 {
             "error" => errors += 1,
             "warn" => warnings += 1,
             _ => {}
@@ -1824,6 +1877,35 @@ mod tests {
         assert_eq!(details.get("lastBootstrapAtMs"), Some(&json!(1000)));
         assert_eq!(details.get("lastLookupAtMs"), Some(&json!(2000)));
         assert_eq!(details.get("lastLookupSuccess"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn scan_log_line_finds_level_without_allocating_message() {
+        let (ts, level, end) = scan_log_line("2026-01-02T03:04:05Z  WARN risuko: slow disk");
+        assert_eq!(ts, Some("2026-01-02T03:04:05Z"));
+        assert_eq!(level, "warn");
+        assert!(end.is_some());
+        assert_eq!(scan_log_line("no level here").1, "unknown");
+    }
+
+    #[test]
+    fn tool_checks_reflect_missing_and_found_tools() {
+        let checks = tool_checks(&ToolFacts {
+            yt_dlp: Some("2026.01.01".into()),
+            ffmpeg: None,
+        });
+        assert_eq!(checks[0].id, "yt-dlp");
+        assert_eq!(checks[0].status, HealthStatus::Ok);
+        assert_eq!(checks[1].id, "ffmpeg");
+        assert_eq!(checks[1].status, HealthStatus::Warn);
+    }
+
+    #[test]
+    fn probe_dir_without_write_test_leaves_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = probe_dir("recent", dir.path().to_str().unwrap(), false);
+        assert_ne!(check.status, HealthStatus::Fail);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

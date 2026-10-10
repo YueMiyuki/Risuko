@@ -6944,10 +6944,10 @@ version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
- "dirs 6.0.0",
  "risuko-engine",
  "risuko-http",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6991,6 +6991,7 @@ dependencies = [
  "cbc 0.2.1",
  "dirs 6.0.0",
  "feed-rs",
+ "flate2",
  "fs4",
  "futures-util",
  "glob",
@@ -7060,7 +7061,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "tokio-socks",
  "tokio-util",
  "tower-service",
  "tracing",
@@ -7072,7 +7072,6 @@ dependencies = [
 name = "risuko-napi"
 version = "0.7.1"
 dependencies = [
- "dirs 6.0.0",
  "napi",
  "napi-build",
  "napi-derive",
@@ -7091,7 +7090,9 @@ dependencies = [
  "iroh-blobs",
  "irpc",
  "n0-future",
+ "risuko-engine",
  "serde",
+ "tempfile",
  "tokio",
 ]
 
@@ -9114,18 +9115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-socks"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7e2948f60dbe26b35f2c7fb74ac2854c1fddded0fe9d7548fcc674a246f7615"
-dependencies = [
- "either",
- "futures-util",
- "thiserror 1.0.69",
  "tokio",
 ]
 

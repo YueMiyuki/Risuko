@@ -13,6 +13,12 @@ pub struct RssFeed {
     pub created_at: u64,
     pub is_active: bool,
     pub error_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,7 +33,6 @@ pub struct ParsedMeta {
     pub episode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absolute_episode: Option<u32>,
-    /// Always serialized (as `[]` when empty) so the renderer can rely on the key being present in JSON payloads
     #[serde(default)]
     pub quality_tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,7 +45,6 @@ pub struct ParsedMeta {
     pub container: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// Best-effort seeders parsed from title (e.g. `[123S/45L]`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seeders: Option<u32>,
 }
@@ -53,7 +57,6 @@ pub struct RssItem {
     pub link: String,
     pub pub_date: Option<u64>,
     pub description: String,
-    /// Full body HTML (content:encoded / atom:content) when the feed provides one beyond the short summary. Empty when the feed has no separate body
     #[serde(default)]
     pub content: String,
     pub enclosure_url: Option<String>,
@@ -67,7 +70,6 @@ pub struct RssItem {
     pub parsed_meta: Option<ParsedMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule_id: Option<String>,
-    /// Additional media URLs scraped from the entry's HTML body (img/video/audio/source) plus any enclosure-style links beyond the primary `enclosure_url`. Useful for content feeds where the primary enclosure is just a cover image and the real payloads live inline
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media_urls: Vec<String>,
 }
@@ -124,11 +126,8 @@ pub enum Weekday {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
     pub days: Vec<Weekday>,
-    /// 0..=23
     pub start_hour: u8,
-    /// 0..=23, exclusive end. If `end_hour <= start_hour` the window wraps midnight
     pub end_hour: u8,
-    /// Minutes east of UTC
     #[serde(default)]
     pub tz_offset_min: i32,
 }
@@ -137,10 +136,8 @@ pub struct Schedule {
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
 pub enum RuleMode {
-    /// First matching rule (by priority desc) wins
     #[default]
     AnyMatch,
-    /// Highest-scoring matching rule across the active set wins
     BestMatch,
 }
 
@@ -163,7 +160,6 @@ pub struct RssRule {
     #[serde(default = "default_true")]
     pub auto_download: bool,
 
-    /// Empty = all feeds
     #[serde(default)]
     pub feed_ids: Vec<String>,
     #[serde(default)]
@@ -171,7 +167,6 @@ pub struct RssRule {
     #[serde(default)]
     pub mode: RuleMode,
 
-    // Filters
     #[serde(default)]
     pub title_must: Vec<Pattern>,
     #[serde(default)]
@@ -183,7 +178,6 @@ pub struct RssRule {
     #[serde(default)]
     pub min_seeders: Option<u32>,
 
-    // Series / episodes
     #[serde(default)]
     pub series_filter: Option<String>,
     #[serde(default)]
@@ -191,7 +185,6 @@ pub struct RssRule {
     #[serde(default)]
     pub episodes: Option<EpisodeSelector>,
 
-    // Quality
     #[serde(default)]
     pub quality_preferences: Vec<String>,
     #[serde(default)]
@@ -201,13 +194,11 @@ pub struct RssRule {
     #[serde(default)]
     pub upgrade_existing: bool,
 
-    // Output
     #[serde(default)]
     pub download_dir: Option<String>,
     #[serde(default)]
     pub filename_template: Option<String>,
 
-    // Schedule / cooldown
     #[serde(default)]
     pub schedule: Option<Schedule>,
     #[serde(default)]
@@ -230,7 +221,6 @@ pub struct EpisodeKey {
 }
 
 impl EpisodeKey {
-    /// Stringified key for HashMap<String, _> persistence (JSON-friendly)
     pub fn to_storage_key(&self) -> String {
         format!(
             "{}|s{}|e{}|{}",
@@ -258,15 +248,12 @@ pub struct EpisodeRecord {
 pub struct RssStore {
     pub feeds: Vec<RssFeed>,
     pub items: HashMap<String, Vec<RssItem>>,
-    /// Stored sorted by priority desc
     #[serde(default, deserialize_with = "deserialize_rules_lossy")]
     pub rules: Vec<RssRule>,
-    /// Keyed by `EpisodeKey::to_storage_key`
     #[serde(default)]
     pub episode_history: HashMap<String, EpisodeRecord>,
 }
 
-/// Lossy deserializer: when `rules` is an array, drop only the elements that fail to parse (e.g. a single legacy/v1 rule entry) instead of discarding the whole list. Anything else falls back to a best-effort whole-value decode and finally an empty list
 fn deserialize_rules_lossy<'de, D>(deserializer: D) -> Result<Vec<RssRule>, D::Error>
 where
     D: serde::Deserializer<'de>,

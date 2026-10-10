@@ -9,8 +9,6 @@ license = "MIT"
 [lib]
 name = "risuko_engine"
 
-# md-5's lib name is `md5`, so cargo-machete's name scan false-flags it as
-# unused; it IS used in engine/hasher.rs for checksum verification
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
 
@@ -57,6 +55,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 webpki-roots = "1"
 suppaftp = { version = "9", features = ["tokio-rustls-ring", "deprecated"] }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"] }
+flate2 = "1.1"
 russh-sftp = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

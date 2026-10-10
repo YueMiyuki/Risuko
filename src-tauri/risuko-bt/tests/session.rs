@@ -1,5 +1,3 @@
-//! Session behaviour tests: add_torrent dedup and shutdown semantics
-
 use std::path::PathBuf;
 
 use risuko_bt::bencode::{encode_to_vec, Value};
@@ -76,7 +74,7 @@ async fn add_same_torrent_twice_returns_already_managed() {
         .expect("first add");
     let first_id = match first {
         AddTorrentResponse::Added(id, _) => id,
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
+        AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
     };
 
     let second = session
@@ -96,36 +94,37 @@ async fn add_same_torrent_twice_returns_already_managed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_only_returns_metadata_without_adding() {
+async fn shutdown_stops_every_torrent_and_clears_the_session() {
     let tmp = tempfile::tempdir().unwrap();
-    let session = Session::new_with_opts(PathBuf::from(tmp.path()), SessionOptions::default())
+    let session = Session::new_with_opts(PathBuf::from(tmp.path()), quiet_session_opts())
         .await
         .unwrap();
-
-    let bytes = make_torrent_bytes("list-only");
-    let opts = AddTorrentOptions {
-        list_only: true,
-        ..Default::default()
-    };
-    let resp = session
-        .add_torrent(AddTorrent::TorrentFileBytes(bytes.into()), Some(opts))
-        .await
-        .expect("list-only add");
-
-    match resp {
-        AddTorrentResponse::ListOnly(r) => {
-            assert_eq!(r.info.name, "list-only");
-            assert_eq!(r.files.len(), 1);
+    let mut handles = Vec::new();
+    for name in ["shutdown-a", "shutdown-b", "shutdown-c"] {
+        let added = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(make_torrent_bytes(name).into()),
+                Some(AddTorrentOptions::default()),
+            )
+            .await
+            .expect("add");
+        match added {
+            AddTorrentResponse::Added(_, handle) => handles.push(handle),
+            AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
         }
-        _ => panic!("expected ListOnly"),
     }
+    assert_eq!(session.with_torrents(|iter| iter.count()), 3);
 
-    // list_only must NOT register the torrent
-    let count = session.with_torrents(|iter| iter.count());
-    assert_eq!(count, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(15), session.shutdown())
+        .await
+        .expect("shutdown did not finish");
+
+    assert_eq!(session.with_torrents(|iter| iter.count()), 0);
+    for handle in handles {
+        assert!(session.pause(&handle).await.is_err());
+    }
 }
 
-/// Session must start when an IPv6 listener is requested; on hosts without v6 the bind is logged-and-skipped, so this asserts only that startup succeeds (session dropped immediately to clean up tasks)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_starts_with_listen_ipv6_enabled() {
     let tmp = tempfile::tempdir().unwrap();
@@ -136,7 +135,6 @@ async fn session_starts_with_listen_ipv6_enabled() {
             upnp_lease: None,
             listen_ipv6: true,
         }),
-        // Disable LSD to avoid multicast bind warnings polluting test output
         disable_local_service_discovery: true,
         ..Default::default()
     };
@@ -167,7 +165,7 @@ async fn readd_after_deleting_payload_does_not_stay_complete() {
         .expect("first add");
     let (id1, handle1) = match first {
         AddTorrentResponse::Added(id, handle) => (id, handle),
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
+        AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
     };
     wait_until_finished(&handle1).await;
 
@@ -196,7 +194,6 @@ async fn readd_after_deleting_payload_does_not_stay_complete() {
                 handle.stats().finished
             );
         }
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
     }
 }
 
@@ -224,7 +221,7 @@ async fn readd_of_complete_torrent_rehashes_existing_files() {
             wait_until_finished(&handle).await;
             id
         }
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
+        AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
     };
 
     let second = session
@@ -242,7 +239,6 @@ async fn readd_of_complete_torrent_rehashes_existing_files() {
         AddTorrentResponse::AlreadyManaged(_, _) => {
             panic!("complete torrent should be respawned so disk is rehashed");
         }
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
     }
 }
 
@@ -284,7 +280,7 @@ async fn adding_first_tracker_to_trackerless_torrent_starts_polling() {
         .expect("add trackerless torrent");
     let handle = match added {
         AddTorrentResponse::Added(_, handle) => handle,
-        other => panic!("expected Added, got {:?}", std::mem::discriminant(&other)),
+        AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
     };
 
     let url = format!("http://{tracker_addr}/announce");

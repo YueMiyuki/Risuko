@@ -129,20 +129,17 @@ internal class PackageManagerHook(
         val sortedAbis = preferredAbis.clone().also { it.sort() }
         val list = libsDir.list() ?: return null
 
-        // .so directly in the root
         if (list.any { it.endsWith(".so") }) {
             val cpuAbi = preferredAbis.firstOrNull() ?: return null
             Log.w(LOG_TAG, "native .so in lib root, cpuAbi=$cpuAbi")
             return cpuAbi to libsDir.absolutePath
         }
-        // canonical ABI subdir present as-is
         for (name in list) {
             if (sortedAbis.binarySearchExists(name)) {
                 val d = File(libsDir, name)
                 if (d.isDirectory) return name to d.absolutePath
             }
         }
-        // canonical match, then short dir name (arm/arm64)
         for (canonical in preferredAbis) {
             val d = File(libsDir, canonical)
             if (d.isDirectory) return canonical to d.absolutePath
@@ -151,7 +148,6 @@ internal class PackageManagerHook(
                 if (d2.isDirectory) return canonical to d2.absolutePath
             }
         }
-        // any subdir that contains a .so
         for (name in list) {
             val sub = File(libsDir, name)
             if (!sub.isDirectory) continue
@@ -199,9 +195,6 @@ internal class PackageManagerHook(
     }
 
     override fun onTargetBinderRestore(binder: IBinder) {
-        // The "package" service is a remote BinderProxy, so queryLocalInterface on it
-        // returns null. Restore the real IInterface captured in onProxyBinderCreate,
-        // falling back to re-deriving it from the binder if unavailable
         val realInterface = realPackageManagerInterface
             ?: Framework.packageManagerAsInterface(binder)
         binderCache[Framework.SERVICE_PACKAGE] = binder

@@ -32,7 +32,6 @@ fn with_desktop_plugins<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri:
                 let _ = window.show();
                 let _ = window.set_focus();
 
-                // A relaunched second instance may carry leading flags (e.g. --opened-at-login=1), so scan all args for the first path that exists rather than assuming it is at a fixed index
                 if let Some(path) = args
                     .iter()
                     .skip(1)
@@ -176,11 +175,9 @@ fn init_logging(
     guard
 }
 
-/// Apply environment workarounds for known WebKitGTK/Linux rendering issues before any GTK/WebKit code initializes. Only sets variables not already defined, so users can override
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_workarounds() {
-    // WebKitGTK's DMA-BUF renderer (default since 2.42) frequently fails to initialize EGL/GBM on NVIDIA, virtualized GPUs, Wayland sessions without a working GBM backend, or older Mesa stacks. The failure manifests as: "Could not create GBM EGL display: EGL_NOT_INITIALIZED. Aborting..." followed by SIGABRT before the window is shown. Disabling DMA-BUF forces the legacy GLES path which is far more compatible. See: https://github.com/tauri-apps/tauri/issues/9304
-    // `__NV_DISABLE_EXPLICIT_SYNC` is read by the NVIDIA driver only; Tauri documents it for the Wayland "Error 71" crash and reports no performance cost, so it is safe to carry for every GPU. See: https://v2.tauri.app/develop/debug/linux-graphics/
+    // WebKitGTK DMA-BUF renderer aborts with GBM EGL errors on NVIDIA and VMs, see tauri#9304
     for (key, value) in [
         ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
         ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
@@ -192,7 +189,6 @@ fn apply_linux_webkit_workarounds() {
     }
 }
 
-/// Log the app, webview and (on Linux) display environment once per launch so freeze and rendering reports carry the facts that decide the WebKitGTK code path (session type, GDK backend, IM modules, renderer overrides) without a follow-up round trip
 fn log_runtime_diagnostics(app: &tauri::App) {
     let webview = tauri::webview_version().unwrap_or_else(|e| format!("unknown ({e})"));
     tracing::info!(
@@ -203,7 +199,6 @@ fn log_runtime_diagnostics(app: &tauri::App) {
 
     #[cfg(target_os = "linux")]
     {
-        // AppImage launchers force GDK_BACKEND=x11, so a Wayland session can still run through XWayland; logging both the session and the backend keeps that visible
         const KEYS: [&str; 17] = [
             "XDG_SESSION_TYPE",
             "XDG_CURRENT_DESKTOP",
@@ -251,7 +246,6 @@ pub fn run() {
     .setup(|app| {
         let handle = app.handle();
 
-        // Create Tauri-backed trait implementations
         let config_dir_provider = bridge::TauriConfigDir::new(handle);
         let event_sink: Arc<dyn risuko_engine::EventSink> =
             Arc::new(bridge::TauriEventSink::new(handle));
@@ -291,7 +285,6 @@ pub fn run() {
         app.manage(app_state);
         sync_open_at_login_setting(app);
 
-        // P2P file sharing
         {
             let (share_tx, mut share_rx) =
                 tokio::sync::mpsc::unbounded_channel::<risuko_share::ShareEnvelope>();
@@ -319,13 +312,12 @@ pub fn run() {
             });
         }
 
-        // Windows/Linux use a custom title bar, so disable native decorations; macOS keeps decorations and uses `titleBarStyle: Overlay`
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.set_decorations(false);
         }
 
-        let opened_at_login = std::env::args().any(|arg| arg == "--opened-at-login=1");
+        let opened_at_login = std::env::args_os().any(|arg| arg == "--opened-at-login=1");
         if opened_at_login {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
@@ -360,10 +352,10 @@ pub fn run() {
 
         {
             let vault = app.state::<state::AppState>().vault.clone();
-            tauri::async_runtime::block_on(commands::upload_cmds::rehydrate_upload_sinks(
-                &upload_mgr,
-                &vault,
-            ));
+            let upload_mgr = upload_mgr.clone();
+            tauri::async_runtime::spawn(async move {
+                commands::upload_cmds::rehydrate_upload_sinks(&upload_mgr, &vault).await;
+            });
         }
 
         if should_start {
@@ -393,7 +385,6 @@ pub fn run() {
 
         managers::menu::setup_menu(app)?;
 
-        // On non-macOS, respect the hide-app-menu user preference
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
         {
             let hide_menu = app
@@ -408,15 +399,12 @@ pub fn run() {
                 })
                 .unwrap_or(true);
             if hide_menu {
+                managers::menu::set_menu_hidden(true);
                 let _ = app.handle().remove_menu();
             }
         }
 
         managers::tray::setup_tray(app)?;
-
-        managers::flyout::setup_flyout(app)?;
-
-        managers::clip_prompt::setup_clip_prompt(app)?;
 
         #[cfg(not(target_os = "android"))]
         {
@@ -438,7 +426,6 @@ pub fn run() {
         }
 
         let rss = app.state::<state::AppState>().rss.clone();
-        // `RssManager::start_polling` uses `tokio::spawn`, so enter Tauri's async runtime before invoking it from this synchronous setup hook
         tauri::async_runtime::spawn(async move {
             drop(RssManager::start_polling(rss));
         });
@@ -471,7 +458,7 @@ pub fn run() {
         if let tauri::WindowEvent::Focused(false) = event {
             #[cfg(not(target_os = "android"))]
             if window.label() == managers::flyout::FLYOUT_LABEL {
-                // blur also fires when the flyout hands focus to the main window it just opened; demoting then would strand the visible UI
+                // blur also fires when the flyout hands focus to the main window; demoting then strands the UI
                 #[cfg(target_os = "macos")]
                 managers::flyout::demote_if_ui_hidden(window.app_handle());
                 let _ = window.hide();
@@ -496,10 +483,10 @@ pub fn run() {
         commands::clipboard_cmds::get_clip_prompt_uri,
         commands::clipboard_cmds::clip_prompt_accept,
         commands::clipboard_cmds::clip_prompt_dismiss,
-        commands::app_cmds::relaunch_app,
+        commands::panel_cmds::panel_ready,
         commands::app_cmds::quit_app,
+        commands::app_cmds::relaunch_app,
         commands::app_cmds::show_window,
-        commands::app_cmds::hide_window,
         commands::app_cmds::log_frontend,
         commands::app_cmds::factory_reset,
         commands::app_cmds::reset_session,
@@ -548,7 +535,6 @@ pub fn run() {
         commands::engine_cmds::update_task,
         commands::engine_cmds::change_global_option_engine,
         commands::engine_cmds::get_option_engine,
-        commands::engine_cmds::get_global_option_engine,
         commands::engine_cmds::get_global_stat,
         commands::engine_cmds::save_session,
         commands::engine_cmds::get_version,
@@ -560,11 +546,8 @@ pub fn run() {
         commands::stats_cmds::get_download_stats,
         commands::stats_cmds::export_download_stats,
         commands::stats_cmds::merge_download_stats,
-        commands::stats_cmds::clear_download_stats,
         commands::engine_cmds::get_peers,
         commands::engine_cmds::multicall_engine,
-        commands::engine_cmds::infer_out_from_uri,
-        commands::engine_cmds::resolve_file_category,
         commands::cookie_cmds::list_browsers_cmd,
         commands::cookie_cmds::import_browser_cookies,
         commands::cookie_cmds::import_browser_cookies_elevated,
@@ -573,11 +556,6 @@ pub fn run() {
         commands::cookie_cmds::clear_cookie_entries,
         commands::cookie_cmds::retry_with_cookies,
         commands::cookie_cmds::capture_user_agent,
-        commands::engine_cmds::list_routing_rules,
-        commands::engine_cmds::add_routing_rule,
-        commands::engine_cmds::update_routing_rule,
-        commands::engine_cmds::remove_routing_rule,
-        commands::engine_cmds::resolve_routing,
         commands::event_cmds::on_download_status_change,
         commands::event_cmds::on_speed_change,
         commands::event_cmds::on_progress_change,
@@ -596,13 +574,10 @@ pub fn run() {
         commands::rss_cmds::update_rss_feed_settings,
         commands::rss_cmds::add_rss_rule,
         commands::rss_cmds::update_rss_rule,
-        commands::rss_cmds::reorder_rss_rules,
         commands::rss_cmds::dry_run_rss_rule,
-        commands::rss_cmds::parse_rss_item_title,
         commands::rss_cmds::remove_rss_rule,
         commands::rss_cmds::get_rss_rules,
         commands::rss_cmds::delete_rss_items,
-        commands::rss_cmds::mark_rss_downloaded,
         commands::rss_cmds::clear_rss_download,
         commands::rss_cmds::read_rss_download,
         commands::rss_cmds::download_rss_item_tracked,
@@ -615,7 +590,6 @@ pub fn run() {
         commands::upload_cmds::test_upload_sink,
         commands::upload_cmds::get_default_upload_sink,
         commands::upload_cmds::set_default_upload_sink,
-        commands::upload_cmds::set_upload_max_concurrency,
         commands::upload_cmds::list_upload_rules,
         commands::upload_cmds::add_upload_rule,
         commands::upload_cmds::update_upload_rule,
@@ -638,13 +612,29 @@ pub fn run() {
     .build(tauri::generate_context!())
     .expect("error while building Risuko");
 
-    app.run(|_, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-        ) {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
             commands::event_cmds::cleanup_download_inhibit();
+            let Some(state) = handle.try_state::<state::AppState>() else {
+                return;
+            };
+            if state.is_quitting.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            api.prevent_exit();
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let stop = risuko_engine::engine::stop_engine();
+                match tokio::time::timeout(std::time::Duration::from_secs(15), stop).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("Failed to stop engine on exit: {}", e),
+                    Err(_) => tracing::warn!("Timed out stopping engine on exit"),
+                }
+                handle.exit(0);
+            });
         }
+        tauri::RunEvent::Exit => commands::event_cmds::cleanup_download_inhibit(),
+        _ => {}
     });
 }
 

@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Check if all required translation keys are present in the locales files
-
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +27,12 @@ const FEATURE_KEYS = [
 	"app.previous-month",
 	"app.next-month",
 	"app.browse",
+	"about.tagline",
+	"about.features",
+	"about.check-updates",
+	"about.copy-info",
+	"about.copied",
+	"about.copy-failed",
 	"task.edit-task",
 	"task.edit-dialog-title",
 	"task.edit-confirm",

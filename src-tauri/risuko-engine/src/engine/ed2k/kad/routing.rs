@@ -1,5 +1,3 @@
-//! Kad node IDs, XOR distance ordering, and bounded routing buckets
-
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -20,13 +18,10 @@ pub const MAX_LOOKUP_SOURCES: usize = 300;
 
 pub type KadId = [u8; ID_BYTES];
 
-// Wall-clock timestamps intentionally remain persisted for diagnostics, but probe snapshots need
-// an ordering token that cannot collide when two refreshes happen in the same second
 static NEXT_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_refresh_generation() -> u64 {
     let generation = NEXT_REFRESH_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
-    // Zero is reserved for old state files that predate the generation field
     if generation == 0 {
         1
     } else {
@@ -34,7 +29,6 @@ fn next_refresh_generation() -> u64 {
     }
 }
 
-/// A strongly named Kad node ID; the newtype prevents accidental interchange with an ED2K file hash at integration boundaries
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub KadId);
 
@@ -77,7 +71,6 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// XOR distance as a fixed-width big-endian byte sequence, so lexicographic comparison has the same ordering as the Kad integer distance
 pub fn xor_distance(left: &KadId, right: &KadId) -> KadId {
     std::array::from_fn(|index| left[index] ^ right[index])
 }
@@ -93,7 +86,6 @@ pub fn bucket_index(local: &KadId, remote: &KadId) -> Option<usize> {
 }
 
 pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    // Kad routing must not learn endpoints that cannot be dialed directly; documentation/test networks are filtered too, since they are not usable peers in a real download
     let octets = ip.octets();
     octets[0] != 0
         && !ip.is_unspecified()
@@ -103,7 +95,6 @@ pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         && !ip.is_broadcast()
         && !ip.is_documentation()
         && !ip.is_multicast()
-        // `Ipv4Addr::is_reserved` is still unstable on the Rust version used by the workspace; the documented TEST-NET ranges are filtered explicitly instead
         && !is_special_purpose_range(ip)
         && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
         && octets[0] < 240
@@ -111,7 +102,6 @@ pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
 
 fn is_special_purpose_range(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
-    // IANA special-purpose blocks not covered by the standard `Ipv4Addr` predicates; these are not usable direct peers even when a malformed Kad contact advertises them as routable
     (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
         || (octets[0] == 192 && octets[1] == 31 && octets[2] == 196)
@@ -139,13 +129,10 @@ pub struct Contact {
     pub version: u8,
     pub last_seen: u64,
     pub last_verified: u64,
-    /// Process-local monotonic refresh order used to validate liveness probe snapshots
     #[serde(skip)]
     refresh_generation: u64,
 }
 
-// Equality is the persisted contact contract. The process-local generation is
-// compared separately where liveness snapshot identity matters
 impl PartialEq for Contact {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -274,7 +261,6 @@ impl RoutingTable {
             .cloned()
     }
 
-    /// Return the least-recently-seen contact in the full bucket that would receive `candidate`; the caller must probe this contact before evicting it, and a live pong moves it back to the MRU end instead
     pub fn liveness_probe_target(&self, candidate: &Contact) -> Option<Contact> {
         let index = bucket_index(&self.local_id.0, &candidate.id.0)?;
         let bucket = self.buckets.get(index)?;
@@ -283,7 +269,6 @@ impl RoutingTable {
             .flatten()
     }
 
-    /// Record a successful liveness response and move the contact to the MRU end of its bucket
     pub fn mark_alive(&mut self, id: NodeId) -> bool {
         let Some(index) = self.by_id.get(&id).copied() else {
             return false;
@@ -307,7 +292,6 @@ impl RoutingTable {
         self.insert_checked(contact, false)
     }
 
-    /// Loopback integration tests exercise the real UDP client, but must not teach production routing tables that a local/private endpoint is valid
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, contact: Contact) -> InsertResult {
         self.insert_checked(contact, true)
@@ -338,7 +322,6 @@ impl RoutingTable {
                 existing.tcp_port = contact.tcp_port;
                 existing.version = existing.version.max(contact.version);
                 existing.mark_seen(true);
-                // Move a live contact to the MRU end of its bucket
                 let updated = self.buckets[existing_bucket]
                     .iter()
                     .position(|item| item.id == contact.id)
@@ -351,8 +334,6 @@ impl RoutingTable {
             self.by_id.remove(&contact.id);
         }
 
-        // Contacts reconstructed from old state files have no process-local generation. Assign one
-        // without changing their persisted wall-clock timestamps before they can be probed
         if contact.refresh_generation == 0 {
             contact.refresh_generation = next_refresh_generation();
         }
@@ -363,7 +344,6 @@ impl RoutingTable {
             self.by_id.insert(id, index);
             InsertResult::Inserted
         } else {
-            // Keep a bounded replacement cache; a full bucket is only changed after its LRU contact fails a Kad ping, and timestamps alone are not evidence that the contact is dead
             let replacements = &mut self.replacements[index];
             if let Some(existing) = replacements.iter_mut().find(|entry| entry.id == contact.id) {
                 *existing = contact;
@@ -387,7 +367,6 @@ impl RoutingTable {
         removed
     }
 
-    /// Remove `expected` only when it has not been refreshed or moved since a liveness probe began; this avoids a stale ping timeout evicting a contact that received a newer response meanwhile
     pub fn remove_if_unchanged(&mut self, expected: &Contact) -> Option<Contact> {
         let current = self.get(expected.id)?;
         if current.addr != expected.addr
@@ -402,7 +381,6 @@ impl RoutingTable {
 
     pub fn mark_failed(&mut self, id: NodeId) {
         if let Some(index) = self.by_id.get(&id).copied() {
-            // Keep the timestamp snapshot stable for an in-flight liveness probe; moving the failed contact to the LRU end makes it the next eviction candidate without causing `remove_if_unchanged` to mistake this bookkeeping update for a newer response
             if let Some(position) = self.buckets[index].iter().position(|entry| entry.id == id) {
                 if let Some(contact) = self.buckets[index].remove(position) {
                     self.buckets[index].push_front(contact);
@@ -419,8 +397,6 @@ impl RoutingTable {
     }
 
     pub fn closest_with_replacements(&self, target: NodeId, limit: usize) -> Vec<Contact> {
-        // Replacements are an auxiliary lookup source, so apply the same hard cap before
-        // collecting either active contacts or replacements
         let limit = limit.min(MAX_LOOKUP_QUERIES);
         let mut contacts = self.closest(target, limit);
         if contacts.len() < limit {
@@ -481,7 +457,6 @@ impl LookupConfig {
     }
 }
 
-/// Tracks queried nodes for one iterative lookup and prevents duplicate work
 #[derive(Debug)]
 pub(super) struct LookupTracker {
     queried: HashSet<NodeId>,
@@ -508,12 +483,10 @@ impl LookupTracker {
     }
 }
 
-/// Convert a socket address to an endpoint key for source de-duplication
 fn endpoint_key(addr: SocketAddrV4) -> (Ipv4Addr, u16) {
     (*addr.ip(), addr.port())
 }
 
-/// Keep a bounded set of source endpoints; shared by the service and the eventual ED2K download scheduler
 #[derive(Debug, Default)]
 pub(super) struct SourceSet {
     entries: HashMap<(Ipv4Addr, u16), ()>,
@@ -704,7 +677,6 @@ mod tests {
         assert_eq!(table.insert(original), InsertResult::Inserted);
         let snapshot = table.get(original_id).unwrap();
 
-        // `insert` refreshes an existing contact even when the wall-clock second is unchanged
         let refreshed = Contact::with_times(
             original_id.0,
             SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4672),

@@ -1,13 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use serde_json::{Map, Value};
-
-use risuko_engine::config::defaults;
-use risuko_engine::engine::events::EventBroadcaster;
-use risuko_engine::engine::manager::TaskManager;
-use risuko_engine::engine::options::EngineOptions;
-use risuko_engine::engine::rpc::{RpcCompatMode, RpcServer};
+use risuko_engine::standalone::{StandaloneConfig, StandaloneEngine};
 
 fn init_headless_tracing() {
     use tracing_subscriber::EnvFilter;
@@ -20,178 +13,40 @@ fn init_headless_tracing() {
         .try_init();
 }
 
-/// Start the engine in headless mode (no Tauri, no GUI). Returns a handle to shut down when done
 pub async fn start_headless_engine(
     rpc_port: u16,
 ) -> Result<HeadlessEngine, Box<dyn std::error::Error>> {
     init_headless_tracing();
-
-    let config_dir = get_config_dir();
-    std::fs::create_dir_all(&config_dir)?;
-    risuko_engine::engine::set_file_usenet_credential_resolver(config_dir.clone()).await;
-
-    let system_config = load_config(&config_dir.join("system.json"), defaults::system_defaults());
-    let user_config = load_config(&config_dir.join("user.json"), defaults::user_defaults());
-
-    let mut options = EngineOptions::from_config(&system_config, &user_config);
-    // Override RPC port if specified
-    options.set("rpc-listen-port".into(), Value::from(rpc_port));
-
-    let dir = options.dir();
-    if !dir.is_empty() {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Failed to create download directory '{}': {}", dir, e))?;
-    }
-
-    let events = EventBroadcaster::default();
-    let rpc_host = options.rpc_host();
-    let rpc_secret = options.rpc_secret();
-    let rpc_secret_clone = rpc_secret.clone();
-    let pbh_config = options.pbh_rpc_config(rpc_port)?;
-
     tracing::info!("Starting headless engine on port {}", rpc_port);
-
-    let manager = Arc::new(
-        TaskManager::new(&config_dir, options, events.clone())
-            .await
-            .map_err(|e| format!("Failed to create task manager: {}", e))?,
-    );
-
-    let (rpc_shutdown_tx, mut rpc_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    let mut rpc_server = RpcServer::new(
-        rpc_host.clone(),
-        rpc_port,
-        rpc_secret,
-        manager.clone(),
-        events.clone(),
-        rpc_shutdown_tx.clone(),
-    );
-    rpc_server
-        .start()
-        .await
-        .map_err(|e| format!("Failed to start RPC server: {}", e))?;
-
-    let pbh_rpc_server = if let Some(pbh) = pbh_config {
-        let mut server = RpcServer::new_with_compat(
-            rpc_host,
-            pbh.port,
-            pbh.secret,
-            manager.clone(),
-            events.clone(),
-            rpc_shutdown_tx,
-            RpcCompatMode::Aria2Next,
-        );
-        if let Err(e) = server.start().await {
-            rpc_server.stop();
-            manager.shutdown().await;
-            return Err(format!("Failed to start PeerBanHelper RPC server: {e}").into());
-        }
-        Some(server)
-    } else {
-        drop(rpc_shutdown_tx);
-        None
-    };
-
-    // Start periodic progress update
-    let mgr_progress = manager.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            mgr_progress.update_progress().await;
-        }
-    });
-
-    // Start periodic session auto-save
-    let mgr_save = manager.clone();
-    let auto_save_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(e) = mgr_save.save_session().await {
-                tracing::warn!("Auto-save session failed: {}", e);
-            }
-        }
-    });
-
-    // Monitor for RPC-initiated shutdown requests
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let shutdown_notify_clone = shutdown_notify.clone();
-    tokio::spawn(async move {
-        if rpc_shutdown_rx.recv().await.is_some() {
-            tracing::info!("Shutdown requested via RPC (headless)");
-            shutdown_notify_clone.notify_one();
-        }
-    });
-
-    Ok(HeadlessEngine {
-        manager,
-        rpc_server,
-        pbh_rpc_server,
-        progress_task,
-        auto_save_task,
-        shutdown_notify,
-        rpc_secret: if rpc_secret_clone.is_empty() {
-            None
-        } else {
-            Some(rpc_secret_clone)
-        },
+    let engine = StandaloneEngine::start(StandaloneConfig {
+        config_dir: get_config_dir(),
+        rpc_port: Some(rpc_port),
+        enable_rpc: true,
+        require_download_dir: true,
     })
+    .await?;
+    Ok(HeadlessEngine { engine })
 }
 
 pub struct HeadlessEngine {
-    manager: Arc<TaskManager>,
-    rpc_server: RpcServer,
-    pbh_rpc_server: Option<RpcServer>,
-    progress_task: tokio::task::JoinHandle<()>,
-    auto_save_task: tokio::task::JoinHandle<()>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
-    rpc_secret: Option<String>,
+    engine: StandaloneEngine,
 }
 
 impl HeadlessEngine {
-    /// Returns the RPC secret configured for this engine, if any
     pub fn rpc_secret(&self) -> Option<&str> {
-        self.rpc_secret.as_deref()
+        self.engine.rpc_secret.as_deref()
     }
 
-    /// Resolves when an RPC shutdown request is received
-    pub fn shutdown_requested(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.shutdown_notify.notified()
+    pub async fn shutdown_requested(&self) {
+        self.engine.shutdown_signal().notified().await
     }
 
-    pub async fn shutdown(mut self) {
-        self.progress_task.abort();
-        self.auto_save_task.abort();
-        self.rpc_server.stop();
-        if let Some(mut pbh) = self.pbh_rpc_server {
-            pbh.stop();
-        }
-        self.manager.shutdown().await;
+    pub async fn shutdown(self) {
+        self.engine.stop().await;
         tracing::info!("Headless engine stopped");
     }
 }
 
 pub(super) fn get_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("dev.risuko.app"))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-pub(super) fn load_config(
-    path: &std::path::Path,
-    defaults: Map<String, Value>,
-) -> Map<String, Value> {
-    if let Ok(data) = std::fs::read_to_string(path) {
-        if let Ok(Value::Object(mut map)) = serde_json::from_str(&data) {
-            for (k, v) in &defaults {
-                if !map.contains_key(k) {
-                    map.insert(k.clone(), v.clone());
-                }
-            }
-            return map;
-        }
-    }
-    defaults
+    risuko_engine::standalone::gui_config_dir()
 }

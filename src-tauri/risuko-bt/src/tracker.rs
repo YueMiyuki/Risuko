@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use super::core::Id20;
 
-/// Common "announce" parameters sent to every tracker
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub info_hash: Id20,
@@ -20,7 +19,6 @@ pub struct AnnounceRequest {
     pub left: u64,
     pub event: AnnounceEvent,
     pub num_want: u32,
-    /// BEP 8 obfuscated announce, for HTTP trackers in `obfuscate-announce-list`
     pub obfuscate: bool,
 }
 
@@ -51,13 +49,6 @@ pub struct AnnounceResponse {
     pub leechers: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrapeResponse {
-    pub complete: u32,
-    pub downloaded: u32,
-    pub incomplete: u32,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TrackerError {
     #[error("io: {0}")]
@@ -76,7 +67,6 @@ pub enum TrackerError {
     Url(String),
 }
 
-/// Address family an announce is pinned to (BEP 7)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
     V4,
@@ -88,7 +78,6 @@ impl AddressFamily {
         addr.is_ipv4() == (self == Self::V4)
     }
 
-    /// Wildcard bind address of this family
     pub fn unspecified(self) -> SocketAddr {
         match self {
             Self::V4 => SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -104,15 +93,6 @@ pub(crate) fn is_valid_endpoint(endpoint: SocketAddr) -> bool {
         && endpoint.port() != 0
 }
 
-/// Dispatch a single announce to a tracker URL; returns the parsed response
-pub async fn announce(
-    url: &str,
-    req: &AnnounceRequest,
-    timeout: Duration,
-) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy(url, req, timeout, None).await
-}
-
 pub async fn announce_with_proxy(
     url: &str,
     req: &AnnounceRequest,
@@ -122,10 +102,8 @@ pub async fn announce_with_proxy(
     announce_with_proxy_and_source(url, req, timeout, proxy, None).await
 }
 
-/// How long the slower family may still answer after the other succeeds
 const FAMILY_ANNOUNCE_GRACE: Duration = Duration::from_secs(3);
 
-/// BEP 7: without a fixed source address, announce once per address family and merge the answers; a configured source or a proxied route keeps a single announce
 pub async fn announce_with_proxy_and_source(
     url: &str,
     req: &AnnounceRequest,
@@ -144,7 +122,6 @@ pub async fn announce_with_proxy_and_source(
     .await
 }
 
-/// Whether this tracker's route goes through the proxy; `no_proxy` matches are contacted direct
 fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
     if url.starts_with("udp://") {
         udp::routes_via_proxy(url, proxy)
@@ -153,7 +130,6 @@ fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
     }
 }
 
-/// Once one family succeeds the other only gets `FAMILY_ANNOUNCE_GRACE`; after a failure it keeps its own timeout
 async fn join_family_announces(
     v4: impl Future<Output = Result<AnnounceResponse, TrackerError>>,
     v6: impl Future<Output = Result<AnnounceResponse, TrackerError>>,
@@ -204,7 +180,6 @@ async fn announce_family(
         .map_err(|_| TrackerError::Timeout)?
 }
 
-/// Union of both families' peers, the shorter interval and the larger counts; fails only when both fail
 fn merge_family_responses(
     v4: Result<AnnounceResponse, TrackerError>,
     v6: Result<AnnounceResponse, TrackerError>,
@@ -252,30 +227,6 @@ async fn announce_once(
     }
 }
 
-pub async fn scrape_udp(
-    url: &str,
-    info_hashes: &[Id20],
-    timeout: Duration,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    tokio::time::timeout(timeout, udp::scrape(url, info_hashes, None))
-        .await
-        .map_err(|_| TrackerError::Timeout)?
-}
-
-pub async fn scrape_udp_with_proxy(
-    url: &str,
-    info_hashes: &[Id20],
-    timeout: Duration,
-    proxy: Option<&risuko_http::ProxyConnector>,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    tokio::time::timeout(
-        timeout,
-        udp::scrape_with_proxy(url, info_hashes, proxy, None),
-    )
-    .await
-    .map_err(|_| TrackerError::Timeout)?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,16 +250,15 @@ mod tests {
         };
         let port = v4.local_addr().unwrap().port();
         let Ok(v6) = TcpListener::bind(("::1", port)).await else {
-            return; // no IPv6 loopback here
+            return;
         };
         let resolved: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", port))
             .await
             .map(|addrs| addrs.collect())
             .unwrap_or_default();
         if !(resolved.iter().any(SocketAddr::is_ipv4) && resolved.iter().any(SocketAddr::is_ipv6)) {
-            return; // `localhost` isn't dual-stack on this host
+            return;
         }
-        // Each family's tracker hands out a peer of its own family
         let serve = |listener: TcpListener, peers: Vec<u8>, key: &'static [u8]| async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 4096];
@@ -391,7 +341,6 @@ mod tests {
         assert_eq!(merged.peers.len(), 1);
         assert_eq!(started.elapsed(), FAMILY_ANNOUNCE_GRACE);
 
-        // A failed family leaves the other its own timeout
         let started = tokio::time::Instant::now();
         let slow = async {
             tokio::time::sleep(Duration::from_secs(20)).await;
@@ -421,7 +370,6 @@ mod tests {
             &proxy
         ));
 
-        // A TCP-only proxy leaves UDP trackers direct
         let tcp_only = proxy.with_udp_proxy(Some(ProxyConnector::direct()));
         assert!(routes_via_proxy(
             "http://tracker.example/announce",

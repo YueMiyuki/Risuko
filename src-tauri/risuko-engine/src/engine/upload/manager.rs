@@ -1,5 +1,3 @@
-//! `UploadSinkManager` — owns sinks/rules state, runs a bounded job queue, emits lifecycle events. Mirrors the `RssManager` pattern so persistence and event plumbing are the same shape
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -24,8 +22,9 @@ use super::webdav::WebdavSink;
 
 const UPLOAD_STORE_KEY: &str = "upload-sinks";
 
-/// Upper bound for retained terminal upload jobs Queued and active jobs are never evicted by this cap
 const MAX_TERMINAL_JOBS: usize = 200;
+
+const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 
 use crate::engine::util::now_secs;
 
@@ -39,7 +38,6 @@ struct UploadStore {
     default_sink_id: Option<String>,
     #[serde(default = "default_concurrency")]
     max_concurrency: usize,
-    /// Fallback secret map used when the OS keychain vault is unavailable. Key is a sink id, value the JSON secrets object that would normally live in the vault
     #[serde(default)]
     secret_fallback: HashMap<String, Value>,
 }
@@ -81,9 +79,9 @@ pub struct UploadSinkManager {
     event_sink: StdMutex<Arc<dyn EventSink>>,
     jobs: Arc<Mutex<HashMap<String, UploadJob>>>,
     active: Arc<Mutex<HashMap<String, watch::Receiver<UploadProgress>>>>,
-    /// Cancellation tokens for every spawned job — populated at enqueue time so even queued jobs (still waiting on the semaphore) can be cancelled by the user. Cleared once the job reaches a terminal state
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     semaphore: Arc<RwLock<Arc<Semaphore>>>,
+    sink_runtimes: StdMutex<HashMap<String, BoxedSink>>,
 }
 
 impl UploadSinkManager {
@@ -99,17 +97,15 @@ impl UploadSinkManager {
             active: Arc::new(Mutex::new(HashMap::new())),
             cancels: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(default_concurrency())))),
+            sink_runtimes: StdMutex::new(HashMap::new()),
         }
     }
 
-    /// Swap in a new event sink at runtime. Used by the Tauri host to upgrade from the bootstrap `NoopEventSink` to a `TauriEventSink` once the `AppHandle` is available
     pub fn set_event_sink(&self, sink: Arc<dyn EventSink>) {
         if let Ok(mut s) = self.event_sink.lock() {
             *s = sink;
         }
     }
-
-    // persistence
 
     pub fn load(&self) -> Result<(), String> {
         if let Some(val) = self.storage.load(UPLOAD_STORE_KEY)? {
@@ -121,7 +117,6 @@ impl UploadSinkManager {
                 *s = data;
                 s.max_concurrency = new_concurrency;
                 drop(s);
-                // Rebuild the semaphore with the persisted concurrency value so configured limits actually apply at startup
                 let mut sem = self.semaphore.blocking_write();
                 *sem = Arc::new(Semaphore::new(new_concurrency));
             }
@@ -138,8 +133,6 @@ impl UploadSinkManager {
         self.storage.save(UPLOAD_STORE_KEY, &wrapper)?;
         Ok(())
     }
-
-    // Fallback secret storage — used when the OS keychain vault is unavailable
 
     pub async fn get_sink_secret_fallback(&self, id: &str) -> Option<Value> {
         let s = self.store.read().await;
@@ -160,8 +153,6 @@ impl UploadSinkManager {
         self.save().await
     }
 
-    // queries
-
     pub async fn list_sinks(&self) -> Vec<UploadSinkRecord> {
         self.store.read().await.sinks.clone()
     }
@@ -176,7 +167,6 @@ impl UploadSinkManager {
 
     pub async fn list_jobs(&self) -> Vec<UploadJob> {
         let mut jobs: Vec<UploadJob> = self.jobs.lock().await.values().cloned().collect();
-        // Stitch live progress in so the frontend sees fresh numbers without a separate event per byte
         let active = self.active.lock().await;
         for job in jobs.iter_mut() {
             if let Some(a) = active.get(&job.id) {
@@ -187,14 +177,11 @@ impl UploadSinkManager {
         jobs
     }
 
-    // sink CRUD
-
     pub async fn add_sink(&self, mut record: UploadSinkRecord) -> Result<UploadSinkRecord, String> {
         if record.id.is_empty() {
             record.id = Uuid::new_v4().to_string();
         }
         record.created_at = now_secs();
-        // Sanity-check by trying to build the runtime — surfaces e.g. an empty WebDAV endpoint at insert time, not at upload time
         let _ = build_sink_runtime(&record.config)?;
 
         let mut s = self.store.write().await;
@@ -217,11 +204,10 @@ impl UploadSinkManager {
             .iter_mut()
             .find(|x| x.id == record.id)
             .ok_or_else(|| format!("unknown sink {}", record.id))?;
-        // Secret fields are stripped from the wire (`skip_serializing` on the Config structs), so the renderer can't echo them back when editing an existing sink. Treat an empty incoming secret as \u201cunchanged\u201d and inherit the value already on disk \u2014 otherwise editing any unrelated field would silently wipe stored credentials
         merge_secrets(&mut record.config, &slot.config);
-        // Validate after the merge so we surface real misconfigurations (rather than the post-merge config still being structurally fine while the unmerged one would have failed)
         let _ = build_sink_runtime(&record.config)?;
         *slot = record;
+        self.invalidate_sink_runtime(&slot.id.clone());
         drop(s);
         self.save().await
     }
@@ -233,13 +219,12 @@ impl UploadSinkManager {
         if s.sinks.len() == before {
             return Err(format!("unknown sink {id}"));
         }
-        // Drop dangling references
         s.rules.retain(|r| r.sink_id != id);
         if s.default_sink_id.as_deref() == Some(id) {
             s.default_sink_id = s.sinks.first().map(|x| x.id.clone());
         }
-        // Clean up any fallback secrets so they don't leak after deletion
         s.secret_fallback.remove(id);
+        self.invalidate_sink_runtime(id);
         drop(s);
         self.save().await
     }
@@ -258,20 +243,23 @@ impl UploadSinkManager {
 
     pub async fn set_max_concurrency(&self, n: usize) -> Result<(), String> {
         let n = n.clamp(1, 16);
-        // Persist first; live resize follows. `tokio::Semaphore` cannot shrink permits already handed out, but we can swap in a fresh semaphore for future jobs — in-flight jobs keep their old permit
-        let mut s = self.store.write().await;
-        s.max_concurrency = n;
-        drop(s);
-        let old = {
-            let mut sem = self.semaphore.write().await;
-            std::mem::replace(&mut *sem, Arc::new(Semaphore::new(n)))
+        let prev = {
+            let mut s = self.store.write().await;
+            std::mem::replace(&mut s.max_concurrency, n)
         };
-        // Close the retired semaphore so any queued workers waiting on it wake up with `AcquireError`, observe the swap, and re-acquire on the new one. Without this, a resize wouldn't reach jobs already queued behind the previous limit
-        old.close();
+        let sem = self.semaphore.read().await.clone();
+        if n > prev {
+            sem.add_permits(n - prev);
+        } else if n < prev {
+            let retire = (prev - n) as u32;
+            tokio::spawn(async move {
+                if let Ok(permits) = sem.acquire_many_owned(retire).await {
+                    permits.forget();
+                }
+            });
+        }
         self.save().await
     }
-
-    // rule CRUD
 
     pub async fn add_rule(&self, mut rule: UploadRule) -> Result<UploadRule, String> {
         if rule.id.is_empty() {
@@ -329,10 +317,7 @@ impl UploadSinkManager {
         runtime.test().await
     }
 
-    // job control
-
     pub async fn cancel_job(&self, id: &str) -> Result<(), String> {
-        // The cancel token is stored as soon as the job is enqueued so this works for queued jobs (still waiting on the semaphore) too. The spawned task checks the token after acquiring its permit and bails
         let cancels = self.cancels.lock().await;
         let token = cancels
             .get(id)
@@ -348,9 +333,6 @@ impl UploadSinkManager {
         jobs.retain(|_, j| matches!(j.status, JobStatus::Queued | JobStatus::Active));
     }
 
-    // enqueue (called from completion hook)
-
-    /// Decide which sink, if any, should handle this file and enqueue if so `override_sink_id` is the per-task explicit choice (highest priority)
     pub async fn enqueue_for_file(
         self: &Arc<Self>,
         gid: &str,
@@ -375,8 +357,7 @@ impl UploadSinkManager {
             return;
         };
 
-        // Snapshot sink record up front — we copy the config into the worker so subsequent edits to the sink don't change an in-flight job
-        let sink_record = {
+        let mut sink_record = {
             let s = self.store.read().await;
             match s.sinks.iter().find(|x| x.id == sink_id).cloned() {
                 Some(r) => r,
@@ -386,6 +367,10 @@ impl UploadSinkManager {
                 }
             }
         };
+        if task_kind == "torrent" && sink_record.post_action != PostUploadAction::Keep {
+            tracing::info!("upload: keeping local files of torrent {gid} despite post-action");
+            sink_record.post_action = PostUploadAction::Keep;
+        }
 
         let job_id = Uuid::new_v4().to_string();
         let job = UploadJob {
@@ -406,10 +391,8 @@ impl UploadSinkManager {
         {
             let mut jobs = self.jobs.lock().await;
             jobs.insert(job_id.clone(), job.clone());
-            // Trim oldest terminal jobs only; queued and active jobs stay
             prune_terminal_jobs(&mut jobs, MAX_TERMINAL_JOBS);
         }
-        // Pre-create the cancel token so users can cancel queued jobs that haven't acquired a semaphore permit yet
         let cancel = CancellationToken::new();
         self.cancels
             .lock()
@@ -441,7 +424,6 @@ impl UploadSinkManager {
     ) -> Option<String> {
         let s = self.store.read().await;
 
-        // Per-task override wins, but must reference a real sink. If the referenced sink no longer exists fail closed: rerouting through the rule/default chain would silently send the file to a different destination than the caller asked for
         if let Some(id) = override_sink_id {
             return if s.sinks.iter().any(|x| x.id == id) {
                 Some(id)
@@ -450,7 +432,6 @@ impl UploadSinkManager {
             };
         }
 
-        // Rules in array order
         let input = RuleInput {
             file_path: local_path,
             size,
@@ -464,6 +445,29 @@ impl UploadSinkManager {
         s.default_sink_id.clone()
     }
 
+    fn invalidate_sink_runtime(&self, id: &str) {
+        if let Ok(mut cache) = self.sink_runtimes.lock() {
+            cache.remove(id);
+        }
+    }
+
+    async fn sink_runtime_for(&self, record: &UploadSinkRecord) -> Result<BoxedSink, String> {
+        let s = self.store.read().await;
+        let Some(current) = s.sinks.iter().find(|x| x.id == record.id) else {
+            return build_sink_runtime(&record.config);
+        };
+        if let Ok(cache) = self.sink_runtimes.lock() {
+            if let Some(rt) = cache.get(&record.id) {
+                return Ok(rt.clone());
+            }
+        }
+        let rt = build_sink_runtime(&current.config)?;
+        if let Ok(mut cache) = self.sink_runtimes.lock() {
+            cache.insert(record.id.clone(), rt.clone());
+        }
+        Ok(rt)
+    }
+
     async fn run_job(
         self: Arc<Self>,
         job_id: String,
@@ -473,13 +477,11 @@ impl UploadSinkManager {
         size: u64,
         cancel: CancellationToken,
     ) {
-        // Wait for a slot. Re-read the current `Arc<Semaphore>` on every attempt so a runtime resize via `set_max_concurrency` doesn't leave queued workers blocked on a semaphore that's already been swapped out (the new permits would never reach them otherwise)
         let permit = loop {
             let sem = self.semaphore.read().await.clone();
             tokio::select! {
                 res = sem.clone().acquire_owned() => match res {
                     Ok(p) => break p,
-                    // The semaphore was closed — either engine shutdown or the exact one we just snapshotted was retired by a resize. Retry against the live one rather than failing the job for what is, from the user's perspective, a no-op
                     Err(_) => {
                         if Arc::ptr_eq(&sem, &*self.semaphore.read().await) {
                             self.cancels.lock().await.remove(&job_id);
@@ -490,7 +492,6 @@ impl UploadSinkManager {
                     }
                 },
                 _ = cancel.cancelled() => {
-                    // Cancelled while still queued — never acquired a permit
                     self.cancels.lock().await.remove(&job_id);
                     self.cancel_job_state(&job_id).await;
                     return;
@@ -498,7 +499,6 @@ impl UploadSinkManager {
             }
         };
 
-        // Cancellation may also have raced acquisition; bail before doing work
         if cancel.is_cancelled() {
             drop(permit);
             self.cancels.lock().await.remove(&job_id);
@@ -512,7 +512,7 @@ impl UploadSinkManager {
         });
         self.active.lock().await.insert(job_id.clone(), rx);
 
-        // Mark active. Mutate under the lock, then drop the guard before emitting so the broadcast/event sink can never re-enter the manager while we still hold `jobs`
+        // Drop the `jobs` guard before emitting so the event sink can't re-enter the manager
         let snapshot = {
             let mut jobs = self.jobs.lock().await;
             jobs.get_mut(&job_id).map(|j| {
@@ -525,7 +525,7 @@ impl UploadSinkManager {
             self.emit_event("engine:upload-start", &snap);
         }
 
-        let sink_runtime = match build_sink_runtime(&sink_record.config) {
+        let sink_runtime = match self.sink_runtime_for(&sink_record).await {
             Ok(r) => r,
             Err(e) => {
                 drop(permit);
@@ -546,15 +546,34 @@ impl UploadSinkManager {
             progress: tx,
         };
 
-        let result = sink_runtime.upload(&file, &ctl).await;
+        let mut attempt = 1;
+        let result = loop {
+            let res = sink_runtime.upload(&file, &ctl).await;
+            match res {
+                Err(e)
+                    if attempt < MAX_UPLOAD_ATTEMPTS
+                        && !cancel.is_cancelled()
+                        && is_retryable_upload_error(&e) =>
+                {
+                    tracing::warn!("upload {job_id}: attempt {attempt} failed ({e}), retrying");
+                    ctl.report(0, size);
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = tokio::time::sleep(upload_retry_delay(attempt)) => {}
+                    }
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
         drop(permit);
         self.cleanup_active(&job_id).await;
 
         match result {
             Ok(_remote_url) => {
-                // Run post-upload action while we still have the path
                 if let Err(e) = run_post_action(
                     &local_path,
+                    &file.remote_relative,
                     sink_record.post_action,
                     sink_record.move_target.as_deref(),
                 )
@@ -620,7 +639,6 @@ impl UploadSinkManager {
         let changed = {
             let mut s = self.store.write().await;
             match s.sinks.iter_mut().find(|x| x.id == sink_id) {
-                // Skip full-store save when second-granularity timestamp has not moved
                 Some(sink) if sink.last_used_at != Some(now) => {
                     sink.last_used_at = Some(now);
                     true
@@ -634,7 +652,6 @@ impl UploadSinkManager {
     }
 
     fn emit_event(&self, name: &str, job: &UploadJob) {
-        // Snapshot the current sink with a quick std-lock — virtually never contended (only `set_event_sink` writes, once at startup)
         let sink = match self.event_sink.lock() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
@@ -646,7 +663,6 @@ impl UploadSinkManager {
     }
 }
 
-/// Evict oldest terminal jobs so at most `max_terminal` remain
 fn prune_terminal_jobs(jobs: &mut HashMap<String, UploadJob>, max_terminal: usize) {
     let mut terminal: Vec<(u64, String)> = jobs
         .values()
@@ -661,7 +677,6 @@ fn prune_terminal_jobs(jobs: &mut HashMap<String, UploadJob>, max_terminal: usiz
     if terminal.len() <= max_terminal {
         return;
     }
-    // Drop the oldest excess terminal jobs
     terminal.sort_by_key(|(created_at, _)| *created_at);
     let to_remove = terminal.len() - max_terminal;
     for (_, id) in terminal.into_iter().take(to_remove) {
@@ -669,7 +684,6 @@ fn prune_terminal_jobs(jobs: &mut HashMap<String, UploadJob>, max_terminal: usiz
     }
 }
 
-/// Build the runtime sink object from its persisted config. Centralised so adding a new protocol means adding one match arm here plus one new module
 pub fn build_sink_runtime(cfg: &SinkConfig) -> Result<BoxedSink, String> {
     match cfg {
         SinkConfig::Webdav(c) => Ok(Arc::new(WebdavSink::new(c.clone())?)),
@@ -679,19 +693,80 @@ pub fn build_sink_runtime(cfg: &SinkConfig) -> Result<BoxedSink, String> {
     }
 }
 
+fn move_destination(target: &Path, remote_relative: &str, path: &Path) -> Option<PathBuf> {
+    let mut dst = target.to_path_buf();
+    let mut any = false;
+    for comp in Path::new(remote_relative).components() {
+        if let std::path::Component::Normal(part) = comp {
+            dst.push(part);
+            any = true;
+        }
+    }
+    if !any {
+        dst.push(path.file_name()?);
+    }
+    Some(dst)
+}
+
+async fn free_destination(path: PathBuf) -> PathBuf {
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return path;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(str::to_string);
+    for index in 1..10_000u32 {
+        let name = match &ext {
+            Some(ext) => format!("{stem} ({index}).{ext}"),
+            None => format!("{stem} ({index})"),
+        };
+        let candidate = path.with_file_name(name);
+        if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+            return candidate;
+        }
+    }
+    path.with_file_name(format!("{stem}.{}", Uuid::new_v4().simple()))
+}
+
+fn is_retryable_upload_error(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    ![
+        "cancel",
+        "auth",
+        "login",
+        "denied",
+        "forbidden",
+        "401",
+        "403",
+        "traversal",
+        "no such file",
+        "open ",
+    ]
+    .iter()
+    .any(|marker| e.contains(marker))
+}
+
+fn upload_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2u64.saturating_mul(u64::from(attempt)).min(30))
+}
+
 async fn run_post_action(
     path: &Path,
+    remote_relative: &str,
     action: PostUploadAction,
     move_target: Option<&Path>,
 ) -> Result<(), String> {
     match action {
         PostUploadAction::Keep => Ok(()),
-        PostUploadAction::Trash => {
-            // Best-effort delete; trash crates aren't a workspace dep here. Use unlink as a pragmatic fallback — the desktop app can swap in its `trash_item` command via a future trait
-            tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| format!("remove {}: {e}", path.display()))
-        }
+        PostUploadAction::Trash => tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| format!("remove {}: {e}", path.display())),
         PostUploadAction::Move => {
             let target = match move_target {
                 Some(t) => t,
@@ -700,11 +775,14 @@ async fn run_post_action(
             tokio::fs::create_dir_all(target)
                 .await
                 .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
-            let file_name = path
-                .file_name()
+            let dst = move_destination(target, remote_relative, path)
                 .ok_or_else(|| "source has no file name".to_string())?;
-            let dst = target.join(file_name);
-            // Try rename; only fall back to copy + delete on cross-device. Other errors (permission, source missing, target busy, etc.) are surfaced so we don't silently turn a logical move failure into a successful copy that leaves stale state behind
+            if let Some(parent) = dst.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            }
+            let dst = free_destination(dst).await;
             if let Err(e) = tokio::fs::rename(path, &dst).await {
                 if !is_cross_device_error(&e) {
                     return Err(format!(
@@ -725,7 +803,6 @@ async fn run_post_action(
     }
 }
 
-/// Detect EXDEV / cross-volume rename failures across platforms. Newer toolchains classify this via `ErrorKind::CrossesDevices`; older releases still report it as `Other`, so we also probe the raw OS code (EXDEV=18 on Linux/macOS, ERROR_NOT_SAME_DEVICE=17 on Windows)
 fn is_cross_device_error(e: &std::io::Error) -> bool {
     if e.kind() == std::io::ErrorKind::CrossesDevices {
         return true;
@@ -739,7 +816,6 @@ fn is_cross_device_error(e: &std::io::Error) -> bool {
     }
 }
 
-/// Carry forward secret fields from `old` whenever the corresponding field in `new` is empty. Mirrors the `skip_serializing` set on the protocol Config structs so the renderer can omit secrets it never received in the first place. Any non-empty incoming value wins (i.e. the user explicitly retyped the credential)
 fn merge_secrets(new: &mut SinkConfig, old: &SinkConfig) {
     match (new, old) {
         (SinkConfig::Webdav(n), SinkConfig::Webdav(o)) if n.password.is_empty() => {
@@ -759,7 +835,6 @@ fn merge_secrets(new: &mut SinkConfig, old: &SinkConfig) {
         (SinkConfig::Ftp(n), SinkConfig::Ftp(o)) if n.password.is_empty() => {
             n.password = o.password.clone();
         }
-        // Protocol switched on edit \u2014 nothing to inherit
         _ => {}
     }
 }
@@ -807,8 +882,6 @@ mod tests {
             insecure: false,
         })
     }
-
-    // -- UploadSinkManager CRUD --
 
     #[test]
     fn add_sink_generates_id_and_created_at() {
@@ -937,7 +1010,6 @@ mod tests {
             }))
             .unwrap();
         let mut updated = created.clone();
-        // Clear password and private key — merge_secrets should preserve them
         if let SinkConfig::Sftp(ref mut c) = updated.config {
             c.password.clear();
             c.private_key.clear();
@@ -978,13 +1050,11 @@ mod tests {
                 last_used_at: None,
             }))
             .unwrap();
-        // Default should be A (first)
         assert_eq!(rt.block_on(mgr.default_sink_id()), Some(a.id.clone()));
         rt.block_on(mgr.remove_sink(&a.id)).unwrap();
         let sinks = rt.block_on(mgr.list_sinks());
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].id, b.id);
-        // Default should fallback to B
         assert_eq!(rt.block_on(mgr.default_sink_id()), Some(b.id.clone()));
     }
 
@@ -1023,7 +1093,6 @@ mod tests {
         let mgr = &ctx.mgr;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(mgr.set_max_concurrency(0)).unwrap();
-        // list_sinks doesn't expose concurrency and test_manager() owns the TempDir, so we can't re-open to read it back. set_max_concurrency calls save(); just check it doesn't error and swaps the semaphore — no panic = success for this smoke test
         rt.block_on(mgr.set_max_concurrency(100)).unwrap();
     }
 
@@ -1046,7 +1115,6 @@ mod tests {
                 last_used_at: None,
             }))
             .unwrap();
-        // Create fresh manager pointing at same storage
         let mgr2 = UploadSinkManager::new(storage, event_sink);
         mgr2.load().unwrap();
         let sinks = rt.block_on(mgr2.list_sinks());
@@ -1160,5 +1228,86 @@ mod tests {
             insecure: false,
         });
         assert!(build_sink_runtime(&cfg).is_err());
+    }
+
+    #[test]
+    fn move_destination_preserves_subtree() {
+        let t = Path::new("/dst");
+        let src = Path::new("/src/a/ep01.mkv");
+        assert_eq!(
+            move_destination(t, "S01/ep01.mkv", src),
+            Some(PathBuf::from("/dst/S01/ep01.mkv"))
+        );
+        assert_eq!(
+            move_destination(t, "../../etc/x", src),
+            Some(PathBuf::from("/dst/etc/x"))
+        );
+        assert_eq!(
+            move_destination(t, "", src),
+            Some(PathBuf::from("/dst/ep01.mkv"))
+        );
+    }
+
+    #[tokio::test]
+    async fn post_action_move_never_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("out");
+        let src_a = dir.path().join("a.txt");
+        let src_b = dir.path().join("b.txt");
+        std::fs::write(&src_a, "A").unwrap();
+        std::fs::write(&src_b, "B").unwrap();
+        run_post_action(
+            &src_a,
+            "CD1/readme.txt",
+            PostUploadAction::Move,
+            Some(&target),
+        )
+        .await
+        .unwrap();
+        run_post_action(
+            &src_b,
+            "CD1/readme.txt",
+            PostUploadAction::Move,
+            Some(&target),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("CD1/readme.txt")).unwrap(),
+            "A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("CD1/readme (1).txt")).unwrap(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn retry_skips_credential_and_cancel_errors() {
+        assert!(is_retryable_upload_error("PUT failed: connection reset"));
+        assert!(is_retryable_upload_error("PUT x returned 503: busy"));
+        assert!(!is_retryable_upload_error("cancelled"));
+        assert!(!is_retryable_upload_error("FTP login failed: 530"));
+        assert!(!is_retryable_upload_error("PUT x returned 403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn resize_keeps_single_semaphore_within_limit() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let sem = mgr.semaphore.read().await.clone();
+        let held = sem.clone().acquire_many_owned(2).await.unwrap();
+        mgr.set_max_concurrency(1).await.unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sem.available_permits() != 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        mgr.set_max_concurrency(4).await.unwrap();
+        assert_eq!(sem.available_permits(), 4);
     }
 }

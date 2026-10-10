@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Test script for Risuko aria2-compatible JSON-RPC 2.0 endpoint
-# Usage: ./scripts/test-rpc.sh [secret]
-#   If your RPC secret is set, pass it as the first argument
 
 set -euo pipefail
 
@@ -9,7 +6,6 @@ HOST="http://127.0.0.1:16800/jsonrpc"
 SECRET="${1:-}"
 DL_URL="https://cdn.hotelnearmedanta.com/testfile.org/testfile.org-5GB.dat"
 
-# Build token param if secret is provided
 TOKEN_PARAM=""
 if [[ -n "$SECRET" ]]; then
   TOKEN_PARAM="\"token:${SECRET}\","
@@ -36,23 +32,18 @@ echo " Secret:   ${SECRET:-<none>}"
 echo "============================================"
 echo ""
 
-# 1. getVersion
 echo "--- 1. Get Version ---"
 rpc "risuko.getVersion" ""
 
-# 2. listMethods
 echo "--- 2. List Methods ---"
 rpc "system.listMethods" "" 2
 
-# 3. getGlobalStat
 echo "--- 3. Global Stats ---"
 rpc "risuko.getGlobalStat" "" 3
 
-# 4. getGlobalOption
 echo "--- 4. Global Options ---"
 rpc "risuko.getGlobalOption" "" 4
 
-# 5. addUri - start a download
 echo "--- 5. Add Download ---"
 RESPONSE=$(curl -s -X POST "$HOST" \
   -H "Content-Type: application/json" \
@@ -69,60 +60,48 @@ if [[ -z "$GID" ]]; then
   exit 1
 fi
 
-# 6. tellStatus
 echo "--- 6. Tell Status ---"
 sleep 1
 rpc "risuko.tellStatus" "\"${GID}\"" 6
 
-# 7. tellActive
 echo "--- 7. Tell Active ---"
 rpc "risuko.tellActive" "" 7
 
-# 8. changeOption (limit download speed to 1MB/s)
 echo "--- 8. Change Option (limit to 1MB/s) ---"
 rpc "risuko.changeOption" "\"${GID}\",{\"max-download-limit\":\"1048576\"}" 8
 
 sleep 1
 
-# 9. tellStatus again to see speed limit applied
 echo "--- 9. Tell Status (after speed limit) ---"
 rpc "risuko.tellStatus" "\"${GID}\",[\"gid\",\"status\",\"totalLength\",\"completedLength\",\"downloadSpeed\"]" 9
 
-# 10. pause
 echo "--- 10. Pause Download ---"
 rpc "risuko.pause" "\"${GID}\"" 10
 
 sleep 1
 
-# 11. tellStatus (should be paused)
 echo "--- 11. Tell Status (paused) ---"
 rpc "risuko.tellStatus" "\"${GID}\",[\"gid\",\"status\"]" 11
 
-# 12. unpause
 echo "--- 12. Unpause Download ---"
 rpc "risuko.unpause" "\"${GID}\"" 12
 
 sleep 1
 
-# 13. tellStatus (should be active again)
 echo "--- 13. Tell Status (resumed) ---"
 rpc "risuko.tellStatus" "\"${GID}\",[\"gid\",\"status\",\"downloadSpeed\",\"completedLength\"]" 13
 
-# 14. remove
 echo "--- 14. Remove Download ---"
 rpc "risuko.forceRemove" "\"${GID}\"" 14
 
 sleep 1
 
-# 15. tellStopped
 echo "--- 15. Tell Stopped ---"
 rpc "risuko.tellStopped" "0,10" 15
 
-# 16. purgeDownloadResult
 echo "--- 16. Purge Download Results ---"
 rpc "risuko.purgeDownloadResult" "" 16
 
-# 17. system.multicall
 echo "--- 17. Multicall (getVersion + getGlobalStat) ---"
 MULTI_PARAMS="[{\"methodName\":\"risuko.getVersion\",\"params\":[${TOKEN_PARAM%,}]},{\"methodName\":\"risuko.getGlobalStat\",\"params\":[${TOKEN_PARAM%,}]}]"
 rpc "system.multicall" "${MULTI_PARAMS}" 17

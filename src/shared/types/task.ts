@@ -17,6 +17,7 @@ export interface DownloadFile {
 interface BitTorrentInfo {
 	info?: {
 		name?: string;
+		dirName?: string;
 	};
 	infoHash?: string;
 	infoHashV2?: string;
@@ -30,7 +31,7 @@ export interface UsenetRepairFailure {
 	partialsRetained: boolean;
 }
 
-export type Ed2kKadLookupState =
+type Ed2kKadLookupState =
 	| "disabled"
 	| "bootstrapping"
 	| "searching"
@@ -38,7 +39,7 @@ export type Ed2kKadLookupState =
 	| "timeout"
 	| "error";
 
-export interface Ed2kKadTaskStatus {
+interface Ed2kKadTaskStatus {
 	state: Ed2kKadLookupState;
 	queriedNodes: number;
 	discoveredSources: number;
@@ -118,6 +119,10 @@ export interface GlobalStat {
 	numWaiting: string;
 	numStopped: string;
 	numStoppedTotal: string;
+	numCompleted?: string;
+	numStoppedError?: string;
+	numScheduled?: string;
+	numPaused?: string;
 	downloadSpeed: string;
 	uploadSpeed: string;
 }

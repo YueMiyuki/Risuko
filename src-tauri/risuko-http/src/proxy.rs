@@ -31,10 +31,6 @@ enum NoProxyEntry {
 }
 
 impl NoProxy {
-    pub fn new(value: impl AsRef<str>) -> Self {
-        Self::parse(value)
-    }
-
     pub fn normalize(value: impl AsRef<str>) -> String {
         Self::parse(value).normalized().to_string()
     }
@@ -90,8 +86,7 @@ impl NoProxy {
                 host: rule,
                 port: rule_port,
             } => {
-                rule_port_matches(*rule_port, port)
-                    && (host == *rule || host.ends_with(&format!(".{rule}")))
+                rule_port_matches(*rule_port, port) && (host == *rule || is_subdomain(&host, rule))
             }
             NoProxyEntry::Ip {
                 addr,
@@ -108,8 +103,30 @@ impl NoProxy {
         })
     }
 
-    pub fn matches(&self, host: &str, port: Option<u16>) -> bool {
-        self.matches_host_port(host, port)
+    pub(crate) fn matches_ip(&self, ip: IpAddr, port: Option<u16>) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, NoProxyEntry::Host { .. }))
+        {
+            return self.matches_host_port(&ip.to_string(), port);
+        }
+        self.entries.iter().any(|entry| match entry {
+            NoProxyEntry::Any => true,
+            NoProxyEntry::Host { .. } => false,
+            NoProxyEntry::Ip {
+                addr,
+                port: rule_port,
+            } => rule_port_matches(*rule_port, port) && ip == *addr,
+            NoProxyEntry::Network {
+                addr,
+                prefix,
+                port: rule_port,
+            } => rule_port_matches(*rule_port, port) && ip_in_network(ip, *addr, *prefix),
+        })
     }
 }
 
@@ -117,6 +134,12 @@ impl std::fmt::Display for NoProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.normalized)
     }
+}
+
+fn is_subdomain(host: &str, rule: &str) -> bool {
+    host.len() > rule.len()
+        && host.ends_with(rule)
+        && host.as_bytes()[host.len() - rule.len() - 1] == b'.'
 }
 
 fn rule_port_matches(rule: Option<u16>, actual: Option<u16>) -> bool {
@@ -228,7 +251,6 @@ fn split_host_port(raw: &str) -> Option<(String, Option<u16>)> {
         if let Some(port_text) = rest.strip_prefix(':') {
             return Some((host.to_string(), Some(parse_port(port_text)?)));
         }
-        // Also accept bracketed IPv6 CIDR notation with an optional port
         let cidr = rest.strip_prefix('/')?;
         let (prefix, port) = if let Some((prefix, port_text)) = cidr.rsplit_once(':') {
             (prefix, Some(parse_port(port_text)?))
@@ -415,10 +437,6 @@ impl Proxy {
         Ok(Self::all(url)?.with_bypass(bypass))
     }
 
-    pub fn all_with_no_proxy<U: AsRef<str>>(url: U, no_proxy: NoProxy) -> Result<Self> {
-        Ok(Self::all(url)?.with_no_proxy(no_proxy))
-    }
-
     pub(crate) fn url(&self) -> &Url {
         &self.url
     }
@@ -441,7 +459,7 @@ impl Proxy {
     }
 }
 
-fn percent_decode_str(value: &str) -> String {
+pub(crate) fn percent_decode_str(value: &str) -> String {
     percent_encoding::percent_decode_str(value)
         .decode_utf8_lossy()
         .into_owned()
@@ -450,6 +468,34 @@ fn percent_decode_str(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_ip_agrees_with_matches_host_port() {
+        let bypass = NoProxy::parse("10.0.0.0/8,[2001:db8::]/32,192.168.1.5:80,host.example");
+        for (ip, port) in [
+            ("10.1.2.3", 1),
+            ("11.1.2.3", 1),
+            ("2001:db8::1", 9),
+            ("2001:db9::1", 9),
+            ("192.168.1.5", 80),
+            ("192.168.1.5", 81),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                bypass.matches_ip(ip, Some(port)),
+                bypass.matches_host_port(&ip.to_string(), Some(port)),
+                "{ip}:{port}"
+            );
+        }
+        assert!(!NoProxy::default().matches_ip("10.0.0.1".parse().unwrap(), Some(1)));
+    }
+
+    #[test]
+    fn subdomain_match_requires_label_boundary() {
+        let bypass = NoProxy::parse("example.com");
+        assert!(bypass.matches_host_port("a.example.com", None));
+        assert!(!bypass.matches_host_port("badexample.com", None));
+    }
 
     #[test]
     fn normalizes_hosts_ports_and_duplicates() {

@@ -1,27 +1,35 @@
-//! giFT (FastTrack/OpenFT/Gnutella IPC bridge) — Phase 5. Connects to a local giftd over TCP/1213 and forwards a download request; URI scheme `gift://<inner-uri>` forwards `<inner-uri>` verbatim to giftd. The legacy IPC frame format is line-oriented: each command is one line ending in `\n`, fields space-separated
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{sleep, timeout};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::engine::gnutella::types::url_decode;
 use crate::engine::options::EngineOptions;
 
-/// Parsed `gift://` URI; the part after the scheme is forwarded verbatim to the local giFT daemon as the inner network/file identifier
+const MAX_LINE: usize = 64 * 1024;
+const FIRST_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+const STATUS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn remove_transfer<W: tokio::io::AsyncWrite + Unpin>(wr: &mut W, id: Option<&str>) {
+    if let Some(id) = id {
+        let _ = wr
+            .write_all(format!("TRANSFER REMOVE id={id}\n").as_bytes())
+            .await;
+    }
+}
+
 pub struct GiftLink {
     pub inner: String,
 }
 
-/// True when the input begins with `gift://` (case-insensitive)
 pub fn is_gift_uri(uri: &str) -> bool {
     uri.trim().to_ascii_lowercase().starts_with("gift://")
 }
 
-/// Parse a `gift://<inner>` URI and capture the inner payload as-is
 pub fn parse_gift_uri(uri: &str) -> Option<GiftLink> {
     let s = uri.trim();
     let lower = s.to_ascii_lowercase();
@@ -34,7 +42,6 @@ pub fn parse_gift_uri(uri: &str) -> Option<GiftLink> {
     }
 }
 
-/// Drive a download through a locally-running `giftd` daemon over its IPC socket (default `127.0.0.1:1213`), honouring the `gift-enabled`, `gift-host` and `gift-port` engine options; returns the output path on success or a failure string (`"cancelled"` on abort)
 pub async fn run_gift_download(
     uri: &str,
     dir: &str,
@@ -76,7 +83,6 @@ pub async fn run_gift_download(
     let (rd, mut wr) = tokio::io::split(stream);
     let mut reader = BufReader::new(rd);
 
-    // ATTACH: register as a UI client
     wr.write_all(b"ATTACH risuko\n")
         .await
         .map_err(|e| e.to_string())?;
@@ -86,7 +92,6 @@ pub async fn run_gift_download(
         .await
         .map_err(|e| e.to_string())?;
 
-    // TRANSFER ADD url="..." path="..."
     let safe_name =
         crate::engine::util::safe_filename(&extract_gift_name(&link.inner), "gift-download");
     let out_path = out_dir.join(&safe_name);
@@ -106,31 +111,51 @@ pub async fn run_gift_download(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Watch transfer status events; giftd emits lines like `TRANSFER STATUS id=<n> total=<bytes> done=<bytes> state=<active|complete|...>`
     let mut transfer_id: Option<String> = None;
     let mut last_progress: Option<(tokio::time::Instant, u64)> = None;
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
+    let mut last_status = tokio::time::Instant::now();
+    let mut seen_status = false;
     loop {
-        if cancel_token.is_cancelled() {
-            if let Some(id) = transfer_id.as_ref() {
-                let _ = wr
-                    .write_all(format!("TRANSFER REMOVE id={id}\n").as_bytes())
-                    .await;
-            }
-            return Err("cancelled".into());
+        let limit = if seen_status {
+            STATUS_IDLE_TIMEOUT
+        } else {
+            FIRST_STATUS_TIMEOUT
+        };
+        let remaining = limit.saturating_sub(last_status.elapsed());
+        if remaining.is_zero() {
+            remove_transfer(&mut wr, transfer_id.as_deref()).await;
+            return Err("giftd sent no transfer status in time".into());
         }
-        line.clear();
-        let read = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+        // read_until keeps partial data in `line` across timeouts and cancellation
+        let room = (MAX_LINE + 1).saturating_sub(line.len()) as u64;
+        let read = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                remove_transfer(&mut wr, transfer_id.as_deref()).await;
+                return Err("cancelled".into());
+            }
+            r = timeout(remaining, async {
+                (&mut reader).take(room).read_until(b'\n', &mut line).await
+            }) => r,
+        };
         match read {
-            Ok(Ok(0)) => return Err("giftd disconnected".into()),
+            Ok(Ok(0)) if line.len() <= MAX_LINE => return Err("giftd disconnected".into()),
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => {
-                sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+            Err(_) => continue,
         }
-        let trimmed = line.trim();
+        if line.len() > MAX_LINE {
+            return Err("giftd line too long".into());
+        }
+        if line.last() != Some(&b'\n') {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&line).into_owned();
+        line.clear();
+        let trimmed = text.trim();
+        if trimmed.starts_with("ERROR") {
+            return Err(format!("giftd: {trimmed}"));
+        }
         if let Some(rest) = trimmed.strip_prefix("TRANSFER STATUS ") {
             let mut id = None;
             let mut t = 0u64;
@@ -147,6 +172,8 @@ pub async fn run_gift_download(
                     state = v.to_string();
                 }
             }
+            last_status = tokio::time::Instant::now();
+            seen_status = true;
             if let Some(i) = id {
                 transfer_id = Some(i);
             }
@@ -154,7 +181,6 @@ pub async fn run_gift_download(
                 total.store(t, Ordering::Relaxed);
             }
             completed.store(d, Ordering::Relaxed);
-            // Compute speed from delta bytes / elapsed time
             let now = tokio::time::Instant::now();
             if let Some((prev_time, prev_done)) = last_progress {
                 let elapsed_ms = now.duration_since(prev_time).as_millis() as u64;
@@ -176,21 +202,27 @@ pub async fn run_gift_download(
     }
 }
 
-/// Derive an output filename from a giFT inner URI by taking the last path component before any query string; returns `"gift-download"` when no usable name is present
 pub fn extract_gift_name(inner: &str) -> String {
-    if let Some(rest) = inner.split('?').next() {
-        if let Some(name) = rest.rsplit('/').next() {
-            if !name.is_empty() {
-                return name.to_string();
-            }
-        }
+    let (path, query) = inner.split_once('?').unwrap_or((inner, ""));
+    let dn = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("dn="))
+        .map(url_decode)
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    if let Some(name) = dn {
+        return name;
     }
-    "gift-download".to_string()
+    match path.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "gift-download".to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     #[test]
     fn detects() {
         assert!(is_gift_uri("gift://FastTrack/sha1/ABC"));
@@ -200,5 +232,61 @@ mod tests {
     fn parses() {
         let l = parse_gift_uri("gift://OpenFT/file?dn=foo&xl=42").unwrap();
         assert_eq!(l.inner, "OpenFT/file?dn=foo&xl=42");
+    }
+
+    async fn run_against(chunks: Vec<&'static [u8]>) -> Result<PathBuf, String> {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            let _ = sock.read(&mut b).await;
+            for c in chunks {
+                sock.write_all(c).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("gift-enabled".into(), true.into());
+        cfg.insert("gift-port".into(), port.into());
+        let opts = EngineOptions::from_config(&cfg, &serde_json::Map::new());
+        let dir = tempfile::tempdir().unwrap();
+        run_gift_download(
+            "gift://OpenFT/file?dn=x.bin",
+            dir.path().to_str().unwrap(),
+            &opts,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn keeps_partial_status_line_across_reads() {
+        let res = run_against(vec![
+            b"TRANSFER STATUS id=1 total=10 ",
+            b"done=10 state=complete\n",
+        ])
+        .await;
+        assert!(res.unwrap().ends_with("x.bin"));
+    }
+
+    #[tokio::test]
+    async fn surfaces_error_lines() {
+        let err = run_against(vec![b"ERROR bad request\n"]).await.unwrap_err();
+        assert!(err.contains("ERROR bad request"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_overlong_line() {
+        let long: &'static [u8] = Box::leak(vec![b'a'; MAX_LINE + 10].into_boxed_slice());
+        let err = run_against(vec![long]).await.unwrap_err();
+        assert!(err.contains("too long"), "{err}");
     }
 }

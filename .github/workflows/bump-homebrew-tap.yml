@@ -1,13 +1,15 @@
 name: Bump Homebrew tap
 
-# Runs after Release completes for a tag push. Downloads the published
-# release assets, recomputes their SHA-256 sums, rewrites the version and
-# sha256 fields in the Formula/Cask files in the homebrew-risuko tap repo,
-# and pushes the result.
 on:
-  workflow_run:
-    workflows: [Release]
-    types: [completed]
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to bump to (e.g. v0.1.11)
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -25,26 +27,14 @@ jobs:
   bump:
     name: Bump Formula/risuko-cli.rb and Casks/risuko-app.rb
     runs-on: ubuntu-latest
-    # Only run for successful tag releases (workflow_run) or manual dispatch.
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - name: Resolve target tag
         id: tag
         env:
-          GH_EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
-          WR_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
-          if [ "$GH_EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="$INPUT_TAG"
-          else
-            tag="$WR_TAG"
-          fi
+          tag="$INPUT_TAG"
           if [[ ! "$tag" =~ ^v ]]; then
             echo "::error::Resolved tag '$tag' does not start with 'v'"
             exit 1
@@ -123,10 +113,6 @@ jobs:
           formula = pathlib.Path("tap/Formula/risuko-cli.rb")
           cask    = pathlib.Path("tap/Casks/risuko-app.rb")
 
-          # --- Formula ---
-          # Match each `url ".../{file}"` followed by `sha256 "..."` and
-          # replace the sha256 line in place. Anchored on the URL filename
-          # so order/whitespace shifts don't matter.
           cli_targets = {
               "risuko-cli-darwin-arm64.tar.gz": os.environ["CLI_DARWIN_ARM64"],
               "risuko-cli-darwin-x64.tar.gz":   os.environ["CLI_DARWIN_X64"],
@@ -152,10 +138,6 @@ jobs:
               src = new_src
           formula.write_text(src)
 
-          # --- Cask ---
-          # The cask uses {version} interpolation in the URL. Keep the URL
-          # filenames in lockstep with the canonical release DMG names while
-          # replacing the matching checksum inside each architecture block.
           src = cask.read_text()
           src = re.sub(
               r'^(\s*version\s+")[^"]+(")',
@@ -166,8 +148,6 @@ jobs:
           )
 
           def replace_block(src, block_keyword, sha, filename):
-              # Match `on_arm do` or `on_intel do` ... `end`, then rewrite its
-              # checksum and URL filename together.
               pat = re.compile(
                   r'(' + block_keyword + r'\s+do\b.*?sha256\s+")[0-9a-f]{64}(".*?url\s+"[^"]*/)[^"]+(".*?\n\s*end)',
                   flags=re.DOTALL,

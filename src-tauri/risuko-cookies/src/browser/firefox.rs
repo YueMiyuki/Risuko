@@ -1,6 +1,5 @@
-// Firefox-family cookie extraction
-
 use crate::browser::chromium::Cookie;
+use crate::utils::host::{cookie_covers_host, host_key_candidates};
 use crate::utils::paths;
 use eyre::{bail, Result};
 use rusqlite::Connection;
@@ -47,8 +46,7 @@ impl BrowserConfig {
     }
 }
 
-pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec<Cookie>> {
-    // Browsers can have multiple profiles
+fn find_cookie_dbs(config: &BrowserConfig) -> Vec<std::path::PathBuf> {
     let mut all_dbs = Vec::new();
     for pattern in &config.cookie_paths {
         if let Ok(paths) = paths::find_matching(pattern) {
@@ -59,64 +57,76 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
             }
         }
     }
+    all_dbs
+}
+
+pub fn is_available(config: &BrowserConfig) -> bool {
+    !find_cookie_dbs(config).is_empty()
+}
+
+fn read_db(cookie_db: &std::path::Path, host: Option<&str>) -> Result<Vec<Cookie>> {
+    // Copy because Firefox keeps the DB locked
+    let temp = paths::copy_db_snapshot(cookie_db)?;
+    let conn = Connection::open(temp.db_path())?;
+
+    let mut sql = String::from(
+        "SELECT name, value, host, path, isSecure, isHttpOnly, expiry FROM moz_cookies",
+    );
+    let candidates = host.map(host_key_candidates).unwrap_or_default();
+    if host.is_some() {
+        sql.push_str(" WHERE host IN (");
+        sql.push_str(&vec!["?"; candidates.len()].join(","));
+        sql.push(')');
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let cookie_iter = stmt.query_map(rusqlite::params_from_iter(candidates.iter()), parse_row)?;
+
+    let mut cookies = Vec::new();
+    for cookie in cookie_iter.flatten() {
+        if let Some(request_host) = host {
+            if !cookie_covers_host(request_host, &cookie.domain) {
+                tracing::trace!(target: "risuko_cookies", "firefox: skip cookie '{}' host={} (does not cover {})", cookie.name, cookie.domain, request_host);
+                continue;
+            }
+        }
+        tracing::trace!(target: "risuko_cookies", "firefox: keep cookie '{}' host={} value_len={}", cookie.name, cookie.domain, cookie.value.len());
+        cookies.push(cookie);
+    }
+    Ok(cookies)
+}
+
+pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec<Cookie>> {
+    let all_dbs = find_cookie_dbs(config);
     if all_dbs.is_empty() {
         bail!("firefox cookie database not found");
     }
 
     let mut cookies = Vec::new();
-    let mut skipped_domain = 0usize;
-
+    let mut failed = 0usize;
+    let mut last_err = None;
     for cookie_db in &all_dbs {
         tracing::debug!(target: "risuko_cookies", "firefox: using db path {}", cookie_db.display());
-
-        // Copy to a temp file because Firefox keeps the DB locked while running
-        let temp = tempfile::NamedTempFile::new()?;
-        std::fs::copy(cookie_db, temp.path())?;
-
-        let conn = Connection::open(temp.path())?;
-
-        let total_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM moz_cookies", [], |row| row.get(0))?;
-        tracing::debug!(target: "risuko_cookies", "firefox: total rows in moz_cookies = {}", total_count);
-
-        let mut stmt = conn.prepare(
-            "SELECT name, value, host, path, isSecure, isHttpOnly, expiry FROM moz_cookies",
-        )?;
-        let cookie_iter = stmt.query_map([], parse_row)?;
-
-        for cookie in cookie_iter.flatten() {
-            if let Some(request_host) = host {
-                if !cookie_covers_host(request_host, &cookie.domain) {
-                    tracing::trace!(target: "risuko_cookies", "firefox: skip cookie '{}' host={} (does not cover {})", cookie.name, cookie.domain, request_host);
-                    skipped_domain += 1;
-                    continue;
-                }
+        match read_db(cookie_db, host) {
+            Ok(mut c) => cookies.append(&mut c),
+            Err(e) => {
+                tracing::debug!(target: "risuko_cookies", "firefox: skipping db {}: {}", cookie_db.display(), e);
+                failed += 1;
+                last_err = Some(e);
             }
-            tracing::trace!(target: "risuko_cookies", "firefox: keep cookie '{}' host={} value_len={}", cookie.name, cookie.domain, cookie.value.len());
-            cookies.push(cookie);
+        }
+    }
+    if failed == all_dbs.len() {
+        if let Some(e) = last_err {
+            return Err(e);
         }
     }
 
     tracing::debug!(target: "risuko_cookies",
-        "firefox: scanned {} db(s), host_filter={:?} -> kept={} skipped_domain={}",
-        all_dbs.len(), host, cookies.len(), skipped_domain
+        "firefox: scanned {} db(s), host_filter={:?} -> kept={}",
+        all_dbs.len(), host, cookies.len()
     );
 
     Ok(cookies)
-}
-
-// Modern Firefox stores domain cookies without a leading dot
-fn cookie_covers_host(request_host: &str, cookie_host: &str) -> bool {
-    let r = request_host.to_lowercase();
-    let c = cookie_host.to_lowercase();
-
-    if let Some(domain) = c.strip_prefix('.') {
-        // Older Firefox: domain cookie with explicit leading dot
-        r == domain || r.ends_with(&format!(".{domain}"))
-    } else {
-        // Modern Firefox: bare domain is a domain cookie (covers subdomains)
-        r == c || r.ends_with(&format!(".{c}"))
-    }
 }
 
 fn parse_row(row: &rusqlite::Row) -> rusqlite::Result<Cookie> {
@@ -136,35 +146,4 @@ fn parse_row(row: &rusqlite::Row) -> rusqlite::Result<Cookie> {
         http_only: row.get::<_, i32>(5)? != 0,
         expires,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::cookie_covers_host;
-
-    #[test]
-    fn domain_cookie_without_dot_covers_subdomain() {
-        // Modern Firefox: domain cookie stored as "spigotmc.org" (no dot)
-        assert!(cookie_covers_host("www.spigotmc.org", "spigotmc.org"));
-        assert!(cookie_covers_host("dl.spigotmc.org", "spigotmc.org"));
-        assert!(cookie_covers_host("spigotmc.org", "spigotmc.org"));
-    }
-
-    #[test]
-    fn old_domain_cookie_with_dot_covers_subdomain() {
-        // Older Firefox: domain cookie stored as ".spigotmc.org"
-        assert!(cookie_covers_host("www.spigotmc.org", ".spigotmc.org"));
-        assert!(cookie_covers_host("dl.spigotmc.org", ".spigotmc.org"));
-    }
-
-    #[test]
-    fn host_only_cookie_exact_match() {
-        assert!(cookie_covers_host("www.spigotmc.org", "www.spigotmc.org"));
-    }
-
-    #[test]
-    fn no_false_match_on_suffix() {
-        assert!(!cookie_covers_host("notspigotmc.org", "spigotmc.org"));
-        assert!(!cookie_covers_host("www.spigotmc.org", "example.com"));
-    }
 }

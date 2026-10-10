@@ -1,9 +1,40 @@
-//! Peer wire messages (BEP-3 & BEP-10 extension container); frame `<len: u32 BE><msg_id: u8?><payload>` where length 0 is a keep-alive (no id, no payload)
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// Practical upper bound for a single peer message; BEP-3 chunks and ut_metadata pieces are 16 KiB, we allow generous headroom
 pub const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
+const MAX_PIECE_DATA_BYTES: usize = 64 * 1024;
+const MAX_EXTENDED_BYTES: usize = 1024 * 1024;
+
+fn body_len_allowed(id: u8, body_len: usize) -> Result<(), MessageError> {
+    let exact = match id {
+        id::CHOKE | id::UNCHOKE | id::INTERESTED | id::NOT_INTERESTED => Some(0),
+        id::HAVE | id::SUGGEST_PIECE | id::ALLOWED_FAST => Some(4),
+        id::REQUEST | id::CANCEL | id::REJECT_REQUEST => Some(12),
+        id::PORT => Some(2),
+        id::HAVE_ALL | id::HAVE_NONE => Some(0),
+        id::HASH_REQUEST | id::HASH_REJECT => Some(48),
+        _ => None,
+    };
+    if let Some(expected) = exact {
+        if body_len != 1 + expected {
+            return Err(MessageError::Truncated {
+                id,
+                expected,
+                got: body_len - 1,
+            });
+        }
+        return Ok(());
+    }
+    let max = match id {
+        id::PIECE => 1 + 8 + MAX_PIECE_DATA_BYTES,
+        id::EXTENDED => MAX_EXTENDED_BYTES,
+        _ => MAX_MESSAGE_BYTES,
+    };
+    if body_len > max {
+        return Err(MessageError::TooLarge(body_len));
+    }
+    Ok(())
+}
 
 pub mod id {
     pub const CHOKE: u8 = 0;
@@ -31,8 +62,6 @@ pub mod id {
 pub enum MessageError {
     #[error("truncated message: id {id}, expected {expected} bytes, got {got}")]
     Truncated { id: u8, expected: usize, got: usize },
-    #[error("unknown message id {0}")]
-    UnknownId(u8),
     #[error("message too large: {0} bytes")]
     TooLarge(usize),
 }
@@ -71,15 +100,12 @@ pub enum Message {
         begin: u32,
         length: u32,
     },
-    /// BEP-6 advisory piece suggestion
     SuggestPiece(u32),
-    /// BEP-6 piece that may be requested while choked
     AllowedFast(u32),
     Extended {
         ext_id: u8,
         payload: Bytes,
     },
-    /// BEP 52: request `length` hashes at `base_layer` of the file's Merkle tree from `index`, plus `proof_layers` levels of sibling hashes for verification
     HashRequest {
         pieces_root: [u8; 32],
         base_layer: u32,
@@ -87,7 +113,6 @@ pub enum Message {
         length: u32,
         proof_layers: u32,
     },
-    /// BEP 52 response: `length` hashes followed by [`hashes_uncle_count`] uncle hashes
     Hashes {
         pieces_root: [u8; 32],
         base_layer: u32,
@@ -96,7 +121,6 @@ pub enum Message {
         proof_layers: u32,
         hashes: Bytes,
     },
-    /// BEP 52: peer cannot fulfil the matching `HashRequest`
     HashReject {
         pieces_root: [u8; 32],
         base_layer: u32,
@@ -104,7 +128,6 @@ pub enum Message {
         length: u32,
         proof_layers: u32,
     },
-    /// Fallback for message ids we don't recognise — keep the raw payload so future decode upgrades don't need protocol changes
     Unknown {
         id: u8,
         payload: Bytes,
@@ -114,10 +137,17 @@ pub enum Message {
 pub struct MessageEncoder;
 
 impl MessageEncoder {
-    /// Encode a message to bytes ready to write on the wire (length prefix included)
     pub fn encode(msg: &Message) -> Bytes {
         let mut buf = BytesMut::with_capacity(64);
-        // Reserve 4 bytes for the length prefix; fill after we know body size
+        Self::encode_into(&mut buf, msg);
+        buf.freeze()
+    }
+
+    pub fn encode_into(buf: &mut BytesMut, msg: &Message) {
+        let start = buf.len();
+        if let Message::Piece { data, .. } = msg {
+            buf.reserve(13 + data.len());
+        }
         buf.put_u32(0);
         match msg {
             Message::KeepAlive => {}
@@ -237,13 +267,11 @@ impl MessageEncoder {
                 buf.extend_from_slice(payload);
             }
         }
-        let body_len = (buf.len() - 4) as u32;
-        buf[..4].copy_from_slice(&body_len.to_be_bytes());
-        buf.freeze()
+        let body_len = (buf.len() - start - 4) as u32;
+        buf[start..start + 4].copy_from_slice(&body_len.to_be_bytes());
     }
 }
 
-/// Uncle hashes in a BEP 52 `hashes` message: the first `log2(length) - 1` proof layers are implied by the hashes and omitted
 pub fn hashes_uncle_count(length: u32, proof_layers: u32) -> usize {
     let subtree_layers = length
         .max(1)
@@ -254,12 +282,10 @@ pub fn hashes_uncle_count(length: u32, proof_layers: u32) -> usize {
         .saturating_sub(subtree_layers as usize)
 }
 
-/// Stateful decoder that consumes bytes from a `BytesMut` buffer
 #[derive(Default)]
 pub struct MessageDecoder;
 
 impl MessageDecoder {
-    /// Try to decode a single message from the buffer; returns `Ok(None)` when more bytes are needed
     pub fn try_decode(buf: &mut BytesMut) -> Result<Option<Message>, MessageError> {
         if buf.len() < 4 {
             return Ok(None);
@@ -269,6 +295,9 @@ impl MessageDecoder {
         let body_len = u32::from_be_bytes(len_bytes) as usize;
         if body_len > MAX_MESSAGE_BYTES {
             return Err(MessageError::TooLarge(body_len));
+        }
+        if body_len > 0 && buf.len() > 4 {
+            body_len_allowed(buf[4], body_len)?;
         }
         if buf.len() < 4 + body_len {
             return Ok(None);
@@ -449,7 +478,6 @@ impl MessageDecoder {
                 Message::Extended { ext_id, payload }
             }
             id::HASH_REQUEST | id::HASH_REJECT => {
-                // 32-byte root + 4*4-byte u32 fields = 48 bytes
                 if remaining != 48 {
                     return Err(MessageError::Truncated {
                         id,
@@ -601,6 +629,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_frame_length_before_buffering_body() {
+        let mut raw = BytesMut::new();
+        raw.put_u32(2 * 1024 * 1024);
+        raw.put_u8(id::HAVE);
+        assert!(MessageDecoder::try_decode(&mut raw).is_err());
+
+        let mut raw = BytesMut::new();
+        raw.put_u32(1 + 8 + 128 * 1024);
+        raw.put_u8(id::PIECE);
+        assert!(matches!(
+            MessageDecoder::try_decode(&mut raw),
+            Err(MessageError::TooLarge(_))
+        ));
+
+        let mut raw = BytesMut::new();
+        raw.put_u32(13);
+        raw.put_u8(id::REQUEST);
+        assert!(MessageDecoder::try_decode(&mut raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn encode_into_appends_after_existing_bytes() {
+        let mut buf = BytesMut::from(&b"xy"[..]);
+        MessageEncoder::encode_into(&mut buf, &Message::Have { piece_index: 9 });
+        MessageEncoder::encode_into(&mut buf, &Message::KeepAlive);
+        assert_eq!(&buf[..2], b"xy");
+        let mut rest = buf.split_off(2);
+        assert!(matches!(
+            MessageDecoder::try_decode(&mut rest).unwrap(),
+            Some(Message::Have { piece_index: 9 })
+        ));
+        assert!(matches!(
+            MessageDecoder::try_decode(&mut rest).unwrap(),
+            Some(Message::KeepAlive)
+        ));
+    }
+
+    #[test]
     fn rejects_oversized_frame() {
         let mut raw = BytesMut::new();
         raw.put_u32((MAX_MESSAGE_BYTES + 1) as u32);
@@ -635,7 +701,6 @@ mod tests {
     #[test]
     fn hashes_round_trip() {
         let mut hashes = Vec::new();
-        // length=2 + proof_layers=3 = 5 hashes total
         for i in 0..5 {
             hashes.extend_from_slice(&[i as u8; 32]);
         }
@@ -666,7 +731,6 @@ mod tests {
 
     #[test]
     fn hashes_rejects_truncated_payload() {
-        // Encode a Hashes with length=2/proof_layers=3 (=> 5*32 hash bytes) then strip a hash to force a length mismatch on decode
         let mut hashes = Vec::with_capacity(5 * 32);
         for i in 0..5 {
             hashes.extend_from_slice(&[i as u8; 32]);
@@ -679,9 +743,7 @@ mod tests {
             proof_layers: 3,
             hashes: Bytes::from(hashes),
         });
-        // Drop trailing 32 bytes => length mismatch
         let mut chopped = BytesMut::from(&bytes[..bytes.len() - 32]);
-        // Rewrite length prefix to match the new (shorter) body
         let new_body_len = (chopped.len() - 4) as u32;
         chopped[..4].copy_from_slice(&new_body_len.to_be_bytes());
         let err = MessageDecoder::try_decode(&mut chopped).unwrap_err();
@@ -690,7 +752,6 @@ mod tests {
 
     #[test]
     fn hashes_omits_proof_layers_covered_by_the_request() {
-        // length 8 implies 2 of the 5 proof layers, leaving 3 uncles
         assert_eq!(hashes_uncle_count(8, 5), 3);
         assert_eq!(hashes_uncle_count(2, 3), 3);
         assert_eq!(hashes_uncle_count(512, 0), 0);

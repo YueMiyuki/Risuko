@@ -35,7 +35,8 @@
 		"knip": "pnpx knip --fix",
 		"pre-commit": "pnpm typecheck && pnpm check:i18n && pnpm fmt",
 		"prepare": "pnpx husky",
-		"risuko": "node packages/risuko-cli/bin.js"
+		"risuko": "cargo run --manifest-path src-tauri/Cargo.toml -p risuko-cli --",
+		"set-version": "node scripts/set-version.mjs"
 	},
 	"engines": {
 		"node": ">=22.0.0"

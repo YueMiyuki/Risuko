@@ -131,23 +131,21 @@ export interface AppConfig {
 	[key: string]: unknown;
 }
 
-export interface ProxyProfile {
+interface ProxyProfile {
 	enable?: boolean;
 	server?: string;
 	bypass?: string;
 	scope?: string[];
 }
 
-export interface P2pProxyProfile {
+interface P2pProxyProfile {
 	enable?: boolean;
 	server?: string;
 	bypass?: string;
-	/** Optional SOCKS5 route for UDP-capable P2P operations */
 	udp?: P2pUdpProxyProfile;
 }
 
-export interface P2pUdpProxyProfile {
-	/** Empty means inherit the main P2P route when the runtime supports it */
+interface P2pUdpProxyProfile {
 	server?: string;
 	bypass?: string;
 }
@@ -155,36 +153,35 @@ export interface P2pUdpProxyProfile {
 export interface ProxyConfig {
 	http?: ProxyProfile;
 	p2p?: P2pProxyProfile;
-	// Legacy fields are accepted while older settings are being migrated
 	enable?: boolean;
 	server?: string;
 	bypass?: string;
 	scope?: string[];
 }
 
-export const PROXY_SCOPE_OPTIONS = [
+const PROXY_SCOPE_OPTIONS = [
 	"download",
 	"update-app",
 	"update-trackers",
 ] as const;
 
-export type ProxyScope = (typeof PROXY_SCOPE_OPTIONS)[number];
+type ProxyScope = (typeof PROXY_SCOPE_OPTIONS)[number];
 
-export interface NormalizedProxyProfile {
+interface NormalizedProxyProfile {
 	enable: boolean;
 	server: string;
 	bypass: string;
 	scope: ProxyScope[];
 }
 
-export interface NormalizedP2pProxyProfile {
+interface NormalizedP2pProxyProfile {
 	enable: boolean;
 	server: string;
 	bypass: string;
 	udp: NormalizedP2pUdpProxyProfile;
 }
 
-export interface NormalizedP2pUdpProxyProfile {
+interface NormalizedP2pUdpProxyProfile {
 	server: string;
 	bypass: string;
 }
@@ -456,8 +453,6 @@ const normalizeBypassEntry = (raw: string): string | null => {
 	if (cidr !== null || host.includes(":") || host.includes("/")) {
 		return null;
 	}
-	// A dotted all-numeric token is intended to be an IPv4 address.  Do not
-	// reinterpret malformed forms such as 001.002.003.004 as DNS hostnames
 	if (
 		host.includes(".") &&
 		host.split(".").every((label) => /^\d+$/.test(label))
@@ -484,7 +479,6 @@ const normalizeBypassEntry = (raw: string): string | null => {
 	return `${host}${port === null ? "" : `:${port}`}`;
 };
 
-/** Normalize bypass entries without exposing credentials or preserving duplicate rules */
 export const normalizeProxyBypass = (value: unknown): string => {
 	const raw = Array.isArray(value)
 		? value
@@ -530,7 +524,6 @@ const normalizeProxyScopes = (value: unknown): ProxyScope[] => {
 	return scopes;
 };
 
-/** Return the canonical nested proxy shape used by preferences and cloud sync */
 export const normalizeProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	const root =
 		value && typeof value === "object" && !Array.isArray(value)
@@ -543,10 +536,6 @@ export const normalizeProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	const hasLegacyFields = ["enable", "server", "bypass", "scope"].some((key) =>
 		Object.hasOwn(root, key),
 	);
-	// Migrate legacy values field-by-field.  A partially written nested profile
-	// (for example from an older sync client) must not discard legacy values for
-	// fields it did not send; explicit nested values still win, including false,
-	// an empty string, or an empty scope array
 	const legacyHttp = hasLegacyFields ? root : {};
 	const http = nestedHttp ? { ...legacyHttp, ...nestedHttp } : legacyHttp;
 	const p2p =
@@ -577,7 +566,6 @@ export const normalizeProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	};
 };
 
-/** Normalize a network sync payload, including legacy flattened P2P routes */
 export const normalizeNetworkProxyConfig = (
 	data: Record<string, unknown>,
 ): Record<string, unknown> => {
@@ -618,9 +606,6 @@ export const normalizeNetworkProxyConfig = (
 	const legacyTcpBypass = normalizeProxyBypass(setting("p2p-no-proxy"));
 	const legacyUdpServer = setting("p2p-udp-proxy").trim();
 	const legacyUdpBypass = normalizeProxyBypass(setting("p2p-udp-no-proxy"));
-	// Current clients publish flattened UDP keys as a derived view of the TCP
-	// route when the nested UDP override is blank. Preserve that blank so later
-	// TCP edits continue to flow through to UDP
 	const flattenedUdpInheritsTcp =
 		legacyUdpServer.length > 0 &&
 		legacyUdpServer === legacyTcpServer &&
@@ -681,7 +666,6 @@ export const normalizeNetworkProxyConfig = (
 	};
 };
 
-/** Return a proxy profile suitable for diagnostics/logging, with URL userinfo removed */
 export const redactProxyUrl = (value: string): string => {
 	const trimmed = value.trim();
 	if (!trimmed) {
@@ -729,7 +713,6 @@ export const redactProxyConfig = (value: unknown): NormalizedProxyConfig => {
 	};
 };
 
-/** Redact both nested profiles and legacy flattened engine keys in a diagnostic object */
 export const redactProxySettings = (
 	value: Record<string, unknown>,
 ): Record<string, unknown> => {

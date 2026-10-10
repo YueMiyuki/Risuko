@@ -4,7 +4,6 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 
-/** Stand-in renderer service (slot 2). See [StubSandboxedProcessService0] */
 class StubSandboxedProcessService2 : Service() {
     private val delegate = SandboxedProcessServiceDelegate()
     override fun onCreate() {

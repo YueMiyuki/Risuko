@@ -15,6 +15,14 @@ use tauri::{App, AppHandle};
 use super::{emit_command, show_and_emit};
 
 #[cfg(not(target_os = "android"))]
+static MENU_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(target_os = "android"))]
+pub fn set_menu_hidden(hidden: bool) {
+    MENU_HIDDEN.store(hidden, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(target_os = "android"))]
 static CACHED_LABELS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 #[cfg(not(target_os = "android"))]
@@ -46,9 +54,11 @@ pub fn update_menu_labels(
     handle: &AppHandle,
     labels: &HashMap<String, String>,
 ) -> Result<(), String> {
-    // Cache labels so toggle_app_menu can restore them
     if let Ok(mut cached) = CACHED_LABELS.lock() {
         *cached = Some(labels.clone());
+    }
+    if MENU_HIDDEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
     }
     let menu = build_menu(handle, labels).map_err(|e| e.to_string())?;
     handle.set_menu(menu).map_err(|e| e.to_string())?;
@@ -65,6 +75,7 @@ pub fn update_menu_labels(
 
 #[cfg(not(target_os = "android"))]
 pub fn toggle_app_menu(handle: &AppHandle, hidden: bool) -> Result<(), String> {
+    set_menu_hidden(hidden);
     if hidden {
         handle.remove_menu().map_err(|e| e.to_string())?;
     } else {

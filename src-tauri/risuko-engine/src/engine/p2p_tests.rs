@@ -1,11 +1,7 @@
-//! Integration-style unit tests for the surviving P2P protocols (ADC, Gnutella, G2, giFT); fixtures are static URIs and synthetic byte buffers since none of these networks publish live static download endpoints, so we exercise only the URI parsers and pure helpers
-
 use crate::engine::adc::{is_adc_uri, parse_adc_hub_uri, parse_dchub_file_uri, types::HubDialect};
 use crate::engine::g2::{is_g2_uri, parse_g2_uri};
 use crate::engine::gift::{extract_gift_name, is_gift_uri, parse_gift_uri};
 use crate::engine::gnutella::{is_gnutella_uri, parse_gnutella_uri};
-
-// ---------- ADC / DC ----------
 
 #[test]
 fn adc_scheme_detection_covers_all_dialects() {
@@ -64,28 +60,29 @@ fn adc_hub_uri_rejects_unknown_scheme_and_bad_port() {
 #[test]
 fn dchub_file_uri_decodes_dn_xl_tth() {
     let f = parse_dchub_file_uri(
-        "dchub://hub:411/?TTH=PLSTQHKO5F2F5OJG6DNCKEXNV6YLQ47A&xl=2048&dn=movie%20name.mkv",
+        "dchub://hub:411/?TTH=PLSTQHKO5F2F5OJG6DNCKEXNV6YLQ47APLSTQHK&xl=2048&dn=movie%20name.mkv",
     )
     .unwrap();
     assert_eq!(f.file_name, "movie name.mkv");
     assert_eq!(f.file_size, 2048);
-    assert_eq!(f.tth.as_deref(), Some("PLSTQHKO5F2F5OJG6DNCKEXNV6YLQ47A"));
+    assert_eq!(
+        f.tth.as_deref(),
+        Some("PLSTQHKO5F2F5OJG6DNCKEXNV6YLQ47APLSTQHK")
+    );
 }
 
 #[test]
 fn dchub_file_uri_handles_plus_as_space_and_missing_size() {
-    let f = parse_dchub_file_uri("dchub://hub/?TTH=ABC&dn=hello+world").unwrap();
+    let f = parse_dchub_file_uri("dchub://hub/?dn=hello+world").unwrap();
     assert_eq!(f.file_name, "hello world");
     assert_eq!(f.file_size, 0);
-    assert_eq!(f.tth.as_deref(), Some("ABC"));
+    assert!(f.tth.is_none());
 }
 
 #[test]
 fn dchub_file_uri_returns_none_when_no_query() {
     assert!(parse_dchub_file_uri("dchub://hub.example.com/").is_none());
 }
-
-// ---------- Gnutella 0.6 ----------
 
 #[test]
 fn gnutella_scheme_detection() {
@@ -119,8 +116,6 @@ fn gnutella_uri_recognises_bitprint_urn() {
     assert!(l.urn.unwrap().starts_with("urn:bitprint:"));
 }
 
-// ---------- Gnutella2 ----------
-
 #[test]
 fn g2_scheme_detection() {
     assert!(is_g2_uri("g2://h:6346/sha1/ABC"));
@@ -150,8 +145,6 @@ fn g2_uri_returns_none_for_non_g2_scheme() {
     assert!(parse_g2_uri("g2://h:notaport/sha1/A").is_none());
 }
 
-// ---------- giFT IPC ----------
-
 #[test]
 fn gift_scheme_detection() {
     assert!(is_gift_uri("gift://Gnutella/sha1/ABC"));
@@ -167,7 +160,9 @@ fn gift_uri_preserves_inner_payload_verbatim() {
 
 #[test]
 fn gift_extract_name_strips_query_and_path() {
-    assert_eq!(extract_gift_name("Gnutella/sha1/ABC?dn=foo.bin"), "ABC");
+    assert_eq!(extract_gift_name("Gnutella/sha1/ABC?dn=foo.bin"), "foo.bin");
+    assert_eq!(extract_gift_name("OpenFT/file?xl=1&dn=a%20b"), "a b");
+    assert_eq!(extract_gift_name("Gnutella/sha1/ABC?xl=1"), "ABC");
     assert_eq!(extract_gift_name("OpenFT/dir/sub/file.zip"), "file.zip");
     assert_eq!(extract_gift_name("Gnutella/"), "gift-download");
     assert_eq!(extract_gift_name(""), "gift-download");

@@ -1,5 +1,3 @@
-//! eMule Kad 2.0 UDP wire codec; Kad packets have their own codec (they are neither length-prefixed ED2K TCP packets nor BEP-5 bencoded), and all scalar fields here are little endian as used by eMule/aMule
-
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -8,6 +6,7 @@ use super::routing::{Contact, KadId};
 pub const KAD_PROTOCOL: u8 = 0xe4;
 pub const KAD_PROTOCOL_COMPRESSED: u8 = 0xe5;
 pub const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
+const MAX_INFLATED_SIZE: usize = 64 * 1024;
 
 pub const OP_BOOTSTRAP_REQ: u8 = 0x01;
 pub const OP_BOOTSTRAP_RES: u8 = 0x09;
@@ -16,26 +15,16 @@ pub const OP_HELLO_RES: u8 = 0x19;
 pub const OP_HELLO_RES_ACK: u8 = 0x22;
 pub const OP_ROUTING_REQ: u8 = 0x21;
 pub const OP_ROUTING_RES: u8 = 0x29;
-pub const OP_SEARCH_KEY_REQ: u8 = 0x33;
 pub const OP_SEARCH_SOURCE_REQ: u8 = 0x34;
 pub const OP_SEARCH_RES: u8 = 0x3b;
 pub const OP_PING: u8 = 0x60;
 pub const OP_PONG: u8 = 0x61;
 
-// Standard Kad source tags; kept here rather than duplicated in the lookup implementation
 pub const TAG_SOURCE_IP: u8 = 0xfe;
 pub const TAG_SOURCE_PORT: u8 = 0xfd;
 pub const TAG_SOURCE_UDP_PORT: u8 = 0xfc;
 pub const TAG_SOURCE_TYPE: u8 = 0xff;
-pub const TAG_SERVER_IP: u8 = 0xfb;
-pub const TAG_SERVER_PORT: u8 = 0xfa;
-pub const TAG_BUDDY_HASH: u8 = 0xf8;
-pub const TAG_ENCRYPTION: u8 = 0xf3;
-pub const TAG_UDP_VERSION: u8 = 0x22;
-pub const TAG_KAD_VERSION: u8 = 0x32;
-pub const TAG_KAD_MISC_OPTIONS: u8 = 0xf2;
 
-// aMule/eMule's CUInt128 writer emits four little-endian u32 chunks in big-endian chunk order; keep IDs in canonical (big-endian byte) form in the routing table and reverse each 4-byte chunk only at the wire boundary
 fn id_to_wire(id: &KadId) -> KadId {
     let mut wire = *id;
     for chunk in wire.chunks_exact_mut(4) {
@@ -44,12 +33,10 @@ fn id_to_wire(id: &KadId) -> KadId {
     wire
 }
 
-// Chunk-reversal is its own inverse, so decoding from wire form is the same operation as encoding to it; keep this alias distinct from `id_to_wire` so call sites read clearly and do not "optimize" one to call the other away
 fn id_from_wire(id: &KadId) -> KadId {
     id_to_wire(id)
 }
 
-// The type values are defined by TagTypes.h in eMule/aMule
 pub const TAGTYPE_HASH16: u8 = 0x01;
 pub const TAGTYPE_STRING: u8 = 0x02;
 pub const TAGTYPE_UINT32: u8 = 0x03;
@@ -62,7 +49,6 @@ pub const TAGTYPE_UINT8: u8 = 0x09;
 pub const TAGTYPE_BSOB: u8 = 0x0a;
 pub const TAGTYPE_UINT64: u8 = 0x0b;
 
-/// A decoded Kad datagram; unknown opcodes are retained so callers can log or explicitly ignore extensions without accepting compressed packets
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadPacket {
     pub opcode: u8,
@@ -93,7 +79,18 @@ impl KadPacket {
         }
         match data[0] {
             KAD_PROTOCOL => Ok(Self::new(data[1], data[2..].to_vec())),
-            KAD_PROTOCOL_COMPRESSED => Err(WireError::CompressedUnsupported),
+            KAD_PROTOCOL_COMPRESSED => {
+                use std::io::Read;
+                let mut inflated = Vec::new();
+                flate2::read::ZlibDecoder::new(&data[2..])
+                    .take(MAX_INFLATED_SIZE as u64 + 1)
+                    .read_to_end(&mut inflated)
+                    .map_err(|_| WireError::InvalidValue("compressed Kad packet"))?;
+                if inflated.len() > MAX_INFLATED_SIZE {
+                    return Err(WireError::TooLarge(inflated.len()));
+                }
+                Ok(Self::new(data[1], inflated))
+            }
             protocol => Err(WireError::InvalidProtocol(protocol)),
         }
     }
@@ -103,7 +100,6 @@ impl KadPacket {
 pub enum WireError {
     Truncated { context: &'static str },
     InvalidProtocol(u8),
-    CompressedUnsupported,
     TooLarge(usize),
     InvalidValue(&'static str),
     InvalidTagType(u8),
@@ -116,7 +112,6 @@ impl fmt::Display for WireError {
         match self {
             Self::Truncated { context } => write!(f, "truncated {context}"),
             Self::InvalidProtocol(value) => write!(f, "invalid Kad protocol 0x{value:02x}"),
-            Self::CompressedUnsupported => write!(f, "compressed Kad packets are unsupported"),
             Self::TooLarge(size) => write!(f, "Kad datagram is too large ({size} bytes)"),
             Self::InvalidValue(context) => write!(f, "invalid {context}"),
             Self::InvalidTagType(value) => write!(f, "unsupported tag type 0x{value:02x}"),
@@ -130,7 +125,6 @@ impl fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-/// Kad tag value; integer values are normalized to `u64`, preserving the wire width separately in `KadTag::wire_type` when a packet is re-encoded
 #[derive(Debug, Clone, PartialEq)]
 pub enum KadTagValue {
     UInt(u64),
@@ -147,10 +141,8 @@ impl Eq for KadTagValue {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadTag {
-    /// Numeric IDs are the common form in Kad packets; a string name is retained for compatibility with generic eMule tags
     pub name: KadTagName,
     pub value: KadTagValue,
-    /// Original wire type; `None` means use the natural type while encoding
     pub wire_type: Option<u8>,
 }
 
@@ -185,7 +177,6 @@ impl KadTag {
     }
 }
 
-/// A contact as represented in bootstrap/routing packets
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadWireContact {
     pub id: KadId,
@@ -206,14 +197,12 @@ impl KadWireContact {
     }
 }
 
-/// Parsed response from a Kad node lookup
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingResponse {
     pub target: KadId,
     pub contacts: Vec<KadWireContact>,
 }
 
-/// Parsed source-search result; Kad2 puts the requested file ID first and does not include a sender ID in this response
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSearchResponse {
     pub target: KadId,
@@ -222,7 +211,6 @@ pub struct SourceSearchResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadSourceRecord {
-    /// ED2K user hash for the source; distinct from the responding node's Kad routing ID
     pub id: KadId,
     pub tags: Vec<KadTag>,
 }
@@ -235,7 +223,6 @@ impl KadSourceRecord {
 
     pub fn ip(&self) -> Option<Ipv4Addr> {
         let raw = u32::try_from(self.tag_uint(TAG_SOURCE_IP)?).ok()?;
-        // Kad stores IPv4 values in host order and serializes them with its little-endian scalar writer; decode the scalar as little endian, then render its network-order value as dotted IPv4
         Some(Ipv4Addr::from(raw.to_be_bytes()))
     }
 
@@ -259,7 +246,6 @@ impl KadSourceRecord {
             if !matches!(tag.name, KadTagName::Id(name) if name == id) {
                 continue;
             }
-            // Source endpoint fields have a numeric wire contract; do not reinterpret BOOL tags as integers, and reject duplicate names rather than accepting whichever one happens to be first
             let KadTagValue::UInt(candidate) = &tag.value else {
                 return None;
             };
@@ -330,7 +316,6 @@ impl<'a> Cursor<'a> {
 }
 
 fn encode_name(out: &mut Vec<u8>, name: &KadTagName, wire_type: u8) {
-    // Kad uses CDataIO tags, whose name is always a u16-length-prefixed byte string; a numeric Kad tag ID is encoded as a one-byte name, not with the high-bit compact-name form used by generic ED2K tags
     out.push(wire_type);
     match name {
         KadTagName::Id(id) => {
@@ -369,7 +354,6 @@ fn natural_wire_type(value: &KadTagValue) -> u8 {
     }
 }
 
-/// Encode a tag using the canonical eMule name/type representation
 pub fn encode_tag(out: &mut Vec<u8>, tag: &KadTag) {
     let wire_type = tag
         .wire_type
@@ -396,7 +380,7 @@ pub fn encode_tag(out: &mut Vec<u8>, tag: &KadTag) {
         (KadTagValue::BoolArray(values), TAGTYPE_BOOLARRAY) => {
             let len = u16::try_from(values.len()).unwrap_or(u16::MAX);
             out.extend_from_slice(&len.to_le_bytes());
-            // eMule's CTag reader consumes one sentinel byte after every eight boolean values (`len / 8 + 1`), including an empty array
+            // eMule's reader consumes one sentinel byte per eight booleans (`len / 8 + 1`), even for empty arrays
             let bytes = values.len() / 8 + 1;
             for byte in 0..bytes {
                 let mut value = 0u8;
@@ -417,7 +401,6 @@ pub fn encode_tag(out: &mut Vec<u8>, tag: &KadTag) {
             );
         }
         (KadTagValue::Bsob(value), TAGTYPE_BSOB) => {
-            // BSOB is the legacy small-blob form used by Kad tags; its length is a single byte, and unlike BLOB it is not a u32 field
             debug_assert!(
                 value.len() <= usize::from(u8::MAX),
                 "BSOB value exceeds single-byte length and will be truncated"
@@ -426,7 +409,6 @@ pub fn encode_tag(out: &mut Vec<u8>, tag: &KadTag) {
             out.push(len as u8);
             out.extend_from_slice(&value[..len]);
         }
-        // Preserve malformed/unknown combinations as an empty value only in the encoder; builders in this module always use matching pairs, and callers cannot use this to make the decoder accept an unknown type
         _ => {}
     }
 }
@@ -469,7 +451,6 @@ fn decode_tag(cursor: &mut Cursor<'_>) -> Result<KadTag, WireError> {
                     count,
                 });
             }
-            // Match aMule's CTag reader; the extra byte is part of the legacy BOOLARRAY representation and must be consumed even when the count is an exact multiple of eight
             let bytes = count / 8 + 1;
             let raw = cursor.take(bytes, "bool array")?;
             let values = (0..count)
@@ -495,7 +476,6 @@ fn decode_tag(cursor: &mut Cursor<'_>) -> Result<KadTag, WireError> {
         TAGTYPE_UINT16 => KadTagValue::UInt(cursor.u16("uint16 tag")? as u64),
         TAGTYPE_UINT8 => KadTagValue::UInt(cursor.u8("uint8 tag")? as u64),
         TAGTYPE_UINT64 => KadTagValue::UInt(cursor.u64("uint64 tag")?),
-        // eMule defines compact strings only through TAGTYPE_STR22 (0x26); treat later values as unknown tag types instead of inferring a length from an extension that Kad 2.0 does not define
         compressed if (0x11..=0x26).contains(&compressed) => {
             let len = usize::from(compressed - 0x10);
             KadTagValue::String(
@@ -537,7 +517,6 @@ fn encode_tags(out: &mut Vec<u8>, tags: &[KadTag]) {
 }
 
 pub fn build_bootstrap_request() -> KadPacket {
-    // Bootstrap requests carry no payload in Kad2.0; the remote endpoint supplies the sender's UDP port, and while including the ID is a harmless extension understood by a few implementations, the interoperable form is empty and is what aMule emits
     KadPacket::new(OP_BOOTSTRAP_REQ, Vec::new())
 }
 
@@ -560,7 +539,6 @@ pub fn parse_bootstrap_response(
         contacts.push(read_contact(&mut cursor)?);
     }
     cursor.finish("bootstrap response trailing bytes")?;
-    // The response's source IP/UDP endpoint is filled by the service, which knows the datagram sender; use unspecified IP here as a marker
     Ok((
         KadWireContact {
             id,
@@ -646,7 +624,6 @@ pub fn parse_routing_response(payload: &[u8]) -> Result<RoutingResponse, WireErr
     parse_routing_response_with_limit(payload, 32)
 }
 
-/// Parse a routing response while enforcing the contact count requested by the corresponding lookup operation; Kad's FIND_VALUE request (kind `2`) asks for two contacts, and accepting more would let an oversized answer evade the lookup bound and poison the candidate table
 pub fn parse_routing_response_with_limit(
     payload: &[u8],
     max_contacts: usize,
@@ -721,7 +698,6 @@ pub fn build_ping() -> KadPacket {
     KadPacket::new(OP_PING, Vec::new())
 }
 
-/// Parse a Kad pong, which carries the UDP port the peer observed for us
 pub fn parse_pong(payload: &[u8]) -> Result<u16, WireError> {
     let mut cursor = Cursor::new(payload);
     let observed_port = cursor.u16("pong UDP port")?;
@@ -729,27 +705,9 @@ pub fn parse_pong(payload: &[u8]) -> Result<u16, WireError> {
     Ok(observed_port)
 }
 
-pub fn is_supported_opcode(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        OP_BOOTSTRAP_REQ
-            | OP_BOOTSTRAP_RES
-            | OP_HELLO_REQ
-            | OP_HELLO_RES
-            | OP_HELLO_RES_ACK
-            | OP_ROUTING_REQ
-            | OP_ROUTING_RES
-            | OP_SEARCH_SOURCE_REQ
-            | OP_SEARCH_RES
-            | OP_PING
-            | OP_PONG
-    )
-}
-
 fn read_contact(cursor: &mut Cursor<'_>) -> Result<KadWireContact, WireError> {
     let id = cursor.id("contact id")?;
     let raw_ip = cursor.u32("contact ip")?;
-    // Kad's packet writer serializes the host-order IPv4 scalar little endian, so convert that scalar back to network-order dotted bytes
     let ip = Ipv4Addr::from(raw_ip.to_be_bytes());
     let udp_port = cursor.u16("contact udp port")?;
     let tcp_port = cursor.u16("contact tcp port")?;
@@ -781,16 +739,41 @@ mod tests {
 
     #[test]
     fn packet_rejects_compressed_and_oversized_datagrams() {
-        assert_eq!(
-            KadPacket::decode(&[KAD_PROTOCOL_COMPRESSED, OP_PING]).unwrap_err(),
-            WireError::CompressedUnsupported
-        );
+        assert!(KadPacket::decode(&[KAD_PROTOCOL_COMPRESSED, OP_PING, 0x78]).is_err());
         let mut data = vec![KAD_PROTOCOL, OP_PING];
         data.resize(MAX_DATAGRAM_SIZE + 1, 0);
         assert!(matches!(
             KadPacket::decode(&data),
             Err(WireError::TooLarge(_))
         ));
+    }
+
+    fn zlib(opcode: u8, data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(
+            vec![KAD_PROTOCOL_COMPRESSED, opcode],
+            flate2::Compression::fast(),
+        );
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn compressed_packet_is_inflated_and_bombs_are_rejected() {
+        let packet = KadPacket::decode(&zlib(OP_SEARCH_RES, &[0xab; 300])).unwrap();
+        assert_eq!(packet.opcode, OP_SEARCH_RES);
+        assert_eq!(packet.payload, vec![0xab; 300]);
+
+        let bomb = zlib(OP_SEARCH_RES, &vec![0u8; MAX_INFLATED_SIZE + 10]);
+        assert!(bomb.len() < MAX_DATAGRAM_SIZE);
+        assert!(matches!(
+            KadPacket::decode(&bomb),
+            Err(WireError::TooLarge(_))
+        ));
+        assert!(KadPacket::decode(&zlib(OP_PING, &[]))
+            .unwrap()
+            .payload
+            .is_empty());
     }
 
     #[test]
@@ -968,7 +951,6 @@ mod tests {
 
     #[test]
     fn decoded_u64_ip_tag_is_not_truncated_to_ipv4() {
-        // Keep the low four bytes usable so an unchecked cast would produce a seemingly valid direct source endpoint
         let oversized_ip = (1u64 << 32) | u64::from(u32::from_be_bytes([1, 2, 3, 4]));
         let record = KadSourceRecord {
             id: id(7),
@@ -1052,7 +1034,6 @@ mod tests {
 
     #[test]
     fn kad_tags_reject_generic_ed2k_compact_names() {
-        // Kad's CDataIO decoder reads the tag type verbatim, so a generic ED2K compact-name type byte is not a valid Kad UINT16 tag
         let compact_ed2k_tag = vec![1, TAGTYPE_UINT16 | 0x80, 1, 0, TAG_SOURCE_PORT, 0x34, 0x12];
         let mut cursor = Cursor::new(&compact_ed2k_tag);
 
@@ -1116,7 +1097,6 @@ mod tests {
 
     #[test]
     fn compressed_string_tag_types_after_str22_are_rejected() {
-        // `0x27` is not a defined compact-string type; eMule's range stops at STR22 (`0x26`), and Kad still uses its normal u16 name length
         let invalid_compact_string = vec![1, 0x27, 1, 0, TAG_SOURCE_PORT];
         let mut cursor = Cursor::new(&invalid_compact_string);
 

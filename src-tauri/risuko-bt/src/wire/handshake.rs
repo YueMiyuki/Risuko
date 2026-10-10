@@ -1,15 +1,10 @@
-//! BitTorrent handshake (BEP-3), 68 bytes: 1 len + 19 "BitTorrent protocol" + 8 reserved (BEP-10 ext, BEP-5 DHT) + 20 info-hash + 20 peer-id
-
 use super::super::core::Id20;
 
 pub const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 pub const HANDSHAKE_LEN: usize = 1 + 19 + 8 + 20 + 20;
 
-/// Reserved bit flags we care about; byte indices are 0-based from the start of the 8-byte reserved area
 pub mod reserved {
-    /// Bit 20 (byte 5, bit 0x10) — BEP-10 Extension Protocol
     pub const EXT_PROTOCOL: (usize, u8) = (5, 0x10);
-    /// BEP 52 v2 upgrade bit (BEP 4: byte 7, 0x10; 0x08 is NAT Traversal)
     pub const V2: (usize, u8) = (7, 0x10);
     pub const DHT: (usize, u8) = (7, 0x01);
     pub const FAST: (usize, u8) = (7, 0x04);
@@ -31,6 +26,7 @@ pub struct Handshake {
 }
 
 impl Handshake {
+    #[cfg(test)]
     pub fn new_with_v2(info_hash: Id20, peer_id: Id20, advertise_v2: bool) -> Self {
         Self::new_with_features(info_hash, peer_id, advertise_v2, true, true)
     }
@@ -69,7 +65,6 @@ impl Handshake {
         self.reserved[b] & m != 0
     }
 
-    /// True if the peer advertises BEP 52 (BitTorrent v2) capability
     pub fn has_v2(&self) -> bool {
         let (b, m) = reserved::V2;
         self.reserved[b] & m != 0
@@ -115,7 +110,6 @@ mod tests {
         let parsed = Handshake::parse(&bytes).unwrap();
         assert_eq!(hs, parsed);
         assert!(parsed.has_ext_protocol());
-        // `advertise_v2 = true` carries the v2 capability bit
         assert!(parsed.has_v2());
     }
 

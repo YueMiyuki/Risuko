@@ -1,3 +1,4 @@
+import java.nio.file.Files
 import java.util.Properties
 
 plugins {
@@ -18,7 +19,7 @@ android {
     namespace = "app.risuko.mobile"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "app.risuko.mobile"
+        applicationId = providers.environmentVariable("RISUKO_ANDROID_APPLICATION_ID").orNull?.ifBlank { null } ?: "app.risuko.mobile"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -65,13 +66,13 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
         }
         jniLibs.walkTopDown().forEach { candidate ->
             val path = candidate.toPath()
-            if (java.nio.file.Files.isSymbolicLink(path)) {
+            if (Files.isSymbolicLink(path)) {
                 try {
                     val target = path.toRealPath()
-                    java.nio.file.Files.delete(path)
-                    java.nio.file.Files.copy(target, path)
+                    Files.delete(path)
+                    Files.copy(target, path)
                 } catch (_: Exception) {
-                    java.nio.file.Files.deleteIfExists(path)
+                    Files.deleteIfExists(path)
                 }
             }
         }

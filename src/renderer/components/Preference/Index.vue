@@ -187,6 +187,7 @@ export default {
 		return {
 			searchQuery: "",
 			searchEntries: getPreferenceSearchEntries(),
+			searchRetryTimer: undefined as number | undefined,
 		};
 	},
 	computed: {
@@ -273,6 +274,7 @@ export default {
 		usePreferenceStore().fetchPreference();
 	},
 	beforeUnmount() {
+		window.clearTimeout(this.searchRetryTimer);
 		getLocaleManager()
 			.getI18n()
 			.off("languageChanged", this.refreshSearchEntries);
@@ -325,7 +327,8 @@ export default {
 				if (found || attempt >= SEARCH_TARGET_RETRY_LIMIT) {
 					return;
 				}
-				window.setTimeout(
+				window.clearTimeout(this.searchRetryTimer);
+				this.searchRetryTimer = window.setTimeout(
 					() =>
 						this.scheduleSearchTarget(settingKey, fallbackTarget, attempt + 1),
 					SEARCH_TARGET_RETRY_DELAY,

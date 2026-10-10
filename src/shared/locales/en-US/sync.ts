@@ -42,7 +42,6 @@ export default {
 	"category-directories": "Directories",
 	"category-download": "Download Behavior",
 	"category-media": "Media Format",
-	"category-rss": "RSS",
 	"category-stats": "Stats",
 	"category-task-routing": "Task Routing",
 	"category-notifications": "Notifications",

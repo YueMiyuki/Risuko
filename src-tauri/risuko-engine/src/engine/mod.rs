@@ -18,6 +18,7 @@ pub mod rpc;
 pub mod rss;
 pub mod session;
 pub mod speed_limiter;
+pub(crate) mod ssh_auth;
 pub mod ssh_known_hosts;
 pub mod stats;
 pub mod task;
@@ -31,7 +32,6 @@ pub mod usenet_transport;
 pub mod usenet_worker;
 pub(crate) mod util;
 
-// Legacy P2P / IPC protocol stacks
 pub mod adc;
 pub mod archive_pipeline;
 pub mod archive_safety;
@@ -43,8 +43,8 @@ pub mod gnutella;
 mod p2p_tests;
 
 pub use session::SESSION_FILENAME;
+pub use util::is_windows_device_name;
 
-/// Suffix for per-chunk resume metadata sidecar file
 pub const CHUNK_META_SUFFIX: &str = ".chunks";
 
 pub const STARTUP_ONLY_KEYS: &[&str] = &[
@@ -60,7 +60,8 @@ pub const STARTUP_ONLY_KEYS: &[&str] = &[
     "ed2k-kad-port",
     "bt-max-peers-per-torrent",
     "bt-max-outstanding-per-peer",
-    "bt-upload-rate-limit",
+    "bt-ban-corrupt-peers",
+    "bt-ban-corrupt-strikes",
     "bt-enable-upnp",
     "bt-upnp-lease",
     "bt-enable-lsd",
@@ -96,12 +97,10 @@ pub async fn set_usenet_credential_resolver(
     *USENET_CREDENTIAL_RESOLVER.write().await = Some(resolver);
 }
 
-/// Install a file-backed resolver for hosts that own the engine lifecycle (standalone/headless and NAPI); unlike `ensure_*`, this refreshes the path on every host start so a reused process cannot retain an old config dir
 pub async fn set_file_usenet_credential_resolver(config_dir: impl Into<PathBuf>) {
     set_usenet_credential_resolver(Arc::new(FileUsenetCredentialResolver::new(config_dir))).await;
 }
 
-/// Install the file-backed resolver only when the host has not supplied a stronger resolver (for example, the Tauri OS-keychain resolver)
 pub async fn ensure_file_usenet_credential_resolver(config_dir: impl Into<PathBuf>) {
     let mut guard = USENET_CREDENTIAL_RESOLVER.write().await;
     if guard.is_none() {
@@ -109,12 +108,10 @@ pub async fn ensure_file_usenet_credential_resolver(config_dir: impl Into<PathBu
     }
 }
 
-/// Location of the durable plaintext fallback used when an OS keychain is unavailable; deliberately separate from user.json so secrets do not cross the normal renderer configuration boundary
 pub fn usenet_credential_fallback_path(config_dir: &Path) -> PathBuf {
     config_dir.join("usenet-credentials.json")
 }
 
-/// File-backed credential resolver for standalone and NAPI hosts; Tauri uses the same file only as a fallback behind its keychain resolver
 pub struct FileUsenetCredentialResolver {
     path: PathBuf,
 }
@@ -163,7 +160,6 @@ impl usenet::UsenetCredentialResolver for FileUsenetCredentialResolver {
 }
 
 pub async fn usenet_credential_resolver() -> std::sync::Arc<dyn usenet::UsenetCredentialResolver> {
-    // Host entry points call `ensure_file_usenet_credential_resolver` (or install their own resolver) before creating a manager; keep the anonymous fallback for direct library users that intentionally construct a manager without a host credential store
     USENET_CREDENTIAL_RESOLVER
         .read()
         .await
@@ -179,7 +175,6 @@ static STARTUP_SNAPSHOT: std::sync::Mutex<
     Option<std::collections::HashMap<String, serde_json::Value>>,
 > = std::sync::Mutex::new(None);
 
-/// Time since the engine last successfully started, or `None` if not running
 pub fn engine_uptime() -> Option<Duration> {
     ENGINE_STARTED_AT
         .lock()
@@ -187,7 +182,6 @@ pub fn engine_uptime() -> Option<Duration> {
         .and_then(|g| g.as_ref().map(|t| Instant::now().duration_since(*t)))
 }
 
-/// Snapshot of startup-only keys captured the last time the engine started; `None` until the engine has run at least once in this process
 pub fn startup_snapshot() -> Option<std::collections::HashMap<String, serde_json::Value>> {
     STARTUP_SNAPSHOT.lock().ok().and_then(|g| g.clone())
 }
@@ -202,20 +196,7 @@ struct EngineInstance {
 }
 
 fn parse_config_bool(value: Option<&serde_json::Value>) -> bool {
-    value
-        .and_then(|v| match v {
-            serde_json::Value::Bool(flag) => Some(*flag),
-            serde_json::Value::String(text) => {
-                let normalized = text.trim().to_ascii_lowercase();
-                Some(matches!(normalized.as_str(), "1" | "true" | "yes" | "on"))
-            }
-            serde_json::Value::Number(number) => number
-                .as_i64()
-                .map(|n| n != 0)
-                .or_else(|| number.as_f64().map(|n| n != 0.0)),
-            _ => None,
-        })
-        .unwrap_or(false)
+    value.and_then(options::json_bool).unwrap_or(false)
 }
 
 pub fn should_start_embedded_engine(config: &ConfigManager) -> bool {
@@ -225,7 +206,6 @@ pub fn should_start_embedded_engine(config: &ConfigManager) -> bool {
     !external_enabled
 }
 
-/// Start the engine with explicit dependencies (no Tauri required): `config` is the loaded ConfigManager, `event_sink` receives engine events (Tauri emitter, NAPI callback, or no-op), and `upload_sinks` is an optional cloud-upload manager to which completed downloads are forwarded via the event bridge
 pub async fn start_engine(
     config: &ConfigManager,
     event_sink: Arc<dyn EventSink>,
@@ -236,7 +216,6 @@ pub async fn start_engine(
         return Ok(());
     }
 
-    // Check if already running
     {
         let guard = ENGINE_INSTANCE.lock().await;
         if guard.is_some() {
@@ -253,7 +232,6 @@ pub async fn start_engine(
 
     std::fs::create_dir_all(&config_dir)?;
 
-    // Create the download directory if configured
     let dir = options.dir();
     if !dir.is_empty() {
         std::fs::create_dir_all(&dir).ok();
@@ -314,29 +292,34 @@ pub async fn start_engine(
         None
     };
 
-    // Start periodic progress update
     let mgr_for_progress = manager.clone();
     let progress_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            mgr_for_progress.update_progress().await;
-        }
-    });
-
-    // Start periodic session auto-save
-    let mgr_for_save = manager.clone();
-    let auto_save_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(e) = mgr_for_save.save_session().await {
-                tracing::warn!("Auto-save session failed: {}", e);
+            let mgr = mgr_for_progress.clone();
+            if let Err(e) = tokio::spawn(async move { mgr.update_progress().await }).await {
+                tracing::error!("Progress update panicked: {}", e);
             }
         }
     });
 
-    // Bridge engine events to the event sink
+    let mgr_for_save = manager.clone();
+    let auto_save_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let mgr = mgr_for_save.clone();
+            match tokio::spawn(async move { mgr.save_session().await }).await {
+                Ok(Err(e)) => tracing::warn!("Auto-save session failed: {}", e),
+                Err(e) => tracing::error!("Auto-save session panicked: {}", e),
+                Ok(Ok(_)) => {}
+            }
+        }
+    });
+
     let sink = event_sink.clone();
     let mut event_rx = events.subscribe();
     let mgr_for_uploads = manager.clone();
@@ -367,7 +350,6 @@ pub async fn start_engine(
                     let payload = serde_json::json!({ "gid": gid });
                     sink.emit(name, payload);
 
-                    // Forward completed downloads to the upload pipeline, dispatching on `download-complete` only (the BT-specific event fires before the final move-to-dir step on some tasks, so it's the wrong hook for cloud sync); hand off to a detached task so a slow files_for_upload/enqueue_for_file pair can't stall the broadcast receiver and lag other events
                     if matches!(event, EngineEvent::DownloadComplete { .. }) {
                         if let Some(uploads) = upload_mgr.clone() {
                             let mgr = mgr_for_uploads.clone();
@@ -405,7 +387,6 @@ pub async fn start_engine(
         }
     });
 
-    // Clean up aria2 session file
     session::SessionManager::cleanup_legacy(&config_dir);
 
     let instance = EngineInstance {
@@ -419,7 +400,6 @@ pub async fn start_engine(
 
     *ENGINE_INSTANCE.lock().await = Some(instance);
 
-    // Capture startup-only key snapshot + start time so health checks can detect drift and report uptime
     if let Ok(mut g) = STARTUP_SNAPSHOT.lock() {
         let mut snap = std::collections::HashMap::new();
         for key in STARTUP_ONLY_KEYS {
@@ -436,7 +416,6 @@ pub async fn start_engine(
         *g = Some(Instant::now());
     }
 
-    // Monitor for RPC-initiated shutdown requests
     tokio::spawn(async move {
         if rpc_shutdown_rx.recv().await.is_some() {
             tracing::info!("Shutdown requested via RPC");
@@ -453,18 +432,15 @@ pub async fn start_engine(
 pub async fn stop_engine() -> Result<(), Box<dyn std::error::Error>> {
     let mut guard = ENGINE_INSTANCE.lock().await;
     if let Some(mut instance) = guard.take() {
-        // Stop periodic tasks
         instance.progress_task.abort();
         instance.auto_save_task.abort();
         instance.event_bridge_task.abort();
 
-        // Stop RPC server
         instance.rpc_server.stop();
         if let Some(mut pbh) = instance.pbh_rpc_server {
             pbh.stop();
         }
 
-        // Shutdown manager (saves session, stops downloads, closes torrent engine)
         instance.manager.shutdown().await;
     }
     drop(guard);
@@ -506,7 +482,6 @@ pub async fn reload_p2p_profile(config: &ConfigManager) -> Result<(), Box<dyn st
         .map_err(|error| error.into())
 }
 
-/// Get a handle to the task manager for direct calls
 pub async fn get_manager() -> Option<Arc<TaskManager>> {
     let guard = ENGINE_INSTANCE.lock().await;
     guard.as_ref().map(|i| i.manager.clone())

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
+use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 use tokio::time::timeout;
 
@@ -51,9 +52,7 @@ fn read_script_config(state: &AppState) -> Result<ScriptConfig, String> {
     })
 }
 
-/// Tokenize an args template by whitespace (no shell interpretation), then substitute `{path}`, `{hash}`, `{status}` placeholders. Note: whitespace tokenization collapses consecutive spaces and does not preserve empty arguments
 fn replace_placeholders(token: &str, path: &str, hash: &str, status: &str) -> String {
-    // Substitute {path} last so placeholder-looking text inside the path literal is never re-expanded
     token
         .replace("{hash}", hash)
         .replace("{status}", status)
@@ -78,16 +77,53 @@ pub struct ScriptRunResult {
     message: Option<String>,
 }
 
-fn truncate(mut s: String) -> String {
-    if s.len() > MAX_OUTPUT_BYTES {
-        let mut cut = MAX_OUTPUT_BYTES;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
+#[derive(Default)]
+struct CappedOutput {
+    buf: Vec<u8>,
+    truncated: bool,
+}
+
+impl CappedOutput {
+    fn push_line(&mut self, line: &[u8]) {
+        let room = MAX_OUTPUT_BYTES.saturating_sub(self.buf.len());
+        if room == 0 {
+            self.truncated = true;
+            return;
         }
-        s.truncate(cut);
-        s.push_str("\n...[truncated]");
+        let take = line.len().min(room);
+        self.buf.extend_from_slice(&line[..take]);
+        if take < room {
+            self.buf.push(b'\n');
+        } else {
+            self.truncated = true;
+        }
     }
-    s
+
+    fn into_string(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.buf).into_owned();
+        if self.truncated {
+            text.push_str("\n...[truncated]");
+        }
+        text
+    }
+}
+
+fn failure_result(
+    start: std::time::Instant,
+    timed_out: bool,
+    message: String,
+    stdout: String,
+    stderr: String,
+) -> ScriptRunResult {
+    ScriptRunResult {
+        success: false,
+        exit_code: None,
+        stdout,
+        stderr,
+        duration_ms: start.elapsed().as_millis(),
+        timed_out,
+        message: Some(message),
+    }
 }
 
 async fn execute(
@@ -104,45 +140,59 @@ async fn execute(
         cmd = cmd.env(k, v);
     }
 
-    let fut = cmd.output();
-    match timeout(Duration::from_millis(timeout_ms), fut).await {
-        Ok(Ok(output)) => {
-            let stdout = truncate(String::from_utf8_lossy(&output.stdout).into_owned());
-            let stderr = truncate(String::from_utf8_lossy(&output.stderr).into_owned());
-            let exit_code = output.status.code();
-            let success = output.status.success();
-            ScriptRunResult {
-                success,
-                exit_code,
-                stdout,
-                stderr,
-                duration_ms: start.elapsed().as_millis(),
-                timed_out: false,
-                message: None,
+    let (mut rx, child) = match cmd.spawn() {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            return failure_result(
+                start,
+                false,
+                format!("spawn failed: {e}"),
+                String::new(),
+                String::new(),
+            )
+        }
+    };
+
+    let mut stdout = CappedOutput::default();
+    let mut stderr = CappedOutput::default();
+    let mut code = None;
+    let drain = async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(line) => stdout.push_line(&line),
+                CommandEvent::Stderr(line) => stderr.push_line(&line),
+                CommandEvent::Terminated(payload) => code = payload.code,
+                _ => {}
             }
         }
-        Ok(Err(e)) => ScriptRunResult {
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            duration_ms: start.elapsed().as_millis(),
-            timed_out: false,
-            message: Some(format!("spawn failed: {e}")),
-        },
-        Err(_) => ScriptRunResult {
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            duration_ms: start.elapsed().as_millis(),
-            timed_out: true,
-            message: Some(format!("script timed out after {timeout_ms}ms")),
-        },
+    };
+    if timeout(Duration::from_millis(timeout_ms), drain)
+        .await
+        .is_err()
+    {
+        if let Err(e) = child.kill() {
+            tracing::warn!("[completion-script] failed to kill timed out script: {e}");
+        }
+        return failure_result(
+            start,
+            true,
+            format!("script timed out after {timeout_ms}ms"),
+            stdout.into_string(),
+            stderr.into_string(),
+        );
+    }
+
+    ScriptRunResult {
+        success: code == Some(0),
+        exit_code: code,
+        stdout: stdout.into_string(),
+        stderr: stderr.into_string(),
+        duration_ms: start.elapsed().as_millis(),
+        timed_out: false,
+        message: None,
     }
 }
 
-/// Per-task overrides for the completion script. Any field set takes precedence over the saved global preference. `enabled = Some(false)` fully disables the script for that task even when globally enabled
 #[derive(Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionScriptOverrides {
@@ -166,7 +216,6 @@ fn merge_with_overrides(
         let trimmed = command.trim().to_string();
         if !trimmed.is_empty() {
             cfg.command = trimmed;
-            // A per-task command implies opt-in even if global was disabled, unless the override explicitly set enabled=false above
             if o.enabled.is_none() {
                 cfg.enabled = true;
             }
@@ -181,7 +230,6 @@ fn merge_with_overrides(
     cfg
 }
 
-/// Fire-and-forget invocation from the renderer when a download finishes Reads the saved script config; no-op when disabled or unconfigured
 #[tauri::command]
 pub async fn run_completion_script(
     handle: AppHandle,
@@ -232,7 +280,6 @@ pub async fn run_completion_script(
     Ok(())
 }
 
-/// Synchronous test invocation used by the Preference UI to validate the configured script without waiting for an actual download to complete
 #[tauri::command]
 pub async fn test_completion_script(
     handle: AppHandle,
@@ -282,6 +329,26 @@ mod tests {
                 "complete",
             ]
         );
+    }
+
+    #[test]
+    fn capped_output_drops_bytes_past_the_cap() {
+        let mut out = CappedOutput::default();
+        let line = vec![b'a'; 1000];
+        for _ in 0..100 {
+            out.push_line(&line);
+        }
+        assert!(out.buf.len() <= MAX_OUTPUT_BYTES);
+        assert!(out.truncated);
+        assert!(out.into_string().ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn capped_output_keeps_short_output_whole() {
+        let mut out = CappedOutput::default();
+        out.push_line(b"one");
+        out.push_line(b"two");
+        assert_eq!(out.into_string(), "one\ntwo\n");
     }
 
     #[test]

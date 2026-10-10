@@ -53,47 +53,45 @@
       </recycle-scroller>
     </template>
     <div v-else class="table-wrapper">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead class="w-10.5">
-              <Checkbox :model-value="allSelected" @update:model-value="toggleAll" />
-            </TableHead>
-            <TableHead class="min-w-50">{{ $t('task.file-name') }}</TableHead>
-            <TableHead class="w-20">{{ $t('task.file-extension') }}</TableHead>
-            <TableHead class="w-21.25 text-right">{{ $t('task.file-size') }}</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          <TableRow
-            v-for="row in files"
-            :key="row.idx"
-            @dblclick="toggleRow(row, !isSelected(row))"
-            :class="{ 'bg-muted/50': isSelected(row) }"
+      <div class="task-files-add-row task-files-add-head" role="row">
+        <span class="task-files-add-check">
+          <Checkbox :model-value="allSelected" @update:model-value="toggleAll" />
+        </span>
+        <span>{{ $t('task.file-name') }}</span>
+        <span>{{ $t('task.file-extension') }}</span>
+        <span class="text-right">{{ $t('task.file-size') }}</span>
+      </div>
+      <recycle-scroller
+        class="task-files-add-scroller"
+        :items="files"
+        :item-size="ADD_ROW_HEIGHT"
+        key-field="idx"
+      >
+        <template #default="{ item }">
+          <div
+            class="task-files-add-row task-files-add-body hover:bg-muted/50"
+            :class="{ 'bg-muted/50': isSelected(item) }"
+            @dblclick="toggleRow(item, !isSelected(item))"
           >
-            <TableCell>
+            <span class="task-files-add-check">
               <Checkbox
-                :model-value="isSelected(row)"
-                @update:model-value="(val) => toggleRow(row, val)"
+                :model-value="isSelected(item)"
+                @update:model-value="(val) => toggleRow(item, val)"
               />
-            </TableCell>
-            <TableCell class="max-w-50">
-              <button
-                type="button"
-                class="task-files-name"
-                :title="row.path || row.name"
-                :aria-pressed="isSelected(row)"
-                @click="onNameClick(row, $event)"
-                @dblclick.stop
-              >
-                {{ row.name }}
-              </button>
-            </TableCell>
-            <TableCell>{{ formatExtension(row.extension) }}</TableCell>
-            <TableCell class="text-right">{{ formatBytes(row.length) }}</TableCell>
-          </TableRow>
-        </TableBody>
-      </Table>
+            </span>
+            <button
+              type="button"
+              class="task-files-name"
+              :title="item.path || item.name"
+              :aria-pressed="isSelected(item)"
+              @click="onNameClick(item, $event)"
+              @dblclick.stop
+            >{{ item.name }}</button>
+            <span>{{ formatExtension(item.extension) }}</span>
+            <span class="text-right">{{ formatBytes(item.length) }}</span>
+          </div>
+        </template>
+      </recycle-scroller>
     </div>
     <div class="files-toolbar">
       <div class="files-toolbar-filters">
@@ -161,14 +159,9 @@ import {
 import { isEmpty } from "lodash";
 import { Checkbox } from "@/components/ui/checkbox";
 import UiButton from "@/components/ui/compat/UiButton.vue";
-import {
-	Table,
-	TableBody,
-	TableCell,
-	TableHead,
-	TableHeader,
-	TableRow,
-} from "@/components/ui/table";
+import { selectionState, sortedIndexList } from "@/utils/fileSelection";
+
+const ADD_ROW_HEIGHT = 37;
 
 interface TaskFileRow {
 	idx: number;
@@ -186,12 +179,6 @@ export default {
 	components: {
 		[UiButton.name]: UiButton,
 		Checkbox,
-		Table,
-		TableBody,
-		TableCell,
-		TableHead,
-		TableHeader,
-		TableRow,
 		Video,
 		Headphones,
 		Image,
@@ -206,13 +193,12 @@ export default {
 		files: { type: Array, default: () => [] },
 	},
 	data() {
-		return { selectedIndices: new Set<number>() };
+		return { selectedIndices: new Set<number>(), ADD_ROW_HEIGHT };
 	},
 	computed: {
 		allSelected() {
 			return (
-				this.files?.length > 0 &&
-				this.selectedIndices.size === this.files.length
+				selectionState(this.files?.length ?? 0, this.selectedIndices) === "all"
 			);
 		},
 		selectedFiles() {
@@ -233,15 +219,14 @@ export default {
 		},
 		selectedFileIndex() {
 			const { files, selectedIndices } = this;
-			if ((files as TaskFileRow[]).length === 0 || selectedIndices.size === 0) {
+			const state = selectionState(files.length, selectedIndices);
+			if (state === "none") {
 				return NONE_SELECTED_FILES;
 			}
-			if ((files as TaskFileRow[]).length === selectedIndices.size) {
+			if (state === "all") {
 				return SELECTED_ALL_FILES;
 			}
-			const arr = Array.from(selectedIndices) as number[];
-			arr.sort((a, b) => a - b);
-			return arr.join(",");
+			return sortedIndexList(selectedIndices);
 		},
 	},
 	watch: {
@@ -307,3 +292,48 @@ export default {
 	},
 };
 </script>
+
+<style scoped>
+.task-files-add-scroller {
+  max-height: min(50vh, 24rem);
+  scrollbar-gutter: stable;
+}
+
+.task-files-add-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 80px 85px;
+  align-items: center;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  white-space: nowrap;
+}
+
+.task-files-add-row > span,
+.task-files-add-row > button {
+  padding: 0 0.5rem;
+}
+
+.task-files-add-row > .task-files-add-check {
+  padding-right: 0;
+  display: flex;
+  align-items: center;
+}
+
+.task-files-add-check :deep([role='checkbox']) {
+  transform: translateY(2px);
+}
+
+.task-files-add-head {
+  height: 40px;
+  font-weight: 500;
+  color: var(--foreground, inherit);
+  overflow: hidden;
+  scrollbar-gutter: stable;
+}
+
+.task-files-add-body {
+  height: 37px;
+}
+</style>

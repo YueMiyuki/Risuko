@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-
-
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -27,7 +25,6 @@ export function buildManifest(dir, { version, repo } = {}) {
 	return { version, notes: "", pub_date: new Date().toISOString(), platforms };
 }
 
-// CLI: node scripts/build-updater-manifest.mjs <fragments-dir> [out]
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	const [dir, out = "latest.json"] = process.argv.slice(2);
 	if (!dir) {

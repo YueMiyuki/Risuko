@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::RngExt;
 use serde_json::{Map, Value};
@@ -19,7 +19,9 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{FtpProtocol, FtpUri};
+use crate::engine::options::json_bool;
 use crate::engine::speed_limiter::{SpeedEma, SpeedLimiter};
+use risuko_bt::limiter::Throttle;
 
 const PART_SUFFIX: &str = ".part";
 const BUF_SIZE: usize = 64 * 1024;
@@ -27,11 +29,10 @@ const PROXY_BRIDGE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const PROXY_BRIDGE_TOKEN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const PROXY_BRIDGE_TOKEN_LEN: usize = 32;
 
-/// Macro running the FTP/FTPS download loop on a connected+logged-in stream, avoiding duplication across `AsyncFtpStream` vs `AsyncRustlsFtpStream` (whose concrete type differs after `into_secure`)
 macro_rules! ftp_transfer {
     ($ftp:expr, $parsed:expr, $part_path:expr, $file_size:expr,
      $total:expr, $completed:expr, $speed:expr,
-     $connections:expr, $cancel_token:expr, $global_limiter:expr, $task_limiter:expr) => {{
+     $connections:expr, $cancel_token:expr, $throttle:expr, $read_timeout:expr) => {{
         $ftp.transfer_type(suppaftp::types::FileType::Binary)
             .await
             .map_err(|e| format!("Failed to set binary mode: {e}"))?;
@@ -55,15 +56,13 @@ macro_rules! ftp_transfer {
         } else {
             $file_size
         };
-        // If .part already matches the remote size, skip transfer and let finalization rename it; oversized .part files are stale and get recreated in the resume branch below
         if existing_size > 0 && effective_size > 0 && existing_size == effective_size {
             $completed.store(existing_size, Ordering::Relaxed);
             tracing::info!("FTP .part already complete ({existing_size} bytes), skipping transfer");
             let _ = $ftp.quit().await;
         } else {
             let resume_offset =
-                if existing_size > 0 && effective_size > 0 && existing_size < effective_size {
-                    // Avoid truncating the u64 resume offset on 32-bit targets
+                if existing_size > 0 && (effective_size == 0 || existing_size < effective_size) {
                     match usize::try_from(existing_size) {
                         Ok(off) => match $ftp.resume_transfer(off).await {
                             Ok(()) => {
@@ -118,7 +117,7 @@ macro_rules! ftp_transfer {
                 }
 
                 let n = tokio::select! {
-                    result = data_stream.read(&mut buf) => {
+                    result = read_with_timeout(&mut data_stream, &mut buf, $read_timeout) => {
                         result.map_err(|e| format!("FTP read error: {e}"))?
                     }
                     _ = $cancel_token.cancelled() => {
@@ -130,8 +129,7 @@ macro_rules! ftp_transfer {
                     break;
                 }
 
-                $global_limiter.acquire(n).await;
-                $task_limiter.acquire(n).await;
+                $throttle.acquire(n).await;
 
                 file.write_all(&buf[..n])
                     .await
@@ -157,9 +155,19 @@ macro_rules! ftp_transfer {
                 .map_err(|e| format!("Failed to flush: {e}"))?;
             drop(file);
 
-            $ftp.finalize_retr_stream(data_stream)
-                .await
-                .map_err(|e| format!("FTP finalize failed: {e}"))?;
+            // Idle control connection can fail the closing 226 although every byte arrived
+            if let Err(e) = $ftp.finalize_retr_stream(data_stream).await {
+                if remote_size > 0 && bytes_downloaded == remote_size {
+                    tracing::warn!("FTP finalize failed after a complete transfer: {e}");
+                } else {
+                    return Err(format!("FTP finalize failed: {e}"));
+                }
+            }
+            if remote_size > 0 && bytes_downloaded != remote_size {
+                return Err(format!(
+                    "FTP incomplete transfer: got {bytes_downloaded} of {remote_size} bytes"
+                ));
+            }
 
             let _ = $ftp.quit().await;
         }
@@ -167,7 +175,6 @@ macro_rules! ftp_transfer {
     }};
 }
 
-/// Run an FTP or FTPS download
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ftp_ftps_download(
     parsed: &FtpUri,
@@ -196,11 +203,7 @@ pub async fn run_ftp_ftps_download(
     let dir_path = Path::new(dir);
     fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
-    let filename = if out.is_empty() {
-        basename_from_ftp_path(&parsed.path)
-    } else {
-        out.to_string()
-    };
+    let filename = output_filename(&parsed.path, out);
 
     let part_name = if filename.ends_with(PART_SUFFIX) {
         filename.clone()
@@ -208,6 +211,7 @@ pub async fn run_ftp_ftps_download(
         format!("{filename}{PART_SUFFIX}")
     };
     let part_path = dir_path.join(&part_name);
+    let _part_claim = super::PartClaim::acquire(&part_path)?;
 
     let user = parsed
         .user
@@ -220,14 +224,82 @@ pub async fn run_ftp_ftps_download(
         .or_else(|| option_str(options, "ftp-passwd"))
         .unwrap_or_else(|| "risuko@".to_string());
 
-    let addr = format!("{}:{}", parsed.host, parsed.port);
-    let file_size = total.load(Ordering::Relaxed);
     let http_proxy = http_proxy_from_options(options)?;
-    let control_proxy = proxy_for_target(http_proxy.clone(), &parsed.host, parsed.port);
+    let control_proxy = proxy_for_target(http_proxy, &parsed.host, parsed.port);
+    let throttle = Throttle::new(global_limiter, task_limiter);
+    let read_timeout = read_timeout_from_options(options);
+
+    let job = FtpJob {
+        parsed,
+        options,
+        part_path: &part_path,
+        user: &user,
+        password: &password,
+        control_proxy,
+        total: &total,
+        completed: &completed,
+        speed: &speed,
+        connections: &connections,
+        cancel_token: &cancel_token,
+        throttle: &throttle,
+        read_timeout,
+    };
+    retry_transient(options, &cancel_token, || ftp_attempt(&job)).await?;
+
+    let bytes_done = completed.load(Ordering::Relaxed);
+    if total.load(Ordering::Relaxed) == 0 {
+        total.store(bytes_done, Ordering::Relaxed);
+    }
+    speed.store(0, Ordering::Relaxed);
+    connections.store(0, Ordering::Relaxed);
+
+    let auto_rename = options
+        .get("auto-file-renaming")
+        .and_then(json_bool)
+        .unwrap_or(true);
+    let final_path = finalize_download(&part_path, &filename, dir_path, auto_rename)?;
+    tracing::info!("FTP download complete: {}", final_path.display());
+    Ok(final_path)
+}
+
+struct FtpJob<'a> {
+    parsed: &'a FtpUri,
+    options: &'a Map<String, Value>,
+    part_path: &'a Path,
+    user: &'a str,
+    password: &'a str,
+    control_proxy: Option<risuko_http::ProxyConnector>,
+    total: &'a Arc<AtomicU64>,
+    completed: &'a Arc<AtomicU64>,
+    speed: &'a Arc<AtomicU64>,
+    connections: &'a Arc<AtomicU32>,
+    cancel_token: &'a CancellationToken,
+    throttle: &'a Throttle,
+    read_timeout: Option<Duration>,
+}
+
+async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
+    let parsed = job.parsed;
+    let options = job.options;
+    let part_path = job.part_path;
+    let total = job.total;
+    let completed = job.completed;
+    let speed = job.speed;
+    let connections = job.connections;
+    let cancel_token = job.cancel_token;
+    let throttle = job.throttle;
+    let read_timeout = job.read_timeout;
+    let (user, password) = (job.user, job.password);
+    let addr = host_port(&parsed.host, parsed.port);
+    let file_size = total.load(Ordering::Relaxed);
+    let control_proxy = job.control_proxy.clone();
+    let ipv6 = parsed.host.contains(':');
 
     if parsed.protocol == FtpProtocol::Ftps {
-        // Match aria2's `--check-certificate=true` default; only accept self-signed or invalid certs when `check-certificate=false`
-        let verify_cert = option_bool(options, "check-certificate", true);
+        let verify_cert = options
+            .get("check-certificate")
+            .and_then(json_bool)
+            .unwrap_or(true);
         if !verify_cert {
             tracing::warn!(
                 "FTPS certificate verification disabled (check-certificate=false) for {}",
@@ -270,23 +342,14 @@ pub async fn run_ftp_ftps_download(
                 .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))?
         };
 
-        if let Some(proxy) = http_proxy.clone() {
-            let passive_host = parsed.host.clone();
-            ftp = ftp.passive_stream_builder(move |remote| {
-                let proxy = proxy.clone();
-                let passive_host = passive_host.clone();
-                sync_boxed(async move {
-                    proxy_bridge(proxy, passive_host, remote.port())
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)?
-                        .connect()
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)
-                })
-            });
+        if ipv6 {
+            ftp.set_mode(suppaftp::Mode::ExtendedPassive);
+        }
+        if let Some(proxy) = control_proxy {
+            ftp = ftp.passive_stream_builder(passive_proxy_builder(proxy, parsed.host.clone()));
         }
 
-        ftp.login(&user, &password)
+        ftp.login(user, password)
             .await
             .map_err(|e| format!("FTP login failed: {e}"))?;
 
@@ -300,11 +363,11 @@ pub async fn run_ftp_ftps_download(
             speed,
             connections,
             cancel_token,
-            global_limiter,
-            task_limiter
-        )?;
+            throttle,
+            read_timeout
+        )
     } else {
-        let mut ftp = if let Some(proxy) = control_proxy {
+        let mut ftp = if let Some(proxy) = control_proxy.clone() {
             let control = proxy_bridge(proxy, parsed.host.clone(), parsed.port)
                 .await
                 .map_err(|e| format!("FTP proxy bridge failed: {e}"))?
@@ -320,23 +383,14 @@ pub async fn run_ftp_ftps_download(
                 .map_err(|e| format!("FTP connect failed: {e}"))?
         };
 
-        if let Some(proxy) = http_proxy {
-            let passive_host = parsed.host.clone();
-            ftp = ftp.passive_stream_builder(move |remote| {
-                let proxy = proxy.clone();
-                let passive_host = passive_host.clone();
-                sync_boxed(async move {
-                    proxy_bridge(proxy, passive_host, remote.port())
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)?
-                        .connect()
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)
-                })
-            });
+        if ipv6 {
+            ftp.set_mode(suppaftp::Mode::ExtendedPassive);
+        }
+        if let Some(proxy) = control_proxy {
+            ftp = ftp.passive_stream_builder(passive_proxy_builder(proxy, parsed.host.clone()));
         }
 
-        ftp.login(&user, &password)
+        ftp.login(user, password)
             .await
             .map_err(|e| format!("FTP login failed: {e}"))?;
 
@@ -350,23 +404,121 @@ pub async fn run_ftp_ftps_download(
             speed,
             connections,
             cancel_token,
-            global_limiter,
-            task_limiter
-        )?;
+            throttle,
+            read_timeout
+        )
     }
+}
 
-    // Final stats
-    let bytes_done = completed.load(Ordering::Relaxed);
-    if total.load(Ordering::Relaxed) == 0 {
-        total.store(bytes_done, Ordering::Relaxed);
+type PassiveFuture =
+    Pin<Box<dyn Future<Output = suppaftp::FtpResult<TcpStream>> + Send + Sync + 'static>>;
+
+fn passive_proxy_builder(
+    proxy: risuko_http::ProxyConnector,
+    host: String,
+) -> impl Fn(std::net::SocketAddr) -> PassiveFuture + Send + Sync + 'static {
+    move |remote| {
+        let proxy = proxy.clone();
+        let host = host.clone();
+        sync_boxed(async move {
+            proxy_bridge(proxy, host, remote.port())
+                .await
+                .map_err(suppaftp::FtpError::ConnectionError)?
+                .connect()
+                .await
+                .map_err(suppaftp::FtpError::ConnectionError)
+        })
     }
-    speed.store(0, Ordering::Relaxed);
-    connections.store(0, Ordering::Relaxed);
+}
 
-    let auto_rename = option_bool(options, "auto-file-renaming", true);
-    let final_path = finalize_download(&part_path, &filename, dir_path, auto_rename)?;
-    tracing::info!("FTP download complete: {}", final_path.display());
-    Ok(final_path)
+pub(super) fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+pub(super) fn output_filename(path: &str, out: &str) -> String {
+    let raw = if out.is_empty() {
+        basename_from_ftp_path(path)
+    } else {
+        out.to_string()
+    };
+    crate::engine::util::safe_filename(&raw, "download")
+}
+
+pub(super) fn read_timeout_from_options(options: &Map<String, Value>) -> Option<Duration> {
+    let secs = option_u64(options, "timeout").unwrap_or(60);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+async fn read_with_timeout<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    timeout: Option<Duration>,
+) -> io::Result<usize> {
+    match timeout {
+        Some(limit) => tokio::time::timeout(limit, reader.read(buf))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timed out"))?,
+        None => reader.read(buf).await,
+    }
+}
+
+pub(super) fn option_u64(options: &Map<String, Value>, key: &str) -> Option<u64> {
+    match options.get(key)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+pub(super) fn is_transient_error(error: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "FTP read error",
+        "FTP connect failed",
+        "FTP proxy",
+        "FTP incomplete",
+        "FTPS explicit connect failed",
+        "FTPS implicit connect failed",
+        "FTPS proxy",
+        "FTPS AUTH TLS failed",
+        "SSH connect failed",
+        "SFTP proxy connect failed",
+        "SFTP read error",
+        "SFTP incomplete",
+    ];
+    PREFIXES.iter().any(|prefix| error.starts_with(prefix))
+}
+
+pub(super) async fn retry_transient<F, Fut>(
+    options: &Map<String, Value>,
+    cancel_token: &CancellationToken,
+    mut attempt: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let max_tries = option_u64(options, "max-tries").unwrap_or(5);
+    let wait = Duration::from_secs(option_u64(options, "retry-wait").unwrap_or(0).max(1));
+    let mut tries: u64 = 0;
+    loop {
+        let error = match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        tries += 1;
+        if !is_transient_error(&error) || (max_tries != 0 && tries >= max_tries) {
+            return Err(error);
+        }
+        tracing::warn!("Transfer attempt {tries} failed ({error}), retrying in {wait:?}");
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = cancel_token.cancelled() => return Err("Download cancelled".to_string()),
+        }
+    }
 }
 
 pub(super) fn finalize_download(
@@ -381,14 +533,43 @@ pub(super) fn finalize_download(
         filename.to_string()
     };
     let final_path = if auto_rename {
-        crate::engine::util::dedup_path(dir_path, &final_name)
+        reserve_unique_path(dir_path, &final_name)?
     } else {
         dir_path.join(&final_name)
     };
     if part_path != final_path {
-        fs::rename(part_path, &final_path).map_err(|e| format!("Failed to rename: {e}"))?;
+        if let Err(e) = fs::rename(part_path, &final_path) {
+            if auto_rename {
+                let _ = fs::remove_file(&final_path);
+            }
+            return Err(format!("Failed to rename: {e}"));
+        }
     }
     Ok(final_path)
+}
+
+fn reserve_unique_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    for n in 0u32.. {
+        let candidate = if n == 0 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem}.{n}{ext}"))
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Failed to reserve output file: {e}")),
+        }
+    }
+    Err("Failed to reserve output filename".to_string())
 }
 
 pub(super) fn option_str(options: &Map<String, Value>, key: &str) -> Option<String> {
@@ -535,20 +716,6 @@ where
     })
 }
 
-/// Read a boolean option from JSON bools or common string forms; returns `default` when absent or unrecognized
-pub(super) fn option_bool(options: &Map<String, Value>, key: &str, default: bool) -> bool {
-    match options.get(key) {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" => false,
-            _ => default,
-        },
-        _ => default,
-    }
-}
-
-/// Derive a download filename from an already-parsed FTP path
 pub(super) fn basename_from_ftp_path(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     match trimmed.rfind('/') {
@@ -560,6 +727,57 @@ pub(super) fn basename_from_ftp_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_port_brackets_ipv6_literals() {
+        assert_eq!(host_port("example.com", 21), "example.com:21");
+        assert_eq!(host_port("2001:db8::1", 21), "[2001:db8::1]:21");
+    }
+
+    #[test]
+    fn output_filename_is_a_single_safe_component() {
+        let name = output_filename("/x/..\\..\\evil:name.exe", "");
+        assert!(!name.contains(['\\', '/', ':']), "{name}");
+        assert_eq!(output_filename("/a/b/file.bin", ""), "file.bin");
+        assert_eq!(output_filename("/a/b/file.bin", "../x/y.bin"), "_x_y.bin");
+        assert_eq!(output_filename("/a/CON", ""), "download");
+    }
+
+    #[test]
+    fn finalize_never_overwrites_existing_output() {
+        let dir = std::env::temp_dir().join(format!("risuko-ftp-fin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.bin"), b"old").unwrap();
+        fs::write(dir.join("a.bin.part"), b"new").unwrap();
+        let out = finalize_download(&dir.join("a.bin.part"), "a.bin", &dir, true).unwrap();
+        assert_eq!(out, dir.join("a.1.bin"));
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"old");
+        assert_eq!(fs::read(&out).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_connection_errors_are_retried() {
+        assert!(is_transient_error("FTP read error: reset"));
+        assert!(!is_transient_error("FTP login failed: 530"));
+        assert!(!is_transient_error("Download cancelled"));
+    }
+
+    #[tokio::test]
+    async fn retry_transient_stops_on_fatal_and_exhausts_tries() {
+        let mut options = Map::new();
+        options.insert("max-tries".into(), Value::from(2));
+        let token = CancellationToken::new();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_transient(&options, &token, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async { Err("FTP login failed: 530".to_string()) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn bypassed_target_does_not_use_http_proxy() {

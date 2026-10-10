@@ -1,5 +1,3 @@
-// Linux Chromium cookie decryption
-
 use aes::Aes128;
 use cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 use eyre::{bail, Result};
@@ -14,7 +12,12 @@ pub fn decrypt_value(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         bail!("encrypted data too short");
     }
 
-    if &encrypted[..3] == b"v10" || &encrypted[..3] == b"v11" {
+    if &encrypted[..3] == b"v10" {
+        decrypt_v10(encrypted, b"peanuts")
+    } else if &encrypted[..3] == b"v11" {
+        if key.is_empty() {
+            bail!("no keyring secret for v11 cookie");
+        }
         decrypt_v10(encrypted, key)
     } else {
         Ok(encrypted.to_vec())
@@ -26,7 +29,6 @@ fn decrypt_v10(data: &[u8], master_key: &[u8]) -> Result<Vec<u8>> {
         bail!("v10 data too short");
     }
 
-    // v10 format: "v10" + 16-byte IV + ciphertext
     let iv: [u8; 16] = data[3..19].try_into()?;
     let ciphertext = &data[19..];
 
@@ -40,8 +42,14 @@ fn decrypt_v10(data: &[u8], master_key: &[u8]) -> Result<Vec<u8>> {
     Ok(decrypted)
 }
 
-pub fn extract_master_key(_local_state_path: &std::path::Path) -> Result<Vec<u8>> {
-    // Connect to the D-Bus Secret Service and look for a Chrome entry in the login collection
+pub fn extract_master_key(
+    _local_state_path: &std::path::Path,
+    application: &str,
+) -> Result<Vec<u8>> {
+    Ok(keyring_secret(application).unwrap_or_default())
+}
+
+fn keyring_secret(application: &str) -> Result<Vec<u8>> {
     let conn = Connection::session()?;
 
     let proxy = zbus::blocking::Proxy::new(
@@ -55,12 +63,12 @@ pub fn extract_master_key(_local_state_path: &std::path::Path) -> Result<Vec<u8>
         "SearchItems",
         &(std::collections::HashMap::<&str, &str>::from([(
             "application",
-            "chrome",
+            application,
         )]),),
     )?;
 
     if items.is_empty() {
-        bail!("no chrome password in secret service");
+        bail!("no {} password in secret service", application);
     }
 
     let item_path = &items[0];

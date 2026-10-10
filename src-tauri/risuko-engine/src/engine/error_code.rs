@@ -1,15 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Risuko download-failure error codes grouped by category: 1xx general/unknown, 2xx network (DNS/connection/timeout), 3xx HTTP (4xx/5xx/redirects), 4xx file system (disk/permission/path), 5xx protocol-specific (torrent/ed2k/m3u8/ftp), 9xx internal/engine
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCode(pub u16);
 
 impl ErrorCode {
-    // -- General --
     pub const UNKNOWN: Self = Self(100);
 
-    // -- Network --
     pub const DNS_RESOLUTION_FAILED: Self = Self(200);
     pub const CONNECTION_REFUSED: Self = Self(201);
     pub const CONNECTION_RESET: Self = Self(202);
@@ -18,7 +15,6 @@ impl ErrorCode {
     pub const TLS_HANDSHAKE_FAILED: Self = Self(205);
     pub const PROXY_CONNECTION_FAILED: Self = Self(206);
 
-    // -- HTTP --
     pub const HTTP_UNAUTHORIZED: Self = Self(300);
     pub const HTTP_FORBIDDEN: Self = Self(301);
     pub const HTTP_NOT_FOUND: Self = Self(302);
@@ -28,18 +24,14 @@ impl ErrorCode {
     pub const HTTP_SERVICE_UNAVAILABLE: Self = Self(306);
     pub const HTTP_REDIRECT_LOOP: Self = Self(307);
     pub const HTTP_RESPONSE_ERROR: Self = Self(308);
-    /// Cloudflare bot-protection challenge on a 403/503/429 response carrying cf-ray, `server: cloudflare`, or a "Just a moment..." body; resolved by importing browser cookies plus a matching User-Agent
     pub const CLOUDFLARE_CHALLENGE: Self = Self(315);
 
-    // -- File system --
     pub const DISK_FULL: Self = Self(400);
     pub const PERMISSION_DENIED: Self = Self(401);
 
-    // -- Protocol-specific --
     pub const TORRENT_METADATA_FAILED: Self = Self(500);
     pub const TORRENT_NO_SEEDS: Self = Self(501);
     pub const TORRENT_INVALID_FILE: Self = Self(502);
-    /// Pure-v2 magnet resolved the info dict but no peer served the BEP 52 piece-layer hashes; unverifiable until layers are obtained (importing the .torrent file always works)
     pub const TORRENT_PIECE_LAYERS_UNAVAILABLE: Self = Self(503);
     pub const ED2K_SERVER_UNREACHABLE: Self = Self(510);
     pub const ED2K_FILE_NOT_FOUND: Self = Self(511);
@@ -60,7 +52,6 @@ impl ErrorCode {
     pub const USENET_ARCHIVE_LIMIT: Self = Self(553);
     pub const USENET_REPAIR_FAILED: Self = Self(554);
 
-    // -- Internal --
     pub const ENGINE_NOT_RUNNING: Self = Self(900);
 }
 
@@ -70,7 +61,6 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// True when `code` appears as a standalone ASCII number, avoiding `contains("500")` matching embedded runs like "5003" or "15000"
 fn contains_status(haystack: &str, code: &str) -> bool {
     let bytes = haystack.as_bytes();
     let mut start = 0;
@@ -87,12 +77,26 @@ fn contains_status(haystack: &str, code: &str) -> bool {
     false
 }
 
-/// Classify an error message into an error code; for HTTP downloads also pass the protocol kind for better classification
-pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
-    let lower = msg.to_lowercase();
+fn keyword_text(msg: &str) -> String {
+    msg.split_whitespace()
+        .filter(|token| !token.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
 
-    // -- Network errors --
-    if lower.contains("dns") || lower.contains("name resolution") || lower.contains("resolve host")
+fn has_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
+    let lower = keyword_text(msg);
+
+    if has_word(&lower, "dns")
+        || lower.contains("name resolution")
+        || lower.contains("resolve host")
     {
         return ErrorCode::DNS_RESOLUTION_FAILED;
     }
@@ -108,16 +112,15 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
     if lower.contains("network unreachable") || lower.contains("no route") {
         return ErrorCode::NETWORK_UNREACHABLE;
     }
-    if lower.contains("tls") || lower.contains("ssl") || lower.contains("certificate") {
+    if has_word(&lower, "tls") || has_word(&lower, "ssl") || lower.contains("certificate") {
         return ErrorCode::TLS_HANDSHAKE_FAILED;
     }
     if lower.contains("proxy") {
         return ErrorCode::PROXY_CONNECTION_FAILED;
     }
 
-    // -- HTTP status codes (skip for media: its match arm classifies these) --
     if protocol != "media" {
-        // Cloudflare must beat the generic 403/503/429 catch-alls below; the HTTP downloader prefixes its message with [cloudflare-challenge] when it sniffs the response (see http.rs::looks_like_cloudflare_block)
+        // Cloudflare must beat the generic 403/503/429 arms
         if lower.contains("[cloudflare-challenge]")
             || lower.contains("cloudflare challenge")
             || lower.contains("cf_clearance required")
@@ -130,11 +133,10 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
         if contains_status(&lower, "403") || lower.contains("forbidden") {
             return ErrorCode::HTTP_FORBIDDEN;
         }
-        if contains_status(&lower, "404") || lower.contains("not found") {
-            // Distinguish HTTP 404 from file-not-found on disk
-            if protocol == "http" || protocol == "m3u8" {
-                return ErrorCode::HTTP_NOT_FOUND;
-            }
+        if (contains_status(&lower, "404") || lower.contains("not found"))
+            && (protocol == "http" || protocol == "m3u8")
+        {
+            return ErrorCode::HTTP_NOT_FOUND;
         }
         if contains_status(&lower, "416") || lower.contains("range not satisfiable") {
             return ErrorCode::HTTP_RANGE_NOT_SATISFIABLE;
@@ -157,7 +159,6 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
         }
     }
 
-    // -- File system errors --
     if lower.contains("no space") || lower.contains("disk full") || lower.contains("quota") {
         return ErrorCode::DISK_FULL;
     }
@@ -165,10 +166,8 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
         return ErrorCode::PERMISSION_DENIED;
     }
 
-    // -- Protocol-specific patterns --
     match protocol {
         "torrent" => {
-            // Check piece-layers FIRST: the message also contains "metadata"/"peer" so a more general pattern would shadow this typed error
             if lower.contains("piece layers unavailable") {
                 return ErrorCode::TORRENT_PIECE_LAYERS_UNAVAILABLE;
             }
@@ -194,7 +193,7 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
             if lower.contains("parse") || lower.contains("playlist") {
                 return ErrorCode::M3U8_PARSE_FAILED;
             }
-            if lower.contains("decrypt") || lower.contains("aes") {
+            if lower.contains("decrypt") || has_word(&lower, "aes") {
                 return ErrorCode::M3U8_DECRYPT_FAILED;
             }
             if lower.contains("segment") {
@@ -284,7 +283,6 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
         _ => {}
     }
 
-    // -- Fallback for HTTP response errors --
     if (protocol == "http" || protocol == "m3u8")
         && (lower.contains("status") || lower.contains("http"))
     {
@@ -297,6 +295,26 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_ignores_keywords_inside_urls_and_words() {
+        assert_eq!(
+            classify_error("HTTP 404 for https://tlsfiles.example/x", "http"),
+            ErrorCode::HTTP_NOT_FOUND
+        );
+        assert_eq!(
+            classify_error("HTTP 404 for /dl/dnsmasq.tar", "http"),
+            ErrorCode::HTTP_NOT_FOUND
+        );
+        assert_ne!(
+            classify_error("segment Aesthetic.ts failed", "m3u8"),
+            ErrorCode::M3U8_DECRYPT_FAILED
+        );
+        assert_eq!(
+            classify_error("TLS handshake failed", "http"),
+            ErrorCode::TLS_HANDSHAKE_FAILED
+        );
+    }
 
     #[test]
     fn classify_dns_error() {
@@ -356,7 +374,6 @@ mod tests {
 
     #[test]
     fn classify_torrent_resolve_not_dns() {
-        // "Failed to resolve magnet: ..." must NOT be classified as DNS error
         assert_eq!(
             classify_error("Failed to resolve magnet: connection refused", "torrent"),
             ErrorCode::CONNECTION_REFUSED
@@ -369,7 +386,6 @@ mod tests {
 
     #[test]
     fn classify_torrent_piece_layers_unavailable() {
-        // bt::magnet error contract: messages prefixed with this string must surface as the typed code so the UI can prompt the user to import the .torrent instead
         assert_eq!(
             classify_error(
                 "Failed to resolve magnet: piece layers unavailable: no peer served the BEP 52 piece-layer hashes for this magnet",
@@ -381,7 +397,6 @@ mod tests {
 
     #[test]
     fn classify_fallback_http_only() {
-        // "status" / "http" fallback should only fire for HTTP-like protocols
         assert_eq!(
             classify_error("HTTP tracker returned bad status", "http"),
             ErrorCode::HTTP_RESPONSE_ERROR
@@ -434,12 +449,10 @@ mod tests {
 
     #[test]
     fn classify_status_code_respects_digit_boundaries() {
-        // A digit run that embeds "500" must not classify as HTTP 5xx
         assert_eq!(
             classify_error("received 5003 bytes then the stream ended", "http"),
             ErrorCode::UNKNOWN
         );
-        // A standalone 500 status still classifies correctly
         assert_eq!(
             classify_error("HTTP 500 returned by origin", "http"),
             ErrorCode::HTTP_SERVER_ERROR
@@ -448,7 +461,6 @@ mod tests {
 
     #[test]
     fn classify_media_wins_over_http_403() {
-        // A YouTube-specific message that also contains an HTTP status code must be classified by the media arm, not the generic HTTP arm
         assert_eq!(
             classify_error("HTTP Error 403: age-restricted content", "media"),
             ErrorCode::MEDIA_AUTH_REQUIRED

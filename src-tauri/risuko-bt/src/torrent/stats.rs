@@ -1,14 +1,12 @@
-//! Per-torrent live stats
-
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
-/// Snapshot of a single connected peer for UI consumption
+static PEERS_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub struct PeerSnapshot {
     pub addr: SocketAddr,
-    /// Raw bitfield bytes; consumers can hex-encode for display
     pub bitfield: Arc<[u8]>,
     pub am_choking: bool,
     pub am_interested: bool,
@@ -27,43 +25,24 @@ pub struct PeerSnapshot {
     pub optimistic_unchoke: bool,
 }
 
-/// Exponential-moving-average speed tracker
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SpeedSample {
     pub mbps: f32,
-    // internal
-    bytes_since: u64,
-    last_update: Option<Instant>,
-}
-
-impl Default for SpeedSample {
-    fn default() -> Self {
-        Self {
-            mbps: 0.0,
-            bytes_since: 0,
-            last_update: None,
-        }
-    }
 }
 
 impl SpeedSample {
-    /// Record that `bytes` have moved during the last `dt` seconds and update the EMA with a fixed alpha
     pub fn update(&mut self, bytes: u64, dt: f32) {
-        let now = Instant::now();
-        self.last_update = Some(now);
         if dt <= 0.0 {
             return;
         }
         let instant = (bytes as f32 / dt) / 1_048_576.0;
         let alpha = 0.3;
         self.mbps = self.mbps * (1.0 - alpha) + instant * alpha;
-        self.bytes_since = bytes;
     }
 }
 
 #[derive(Clone, Default)]
 pub struct AggregatedLiveStats {
-    /// Number of peers currently connected
     pub live: u32,
 }
 
@@ -90,33 +69,97 @@ impl LiveStats {
 pub struct TorrentStats {
     pub total_bytes: u64,
     pub progress_bytes: u64,
-    /// Bytes still needed for the selected files
     pub left_bytes: u64,
     pub uploaded_bytes: u64,
+    pub(crate) session_downloaded: u64,
     pub finished: bool,
-    pub file_progress: Vec<u64>,
+    pub file_progress: Arc<Vec<u64>>,
+    pub error: Option<String>,
     pub live: Option<LiveStats>,
-    pub peers: Vec<PeerSnapshot>,
-    pub(crate) live_stats: LiveStats,
+    pub peers: Arc<[PeerSnapshot]>,
+    pub peers_seq: u64,
 }
 
 impl TorrentStats {
     pub(crate) fn initial(total_bytes: u64, left_bytes: u64, file_lens: Vec<u64>) -> Self {
-        let file_progress = vec![0u64; file_lens.len()];
+        let file_progress = Arc::new(vec![0u64; file_lens.len()]);
         Self {
             total_bytes,
             progress_bytes: 0,
             left_bytes,
             uploaded_bytes: 0,
+            session_downloaded: 0,
             finished: false,
             file_progress,
+            error: None,
             live: Some(LiveStats::default()),
-            peers: Vec::new(),
-            live_stats: LiveStats::default(),
+            peers: Arc::from(Vec::new()),
+            peers_seq: 0,
         }
     }
 
-    pub(crate) fn refresh_live(&mut self) {
-        self.live = Some(self.live_stats.clone());
+    pub(crate) fn set_peers(&mut self, peers: Vec<PeerSnapshot>) {
+        self.peers = peers.into();
+        self.peers_seq = PEERS_SEQ.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn clear_peers(&mut self) {
+        if !self.peers.is_empty() {
+            self.set_peers(Vec::new());
+        }
+    }
+
+    pub(crate) fn live_mut(&mut self) -> &mut LiveStats {
+        self.live.get_or_insert_with(LiveStats::default)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap() -> PeerSnapshot {
+        PeerSnapshot {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            bitfield: Arc::from(Vec::new()),
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+            seeder: false,
+            peer_id: None,
+            client: None,
+            downloaded: 0,
+            uploaded: 0,
+            dl_speed: 0,
+            up_speed: 0,
+            incoming: false,
+            snubbed: false,
+            progress: 0.0,
+            optimistic_unchoke: false,
+        }
+    }
+
+    #[test]
+    fn peers_seq_changes_only_when_the_list_does() {
+        let mut stats = TorrentStats::initial(10, 10, vec![10]);
+        let first = stats.peers_seq;
+        stats.clear_peers();
+        assert_eq!(stats.peers_seq, first);
+        stats.set_peers(vec![snap()]);
+        assert_ne!(stats.peers_seq, first);
+        let polled = stats.clone();
+        assert_eq!(polled.peers_seq, stats.peers_seq);
+        assert!(Arc::ptr_eq(&polled.peers, &stats.peers));
+        stats.clear_peers();
+        assert_ne!(stats.peers_seq, polled.peers_seq);
+        assert!(stats.peers.is_empty());
+    }
+
+    #[test]
+    fn cloned_stats_share_file_progress_until_written() {
+        let stats = TorrentStats::initial(10, 10, vec![5, 5]);
+        let polled = stats.clone();
+        assert!(Arc::ptr_eq(&polled.file_progress, &stats.file_progress));
     }
 }

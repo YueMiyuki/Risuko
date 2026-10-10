@@ -11,9 +11,10 @@ const POLL_KEYS: &[&str] = &[
     "completedLength",
     "downloadSpeed",
     "uploadSpeed",
-    "files",
     "errorMessage",
 ];
+
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn watch_download(
     client: &RpcClient,
@@ -21,9 +22,16 @@ pub async fn watch_download(
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let mut name_known = false;
+    let mut cached_name = String::from("unknown");
 
     loop {
-        let keys: Vec<Value> = POLL_KEYS.iter().map(|k| json!(k)).collect();
+        let with_files = json_output || !name_known;
+        let keys: Vec<Value> = POLL_KEYS
+            .iter()
+            .chain(with_files.then_some(&"files"))
+            .map(|k| json!(k))
+            .collect();
         let status = client
             .call("risuko.tellStatus", vec![json!(gid), json!(keys)])
             .await?;
@@ -35,7 +43,14 @@ pub async fn watch_download(
         let total: u64 = parse_num(&status, "totalLength");
         let completed: u64 = parse_num(&status, "completedLength");
         let speed: u64 = parse_num(&status, "downloadSpeed");
-        let name = extract_filename(&status, "unknown");
+        if with_files {
+            let name = extract_filename(&status, "");
+            if !name.is_empty() {
+                cached_name = name;
+                name_known = true;
+            }
+        }
+        let name = cached_name.clone();
 
         if json_output {
             println!("{}", serde_json::to_string(&status)?);
@@ -70,7 +85,7 @@ pub async fn watch_download(
             _ => {}
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

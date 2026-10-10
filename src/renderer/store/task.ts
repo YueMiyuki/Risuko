@@ -6,6 +6,7 @@ import logger from "@shared/utils/logger";
 import { defineStore } from "pinia";
 import api from "@/api";
 import { useAppStore } from "@/store/app";
+import { reuseUnchangedRows, TASK_LIST_KEYS } from "@/utils/taskRows";
 
 const DEFAULT_TASKS_PER_PAGE = 20;
 const TASKS_PER_PAGE_OPTIONS = [10, 20, 30, 40, 50];
@@ -205,6 +206,8 @@ const loadSortOrder = (): TaskSortOrder => {
 	return "asc";
 };
 
+let fetchListSeq = 0;
+
 const getTaskSortName = (task: DownloadTask | DisplayTask): string => {
 	return getTaskName(task, { defaultName: "", maxLen: -1 }).toLowerCase();
 };
@@ -264,10 +267,7 @@ export const useTaskStore = defineStore("task", {
 			return state.currentPageMap[state.currentList] || 1;
 		},
 		displayTaskList(state) {
-			return state.taskList.map((task) => ({
-				...task,
-				_displayKey: task.gid,
-			}));
+			return state.taskList as DisplayTask[];
 		},
 		totalLength(state) {
 			return state.taskList.reduce(
@@ -444,6 +444,7 @@ export const useTaskStore = defineStore("task", {
 		},
 		async fetchList() {
 			const type = this.currentList;
+			const seq = ++fetchListSeq;
 			try {
 				let fetchType = type;
 				if (type === "completed") {
@@ -451,9 +452,10 @@ export const useTaskStore = defineStore("task", {
 				}
 				const rawData = (await api.fetchTaskList({
 					type: fetchType,
+					keys: TASK_LIST_KEYS,
 				})) as DownloadTask[];
 
-				if (type !== this.currentList) {
+				if (type !== this.currentList || seq !== fetchListSeq) {
 					return [];
 				}
 
@@ -470,6 +472,10 @@ export const useTaskStore = defineStore("task", {
 					data = rawData;
 				}
 
+				for (const task of data) {
+					(task as DisplayTask)._displayKey = task.gid;
+				}
+				data = reuseUnchangedRows(this.taskList, data);
 				const orderedData = this.applyTaskOrder(type, data);
 				this.taskList = orderedData;
 				this.taskCountMap = {
@@ -491,7 +497,7 @@ export const useTaskStore = defineStore("task", {
 				return orderedData;
 			} catch (err: unknown) {
 				logger.warn("[Risuko] fetchList failed:", (err as Error).message);
-				if (type !== this.currentList) {
+				if (type !== this.currentList || seq !== fetchListSeq) {
 					return [];
 				}
 				this.taskList = [];
@@ -499,84 +505,47 @@ export const useTaskStore = defineStore("task", {
 				return [];
 			}
 		},
-		async updateTaskCountsFromStat(stat: Record<string, number>) {
-			const numActive = stat.numActive || 0;
-			const numWaiting = stat.numWaiting || 0;
-			const numStoppedTotal = stat.numStoppedTotal || 0;
-			const statTotal = numActive + numWaiting + numStoppedTotal;
-
-			let activeCount = numActive;
-			let waitingCount = numWaiting;
-			let scheduledCount = this.taskCountMap.scheduled || 0;
-			let completedCount = this.taskCountMap.completed || 0;
-			let stoppedCount = this.taskCountMap.stopped || 0;
-			let allCount = statTotal;
-
-			try {
-				const keys = ["gid", "status", "files", "bittorrent"];
-				const empty = Promise.resolve([] as DownloadTask[]);
-				const fetchSmall = (
-					type: "active" | "waiting" | "scheduled" | "stopped",
-				) => api.fetchTaskList({ type, keys }) as Promise<DownloadTask[]>;
-				const [activeData, waitingData, scheduledData, stoppedData] =
-					await Promise.all([
-						numActive > 0 ? fetchSmall("active") : empty,
-						numWaiting > 0 ? fetchSmall("waiting") : empty,
-						fetchSmall("scheduled"),
-						numStoppedTotal > 0 ? fetchSmall("stopped") : empty,
-					]);
-				const activeArr = Array.isArray(activeData) ? activeData : [];
-				const waitingArr = Array.isArray(waitingData) ? waitingData : [];
-				const scheduledArr = Array.isArray(scheduledData) ? scheduledData : [];
-				const stoppedArr = Array.isArray(stoppedData) ? stoppedData : [];
-				const completedArr = stoppedArr.filter(
-					(t) => t.status === TASK_STATUS.COMPLETE,
-				);
-				const stoppedOnlyArr = stoppedArr.filter(
-					(t) => t.status !== TASK_STATUS.COMPLETE,
-				);
-				activeCount = activeArr.length;
-				waitingCount = waitingArr.length;
-				scheduledCount = scheduledArr.length;
-				completedCount = completedArr.length;
-				stoppedCount = stoppedOnlyArr.length;
-				allCount =
+		updateTaskCountsFromStat(stat: Record<string, number>) {
+			const activeCount = stat.numActive || 0;
+			const scheduledCount = stat.numScheduled || 0;
+			const waitingCount = Math.max(0, (stat.numWaiting || 0) - scheduledCount);
+			const completedCount = stat.numCompleted || 0;
+			const stoppedCount = stat.numStoppedError || 0;
+			const prev = this.taskCountMap;
+			const next = {
+				all:
 					activeCount +
 					waitingCount +
 					scheduledCount +
 					completedCount +
-					stoppedCount;
-			} catch {
-				if (statTotal === 0) {
-					activeCount = 0;
-					waitingCount = 0;
-					scheduledCount = 0;
-					completedCount = 0;
-					stoppedCount = 0;
-					allCount = 0;
-				} else {
-					activeCount = this.taskCountMap.active || 0;
-					waitingCount = this.taskCountMap.waiting || 0;
-					scheduledCount = this.taskCountMap.scheduled || 0;
-					completedCount = this.taskCountMap.completed || 0;
-					stoppedCount = this.taskCountMap.stopped || 0;
-					allCount = this.taskCountMap.all || 0;
-				}
-			}
-
-			this.taskCountMap = {
-				all: allCount,
+					stoppedCount,
 				active: activeCount,
 				waiting: waitingCount,
 				scheduled: scheduledCount,
 				completed: completedCount,
 				stopped: stoppedCount,
 			};
+			if (
+				prev.all !== next.all ||
+				prev.active !== next.active ||
+				prev.waiting !== next.waiting ||
+				prev.scheduled !== next.scheduled ||
+				prev.completed !== next.completed ||
+				prev.stopped !== next.stopped
+			) {
+				this.taskCountMap = next;
+			}
 		},
-		async sampleActiveSpeeds() {
+		async sampleActiveSpeeds(prefetched?: DownloadTask[]) {
 			try {
+				if (prefetched) {
+					if (sampleSpeedsFromTasks(prefetched) && !document.hidden) {
+						this.speedHistoryRev++;
+					}
+					return;
+				}
 				if (this.currentList === "active" && this.taskList.length > 0) {
-					if (sampleSpeedsFromTasks(this.taskList)) {
+					if (sampleSpeedsFromTasks(this.taskList) && !document.hidden) {
 						this.speedHistoryRev++;
 					}
 					return;
@@ -595,7 +564,7 @@ export const useTaskStore = defineStore("task", {
 						"bittorrent",
 					],
 				})) as DownloadTask[];
-				if (sampleSpeedsFromTasks(tasks)) {
+				if (sampleSpeedsFromTasks(tasks) && !document.hidden) {
 					this.speedHistoryRev++;
 				}
 			} catch {}

@@ -94,9 +94,9 @@ import { ChevronDown, ChevronRight, GripVertical } from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
 import {
 	bytesToSize,
-	calcProgress,
 	checkTaskIsBT,
-	checkTaskIsSeeder,
+	formatProgressPercent,
+	getDisplayTaskStatus,
 	getTaskName,
 } from "@shared/utils";
 import logger from "@shared/utils/logger";
@@ -166,9 +166,6 @@ export default {
 				defaultName: this.$t("task.get-task-name"),
 			});
 		},
-		isSeeder() {
-			return checkTaskIsSeeder(this.task);
-		},
 		isMultiFileBT() {
 			const files = Array.isArray(this.task.files) ? this.task.files : [];
 			return checkTaskIsBT(this.task) && files.length > 1;
@@ -183,10 +180,7 @@ export default {
 					const isComplete = total > 0 && completed >= total;
 					const segs = `${f.path || ""}`.split(/[/\\]/);
 					const name = segs[segs.length - 1] || f.path || "";
-					const percent = `${calcProgress(total, completed, 1)}`.replace(
-						/\.0$/,
-						"",
-					);
+					const percent = formatProgressPercent(total, completed);
 					return {
 						index: f.index,
 						path: f.path,
@@ -200,12 +194,7 @@ export default {
 				});
 		},
 		taskStatus() {
-			const { task, isSeeder } = this;
-			if (isSeeder) {
-				return TASK_STATUS.SEEDING;
-			} else {
-				return task.status;
-			}
+			return getDisplayTaskStatus(this.task);
 		},
 		isActive() {
 			return this.taskStatus === TASK_STATUS.ACTIVE;

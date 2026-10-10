@@ -1,9 +1,8 @@
-//! Task worker for the native Usenet pipeline
-
 use crate::engine::archive_pipeline::{cleanup_after_success, is_archive_volume_name, CleanupMode};
-use crate::engine::task::{DownloadTask, UsenetRepairFailure, UsenetTaskData};
+use crate::engine::task::{DownloadTask, UsenetRepairFailure, UsenetTaskData, UsenetTaskFile};
 use crate::engine::usenet::{
-    NzbSegment, UsenetCredentialResolver, UsenetCredentials, UsenetProviderProfile,
+    deferred_par2_volumes, file_role, FileRole, NzbSegment, UsenetCredentialResolver,
+    UsenetCredentials, UsenetProviderProfile,
 };
 use crate::engine::usenet_par2::{
     platform_limits, verify_or_repair_with_cancel, Par2Error, Par2InputFile, Par2RepairRequest,
@@ -14,20 +13,21 @@ use crate::engine::usenet_pipeline::{
     AssemblyReport, DecodedYencPart, ResumeSidecar, YencAssemblyBudget, YencAssemblyLimits,
 };
 use crate::engine::usenet_transport::{
-    NntpConnection, NntpError, ProviderConnectionCapacityRegistry, ProviderConnectionLease,
-    ProviderPool,
+    canonical_message_id, NntpConnection, NntpError, ProviderConnectionCapacityRegistry,
+    ProviderConnectionLease, ProviderPool,
 };
 use fs4::{FileExt, TryLockError};
+use risuko_bt::limiter::Throttle;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -40,7 +40,6 @@ impl UsenetCredentialResolver for AnonymousCredentialResolver {
     }
 }
 
-/// A transient worker failure plus the non-secret task outcome it can carry
 #[derive(Debug)]
 pub(crate) struct UsenetDownloadError {
     message: String,
@@ -90,23 +89,161 @@ struct NntpArticleSource {
     resolver: Arc<dyn UsenetCredentialResolver>,
     connection_capacity: Arc<ProviderConnectionCapacityRegistry>,
     profile_sessions: ProfileSessionCache,
+    in_flight: AtomicUsize,
     preferred_profile_id: Mutex<Option<String>>,
     active_time: ActiveTimeTracker,
     max_active_seconds: u64,
     cancel: CancellationToken,
     proxy: Option<risuko_http::ProxyConnector>,
+    throttle: Throttle,
+    pipeline_depth: usize,
 }
 
-/// Non-serializable state
+pub(crate) const PIPELINE_DEPTH: usize = 3;
+
 #[derive(Default)]
 struct ProfileSessionCache {
-    sessions: Mutex<HashMap<String, Arc<AsyncMutex<ProfileSession>>>>,
+    sessions: Mutex<HashMap<String, Arc<ProfileSession>>>,
 }
 
 #[derive(Default)]
 struct ProfileSession {
-    credentials: Option<Option<UsenetCredentials>>,
-    connection: Option<LeasedNntpConnection>,
+    credentials: AsyncMutex<Option<Option<UsenetCredentials>>>,
+    idle: Mutex<Vec<LeasedNntpConnection>>,
+    returned: Notify,
+    pipeline: Mutex<PipelineState>,
+}
+
+enum ArticleReply {
+    Article(Vec<u8>),
+    Failed(NntpError),
+    Retry(NntpError),
+    Requeue,
+}
+
+struct QueuedArticle {
+    seq: u64,
+    message_id: String,
+    fresh_only: bool,
+    reply: oneshot::Sender<ArticleReply>,
+}
+
+#[derive(Default)]
+struct PipelineState {
+    queue: VecDeque<QueuedArticle>,
+    drivers: usize,
+    inflight: usize,
+    next_seq: u64,
+}
+
+impl ProfileSession {
+    fn take_idle(&self) -> Option<LeasedNntpConnection> {
+        self.idle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+    }
+
+    fn put_idle(&self, connection: LeasedNntpConnection) {
+        self.idle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(connection);
+        self.returned.notify_one();
+    }
+
+    fn pipeline(&self) -> std::sync::MutexGuard<'_, PipelineState> {
+        self.pipeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn enqueue(
+        &self,
+        message_id: &str,
+        fresh_only: bool,
+        depth: usize,
+    ) -> (u64, bool, oneshot::Receiver<ArticleReply>) {
+        let (reply, receiver) = oneshot::channel();
+        let mut state = self.pipeline();
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let has_room = state.drivers * depth > state.queue.len() + state.inflight;
+        let needs_driver = fresh_only || !has_room;
+        if needs_driver {
+            state.drivers += 1;
+        }
+        state.queue.push_back(QueuedArticle {
+            seq,
+            message_id: message_id.to_string(),
+            fresh_only,
+            reply,
+        });
+        (seq, needs_driver, receiver)
+    }
+
+    fn withdraw(&self, seq: u64) -> bool {
+        let mut state = self.pipeline();
+        match state.queue.iter().position(|item| item.seq == seq) {
+            Some(index) => {
+                state.queue.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn release_driver(&self, inflight: usize) {
+        let stranded = {
+            let mut state = self.pipeline();
+            state.drivers = state.drivers.saturating_sub(1);
+            state.inflight = state.inflight.saturating_sub(inflight);
+            if state.drivers == 0 {
+                std::mem::take(&mut state.queue)
+            } else {
+                VecDeque::new()
+            }
+        };
+        for item in stranded {
+            let _ = item.reply.send(ArticleReply::Requeue);
+        }
+    }
+
+    fn take_batch(
+        &self,
+        room: usize,
+        proven: bool,
+        window_empty: bool,
+        leased: &mut Option<LeasedNntpConnection>,
+    ) -> Option<Vec<QueuedArticle>> {
+        let mut state = self.pipeline();
+        let mut batch = Vec::new();
+        let mut index = 0;
+        while batch.len() < room && index < state.queue.len() {
+            if proven && state.queue[index].fresh_only {
+                index += 1;
+                continue;
+            }
+            if let Some(item) = state.queue.remove(index) {
+                batch.push(item);
+            }
+        }
+        state.inflight += batch.len();
+        if batch.is_empty() && window_empty {
+            state.drivers = state.drivers.saturating_sub(1);
+            if let Some(connection) = leased.take() {
+                self.put_idle(connection);
+            }
+            return None;
+        }
+        Some(batch)
+    }
+
+    fn clear_idle(&self) {
+        let drained =
+            std::mem::take(&mut *self.idle.lock().unwrap_or_else(|error| error.into_inner()));
+        drop(drained);
+    }
 }
 
 struct LeasedNntpConnection {
@@ -115,16 +252,16 @@ struct LeasedNntpConnection {
 }
 
 impl ProfileSessionCache {
-    fn session_for(&self, profile_id: &str) -> Arc<AsyncMutex<ProfileSession>> {
+    fn session_for(&self, profile_id: &str) -> Arc<ProfileSession> {
         self.sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entry(profile_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(ProfileSession::default())))
+            .or_default()
             .clone()
     }
 
-    async fn discard_connections_except(&self, profile_id: &str) {
+    fn discard_connections_except(&self, profile_id: &str) {
         let other_sessions = self
             .sessions
             .lock()
@@ -134,8 +271,23 @@ impl ProfileSessionCache {
             .map(|(_, session)| session.clone())
             .collect::<Vec<_>>();
         for session in other_sessions {
-            session.lock().await.connection.take();
+            session.clear_idle();
         }
+    }
+}
+
+struct InFlightGuard<'a>(&'a AtomicUsize);
+
+impl<'a> InFlightGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -192,6 +344,7 @@ impl ArticleSource for NntpArticleSource {
         Box::pin(async move {
             ensure_usenet_active_time(&self.active_time, self.max_active_seconds)
                 .map_err(ArticleFetchError::Failed)?;
+            let _in_flight = InFlightGuard::new(&self.in_flight);
             let message_id = message_id.to_string();
             let preferred_profile_id = self
                 .preferred_profile_id
@@ -213,6 +366,18 @@ impl ArticleSource for NntpArticleSource {
                 .map(|(_, article)| article)
                 .map_err(article_fetch_error)
         })
+    }
+
+    fn concurrency(&self) -> usize {
+        let profiles = self.pool.ordered_profiles_with_preference(None);
+        let top = profiles.first().map(|profile| profile.priority);
+        profiles
+            .iter()
+            .filter(|profile| Some(profile.priority) == top)
+            .map(|profile| profile.max_connections as usize)
+            .sum::<usize>()
+            .saturating_mul(self.pipeline_depth.max(1))
+            .max(1)
     }
 }
 
@@ -286,7 +451,10 @@ impl NntpArticleSource {
         let article = self
             .fetch_article_from_profile(profile, message_id, admission)
             .await?;
-        decode_yenc_part(&article).map_err(|message| NntpError::ArticleCorrupt { message })
+        tokio::task::spawn_blocking(move || decode_yenc_part(&article))
+            .await
+            .map_err(|error| NntpError::Io(std::io::Error::other(error)))?
+            .map_err(|message| NntpError::ArticleCorrupt { message })
     }
 
     async fn fetch_article_from_profile(
@@ -295,79 +463,129 @@ impl NntpArticleSource {
         message_id: &str,
         admission: ConnectionAdmission,
     ) -> Result<Vec<u8>, NntpError> {
-        let profile_session = self.profile_sessions.session_for(&profile.id);
-        let mut session = profile_session.lock().await;
+        let session = self.profile_sessions.session_for(&profile.id);
+        let depth = self.pipeline_depth.max(1);
         let mut retried_stale_connection = false;
+        let mut fresh_only = false;
 
         loop {
-            let used_cached_connection = session.connection.is_some();
-            if !used_cached_connection {
-                let credentials = self.cached_credentials(&mut session, &profile.id).await?;
-                let capacity_lease = match admission {
-                    ConnectionAdmission::Immediate => {
-                        self.acquire_connection_capacity(&profile, admission)
-                            .await?
-                    }
-                    ConnectionAdmission::Wait => {
-                        self.profile_sessions
-                            .discard_connections_except(&profile.id)
-                            .await;
-                        self.acquire_connection_capacity(&profile, admission)
-                            .await?
-                    }
-                };
-                if matches!(admission, ConnectionAdmission::Immediate) {
-                    self.profile_sessions
-                        .discard_connections_except(&profile.id)
-                        .await;
-                }
-                let connection = self.connect_with_cancel(&profile, credentials).await?;
-                session.connection = Some(LeasedNntpConnection {
-                    connection,
-                    _capacity_lease: capacity_lease,
-                });
+            if self.cancel.is_cancelled() {
+                return Err(NntpError::Cancelled);
             }
-
-            let article = {
-                let connection =
-                    session
-                        .connection
-                        .as_mut()
-                        .ok_or_else(|| NntpError::Protocol {
-                            code: 0,
-                            message: "NNTP session was not initialized".into(),
-                        })?;
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => Err(NntpError::Cancelled),
-                    article = connection.connection.article(message_id) => article,
+            let (seq, needs_driver, mut receiver) = session.enqueue(message_id, fresh_only, depth);
+            let reply = if needs_driver {
+                let checkout = self.checkout_connection(&session, &profile, admission, fresh_only);
+                let checked_out = match admission {
+                    ConnectionAdmission::Immediate => Ok(checkout.await),
+                    ConnectionAdmission::Wait => tokio::select! {
+                        biased;
+                        reply = &mut receiver => Err(reply),
+                        connection = checkout => Ok(connection),
+                    },
+                };
+                match checked_out {
+                    Ok(Ok((leased, reused))) => {
+                        spawn_driver(session.clone(), leased, reused, self.cancel.clone(), depth);
+                        receiver.await
+                    }
+                    Ok(Err(error)) => {
+                        let withdrawn = session.withdraw(seq);
+                        session.release_driver(0);
+                        if withdrawn || matches!(error, NntpError::Cancelled) {
+                            return Err(error);
+                        }
+                        receiver.await
+                    }
+                    Err(reply) => {
+                        session.release_driver(0);
+                        reply
+                    }
                 }
+            } else {
+                receiver.await
             };
-            match article {
-                Ok(article) => return Ok(article),
-                Err(error) => {
-                    let retry_stale_connection = used_cached_connection
-                        && !retried_stale_connection
-                        && should_retry_stale_connection(&error);
-                    if should_discard_connection(&error) {
-                        session.connection.take();
+            match reply {
+                Ok(ArticleReply::Article(article)) => return Ok(article),
+                Ok(ArticleReply::Failed(error)) => return Err(error),
+                Ok(ArticleReply::Retry(error)) => {
+                    if retried_stale_connection {
+                        return Err(error);
                     }
-                    if retry_stale_connection {
-                        retried_stale_connection = true;
-                        continue;
-                    }
-                    return Err(error);
+                    retried_stale_connection = true;
+                    fresh_only = true;
                 }
+                Ok(ArticleReply::Requeue) | Err(_) => {}
             }
         }
     }
 
+    async fn checkout_connection(
+        &self,
+        session: &ProfileSession,
+        profile: &UsenetProviderProfile,
+        admission: ConnectionAdmission,
+        fresh_only: bool,
+    ) -> Result<(LeasedNntpConnection, bool), NntpError> {
+        if !fresh_only {
+            if let Some(connection) = session.take_idle() {
+                return Ok((connection, true));
+            }
+        }
+        let credentials = self.cached_credentials(session, &profile.id).await?;
+        let capacity_lease = match admission {
+            ConnectionAdmission::Immediate => {
+                let lease = self.acquire_connection_capacity(profile, admission).await?;
+                if self.in_flight.load(Ordering::Relaxed) <= 1 {
+                    self.profile_sessions
+                        .discard_connections_except(&profile.id);
+                }
+                lease
+            }
+            ConnectionAdmission::Wait => {
+                self.profile_sessions
+                    .discard_connections_except(&profile.id);
+                let remaining = self.remaining_active_time()?;
+                let acquire =
+                    tokio::time::timeout(remaining, self.connection_capacity.acquire(profile));
+                tokio::pin!(acquire);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Err(NntpError::Cancelled),
+                        _ = session.returned.notified(), if !fresh_only => {
+                            if let Some(connection) = session.take_idle() {
+                                return Ok((connection, true));
+                            }
+                        }
+                        lease = &mut acquire => break match lease {
+                            Ok(result) => result?,
+                            Err(_) => return Err(active_time_limit_error()),
+                        },
+                    }
+                }
+            }
+        };
+        let connection = self.connect_with_cancel(profile, credentials).await?;
+        Ok((
+            LeasedNntpConnection {
+                connection,
+                _capacity_lease: capacity_lease,
+            },
+            false,
+        ))
+    }
+
     async fn cached_credentials(
         &self,
-        session: &mut ProfileSession,
+        session: &ProfileSession,
         profile_id: &str,
     ) -> Result<Option<UsenetCredentials>, NntpError> {
-        if let Some(credentials) = &session.credentials {
+        let mut cached = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(NntpError::Cancelled),
+            cached = session.credentials.lock() => cached,
+        };
+        if let Some(credentials) = &*cached {
             return Ok(credentials.clone());
         }
 
@@ -387,7 +605,7 @@ impl NntpArticleSource {
             code: 0,
             message: error,
         })?;
-        session.credentials = Some(credentials.clone());
+        *cached = Some(credentials.clone());
         Ok(credentials)
     }
 
@@ -433,27 +651,139 @@ impl NntpArticleSource {
         profile: &UsenetProviderProfile,
         credentials: Option<UsenetCredentials>,
     ) -> Result<NntpConnection, NntpError> {
-        tokio::select! {
+        let mut connection = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => Err(NntpError::Cancelled),
+            _ = self.cancel.cancelled() => return Err(NntpError::Cancelled),
             connection = NntpConnection::connect_with_proxy(
                 profile,
                 credentials,
                 self.proxy.as_ref(),
-            ) => connection,
+            ) => connection?,
+        };
+        connection.set_throttle(self.throttle.clone());
+        Ok(connection)
+    }
+}
+
+fn spawn_driver(
+    session: Arc<ProfileSession>,
+    leased: LeasedNntpConnection,
+    proven: bool,
+    cancel: CancellationToken,
+    depth: usize,
+) {
+    tokio::spawn(run_driver(session, leased, proven, cancel, depth));
+}
+
+async fn run_driver(
+    session: Arc<ProfileSession>,
+    leased: LeasedNntpConnection,
+    mut proven: bool,
+    cancel: CancellationToken,
+    depth: usize,
+) {
+    tokio::task::yield_now().await;
+    let mut leased = Some(leased);
+    let mut window: VecDeque<QueuedArticle> = VecDeque::new();
+    loop {
+        let Some(batch) =
+            session.take_batch(depth - window.len(), proven, window.is_empty(), &mut leased)
+        else {
+            return;
+        };
+        let mut fresh = Vec::with_capacity(batch.len());
+        for item in batch {
+            match canonical_message_id(&item.message_id) {
+                Ok(_) => fresh.push(item),
+                Err(error) => {
+                    session.pipeline().inflight -= 1;
+                    let _ = item.reply.send(ArticleReply::Failed(error));
+                }
+            }
+        }
+        let Some(connection) = leased.as_mut() else {
+            return;
+        };
+        if !fresh.is_empty() {
+            let ids = fresh
+                .iter()
+                .map(|item| item.message_id.clone())
+                .collect::<Vec<_>>();
+            window.extend(fresh);
+            if let Err(error) = connection.connection.send_article_requests(&ids).await {
+                break_connection(&session, &mut leased, window, error, proven);
+                return;
+            }
+        }
+        if window.is_empty() {
+            continue;
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(NntpError::Cancelled),
+            article = connection.connection.read_article() => article,
+        };
+        match result {
+            Ok(article) => {
+                proven = true;
+                finish_front(&session, &mut window, ArticleReply::Article(article));
+            }
+            Err(error @ NntpError::ArticleUnavailable { .. }) => {
+                proven = true;
+                finish_front(&session, &mut window, ArticleReply::Failed(error));
+            }
+            Err(error) => {
+                break_connection(&session, &mut leased, window, error, proven);
+                return;
+            }
         }
     }
 }
 
-fn should_discard_connection(error: &NntpError) -> bool {
-    !matches!(
-        error,
-        NntpError::ArticleUnavailable { .. } | NntpError::ArticleCorrupt { .. }
-    )
+fn finish_front(
+    session: &ProfileSession,
+    window: &mut VecDeque<QueuedArticle>,
+    reply: ArticleReply,
+) {
+    if let Some(item) = window.pop_front() {
+        session.pipeline().inflight -= 1;
+        let _ = item.reply.send(reply);
+    }
+}
+
+fn break_connection(
+    session: &ProfileSession,
+    leased: &mut Option<LeasedNntpConnection>,
+    window: VecDeque<QueuedArticle>,
+    error: NntpError,
+    proven: bool,
+) {
+    drop(leased.take());
+    session.release_driver(window.len());
+    let cancelled = matches!(error, NntpError::Cancelled);
+    let mut error = Some(error);
+    for item in window {
+        let reply = match error.take() {
+            Some(error) if cancelled => ArticleReply::Failed(error),
+            Some(error) if proven && should_retry_stale_connection(&error) => {
+                ArticleReply::Retry(error)
+            }
+            Some(error) => ArticleReply::Failed(error),
+            None if cancelled => ArticleReply::Failed(NntpError::Cancelled),
+            None => ArticleReply::Requeue,
+        };
+        let _ = item.reply.send(reply);
+    }
 }
 
 fn should_retry_stale_connection(error: &NntpError) -> bool {
-    matches!(error, NntpError::Io(_) | NntpError::Timeout)
+    matches!(
+        error,
+        NntpError::Io(_)
+            | NntpError::Timeout
+            | NntpError::ServiceUnavailable { code: 400, .. }
+            | NntpError::AuthenticationFailed { code: 480, .. }
+    )
 }
 
 fn ensure_usenet_active_time(
@@ -545,29 +875,6 @@ fn http_proxy_from_options(
     ))
 }
 
-pub async fn run_usenet_download_with_resolver(
-    task: &DownloadTask,
-    options: &Map<String, Value>,
-    completed: Arc<AtomicU64>,
-    total: Arc<AtomicU64>,
-    cancel: CancellationToken,
-    resolver: Arc<dyn UsenetCredentialResolver>,
-) -> Result<PathBuf, String> {
-    run_usenet_download_with_resolver_and_capacity(
-        task,
-        options,
-        completed,
-        total,
-        cancel,
-        resolver,
-        Arc::new(ProviderConnectionCapacityRegistry::default()),
-        None,
-    )
-    .await
-    .map(|(path, _)| path)
-    .map_err(|error| error.to_string())
-}
-
 pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     task: &DownloadTask,
     options: &Map<String, Value>,
@@ -576,6 +883,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     cancel: CancellationToken,
     resolver: Arc<dyn UsenetCredentialResolver>,
     connection_capacity: Arc<ProviderConnectionCapacityRegistry>,
+    throttle: Throttle,
     stage: Option<StageCallback>,
 ) -> Result<(PathBuf, Vec<(usize, PathBuf)>), UsenetDownloadError> {
     let metadata: &UsenetTaskData = task
@@ -591,17 +899,20 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     }
     let pool = Arc::new(ProviderPool::new(profiles).map_err(|error| error.to_string())?);
     let archive_limits = archive_limits_for_task(metadata, options)?;
-    let active_time = ActiveTimeTracker::new();
-    let source = NntpArticleSource {
-        pool,
-        resolver,
-        connection_capacity,
+    let proxy = http_proxy_from_options(options)?;
+    let make_source = || NntpArticleSource {
+        pool: pool.clone(),
+        resolver: resolver.clone(),
+        connection_capacity: connection_capacity.clone(),
         profile_sessions: ProfileSessionCache::default(),
+        in_flight: AtomicUsize::new(0),
         preferred_profile_id: Mutex::new(None),
-        active_time: active_time.clone(),
-        max_active_seconds: archive_limits.max_active_seconds,
+        active_time: ActiveTimeTracker::new(),
+        max_active_seconds: u64::MAX,
         cancel: cancel.clone(),
-        proxy: http_proxy_from_options(options)?,
+        proxy: proxy.clone(),
+        throttle: throttle.clone(),
+        pipeline_depth: PIPELINE_DEPTH,
     };
     let assembly_limits = YencAssemblyLimits::new(
         archive_limits.max_entry_bytes,
@@ -612,84 +923,116 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     tokio::fs::create_dir_all(&destination)
         .await
         .map_err(|error| format!("create Usenet destination: {error}"))?;
-    let expected_total = task_article_bytes(metadata)?;
-    total.store(expected_total, Ordering::Relaxed);
+    task_article_bytes(metadata)?;
 
-    let mut assembled = Vec::new();
-    let mut promoted_outputs = Vec::new();
-    report_stage(&stage, "fetching");
-    for (index, file) in metadata.files.iter().enumerate() {
-        ensure_usenet_active_time(&active_time, archive_limits.max_active_seconds)?;
-        if cancel.is_cancelled() {
-            return Err("Download cancelled".to_string().into());
+    let names: Vec<String> = metadata
+        .files
+        .iter()
+        .map(|file| crate::engine::util::safe_filename(&file.name, "download"))
+        .collect();
+    let roles: Vec<FileRole> = names.iter().map(|name| file_role(name)).collect();
+    let mut fetch_now = Vec::new();
+    let mut deferred = Vec::new();
+    let policy_deferred = deferred_par2_volumes(&names);
+    for (index, name) in names.iter().enumerate() {
+        if policy_deferred.contains(&index) && !volume_has_local_state(&destination, name).await {
+            deferred.push(index);
+        } else {
+            fetch_now.push(index);
         }
-        let name = crate::engine::util::safe_filename(&file.name, "download");
-        let segments: Vec<NzbSegment> = file
+    }
+    let file_bytes = |index: usize| -> u64 {
+        metadata.files[index]
             .segments
             .iter()
-            .map(|segment| NzbSegment {
-                number: segment.number,
-                bytes: segment.bytes,
-                message_id: segment.message_id.clone(),
-            })
-            .collect();
-        let reservation = reserve_output_path(&destination, &name, &segments).await?;
-        let output = reservation.output.clone();
-        let local_before = completed.load(Ordering::Relaxed);
-        report_stage(&stage, "assembling");
-        let report = assemble_file_with_report_with_limits_at_offset(
-            &output,
-            &segments,
-            &source,
-            &cancel,
-            Some(completed.as_ref()),
-            local_before,
-            assembly_limits,
-            &mut assembly_budget,
-        )
-        .await?;
-        ensure_usenet_active_time(&active_time, archive_limits.max_active_seconds)?;
-        assembled.push(AssembledTaskFile {
-            index,
-            is_parity: is_par2_name(&name),
-            name,
-            report,
-            _reservation: reservation,
-        });
+            .fold(0u64, |sum, segment| sum.saturating_add(segment.bytes))
+    };
+    total.store(
+        fetch_now
+            .iter()
+            .fold(0u64, |sum, index| sum.saturating_add(file_bytes(*index))),
+        Ordering::Relaxed,
+    );
+
+    let mut assembled: Vec<AssembledTaskFile> = Vec::new();
+    let mut promoted_outputs = Vec::new();
+    report_stage(&stage, "fetching");
+    let source = make_source();
+    for index in fetch_now {
+        assembled.push(
+            fetch_task_file(
+                index,
+                &metadata.files[index],
+                &destination,
+                &source,
+                &cancel,
+                completed.as_ref(),
+                assembly_limits,
+                &mut assembly_budget,
+                &stage,
+            )
+            .await?,
+        );
     }
     drop(source);
+    let active_time = ActiveTimeTracker::new();
 
-    let needs_repair = assembled
-        .iter()
-        .any(|file| !file.is_parity && !file.report.complete);
-    let parity_files: Vec<PathBuf> = assembled
-        .iter()
-        .filter(|file| file.is_parity && file.report.complete)
-        .map(|file| file.report.output.clone())
-        .collect();
-    let data_files: Vec<Par2InputFile> = assembled
-        .iter()
-        .filter(|file| !file.is_parity)
-        .map(|file| Par2InputFile {
-            manifest_name: file.name.clone(),
-            source_path: file.report.source_path().to_path_buf(),
-            output_path: file.report.output.clone(),
-            expected_size: file.report.expected_size,
-        })
-        .collect();
-    let unavailable = assembled
-        .iter()
-        .filter(|file| !file.report.unavailable_segments.is_empty())
-        .map(|file| format!("{}:{:?}", file.name, file.report.unavailable_segments))
-        .collect::<Vec<_>>();
-    if needs_repair && parity_files.is_empty() {
-        return Err(format!(
-            "PAR2 repair failed: no complete parity files are available; unavailable segments: {}",
-            unavailable.join(", ")
-        )
-        .into());
-    }
-    if !data_files.is_empty() && !parity_files.is_empty() {
+    loop {
+        let needs_repair = assembled
+            .iter()
+            .any(|file| !file.is_parity && !file.report.complete);
+        let parity_files: Vec<PathBuf> = assembled
+            .iter()
+            .filter(|file| file.is_parity && file.report.complete)
+            .map(|file| file.report.output.clone())
+            .collect();
+        let data_files: Vec<Par2InputFile> = assembled
+            .iter()
+            .filter(|file| !file.is_parity)
+            .map(|file| Par2InputFile {
+                manifest_name: file.name.clone(),
+                source_path: file.report.source_path().to_path_buf(),
+                output_path: file.report.output.clone(),
+                expected_size: file.report.expected_size,
+            })
+            .collect();
+        let unavailable = assembled
+            .iter()
+            .filter(|file| !file.report.unavailable_segments.is_empty())
+            .map(|file| format!("{}:{:?}", file.name, file.report.unavailable_segments))
+            .collect::<Vec<_>>();
+        if parity_files.is_empty() {
+            if needs_repair {
+                let picks = pick_recovery_volumes(&deferred, &roles, 1);
+                if !picks.is_empty() {
+                    fetch_recovery_volumes(
+                        &picks,
+                        &mut deferred,
+                        &mut assembled,
+                        &make_source,
+                        metadata,
+                        &destination,
+                        &cancel,
+                        &completed,
+                        &total,
+                        assembly_limits,
+                        &mut assembly_budget,
+                        &stage,
+                    )
+                    .await?;
+                    continue;
+                }
+                return Err(format!(
+                    "PAR2 repair failed: no complete parity files are available; unavailable segments: {}",
+                    unavailable.join(", ")
+                )
+                .into());
+            }
+            break;
+        }
+        if data_files.is_empty() {
+            break;
+        }
         report_stage(
             &stage,
             if needs_repair {
@@ -721,7 +1064,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
             .ok_or_else(|| {
                 "archive limit: Usenet task exceeded the active-time limit".to_string()
             })?;
-        let repair = tokio::select! {
+        let outcome = tokio::select! {
             _ = cancel.cancelled() => {
                 repair_cancel.cancel();
                 let _ = (&mut repair_task).await;
@@ -740,8 +1083,37 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
                     }
                 }
             }
-        }
-        .map_err(|error| UsenetDownloadError::from_par2_error(error, &unavailable))?;
+        };
+        let repair = match outcome {
+            Ok(repair) => repair,
+            Err(Par2Error::InsufficientRecovery { needed, available }) if !deferred.is_empty() => {
+                let picks =
+                    pick_recovery_volumes(&deferred, &roles, needed.saturating_sub(available));
+                if picks.is_empty() {
+                    return Err(UsenetDownloadError::from_par2_error(
+                        Par2Error::InsufficientRecovery { needed, available },
+                        &unavailable,
+                    ));
+                }
+                fetch_recovery_volumes(
+                    &picks,
+                    &mut deferred,
+                    &mut assembled,
+                    &make_source,
+                    metadata,
+                    &destination,
+                    &cancel,
+                    &completed,
+                    &total,
+                    assembly_limits,
+                    &mut assembly_budget,
+                    &stage,
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => return Err(UsenetDownloadError::from_par2_error(error, &unavailable)),
+        };
         persist_par2_repair_state(&assembled, &repair.promoted_outputs).await?;
         promoted_outputs = repair.promoted_outputs.clone();
         let unrepaired = assembled
@@ -761,11 +1133,11 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
             )
             .into());
         }
+        break;
     }
     ensure_usenet_active_time(&active_time, archive_limits.max_active_seconds)?;
-    completed.store(expected_total, Ordering::Relaxed);
+    completed.store(total.load(Ordering::Relaxed), Ordering::Relaxed);
     let cleanup_mode = cleanup_mode_for_task(metadata, options);
-    // This worker assembles and verifies NZB data but doesn't extract archives, so archive-volume cleanup is intentionally disabled in cleanup_inputs
     let (par2_inputs, archive_inputs) = cleanup_inputs(&assembled, false, &promoted_outputs);
     if let Err(error) = cleanup_after_success(cleanup_mode, true, &par2_inputs, &archive_inputs) {
         tracing::warn!(
@@ -785,6 +1157,150 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
             .map(|file| (file.index, file.report.output.clone()))
             .collect(),
     ))
+}
+
+fn volume_blocks(role: FileRole) -> Option<u32> {
+    match role {
+        FileRole::Par2Volume { blocks } => blocks,
+        _ => None,
+    }
+}
+
+async fn volume_has_local_state(destination: &Path, name: &str) -> bool {
+    let output = destination.join(name);
+    for path in [resume_sidecar_path(&output), partial_path(&output), output] {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+fn pick_recovery_volumes(deferred: &[usize], roles: &[FileRole], blocks_needed: u32) -> Vec<usize> {
+    let mut counted: Vec<(usize, u32)> = Vec::new();
+    let mut uncounted: Vec<usize> = Vec::new();
+    for &index in deferred {
+        match volume_blocks(roles[index]) {
+            Some(blocks) => counted.push((index, blocks)),
+            None => uncounted.push(index),
+        }
+    }
+    let mut picks = Vec::new();
+    let mut remaining = blocks_needed.max(1);
+    while remaining > 0 && !counted.is_empty() {
+        let covering = counted
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, blocks))| *blocks >= remaining)
+            .min_by_key(|(_, (index, blocks))| (*blocks, *index))
+            .map(|(position, _)| position);
+        let position = covering.unwrap_or_else(|| {
+            counted
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (index, blocks))| (*blocks, std::cmp::Reverse(*index)))
+                .map(|(position, _)| position)
+                .unwrap_or(0)
+        });
+        let (index, blocks) = counted.remove(position);
+        picks.push(index);
+        remaining = remaining.saturating_sub(blocks);
+    }
+    if remaining > 0 {
+        picks.extend(uncounted);
+    }
+    picks
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_recovery_volumes(
+    picks: &[usize],
+    deferred: &mut Vec<usize>,
+    assembled: &mut Vec<AssembledTaskFile>,
+    make_source: &impl Fn() -> NntpArticleSource,
+    metadata: &UsenetTaskData,
+    destination: &Path,
+    cancel: &CancellationToken,
+    completed: &AtomicU64,
+    total: &AtomicU64,
+    limits: YencAssemblyLimits,
+    budget: &mut YencAssemblyBudget,
+    stage: &Option<StageCallback>,
+) -> Result<(), UsenetDownloadError> {
+    let source = make_source();
+    for &index in picks {
+        let file = &metadata.files[index];
+        let bytes = file
+            .segments
+            .iter()
+            .fold(0u64, |sum, segment| sum.saturating_add(segment.bytes));
+        total.fetch_add(bytes, Ordering::Relaxed);
+        deferred.retain(|pending| *pending != index);
+        assembled.push(
+            fetch_task_file(
+                index,
+                file,
+                destination,
+                &source,
+                cancel,
+                completed,
+                limits,
+                budget,
+                stage,
+            )
+            .await?,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_task_file(
+    index: usize,
+    file: &UsenetTaskFile,
+    destination: &Path,
+    source: &NntpArticleSource,
+    cancel: &CancellationToken,
+    completed: &AtomicU64,
+    limits: YencAssemblyLimits,
+    budget: &mut YencAssemblyBudget,
+    stage: &Option<StageCallback>,
+) -> Result<AssembledTaskFile, UsenetDownloadError> {
+    if cancel.is_cancelled() {
+        return Err("Download cancelled".to_string().into());
+    }
+    let name = crate::engine::util::safe_filename(&file.name, "download");
+    let segments: Vec<NzbSegment> = file
+        .segments
+        .iter()
+        .map(|segment| NzbSegment {
+            number: segment.number,
+            bytes: segment.bytes,
+            message_id: segment.message_id.clone(),
+        })
+        .collect();
+    let reservation = reserve_output_path(destination, &name, &segments).await?;
+    let output = reservation.output.clone();
+    let local_before = completed.load(Ordering::Relaxed);
+    report_stage(stage, "assembling");
+    let report = assemble_file_with_report_with_limits_at_offset(
+        &output,
+        &segments,
+        source,
+        cancel,
+        Some(completed),
+        local_before,
+        limits,
+        budget,
+    )
+    .await?;
+    Ok(AssembledTaskFile {
+        index,
+        is_parity: is_par2_name(&name),
+        name,
+        report,
+        _reservation: reservation,
+    })
 }
 
 fn cleanup_mode_for_task(metadata: &UsenetTaskData, options: &Map<String, Value>) -> CleanupMode {
@@ -992,7 +1508,6 @@ async fn output_slot_is_available(output: &Path) -> Result<bool, String> {
     let sidecar_path = resume_sidecar_path(output);
     match tokio::fs::symlink_metadata(&sidecar_path).await {
         Ok(metadata) => {
-            // Only regular files parse as resume metadata; treat FIFOs, devices, directories, and symlinks as occupied so reservation never blocks on an arbitrary filesystem object
             if !metadata.file_type().is_file() {
                 return Ok(false);
             }
@@ -1055,6 +1570,28 @@ async fn persist_par2_repair_state(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_disconnect_errors_trigger_a_fresh_connection() {
+        assert!(should_retry_stale_connection(
+            &NntpError::ServiceUnavailable {
+                code: 400,
+                message: "timeout".into(),
+            }
+        ));
+        assert!(should_retry_stale_connection(
+            &NntpError::AuthenticationFailed {
+                code: 480,
+                message: "auth".into(),
+            }
+        ));
+        assert!(!should_retry_stale_connection(
+            &NntpError::AuthenticationFailed {
+                code: 481,
+                message: "bad".into(),
+            }
+        ));
+    }
+
     use super::*;
     use crate::engine::task::{UsenetTaskFile, UsenetTaskSegment};
     use crate::engine::usenet_pipeline::{manifest_sha256, ResumeSegment, ResumeSidecar};
@@ -1148,11 +1685,14 @@ mod tests {
             resolver,
             connection_capacity,
             profile_sessions: ProfileSessionCache::default(),
+            in_flight: AtomicUsize::new(0),
             preferred_profile_id: Mutex::new(None),
             active_time: ActiveTimeTracker::new(),
             max_active_seconds: 60,
             cancel: CancellationToken::new(),
             proxy: None,
+            throttle: Throttle::unlimited(),
+            pipeline_depth: PIPELINE_DEPTH,
         }
     }
 
@@ -1736,6 +2276,255 @@ mod tests {
         assert_eq!(second.unwrap().data, b"A");
         primary_server.await.unwrap();
         backup_server.await.unwrap();
+    }
+
+    fn single_connection_source(port: u16) -> NntpArticleSource {
+        let resolver = Arc::new(RecordingResolver {
+            credentials: HashMap::from([("primary".into(), credentials("alice", "secret"))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        source_for_test(vec![profile("primary", port, 0)], resolver)
+    }
+
+    #[tokio::test]
+    async fn pipelining_multiplies_the_fetch_window() {
+        let source = single_connection_source(1);
+        assert_eq!(source.concurrency(), PIPELINE_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn commands_are_written_ahead_of_the_first_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            let mut commands = Vec::new();
+            for _ in 0..PIPELINE_DEPTH {
+                commands.push(read_command(&mut reader).await);
+            }
+            for _ in 0..PIPELINE_DEPTH {
+                write_test_article(&mut reader).await;
+            }
+            commands
+        });
+        let source = single_connection_source(port);
+
+        let results = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                source.fetch("a@example"),
+                source.fetch("b@example"),
+                source.fetch("c@example")
+            )
+        })
+        .await
+        .expect("pipelined fetches stalled");
+
+        assert_eq!(results.0.unwrap().data, b"A");
+        assert_eq!(results.1.unwrap().data, b"A");
+        assert_eq!(results.2.unwrap().data, b"A");
+        let mut commands = server.await.unwrap();
+        commands.sort();
+        assert_eq!(
+            commands,
+            [
+                "ARTICLE <a@example>",
+                "ARTICLE <b@example>",
+                "ARTICLE <c@example>"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_article_mid_window_fails_only_that_id() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream);
+                greet_and_authenticate(&mut reader, "alice", "secret").await;
+                let mut ids = Vec::new();
+                for _ in 0..PIPELINE_DEPTH {
+                    ids.push(read_command(&mut reader).await);
+                }
+                for id in &ids {
+                    if id == "ARTICLE <gone@example>" {
+                        reader
+                            .get_mut()
+                            .write_all(b"430 no such article\r\n")
+                            .await
+                            .unwrap();
+                    } else {
+                        write_test_article(&mut reader).await;
+                    }
+                }
+                assert_eq!(read_command(&mut reader).await, "ARTICLE <later@example>");
+                write_test_article(&mut reader).await;
+            }
+        });
+        let source = single_connection_source(port);
+
+        let (first, second, third) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                source.fetch("one@example"),
+                source.fetch("gone@example"),
+                source.fetch("two@example")
+            )
+        })
+        .await
+        .expect("pipelined fetches stalled");
+
+        assert_eq!(first.unwrap().data, b"A");
+        assert!(matches!(second, Err(ArticleFetchError::Unavailable(_))));
+        assert_eq!(third.unwrap().data, b"A");
+        assert_eq!(source.fetch("later@example").await.unwrap().data, b"A");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_drop_mid_window_requeues_unanswered_ids() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            let mut first_ids = Vec::new();
+            for _ in 0..PIPELINE_DEPTH {
+                first_ids.push(read_command(&mut reader).await);
+            }
+            write_test_article(&mut reader).await;
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            let mut second_ids = Vec::new();
+            for _ in 0..PIPELINE_DEPTH - 1 {
+                second_ids.push(read_command(&mut reader).await);
+            }
+            for _ in &second_ids {
+                write_test_article(&mut reader).await;
+            }
+            (first_ids, second_ids)
+        });
+        let source = single_connection_source(port);
+
+        let results = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                source.fetch("a@example"),
+                source.fetch("b@example"),
+                source.fetch("c@example")
+            )
+        })
+        .await
+        .expect("requeued fetches stalled");
+
+        assert_eq!(results.0.unwrap().data, b"A");
+        assert_eq!(results.1.unwrap().data, b"A");
+        assert_eq!(results.2.unwrap().data, b"A");
+        let (first_ids, mut second_ids) = server.await.unwrap();
+        assert_eq!(first_ids.len(), PIPELINE_DEPTH);
+        second_ids.sort();
+        let mut expected = first_ids[1..].to_vec();
+        expected.sort();
+        assert_eq!(second_ids, expected);
+        assert_eq!(source.pool.ordered_profiles_with_preference(None).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_connection_loss_fails_only_the_oldest_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            let mut first_ids = Vec::new();
+            for _ in 0..PIPELINE_DEPTH {
+                first_ids.push(read_command(&mut reader).await);
+            }
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            for _ in 0..PIPELINE_DEPTH - 1 {
+                read_command(&mut reader).await;
+            }
+            for _ in 0..PIPELINE_DEPTH - 1 {
+                write_test_article(&mut reader).await;
+            }
+            first_ids
+        });
+        let source = single_connection_source(port);
+
+        let results = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                source.fetch("a@example"),
+                source.fetch("b@example"),
+                source.fetch("c@example")
+            )
+        })
+        .await
+        .expect("requeued fetches stalled");
+
+        let outcomes = [results.0, results.1, results.2];
+        let failed = outcomes.iter().filter(|result| result.is_err()).count();
+        assert_eq!(failed, 1, "only the oldest request carries the error");
+        assert!(outcomes
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .all(|part| part.data == b"A"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_use_separate_pooled_connections() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut readers = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                greet_and_authenticate(&mut reader, "alice", "secret").await;
+                readers.push(reader);
+            }
+            for reader in &mut readers {
+                assert!(read_command(reader).await.starts_with("ARTICLE <"));
+            }
+            for reader in &mut readers {
+                write_test_article(reader).await;
+            }
+        });
+        let resolver = Arc::new(RecordingResolver {
+            credentials: HashMap::from([("primary".into(), credentials("alice", "secret"))]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut primary = profile("primary", port, 0);
+        primary.max_connections = 2;
+        let mut source = source_for_test(vec![primary], resolver);
+        source.pipeline_depth = 1;
+        assert_eq!(source.concurrency(), 2);
+
+        let (first, second) = timeout(Duration::from_secs(3), async {
+            tokio::join!(source.fetch("a@example"), source.fetch("b@example"))
+        })
+        .await
+        .expect("concurrent fetches were serialized on one connection");
+
+        assert_eq!(first.unwrap().data, b"A");
+        assert_eq!(second.unwrap().data, b"A");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2325,5 +3114,307 @@ mod tests {
         assert!(lock_path.exists());
         drop(reservation);
         assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn recovery_volume_picks_cover_the_need_with_the_fewest_blocks() {
+        use crate::engine::usenet::file_role;
+        let names = [
+            "a.vol000+01.par2",
+            "a.vol001+02.par2",
+            "a.vol003+04.par2",
+            "a.vol007+08.par2",
+        ];
+        let roles: Vec<FileRole> = names.iter().map(|name| file_role(name)).collect();
+        let all = [0, 1, 2, 3];
+        assert_eq!(pick_recovery_volumes(&all, &roles, 1), [0]);
+        assert_eq!(pick_recovery_volumes(&all, &roles, 3), [2]);
+        assert_eq!(pick_recovery_volumes(&all, &roles, 8), [3]);
+        assert_eq!(pick_recovery_volumes(&all, &roles, 10), [3, 1]);
+        assert_eq!(pick_recovery_volumes(&all, &roles, 100).len(), 4);
+        assert!(pick_recovery_volumes(&[], &roles, 1).is_empty());
+    }
+
+    #[test]
+    fn volumes_without_a_block_count_are_taken_only_after_counted_ones() {
+        use crate::engine::usenet::file_role;
+        let names = ["a.vol1.par2", "a.vol000+02.par2"];
+        let roles: Vec<FileRole> = names.iter().map(|name| file_role(name)).collect();
+        assert_eq!(pick_recovery_volumes(&[0, 1], &roles, 2), [1]);
+        assert_eq!(pick_recovery_volumes(&[0, 1], &roles, 3), [1, 0]);
+    }
+
+    #[tokio::test]
+    async fn volume_local_state_counts_as_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("a.vol0+1.par2");
+        assert!(!volume_has_local_state(dir.path(), "a.vol0+1.par2").await);
+        fs::write(partial_path(&output), b"x").unwrap();
+        assert!(volume_has_local_state(dir.path(), "a.vol0+1.par2").await);
+    }
+
+    fn yenc_article(name: &str, data: &[u8], part: Option<(u64, u64, u64)>) -> Vec<u8> {
+        let mut out = Vec::new();
+        match part {
+            Some((begin, end, total)) => {
+                out.extend_from_slice(
+                    format!("=ybegin part=1 total=2 line=128 size={total} name={name}\r\n")
+                        .as_bytes(),
+                );
+                out.extend_from_slice(format!("=ypart begin={begin} end={end}\r\n").as_bytes());
+            }
+            None => out.extend_from_slice(
+                format!("=ybegin line=128 size={} name={name}\r\n", data.len()).as_bytes(),
+            ),
+        }
+        let mut line = Vec::new();
+        for byte in data {
+            let encoded = byte.wrapping_add(42);
+            let mut piece = Vec::new();
+            if matches!(encoded, 0 | 10 | 13 | 61) {
+                piece.push(b'=');
+                piece.push(encoded.wrapping_add(64));
+            } else {
+                piece.push(encoded);
+            }
+            if line.len() + piece.len() > 128 {
+                flush_yenc_line(&mut out, &mut line);
+            }
+            line.extend(piece);
+        }
+        flush_yenc_line(&mut out, &mut line);
+        match part {
+            Some(_) => {
+                out.extend_from_slice(format!("=yend size={} part=1\r\n", data.len()).as_bytes())
+            }
+            None => out.extend_from_slice(format!("=yend size={}\r\n", data.len()).as_bytes()),
+        }
+        out
+    }
+
+    fn flush_yenc_line(out: &mut Vec<u8>, line: &mut Vec<u8>) {
+        if line.is_empty() {
+            return;
+        }
+        if line[0] == b'.' {
+            out.push(b'.');
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+        line.clear();
+    }
+
+    async fn spawn_article_server(
+        articles: HashMap<String, Vec<u8>>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let articles = Arc::new(articles);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let articles = articles.clone();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    reader
+                        .get_mut()
+                        .write_all(b"200 fake NNTP server ready\r\n")
+                        .await
+                        .ok();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let command = line.trim_end();
+                        if let Some(id) = command
+                            .strip_prefix("ARTICLE <")
+                            .and_then(|rest| rest.strip_suffix('>'))
+                        {
+                            seen.lock().unwrap().push(id.to_string());
+                            match articles.get(id) {
+                                Some(body) => {
+                                    let stream = reader.get_mut();
+                                    stream.write_all(b"220 article follows\r\n").await.ok();
+                                    stream.write_all(body).await.ok();
+                                    stream.write_all(b".\r\n").await.ok();
+                                }
+                                None => {
+                                    reader
+                                        .get_mut()
+                                        .write_all(b"430 no such article\r\n")
+                                        .await
+                                        .ok();
+                                }
+                            }
+                        } else if command.starts_with("QUIT") {
+                            reader.get_mut().write_all(b"205 bye\r\n").await.ok();
+                            break;
+                        } else {
+                            reader
+                                .get_mut()
+                                .write_all(b"500 unknown command\r\n")
+                                .await
+                                .ok();
+                        }
+                    }
+                });
+            }
+        });
+        (port, requested)
+    }
+
+    struct Par2Scenario {
+        task: DownloadTask,
+        options: Map<String, Value>,
+        articles: HashMap<String, Vec<u8>>,
+        index_bytes: u64,
+        volume_bytes: u64,
+    }
+
+    fn par2_scenario(dir: &Path, lose_second_half: bool, port_hint: u16) -> Par2Scenario {
+        let parity = tempfile::tempdir().unwrap();
+        let data = b"ABCDEFGH";
+        let parity_files =
+            crate::engine::usenet_par2::tests::write_fixture(parity.path(), "data.bin", data, true);
+        let index = fs::read(&parity_files[0]).unwrap();
+        let volume = fs::read(&parity_files[1]).unwrap();
+        let mut articles = HashMap::new();
+        articles.insert(
+            "data-1@t".to_string(),
+            yenc_article("data.bin", &data[..4], Some((1, 4, 8))),
+        );
+        if !lose_second_half {
+            articles.insert(
+                "data-2@t".to_string(),
+                yenc_article("data.bin", &data[4..], Some((5, 8, 8))),
+            );
+        }
+        articles.insert(
+            "index-1@t".to_string(),
+            yenc_article("sample.par2", &index, None),
+        );
+        articles.insert(
+            "volume-1@t".to_string(),
+            yenc_article("sample.vol00+1.par2", &volume, None),
+        );
+        let file = |name: &str, segments: &[(u32, u64, &str)]| UsenetTaskFile {
+            name: name.into(),
+            subject: name.into(),
+            groups: Vec::new(),
+            segments: segments
+                .iter()
+                .map(|(number, bytes, id)| UsenetTaskSegment {
+                    number: *number,
+                    bytes: *bytes,
+                    message_id: (*id).into(),
+                })
+                .collect(),
+        };
+        let metadata = UsenetTaskData {
+            files: vec![
+                file("data.bin", &[(1, 4, "data-1@t"), (2, 4, "data-2@t")]),
+                file("sample.par2", &[(1, index.len() as u64, "index-1@t")]),
+                file(
+                    "sample.vol00+1.par2",
+                    &[(1, volume.len() as u64, "volume-1@t")],
+                ),
+            ],
+            ..Default::default()
+        };
+        let task = DownloadTask {
+            dir: dir.to_string_lossy().into_owned(),
+            usenet: Some(metadata),
+            ..Default::default()
+        };
+        let mut options = Map::new();
+        options.insert(
+            "usenet-profiles".into(),
+            serde_json::to_value(vec![profile("primary", port_hint, 0)]).unwrap(),
+        );
+        Par2Scenario {
+            task,
+            options,
+            articles,
+            index_bytes: index.len() as u64,
+            volume_bytes: volume.len() as u64,
+        }
+    }
+
+    async fn run_scenario(
+        lose_second_half: bool,
+    ) -> (
+        Result<(PathBuf, Vec<(usize, PathBuf)>), UsenetDownloadError>,
+        Vec<String>,
+        u64,
+        tempfile::TempDir,
+        Par2Scenario,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scenario = par2_scenario(dir.path(), lose_second_half, 0);
+        let (port, requested) = spawn_article_server(scenario.articles.clone()).await;
+        scenario.options.insert(
+            "usenet-profiles".into(),
+            serde_json::to_value(vec![profile("primary", port, 0)]).unwrap(),
+        );
+        let completed = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let result = timeout(
+            Duration::from_secs(20),
+            run_usenet_download_with_resolver_and_capacity(
+                &scenario.task,
+                &scenario.options,
+                completed,
+                total.clone(),
+                CancellationToken::new(),
+                Arc::new(AnonymousCredentialResolver),
+                Arc::new(ProviderConnectionCapacityRegistry::default()),
+                Throttle::unlimited(),
+                None,
+            ),
+        )
+        .await
+        .expect("usenet run timed out");
+        let requested = requested.lock().unwrap().clone();
+        (
+            result,
+            requested,
+            total.load(Ordering::Relaxed),
+            dir,
+            scenario,
+        )
+    }
+
+    #[tokio::test]
+    async fn undamaged_downloads_never_request_recovery_volumes() {
+        let (result, requested, total, dir, scenario) = run_scenario(false).await;
+        let (_, outputs) = result.unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(
+            !requested.iter().any(|id| id == "volume-1@t"),
+            "{requested:?}"
+        );
+        assert_eq!(total, 8 + scenario.index_bytes);
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), b"ABCDEFGH");
+        assert!(!dir.path().join("sample.vol00+1.par2").exists());
+        assert_eq!(outputs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn damage_fetches_the_recovery_volume_and_counts_it_once_requested() {
+        let (result, requested, total, dir, scenario) = run_scenario(true).await;
+        result.unwrap_or_else(|error| panic!("{error}"));
+
+        assert!(
+            requested.iter().any(|id| id == "volume-1@t"),
+            "{requested:?}"
+        );
+        assert_eq!(total, 8 + scenario.index_bytes + scenario.volume_bytes);
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), b"ABCDEFGH");
     }
 }

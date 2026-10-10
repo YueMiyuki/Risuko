@@ -8,7 +8,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 
-/** Single logcat tag for the whole plugin: `adb logcat -s RWebViewUpgrade` */
 internal const val LOG_TAG = "RWebViewUpgrade"
 
 private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
@@ -31,7 +30,6 @@ internal fun isMainProcess(context: Context): Boolean {
     return true
 }
 
-/** Possible webview provider */
 internal val CANDIDATE_PACKAGES = listOf(
     "com.google.android.webview",
     "com.android.webview",

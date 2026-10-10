@@ -1,5 +1,3 @@
-//! Streaming content hashers for download verification: accepts either `checksum=<algo>:<hex>` (single whole-file digest) or `piece-checksums=<algo>:<hex>,<hex>...` (Metalink-style per-piece); supports `sha-256`/`sha256`, `sha-1`/`sha1`, `md5` matched case-insensitively after stripping `-`, and `Hasher` is a small enum dispatch (no `dyn`) so worker hot paths don't pay a vtable cost per chunk
-
 use md5::Md5;
 use sha1::Sha1;
 use sha2::digest::Digest;
@@ -40,7 +38,6 @@ impl Algo {
     }
 }
 
-/// Streaming hasher; `update` accepts byte slices and `finalize_hex` consumes the state, returning the lower-case hex digest
 pub enum Hasher {
     Sha256(Sha256),
     Sha1(Sha1),
@@ -73,7 +70,6 @@ impl Hasher {
     }
 }
 
-/// Parsed `checksum=<algo>:<hex>` value
 #[derive(Debug, Clone)]
 pub struct WholeChecksum {
     pub algo: Algo,
@@ -82,7 +78,6 @@ pub struct WholeChecksum {
 
 impl WholeChecksum {
     pub fn parse(s: &str) -> Result<Self, String> {
-        // Strip a leading `checksum=` prefix (aria2 style) before splitting on `:`, otherwise `checksum=sha-256:hex` parses as algo "checksum=sha-256" and is rejected
         let body = s
             .trim()
             .strip_prefix("checksum=")
@@ -109,12 +104,10 @@ impl WholeChecksum {
     }
 
     pub fn matches(&self, computed_hex: &str) -> bool {
-        // Case-insensitive compare; lengths validated in `parse`. Not constant-time, but checksum verification isn't a credential check so timing leaks are irrelevant
         self.hex.eq_ignore_ascii_case(computed_hex)
     }
 }
 
-/// Parsed `piece-checksums=<algo>:<hex>,<hex>...` value
 #[derive(Debug, Clone)]
 pub struct PieceChecksums {
     pub algo: Algo,
@@ -123,7 +116,6 @@ pub struct PieceChecksums {
 
 impl PieceChecksums {
     pub fn parse(s: &str) -> Result<Self, String> {
-        // Strip optional `piece-checksums=` prefix before splitting on `:`, else the whole chunk is mistaken for the algorithm name and rejected
         let body = s
             .trim()
             .strip_prefix("piece-checksums=")

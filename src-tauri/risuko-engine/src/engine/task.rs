@@ -105,7 +105,6 @@ pub struct UsenetRepairFailure {
     pub partials_retained: bool,
 }
 
-/// Live Kad source-discovery state for an ED2K task; diagnostic metadata only, not affecting download completion semantics
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ed2kKadTaskStatus {
@@ -173,6 +172,8 @@ pub struct PeerInfo {
     pub optimistic_unchoke: bool,
     #[serde(default)]
     pub bitfield: String,
+    #[serde(skip)]
+    pub raw_bitfield: std::sync::Arc<[u8]>,
 }
 
 #[derive(Clone, Default)]
@@ -202,19 +203,16 @@ pub struct DownloadTask {
     pub options: Map<String, Value>,
     #[serde(default)]
     pub tag: Option<String>,
-    /// Non-secret NZB manifest metadata and provider profile reference
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usenet: Option<UsenetTaskData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usenet_stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usenet_warning: Option<String>,
-    /// Non-secret details for an insufficient PAR2 recovery set
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usenet_repair_failure: Option<UsenetRepairFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ed2k_kad: Option<Ed2kKadTaskStatus>,
-    // BitTorrent
     pub info_hash: Option<String>,
     #[serde(default)]
     pub info_hash_v2: Option<String>,
@@ -223,6 +221,7 @@ pub struct DownloadTask {
     pub bt_name: Option<String>,
     pub seeder: bool,
     pub num_seeders: u32,
+    #[serde(skip)]
     pub peers: Vec<PeerInfo>,
     #[serde(default)]
     pub piece_length: u32,
@@ -243,6 +242,10 @@ pub struct DownloadTask {
     pub schedule_missed: bool,
     #[serde(skip, default)]
     pub chunk_progress: Vec<ChunkProgress>,
+    #[serde(skip, default)]
+    pub bt_files_cache: Option<(u64, bool)>,
+    #[serde(skip, default)]
+    pub bt_peers_key: Option<(u64, u32)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -260,7 +263,6 @@ pub struct TaskPatch {
     pub options: Option<Map<String, Value>>,
 }
 
-/// Result of applying a [`TaskPatch`]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTaskOutcome {
@@ -283,7 +285,6 @@ impl DownloadTask {
             .unwrap_or("")
             .to_string();
 
-        // Build initial file entry so the frontend can extract the task name from URIs
         let initial_files = if !uris.is_empty() {
             let file_uris: Vec<FileUri> = uris
                 .iter()
@@ -292,7 +293,6 @@ impl DownloadTask {
                     status: "waiting".to_string(),
                 })
                 .collect();
-            // Derive initial path from output name or first URI, stripping any .part suffix so the UI shows the final name
             let display_out = out.strip_suffix(".part").unwrap_or(&out);
             let initial_path = if !display_out.is_empty() {
                 format!("{}/{}", dir, display_out)
@@ -587,7 +587,6 @@ impl DownloadTask {
         }
     }
 
-    /// Generic constructor for the legacy P2P/IPC protocols (ADC, Gnutella, G2, giFT), which share one shape: a single URI, an inferred output filename, and no protocol-specific top-level fields beyond the URI
     pub fn new_simple_protocol(
         gid: String,
         kind: TaskKind,
@@ -639,26 +638,24 @@ impl DownloadTask {
         }
     }
 
-    /// Build status response for `tellStatus`
     pub fn to_rpc_status(&self, keys: &[String]) -> Value {
         let full = self.to_full_rpc_status(keys);
         if keys.is_empty() {
             return full;
         }
-        let Value::Object(map) = full else {
+        let Value::Object(mut map) = full else {
             return full;
         };
         let mut filtered = Map::new();
         for key in keys {
-            if let Some(val) = map.get(key) {
-                filtered.insert(key.clone(), val.clone());
+            if let Some(val) = map.remove(key) {
+                filtered.insert(key.clone(), val);
             }
         }
         Value::Object(filtered)
     }
 
     fn to_full_rpc_status(&self, keys: &[String]) -> Value {
-        // Skip serializing large `files` arrays when a non-empty key filter does not request them
         let want_files = keys.is_empty() || keys.iter().any(|k| k == "files");
         let mut m = Map::new();
         m.insert("gid".into(), Value::String(self.gid.clone()));
@@ -666,7 +663,6 @@ impl DownloadTask {
             "status".into(),
             Value::String(self.status.as_str().to_string()),
         );
-        // Lowercase task kind (http/ftp/torrent/ed2k/m3u8/media/adc/gnutella/g2/gift), surfacing the protocol family so the frontend's policy decisions (e.g. skipping peer-swarm tasks from low-speed pause/resume recovery) don't infer it from optional sentinel fields
         if let Ok(Value::String(kind)) = serde_json::to_value(self.kind) {
             m.insert("kind".into(), Value::String(kind));
         }
@@ -725,7 +721,6 @@ impl DownloadTask {
             m.insert("scheduleMissed".into(), Value::Bool(true));
         }
 
-        // BitTorrent fields
         if self.kind == TaskKind::Torrent {
             let mut bt = Map::new();
             if let Some(ref hash) = self.info_hash {
@@ -743,13 +738,16 @@ impl DownloadTask {
             if let Some(ref name) = self.bt_name {
                 let mut info = Map::new();
                 info.insert("name".into(), Value::String(name.clone()));
+                let dir_name = super::torrent::disk_component(name);
+                if dir_name != *name {
+                    info.insert("dirName".into(), Value::String(dir_name));
+                }
                 bt.insert("info".into(), Value::Object(info));
             }
             if let Some(ref c) = self.bt_comment {
                 bt.insert("comment".into(), Value::String(c.clone()));
             }
             if let Some(ts) = self.bt_creation_date {
-                // Frontend formats with `localeDateTimeFormat`, which expects a unix epoch in seconds; pass as JSON number for clarity
                 bt.insert("creationDate".into(), Value::from(ts));
             }
             if !self.bt_announce_list.is_empty() {
@@ -785,7 +783,6 @@ impl DownloadTask {
             }
         }
 
-        // ed2k fields
         if self.kind == TaskKind::Ed2k {
             if let Some(uri) = self.uris.first() {
                 m.insert("ed2kLink".into(), Value::String(uri.clone()));
@@ -802,7 +799,6 @@ impl DownloadTask {
             }
         }
 
-        // m3u8 fields
         if self.kind == TaskKind::M3u8 {
             if let Some(uri) = self.uris.first() {
                 m.insert("m3u8Link".into(), Value::String(uri.clone()));
@@ -839,7 +835,6 @@ impl DownloadTask {
             }
         }
 
-        // Per-chunk progress for multi-thread HTTP downloads
         if !self.chunk_progress.is_empty() {
             let chunks: Vec<Value> = self
                 .chunk_progress
@@ -872,8 +867,6 @@ use crate::engine::util::now_ms;
 mod tests {
     use super::*;
     use serde_json::{json, Map};
-
-    // -- generate_gid --
 
     #[test]
     fn gid_is_16_hex_chars() {
@@ -912,6 +905,7 @@ mod tests {
             handshaking: false,
             optimistic_unchoke: true,
             bitfield: "ff00".into(),
+            raw_bitfield: std::sync::Arc::from([].as_slice()),
         };
         let value = serde_json::to_value(&peer).unwrap();
         assert_eq!(value["peerId"], "%2DRS0001%2D0123456789ab");
@@ -930,8 +924,6 @@ mod tests {
         assert_eq!(value["bitfield"], "ff00");
         assert_eq!(value["amChoking"], "true");
     }
-
-    // -- TaskStatus --
 
     #[test]
     fn status_as_str() {
@@ -960,8 +952,6 @@ mod tests {
         assert_eq!(format!("{}", TaskStatus::Complete), "complete");
     }
 
-    // -- DownloadTask constructors --
-
     #[test]
     fn new_http_basic() {
         let opts = Map::new();
@@ -986,7 +976,6 @@ mod tests {
         let task = DownloadTask::new_http("gid1".into(), uris, "/dl".into(), None, opts);
 
         assert_eq!(task.out, "file.zip.part");
-        // Display path should have .part stripped
         assert_eq!(task.files[0].path, "/dl/file.zip");
     }
 
@@ -1187,8 +1176,6 @@ mod tests {
         assert_eq!(restored.usenet_repair_failure, None);
     }
 
-    // -- to_rpc_status --
-
     #[test]
     fn rpc_status_all_keys() {
         let task = DownloadTask::new_http(
@@ -1313,7 +1300,6 @@ mod tests {
         let status = task.to_rpc_status(&[]);
         let obj = status.as_object().unwrap();
 
-        // Fields must appear at the top level
         assert_eq!(
             obj.get("infoHashV2").unwrap(),
             "deadbeef",
@@ -1325,7 +1311,6 @@ mod tests {
             "metaVersion must be present at RPC root"
         );
 
-        // Fields must also appear inside the nested bittorrent object
         let bt = obj.get("bittorrent").unwrap().as_object().unwrap();
         assert_eq!(
             bt.get("infoHashV2").unwrap(),
@@ -1387,8 +1372,6 @@ mod tests {
         assert_eq!(filtered.get("ed2kKad"), full.get("ed2kKad"));
     }
 
-    // -- new_media --
-
     #[test]
     fn new_media_with_out() {
         let mut opts = Map::new();
@@ -1413,7 +1396,6 @@ mod tests {
         assert_eq!(task.kind, TaskKind::Media);
         assert_eq!(task.status, TaskStatus::Waiting);
         assert_eq!(task.uris, vec![uri.clone()]);
-        // When no out is given, initial path falls back to the URI itself
         assert_eq!(task.files[0].path, uri);
         assert_eq!(task.files[0].uris[0].status, "waiting");
     }

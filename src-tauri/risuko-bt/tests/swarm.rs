@@ -1,5 +1,3 @@
-//! End-to-end swarm test for the in-tree BitTorrent implementation Spins up two `Session`s sharing a 256 KiB random payload. The seeder pre-populates storage and we verify the leecher receives a byte-exact copy via direct peer connection (no tracker / DHT)
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use risuko_bt::core::hash::Id20;
 use risuko_bt::core::metainfo::{TorrentMeta, TorrentMetaInfo, ValidatedTorrentMetaV1Info};
+use risuko_bt::limiter::RateLimiter;
 use risuko_bt::session::{AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
 use sha1::{Digest, Sha1};
 
@@ -14,7 +13,6 @@ const PIECE_LEN: u32 = 64 * 1024;
 const TOTAL: u64 = 256 * 1024;
 
 fn make_payload() -> Vec<u8> {
-    // Deterministic non-trivial pattern: LCG output. Not uniform random, but each piece is distinct which is all we need
     let mut out = Vec::with_capacity(TOTAL as usize);
     let mut x: u32 = 0xDEADBEEF;
     for _ in 0..TOTAL {
@@ -46,7 +44,6 @@ fn build_meta(payload: &[u8]) -> TorrentMeta {
         }],
         single_file_mode: true,
     };
-    // Build a deterministic info-hash by SHA-1ing a concat of name+length+pieces — the value doesn't matter for peer-direct tests as long as both sessions agree. Handshake compares this byte-for-byte
     let mut h = Sha1::new();
     h.update(&info.name);
     h.update((info.files[0].length as u64).to_be_bytes());
@@ -61,9 +58,7 @@ fn build_meta(payload: &[u8]) -> TorrentMeta {
         bootstrap_nodes: Vec::new(),
         bootstrap_hosts: Vec::new(),
         comment: None,
-        created_by: None,
         creation_date: None,
-        encoding: None,
         info_hash: Id20::new(ih),
         info_v2: None,
         info_hash_v2: None,
@@ -88,7 +83,6 @@ async fn leecher_downloads_from_seeder() {
     let seed_dir = tempfile::tempdir().unwrap();
     let leech_dir = tempfile::tempdir().unwrap();
 
-    // Seed side: file is already on disk so scan_existing_pieces marks them
     write_payload(seed_dir.path(), &meta.info.name, &payload);
 
     let seed = Session::new_with_opts(
@@ -121,7 +115,6 @@ async fn leecher_downloads_from_seeder() {
     .await
     .unwrap();
 
-    // Add to seeder
     let _seed_handle = match seed
         .add_from_meta(meta.clone(), AddTorrentOptions::default())
         .await
@@ -131,7 +124,6 @@ async fn leecher_downloads_from_seeder() {
         _ => panic!("expected Added"),
     };
 
-    // Add to leecher
     let leech_handle = match leech
         .add_from_meta(meta.clone(), AddTorrentOptions::default())
         .await
@@ -141,14 +133,12 @@ async fn leecher_downloads_from_seeder() {
         _ => panic!("expected Added"),
     };
 
-    // Dial seeder from leecher
     let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
     leech
         .add_peer(meta.info_hash, seed_addr)
         .await
         .expect("add peer");
 
-    // Poll for completion
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let s = leech_handle.stats();
@@ -166,7 +156,99 @@ async fn leecher_downloads_from_seeder() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Verify byte equality
+    let got = std::fs::read(leech_dir.path().join(&meta.info.name)).unwrap();
+    assert_eq!(got.len(), payload.len(), "length mismatch");
+    assert_eq!(got, payload, "payload mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_if_halted_leaves_a_healthy_torrent_running() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let payload = make_payload();
+    let meta = build_meta(&payload);
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+
+    write_payload(seed_dir.path(), &meta.info.name, &payload);
+
+    let seed = Session::new_with_opts(
+        seed_dir.path().to_path_buf(),
+        SessionOptions {
+            disable_dht: true,
+            listen: Some(risuko_bt::session::ListenerOptions {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let leech = Session::new_with_opts(
+        leech_dir.path().to_path_buf(),
+        SessionOptions {
+            disable_dht: true,
+            listen: Some(risuko_bt::session::ListenerOptions {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let _seed_handle = match seed
+        .add_from_meta(meta.clone(), AddTorrentOptions::default())
+        .await
+        .expect("seed add")
+    {
+        AddTorrentResponse::Added(_, h) => h,
+        _ => panic!("expected Added"),
+    };
+
+    let leech_handle = match leech
+        .add_from_meta(meta.clone(), AddTorrentOptions::default())
+        .await
+        .expect("leech add")
+    {
+        AddTorrentResponse::Added(_, h) => h,
+        _ => panic!("expected Added"),
+    };
+
+    leech
+        .pause_if_halted(&leech_handle)
+        .await
+        .expect("pause if halted");
+
+    let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+    leech
+        .add_peer(meta.info_hash, seed_addr)
+        .await
+        .expect("add peer");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let s = leech_handle.stats();
+        if s.finished {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "timed out: progress={} / {} bytes (peers={})",
+                s.progress_bytes,
+                s.total_bytes,
+                s.live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     let got = std::fs::read(leech_dir.path().join(&meta.info.name)).unwrap();
     assert_eq!(got.len(), payload.len(), "length mismatch");
     assert_eq!(got, payload, "payload mismatch");
@@ -189,11 +271,196 @@ async fn loopback_session(dir: &std::path::Path) -> std::sync::Arc<Session> {
     .unwrap()
 }
 
+async fn timed_transfer(
+    seed_opts: SessionOptions,
+    seed_add: AddTorrentOptions,
+    leech_add: AddTorrentOptions,
+    tweak: impl FnOnce(&Session, &Session, &risuko_bt::ManagedTorrent),
+) -> Duration {
+    let payload = make_payload();
+    let meta = build_meta(&payload);
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    write_payload(seed_dir.path(), &meta.info.name, &payload);
+
+    let seed = Session::new_with_opts(
+        seed_dir.path().to_path_buf(),
+        SessionOptions {
+            disable_dht: true,
+            listen: Some(risuko_bt::session::ListenerOptions {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            ..seed_opts
+        },
+    )
+    .await
+    .unwrap();
+    let leech = loopback_session(leech_dir.path()).await;
+    match seed.add_from_meta(meta.clone(), seed_add).await.unwrap() {
+        AddTorrentResponse::Added(..) => {}
+        _ => panic!("expected Added"),
+    }
+    let leech_handle = match leech.add_from_meta(meta.clone(), leech_add).await.unwrap() {
+        AddTorrentResponse::Added(_, h) => h,
+        _ => panic!("expected Added"),
+    };
+    let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+    let started = std::time::Instant::now();
+    leech.add_peer(meta.info_hash, seed_addr).await.unwrap();
+
+    let mut tweak = Some(tweak);
+    let deadline = started + Duration::from_secs(40);
+    while !leech_handle.stats().finished {
+        assert!(std::time::Instant::now() < deadline, "transfer timed out");
+        if started.elapsed() >= Duration::from_secs(1) {
+            if let Some(f) = tweak.take() {
+                f(&seed, &leech, &leech_handle);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = started.elapsed();
+    let got = std::fs::read(leech_dir.path().join(&meta.info.name)).unwrap();
+    assert_eq!(got, payload, "payload mismatch");
+    elapsed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_connection_budget_caps_live_peers() {
+    let payload = make_payload();
+    let meta = build_meta(&payload);
+    let mut seeds = Vec::new();
+    let mut seed_addrs = Vec::new();
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        write_payload(dir.path(), &meta.info.name, &payload);
+        let seed = loopback_session(dir.path()).await;
+        seed.add_from_meta(meta.clone(), AddTorrentOptions::default())
+            .await
+            .unwrap();
+        seed_addrs.push(
+            format!("127.0.0.1:{}", seed.listen_port())
+                .parse::<SocketAddr>()
+                .unwrap(),
+        );
+        seeds.push((dir, seed));
+    }
+
+    let leech_dir = tempfile::tempdir().unwrap();
+    let leech = Session::new_with_opts(
+        leech_dir.path().to_path_buf(),
+        SessionOptions {
+            disable_dht: true,
+            max_connections: Some(1),
+            listen: Some(risuko_bt::session::ListenerOptions {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let leech_handle = match leech
+        .add_from_meta(
+            meta.clone(),
+            AddTorrentOptions {
+                download_limit: 16 * 1024,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    {
+        AddTorrentResponse::Added(_, h) => h,
+        _ => panic!("expected Added"),
+    };
+    for addr in &seed_addrs {
+        leech.add_peer(meta.info_hash, *addr).await.unwrap();
+    }
+
+    let mut max_live = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let live = leech_handle
+            .stats()
+            .live
+            .map_or(0, |live| live.snapshot.peer_stats.live);
+        max_live = max_live.max(live);
+        assert!(live <= 1, "budget of 1 exceeded: {live} live peers");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(max_live, 1, "the single budgeted peer should connect");
+    drop(seeds);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_torrent_download_cap_paces_the_leecher() {
+    let elapsed = timed_transfer(
+        SessionOptions::default(),
+        AddTorrentOptions::default(),
+        AddTorrentOptions {
+            download_limit: 64 * 1024,
+            ..Default::default()
+        },
+        |_, _, _| {},
+    )
+    .await;
+    assert!(elapsed >= Duration::from_millis(1500), "took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_upload_cap_paces_the_seeder() {
+    let elapsed = timed_transfer(
+        SessionOptions {
+            upload_limiter: Some(std::sync::Arc::new(RateLimiter::new(64 * 1024))),
+            ..Default::default()
+        },
+        AddTorrentOptions::default(),
+        AddTorrentOptions::default(),
+        |_, _, _| {},
+    )
+    .await;
+    assert!(elapsed >= Duration::from_millis(1500), "took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn download_cap_can_be_lifted_while_running() {
+    let elapsed = timed_transfer(
+        SessionOptions::default(),
+        AddTorrentOptions::default(),
+        AddTorrentOptions {
+            download_limit: 8 * 1024,
+            ..Default::default()
+        },
+        |_, _, handle| handle.set_download_limit(0),
+    )
+    .await;
+    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_caps_can_be_lifted_while_running() {
+    let elapsed = timed_transfer(
+        SessionOptions {
+            upload_limiter: Some(std::sync::Arc::new(RateLimiter::new(8 * 1024))),
+            ..Default::default()
+        },
+        AddTorrentOptions::default(),
+        AddTorrentOptions::default(),
+        |seed, _, _| seed.set_upload_limit(0),
+    )
+    .await;
+    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leecher_downloads_only_selected_file() {
     let payload = make_payload();
     let mut meta = build_meta(&payload);
-    // Two piece-aligned files: first.bin = pieces 0-1, second.bin = pieces 2-3
     let half = payload.len() / 2;
     meta.info.single_file_mode = false;
     meta.info.name = "pair".to_string();
@@ -248,7 +515,7 @@ async fn leecher_downloads_only_selected_file() {
     }
     let stats = leech_handle.stats();
     assert_eq!(stats.left_bytes, 0);
-    assert_eq!(stats.file_progress, vec![0, (payload.len() - half) as u64]);
+    assert_eq!(*stats.file_progress, vec![0, (payload.len() - half) as u64]);
     let got = std::fs::read(leech_dir.path().join("second.bin")).unwrap();
     assert!(got == payload[half..], "selected file corrupted");
     assert!(
@@ -256,7 +523,6 @@ async fn leecher_downloads_only_selected_file() {
         "unselected file must not be created"
     );
 
-    // Selecting the other file on the running torrent resumes the download
     leech_handle.set_only_files(None).await.unwrap();
     assert!(!leech_handle.stats().finished);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -275,7 +541,6 @@ async fn leecher_downloads_only_selected_file() {
 async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
     let payload = make_payload();
     let mut meta = build_meta(&payload);
-    // a.bin ends mid-piece: piece 1 holds a.bin[64K..100K) and b.bin[0..28K)
     let split = 100 * 1024;
     meta.info.single_file_mode = false;
     meta.info.name = "pair".to_string();
@@ -335,7 +600,6 @@ async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
     let got = std::fs::read(leech_dir.path().join("b.bin")).unwrap();
     assert!(got == payload[split..]);
 
-    // Selecting a.bin later picks up the boundary bytes already downloaded
     leech_handle.set_only_files(None).await.unwrap();
     wait_finished("full download").await;
     let got = std::fs::read(leech_dir.path().join("a.bin")).unwrap();
@@ -345,12 +609,10 @@ async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
 
 #[test]
 fn sanity_bytes_type_exists() {
-    // Exercise the Bytes re-export so unused-import lints don't trip
     let _ = Bytes::from_static(b"");
     let _ = PathBuf::new();
 }
 
-/// BEP 52 (v2) pure-v2 swarm test
 mod v2 {
     use super::*;
     use risuko_bt::bencode::{encode_to_vec, Value};
@@ -371,7 +633,6 @@ mod v2 {
         out
     }
 
-    /// Compute the per-piece root (SHA-256 Merkle subtree over 16 KiB blocks, zero-padded to `blocks_per_piece`)
     fn piece_root(piece_bytes: &[u8], blocks_per_piece: u32) -> Id32 {
         let mut leaves: Vec<Id32> = piece_bytes
             .chunks(BLOCK_SIZE as usize)
@@ -388,7 +649,6 @@ mod v2 {
         }
     }
 
-    /// Build a real BEP 52 pure-v2 .torrent for a single-file payload. Returns (bencode_bytes, pieces_root, layer_bytes) so the test can assert the parsed `info_hash_v2` matches expectations
     fn build_pure_v2_torrent(name: &str, payload: &[u8]) -> Vec<u8> {
         let blocks_per_piece = V2_PIECE_LEN / BLOCK_SIZE;
         let pieces: Vec<Id32> = payload
@@ -405,7 +665,6 @@ mod v2 {
             layer_bytes.extend_from_slice(&r.0);
         }
 
-        // file tree: { name: { "": { length, pieces root } } }
         let file_leaf = Value::Dict(vec![(
             b"".to_vec(),
             Value::Dict(vec![
@@ -445,7 +704,6 @@ mod v2 {
         let seed_dir = tempfile::tempdir().unwrap();
         let leech_dir = tempfile::tempdir().unwrap();
 
-        // Seed-side payload pre-populated; scan_existing_pieces will mark it local via the V2Merkle verifier
         write_payload(seed_dir.path(), &meta.info.name, &payload);
 
         let seed = Session::new_with_opts(
@@ -523,9 +781,6 @@ mod v2 {
         assert_eq!(got, payload, "v2 payload mismatch");
     }
 
-    // NOTE: an end-to-end pure-v2 magnet swarm test (leecher resolves `magnet:?xt=urn:btmh:...` against a risuko seeder) requires the seeder side to also serve the info dict over BEP 9 ut_metadata. risuko's torrent loop currently does not implement an ut_metadata responder (info dicts are loaded from the .torrent on both sides). Adding one is its own feature; in the meantime the BEP 52 piece- layer responder is exercised by the unit test `core::merkle::tests::full_piece_layer_serve_and_verify_round_trip` and by `torrent::tests::build_hash_response_serves_full_piece_layer`
-
-    /// End-to-end pure-v2 magnet test: 1. Build a real BEP 52 .torrent + payload, seed it from session A 2. Construct a pure-v2 magnet URI (`urn:btmh:1220<sha256>`) 3. Have session B resolve the magnet by dialing session A's listener directly. The resolver must: a. Receive the info dict via BEP-9 `ut_metadata` b. Receive every file's piece-layer rows via BEP 52 `HASH_REQUEST` / `Hashes` 4. Synthesize the .torrent bytes from the resolved info + piece layers, attach to session B, dial seeder, download to completion, and assert byte equality with the original payload Exercises the full pure-v2 magnet path: ut_metadata responder (added in this test's enabling commit), HASH_REQUEST responder, and the leecher's piece-layer fetcher
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pure_v2_magnet_leecher_resolves_and_downloads_from_seeder() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -567,7 +822,6 @@ mod v2 {
         let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
         let magnet_uri = format!("magnet:?xt=urn:btmh:1220{}", hex::encode(v2_hash.0));
 
-        // Resolve via direct peer dial (no tracker / DHT). This drives both ut_metadata fetch and BEP 52 piece-layer fetch through the seeder
         let resolved = risuko_bt::magnet::resolve_with_peers(
             &magnet_uri,
             &[],
@@ -583,7 +837,6 @@ mod v2 {
             "piece layers fetched from seeder"
         );
 
-        // Reconstruct a .torrent blob from the resolved pieces and parse
         let torrent_bytes = risuko_bt::magnet::synth_torrent_bytes(
             &resolved.info_bytes,
             &resolved.trackers,
@@ -682,10 +935,10 @@ mod v2 {
             advertise_dht: false,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await
         .unwrap();
-        // 16 blocks: two at index 4 need 3 uncles to reach the root
         peer.tx
             .send(PeerCommand::Send(Message::HashRequest {
                 pieces_root: root.0,
@@ -718,7 +971,6 @@ mod v2 {
             hashes[0],
             hash_block(&payload[4 * BLOCK_SIZE as usize..5 * BLOCK_SIZE as usize])
         );
-        // Even positions take their uncle on the right
         let mut node = hash_pair(&hashes[0], &hashes[1]);
         let mut position: u32 = 4 / 2;
         for uncle in &hashes[2..] {

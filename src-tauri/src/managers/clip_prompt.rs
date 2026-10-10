@@ -1,6 +1,7 @@
-//! Clipboard Watcher prompt
 #[cfg(not(target_os = "android"))]
-use tauri::{Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use super::panel_gate::ShowStep;
+#[cfg(not(target_os = "android"))]
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[cfg(not(target_os = "android"))]
 pub const CLIP_PROMPT_LABEL: &str = "clip-prompt";
@@ -11,9 +12,8 @@ const PROMPT_WIDTH: f64 = 384.0;
 const PROMPT_HEIGHT: f64 = 156.0;
 
 #[cfg(not(target_os = "android"))]
-pub fn setup_clip_prompt(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let handle = app.handle();
-    if handle.get_webview_window(CLIP_PROMPT_LABEL).is_some() {
+fn build_prompt(app: &AppHandle) -> Result<(), tauri::Error> {
+    if app.get_webview_window(CLIP_PROMPT_LABEL).is_some() {
         return Ok(());
     }
 
@@ -41,41 +41,92 @@ pub fn setup_clip_prompt(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(target_os = "android")]
-pub fn setup_clip_prompt(_app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    Ok(())
+#[cfg(not(target_os = "android"))]
+fn spawn_build(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let ok = match build_prompt(&app) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("[Risuko] failed to build clip-prompt window: {}", e);
+                false
+            }
+        };
+        if let Some(state) = app.try_state::<crate::state::AppState>() {
+            if let Ok(mut gate) = state.clip_gate.lock() {
+                gate.built(ok);
+            }
+        }
+    });
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn show_clip_prompt(app: &tauri::AppHandle, uri: &str) {
+pub fn show_clip_prompt(app: &AppHandle, uri: &str) {
+    let window = app.get_webview_window(CLIP_PROMPT_LABEL);
     #[cfg(target_os = "macos")]
     {
-        let already_open = app
-            .get_webview_window(CLIP_PROMPT_LABEL)
+        let already_open = window
+            .as_ref()
             .and_then(|w| w.is_visible().ok())
             .unwrap_or(false);
         if !already_open {
             prev_focus::remember();
         }
     }
-    if let Some(state) = app.try_state::<crate::state::AppState>() {
-        if let Ok(mut pending) = state.pending_clip_uri.lock() {
-            *pending = Some(uri.to_string());
-        }
-    }
-    let Some(window) = app.get_webview_window(CLIP_PROMPT_LABEL) else {
-        tracing::warn!("[Risuko] clip-prompt window not found");
+    let Some(state) = app.try_state::<crate::state::AppState>() else {
         return;
     };
-    position_prompt(app, &window);
+    if let Ok(mut pending) = state.pending_clip_uri.lock() {
+        *pending = Some(uri.to_string());
+    }
+    let step = {
+        let Ok(mut gate) = state.clip_gate.lock() else {
+            return;
+        };
+        gate.request_show(window.is_some())
+    };
+    match (step, window) {
+        (ShowStep::ShowNow, Some(window)) => present(app, &window, uri),
+        (ShowStep::Build, _) => spawn_build(app),
+        _ => {}
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn on_ready(app: &AppHandle) {
+    let Some(state) = app.try_state::<crate::state::AppState>() else {
+        return;
+    };
+    let want_show = state
+        .clip_gate
+        .lock()
+        .map(|mut gate| gate.page_ready())
+        .unwrap_or(false);
+    if !want_show {
+        return;
+    }
+    let uri = state.pending_clip_uri.lock().ok().and_then(|g| g.clone());
+    let (Some(uri), Some(window)) = (uri, app.get_webview_window(CLIP_PROMPT_LABEL)) else {
+        return;
+    };
+    present(app, &window, &uri);
+}
+
+#[cfg(not(target_os = "android"))]
+fn present(app: &AppHandle, window: &WebviewWindow, uri: &str) {
+    position_prompt(app, window);
     let _ = window.show();
     let _ = window.set_focus();
     let _ = window.emit("clip-prompt:show", uri.to_string());
 }
 
-/// Hide the prompt window
 #[cfg(not(target_os = "android"))]
-pub fn hide_clip_prompt(app: &tauri::AppHandle) {
+pub fn hide_clip_prompt(app: &AppHandle) {
+    if let Some(state) = app.try_state::<crate::state::AppState>() {
+        if let Ok(mut gate) = state.clip_gate.lock() {
+            gate.cancel_pending();
+        }
+    }
     if let Some(window) = app.get_webview_window(CLIP_PROMPT_LABEL) {
         #[cfg(target_os = "macos")]
         crate::managers::flyout::demote_if_ui_hidden(app);
@@ -92,7 +143,6 @@ pub fn restore_prev_focus() {
 mod prev_focus {
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    // pid of the app frontmost when the prompt opened (0 = none / we were front)
     static PREV_APP_PID: AtomicI32 = AtomicI32::new(0);
 
     pub fn remember() {
@@ -119,64 +169,6 @@ mod prev_focus {
 }
 
 #[cfg(not(target_os = "android"))]
-fn position_prompt(app: &tauri::AppHandle, window: &WebviewWindow) {
-    let anchor = app
-        .try_state::<crate::state::AppState>()
-        .and_then(|state| state.tray_anchor.lock().ok().and_then(|guard| *guard));
-
-    let (icon_x, icon_y, icon_w, icon_h) = match anchor {
-        Some(rect) => rect,
-        None => match app.cursor_position() {
-            Ok(pos) => (pos.x, pos.y, 0.0, 0.0),
-            Err(_) => (0.0, 0.0, 0.0, 0.0),
-        },
-    };
-
-    let icon_center_x = icon_x + icon_w / 2.0;
-    let icon_center_y = icon_y + icon_h / 2.0;
-
-    let monitor = app
-        .monitor_from_point(icon_center_x, icon_center_y)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten());
-
-    let Some(monitor) = monitor else {
-        let _ = window.set_position(PhysicalPosition::new(icon_x as i32, icon_y as i32));
-        return;
-    };
-
-    let scale = monitor.scale_factor();
-    let work = monitor.work_area();
-    let wa_x = work.position.x as f64;
-    let wa_y = work.position.y as f64;
-    let wa_w = work.size.width as f64;
-    let wa_h = work.size.height as f64;
-
-    let win_w = PROMPT_WIDTH * scale;
-    let win_h = PROMPT_HEIGHT * scale;
-
-    let in_top_half = icon_center_y < wa_y + wa_h / 2.0;
-    let mut y = if in_top_half {
-        icon_y + icon_h
-    } else {
-        icon_y - win_h
-    };
-
-    let mut x = icon_center_x - win_w / 2.0;
-
-    let max_x = wa_x + wa_w - win_w;
-    let max_y = wa_y + wa_h - win_h;
-    if x < wa_x {
-        x = wa_x;
-    } else if x > max_x {
-        x = max_x.max(wa_x);
-    }
-    if y < wa_y {
-        y = wa_y;
-    } else if y > max_y {
-        y = max_y.max(wa_y);
-    }
-
-    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+fn position_prompt(app: &AppHandle, window: &WebviewWindow) {
+    super::position_near_tray(app, window, PROMPT_WIDTH, PROMPT_HEIGHT);
 }

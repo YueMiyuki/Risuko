@@ -287,10 +287,13 @@ import { computed, ref, watch } from "vue";
 import api from "@/api";
 import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
 import { flushDownloadStatsMinute } from "@/store/task";
+import { bucketByTime, type TimeBucket } from "@/utils/downsample";
 
 defineOptions({ name: "StatsPage" });
 
 const TOP_PROTOCOL_COUNT = 5;
+const MAX_SPEED_POINTS = 1000;
+const SPEED_STEP_SECONDS = 60;
 const CHART_WIDTH = 760;
 const CHART_HEIGHT = 300;
 const CHART_PAD_X = 108;
@@ -403,6 +406,27 @@ const monthlyRows = computed(() => stats.value?.monthly || []);
 const protocolTotals = computed(() => stats.value?.protocolTotals || []);
 const monthCount = computed(() => monthlyRows.value.length);
 const speedPointCount = computed(() => stats.value?.speed.length || 0);
+const speedBuckets = computed(() =>
+	bucketByTime(
+		stats.value?.speed || [],
+		MAX_SPEED_POINTS,
+		SPEED_STEP_SECONDS,
+		(point) => point.minute,
+	),
+);
+const speedSpan = computed(() => {
+	const buckets = speedBuckets.value;
+	return buckets.length
+		? buckets[buckets.length - 1].time - buckets[0].time
+		: 0;
+});
+const speedX = (time: number) => {
+	const plotWidth = CHART_WIDTH - CHART_PAD_X - CHART_PAD_RIGHT;
+	const span = speedSpan.value;
+	return span > 0
+		? CHART_PAD_X + ((time - speedBuckets.value[0].time) / span) * plotWidth
+		: CHART_PAD_X;
+};
 const extraProtocolCount = computed(() =>
 	Math.max(0, protocolTotals.value.length - TOP_PROTOCOL_COUNT),
 );
@@ -508,8 +532,15 @@ const tableRows = computed(() =>
 );
 
 const speedMax = computed(() => {
-	const values = speedLines.value.flatMap((line) => line.values);
-	return Math.max(1, ...values);
+	let max = 1;
+	for (const line of speedLines.value) {
+		for (const value of line.values) {
+			if (value > max) {
+				max = value;
+			}
+		}
+	}
+	return max;
 });
 
 const speedTicks = computed(() => {
@@ -536,42 +567,56 @@ const formatTimeTick = (minute: number) => {
 };
 
 const speedXTicks = computed(() => {
-	const points = stats.value?.speed || [];
-	if (!points.length) {
+	const buckets = speedBuckets.value;
+	if (!buckets.length) {
 		return [];
 	}
-	const last = points.length - 1;
-	const indexes =
-		points.length < 4
-			? points.map((_, index) => index)
-			: [0, Math.floor(last / 3), Math.floor((last * 2) / 3), last];
-	const plotWidth = CHART_WIDTH - CHART_PAD_X - CHART_PAD_RIGHT;
-	return [...new Set(indexes)].map((index) => ({
-		minute: points[index].minute,
-		label: formatTimeTick(points[index].minute),
-		x: CHART_PAD_X + (last === 0 ? 0 : (index / last) * plotWidth),
+	const times =
+		buckets.length < 4
+			? buckets.map((bucket) => bucket.time)
+			: [0, 1, 2, 3].map(
+					(step) => buckets[0].time + (speedSpan.value * step) / 3,
+				);
+	return [...new Set(times)].map((time) => ({
+		minute: time,
+		label: formatTimeTick(Math.round(time)),
+		x: speedX(time),
 	}));
 });
 
-const pointValue = (
-	point: SpeedPoint,
-	protocol: string,
-	metric: SpeedMetric,
+const bucketPeaks = (
+	buckets: TimeBucket<SpeedPoint>[],
+	protocols: string[],
 ) => {
-	const protocols =
-		protocol === "overall"
-			? point.protocols
-			: point.protocols.filter((item) => item.protocol === protocol);
-	return protocols.reduce(
-		(sum, item) =>
-			sum +
-			Number(metric === "download" ? item.downloadSpeed : item.uploadSpeed),
-		0,
-	);
+	const slots = new Map(protocols.map((protocol, index) => [protocol, index]));
+	const overall = slots.get("overall");
+	const peaks = protocols.map(() => ({
+		download: new Array<number>(buckets.length).fill(0),
+		upload: new Array<number>(buckets.length).fill(0),
+	}));
+	const down = new Array<number>(protocols.length);
+	const up = new Array<number>(protocols.length);
+	buckets.forEach((bucket, index) => {
+		for (const point of bucket.items) {
+			down.fill(0);
+			up.fill(0);
+			for (const item of point.protocols) {
+				const slot = overall ?? slots.get(item.protocol);
+				if (slot !== undefined) {
+					down[slot] += Number(item.downloadSpeed);
+					up[slot] += Number(item.uploadSpeed);
+				}
+			}
+			peaks.forEach((peak, slot) => {
+				peak.download[index] = Math.max(peak.download[index], down[slot]);
+				peak.upload[index] = Math.max(peak.upload[index], up[slot]);
+			});
+		}
+	});
+	return peaks;
 };
 
-const makePath = (values: number[], max: number) => {
-	const plotWidth = CHART_WIDTH - CHART_PAD_X - CHART_PAD_RIGHT;
+const makePath = (values: number[], xs: number[], max: number) => {
 	const plotHeight = CHART_PLOT_HEIGHT;
 	const bottom = CHART_PLOT_BOTTOM;
 	if (values.length === 1) {
@@ -580,38 +625,46 @@ const makePath = (values: number[], max: number) => {
 	}
 	return values
 		.map((value, index) => {
-			const x = CHART_PAD_X + (index / (values.length - 1)) * plotWidth;
 			const y = bottom - (value / max) * plotHeight;
-			return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+			return `${index === 0 ? "M" : "L"} ${xs[index].toFixed(2)} ${y.toFixed(2)}`;
 		})
 		.join(" ");
 };
 
 const speedLines = computed<SpeedLine[]>(() => {
-	const points = stats.value?.speed || [];
-	if (!points.length) {
+	const buckets = speedBuckets.value;
+	if (!buckets.length) {
 		return [];
 	}
+	const xs = buckets.map((bucket) => speedX(bucket.time));
 
 	const protocols =
 		splitMode.value === "overall" ? ["overall"] : visibleProtocols.value;
 	const metrics: SpeedMetric[] =
 		seriesMode.value === "both" ? ["download", "upload"] : [seriesMode.value];
-	const raw = protocols.flatMap((protocol) =>
+	const peaks = bucketPeaks(buckets, protocols);
+	const raw = protocols.flatMap((protocol, slot) =>
 		metrics.map((metric) => ({
 			key: `${protocol}:${metric}`,
 			label: `${protocolLabel(protocol)} ${metric === "download" ? "Down" : "Up"}`,
 			metric,
 			protocol,
 			color: colorForSpeedLine(protocol, metric),
-			values: points.map((point) => pointValue(point, protocol, metric)),
+			values: peaks[slot][metric],
 			path: "",
 		})),
 	);
-	const max = Math.max(1, ...raw.flatMap((line) => line.values));
+	let max = 1;
+	for (const line of raw) {
+		for (const value of line.values) {
+			if (value > max) {
+				max = value;
+			}
+		}
+	}
 	return raw
 		.filter((line) => line.values.some((value) => value > 0))
-		.map((line) => ({ ...line, path: makePath(line.values, max) }));
+		.map((line) => ({ ...line, path: makePath(line.values, xs, max) }));
 });
 
 const speedTooltipStyle = computed(() => {
@@ -663,10 +716,28 @@ function clearSpeedHover() {
 	speedHover.value = null;
 }
 
+function nearestBucketIndex(time: number) {
+	const buckets = speedBuckets.value;
+	let low = 0;
+	let high = buckets.length - 1;
+	while (low < high) {
+		const mid = (low + high) >> 1;
+		if (buckets[mid].time < time) {
+			low = mid + 1;
+		} else {
+			high = mid;
+		}
+	}
+	if (low > 0 && time - buckets[low - 1].time <= buckets[low].time - time) {
+		return low - 1;
+	}
+	return low;
+}
+
 function onSpeedChartMove(event: MouseEvent) {
-	const points = stats.value?.speed || [];
+	const buckets = speedBuckets.value;
 	const lines = speedLines.value;
-	if (!points.length || !lines.length) {
+	if (!buckets.length || !lines.length) {
 		clearSpeedHover();
 		return;
 	}
@@ -686,7 +757,7 @@ function onSpeedChartMove(event: MouseEvent) {
 		Math.max(CHART_PAD_X, relX),
 	);
 	const ratio = plotWidth <= 0 ? 0 : (clamped - CHART_PAD_X) / plotWidth;
-	const index = Math.round(ratio * (points.length - 1));
+	const index = nearestBucketIndex(buckets[0].time + ratio * speedSpan.value);
 	const max = speedMax.value;
 	const bottom = CHART_PLOT_BOTTOM;
 	const hoverPoints = lines
@@ -703,10 +774,8 @@ function onSpeedChartMove(event: MouseEvent) {
 		.sort((a, b) => b.value - a.value);
 	speedHover.value = {
 		index,
-		x:
-			CHART_PAD_X +
-			(points.length === 1 ? 0 : (index / (points.length - 1)) * plotWidth),
-		label: formatTimeTick(points[index].minute),
+		x: speedX(buckets[index].time),
+		label: formatTimeTick(buckets[index].time),
 		points: hoverPoints,
 		clientX: event.clientX,
 		clientY: event.clientY,

@@ -1,15 +1,4 @@
 #!/usr/bin/env node
-/**
- * Remove regenerable build artifacts under src-tauri without wiping the
- * active desktop debug cache
- *
- * Usage:
- *   node scripts/clean-tauri.mjs              # desktop-friendly default
- *   node scripts/clean-tauri.mjs --dry-run    # show what would be removed
- *   node scripts/clean-tauri.mjs --full       # clean all shit
- *   node scripts/clean-tauri.mjs --android    # also drop Android Rust targets
- */
-
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -26,7 +15,6 @@ const withAndroidRust = args.has("--android") || args.has("--all");
 const withIncremental = args.has("--incremental") || args.has("--all");
 const skipGradle = args.has("--keep-gradle");
 
-/** @type {{ label: string; path: string; size: number }[]} */
 const removals = [];
 
 function dirSizeBytesRecursive(path) {
@@ -130,7 +118,6 @@ if (full) {
 	if (!skipGradle) queueGradleArtifacts();
 	if (withAndroidRust) queueCrossTargets();
 	else {
-		// Desktop preset still drops non-Android cross targets
 		queue(join(TARGET, "x86_64-pc-windows-msvc"), "target/x86_64-pc-windows-msvc");
 		queue(join(TARGET, "x86_64-unknown-linux-gnu"), "target/x86_64-unknown-linux-gnu");
 	}

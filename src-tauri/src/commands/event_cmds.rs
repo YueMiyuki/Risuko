@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Child, Command};
+use std::sync::Mutex;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 #[cfg(target_os = "windows")]
 use std::{
     ffi::c_void,
@@ -15,7 +18,17 @@ use tauri::AppHandle;
 #[cfg(not(target_os = "android"))]
 use tauri::Manager;
 
-#[tauri::command]
+#[cfg_attr(target_os = "android", allow(dead_code))]
+fn changed<T: PartialEq>(slot: &Mutex<Option<T>>, new: T) -> bool {
+    let mut last = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref() == Some(&new) {
+        return false;
+    }
+    *last = Some(new);
+    true
+}
+
+#[tauri::command(async)]
 pub fn on_download_status_change(
     downloading: bool,
     _state: tauri::State<'_, crate::state::AppState>,
@@ -63,12 +76,7 @@ pub fn on_speed_change(
             .unwrap_or_else(|| "Upload".to_string());
 
         if let Some(tray) = handle.tray_by_id("main") {
-            if !show_tray_speed {
-                let _ = tray.set_tooltip(Some(&app_name));
-                return Ok(());
-            }
-
-            let tooltip = if upload_speed > 0 || download_speed > 0 {
+            let tooltip = if show_tray_speed && (upload_speed > 0 || download_speed > 0) {
                 format!(
                     "{}\n{}: {}/s  {}: {}/s",
                     app_name,
@@ -78,9 +86,12 @@ pub fn on_speed_change(
                     crate::cli::progress::format_size(upload_speed)
                 )
             } else {
-                app_name.clone()
+                app_name
             };
-            let _ = tray.set_tooltip(Some(&tooltip));
+            static LAST_TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
+            if changed(&LAST_TOOLTIP, tooltip.clone()) {
+                let _ = tray.set_tooltip(Some(&tooltip));
+            }
         }
         Ok(())
     }
@@ -100,13 +111,16 @@ pub fn on_progress_change(
     #[cfg(not(target_os = "android"))]
     {
         if let Some(window) = handle.get_webview_window("main") {
-            let (status, prog) = if show_progress_bar && (0.0..=1.0).contains(&progress) {
-                (
-                    tauri::window::ProgressBarStatus::Normal,
-                    Some((progress * 100.0) as u64),
-                )
+            let prog = (show_progress_bar && (0.0..=1.0).contains(&progress))
+                .then_some((progress * 100.0) as u64);
+            static LAST_PROGRESS: Mutex<Option<Option<u64>>> = Mutex::new(None);
+            if !changed(&LAST_PROGRESS, prog) {
+                return Ok(());
+            }
+            let status = if prog.is_some() {
+                tauri::window::ProgressBarStatus::Normal
             } else {
-                (tauri::window::ProgressBarStatus::None, None)
+                tauri::window::ProgressBarStatus::None
             };
             let _ = window.set_progress_bar(tauri::window::ProgressBarState {
                 status: Some(status),
@@ -138,6 +152,13 @@ pub fn update_tray(
     #[cfg(not(target_os = "android"))]
     {
         if let Some(tray) = handle.tray_by_id("main") {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (&image_data, width, height).hash(&mut hasher);
+            static LAST_ICON: Mutex<Option<u64>> = Mutex::new(None);
+            if !changed(&LAST_ICON, hasher.finish()) {
+                return Ok(());
+            }
             let image = tauri::image::Image::new_owned(image_data, width, height);
             let _ = tray.set_icon_with_as_template(Some(image), true);
         }
@@ -162,34 +183,42 @@ pub fn update_app_menu_labels(
 }
 
 fn apply_download_inhibit(downloading: bool) {
-    #[cfg(target_os = "windows")]
-    {
-        windows_apply_download_inhibit(downloading);
+    static DESIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static APPLY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use std::sync::atomic::Ordering::SeqCst;
+    DESIRED.store(downloading, SeqCst);
+    let _guard = APPLY.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let want = DESIRED.load(SeqCst);
+        apply_download_inhibit_inner(want);
+        if DESIRED.load(SeqCst) == want {
+            break;
+        }
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        macos_apply_download_inhibit(downloading);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        linux_apply_download_inhibit(downloading);
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        let _ = downloading;
-    }
-
-    SLEEP_INHIBIT_ACTIVE.store(downloading, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether sleep is currently inhibited. Set by `apply_download_inhibit` on every platform; read by health checks via `sleep_inhibit_active()`
+fn apply_download_inhibit_inner(downloading: bool) {
+    #[cfg(target_os = "windows")]
+    let active = windows_apply_download_inhibit(downloading);
+
+    #[cfg(target_os = "macos")]
+    let active = macos_apply_download_inhibit(downloading);
+
+    #[cfg(target_os = "linux")]
+    let active = linux_apply_download_inhibit(downloading);
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let active = {
+        let _ = downloading;
+        false
+    };
+
+    SLEEP_INHIBIT_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
 static SLEEP_INHIBIT_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the app is inhibiting system sleep
 pub fn sleep_inhibit_active() -> bool {
     SLEEP_INHIBIT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -202,13 +231,11 @@ fn add_recent_document(path: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        // No stable Rust std API exists for app-scoped recent-docs registration on macOS Keep this a no-op for now to avoid opening files as a side effect
         let _ = path;
     }
 
     #[cfg(target_os = "linux")]
     {
-        // No API is available through std
         let _ = path;
     }
 
@@ -220,40 +247,69 @@ fn add_recent_document(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn macos_inhibit_slot() -> &'static Mutex<Option<Child>> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inhibit_child_slot() -> &'static Mutex<Option<Child>> {
     static SLOT: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(target_os = "macos")]
-fn clear_macos_inhibit_child(child_guard: &mut Option<Child>) {
-    if let Some(mut child) = child_guard.take() {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inhibit_child_running(slot: &mut Option<Child>) -> bool {
+    let running = match slot.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => return false,
+    };
+    if !running {
+        *slot = None;
+    }
+    running
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn clear_inhibit_child(slot: &mut Option<Child>) {
+    if let Some(mut child) = slot.take() {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: plain kill(2) on a pid we spawned; a stale pid only yields ESRCH
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_apply_download_inhibit(downloading: bool) {
-    let slot = macos_inhibit_slot();
-    let Ok(mut child_guard) = slot.lock() else {
-        return;
+fn caffeinate_args(pid: u32) -> Vec<String> {
+    vec!["-ims".into(), "-w".into(), pid.to_string()]
+}
+
+#[cfg(target_os = "macos")]
+fn macos_apply_download_inhibit(downloading: bool) -> bool {
+    let Ok(mut child_guard) = inhibit_child_slot().lock() else {
+        return false;
     };
 
-    if downloading {
-        if child_guard.is_none() {
-            match Command::new("caffeinate").args(["-ims"]).spawn() {
-                Ok(child) => {
-                    *child_guard = Some(child);
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to spawn caffeinate: {}", err);
-                }
-            }
+    if !downloading {
+        clear_inhibit_child(&mut child_guard);
+        return false;
+    }
+    if inhibit_child_running(&mut child_guard) {
+        return true;
+    }
+    match Command::new("caffeinate")
+        .args(caffeinate_args(std::process::id()))
+        .spawn()
+    {
+        Ok(child) => {
+            *child_guard = Some(child);
+            true
         }
-    } else {
-        clear_macos_inhibit_child(&mut child_guard);
+        Err(err) => {
+            tracing::warn!("Failed to spawn caffeinate: {}", err);
+            false
+        }
     }
 }
 
@@ -272,79 +328,133 @@ fn parse_dbus_uint32(output: &[u8]) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_apply_download_inhibit(downloading: bool) {
-    let slot = linux_inhibit_cookie_slot();
-    let Ok(mut cookie_guard) = slot.lock() else {
-        return;
+fn systemd_inhibit_args(pid: u32) -> Vec<String> {
+    [
+        "--what=sleep:idle",
+        "--who=Risuko",
+        "--why=Downloading active tasks",
+        "--mode=block",
+        "sh",
+        "-c",
+        "while kill -0 \"$0\" 2>/dev/null; do sleep 2; done",
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain(std::iter::once(pid.to_string()))
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+const DBUS_REPLY_TIMEOUT_MS: u32 = 3000;
+
+#[cfg(target_os = "linux")]
+fn screensaver_args(method: &str, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--session".to_string(),
+        "--dest=org.freedesktop.ScreenSaver".to_string(),
+        "--type=method_call".to_string(),
+        "--print-reply".to_string(),
+        format!("--reply-timeout={DBUS_REPLY_TIMEOUT_MS}"),
+        "/org/freedesktop/ScreenSaver".to_string(),
+        format!("org.freedesktop.ScreenSaver.{method}"),
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_logind_inhibit() -> Option<Child> {
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new("systemd-inhibit")
+        .args(systemd_inhibit_args(std::process::id()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    if matches!(child.try_wait(), Ok(None)) {
+        Some(child)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn screensaver_inhibit(cookie_guard: &mut Option<u32>) -> bool {
+    let extra = [
+        "string:Risuko".to_string(),
+        "string:Downloading active tasks".to_string(),
+    ];
+    match Command::new("dbus-send")
+        .args(screensaver_args("Inhibit", &extra))
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            if let Some(cookie) = parse_dbus_uint32(&output.stdout) {
+                *cookie_guard = Some(cookie);
+                true
+            } else {
+                tracing::warn!("Failed to parse DBus inhibit cookie from response");
+                false
+            }
+        }
+        Ok(output) => {
+            tracing::warn!(
+                "DBus Inhibit call failed with status {:?}",
+                output.status.code()
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!("Failed to invoke DBus Inhibit call: {}", err);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_apply_download_inhibit(downloading: bool) -> bool {
+    let (Ok(mut child_guard), Ok(mut cookie_guard)) = (
+        inhibit_child_slot().lock(),
+        linux_inhibit_cookie_slot().lock(),
+    ) else {
+        return false;
     };
 
     if downloading {
-        if cookie_guard.is_none() {
-            match Command::new("dbus-send")
-                .args([
-                    "--session",
-                    "--dest=org.freedesktop.ScreenSaver",
-                    "--type=method_call",
-                    "--print-reply",
-                    "/org/freedesktop/ScreenSaver",
-                    "org.freedesktop.ScreenSaver.Inhibit",
-                    "string:Risuko",
-                    "string:Downloading active tasks",
-                ])
-                .output()
-            {
-                Ok(output) => {
-                    if output.status.success() {
-                        if let Some(cookie) = parse_dbus_uint32(&output.stdout) {
-                            *cookie_guard = Some(cookie);
-                        } else {
-                            tracing::warn!("Failed to parse DBus inhibit cookie from response");
-                        }
-                    } else {
-                        tracing::warn!(
-                            "DBus Inhibit call failed with status {:?}",
-                            output.status.code()
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to invoke DBus Inhibit call: {}", err);
-                }
-            }
+        if inhibit_child_running(&mut child_guard) || cookie_guard.is_some() {
+            return true;
         }
-    } else if let Some(cookie) = cookie_guard.as_ref().copied() {
+        if let Some(child) = spawn_logind_inhibit() {
+            *child_guard = Some(child);
+            return true;
+        }
+        return screensaver_inhibit(&mut cookie_guard);
+    }
+
+    clear_inhibit_child(&mut child_guard);
+    if let Some(cookie) = cookie_guard.take() {
+        let extra = [format!("uint32:{cookie}")];
         match Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.freedesktop.ScreenSaver",
-                "--type=method_call",
-                "--print-reply",
-                "/org/freedesktop/ScreenSaver",
-                "org.freedesktop.ScreenSaver.UnInhibit",
-                &format!("uint32:{cookie}"),
-            ])
+            .args(screensaver_args("UnInhibit", &extra))
             .output()
         {
-            Ok(output) => {
-                if output.status.success() {
-                    *cookie_guard = None;
-                } else {
-                    tracing::warn!(
-                        "DBus UnInhibit call failed with status {:?}, keeping cookie {} for retry",
-                        output.status.code(),
-                        cookie
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to invoke DBus UnInhibit call, keeping cookie {} for retry: {}",
-                    cookie,
-                    err
-                );
-            }
+            Ok(output) if output.status.success() => {}
+            Ok(output) => tracing::warn!(
+                "DBus UnInhibit call failed with status {:?} for cookie {}",
+                output.status.code(),
+                cookie
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to invoke DBus UnInhibit call for cookie {}: {}",
+                cookie,
+                err
+            ),
         }
     }
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -388,11 +498,13 @@ fn windows_inhibit_worker() -> &'static WindowsInhibitWorker {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_apply_download_inhibit(downloading: bool) {
+fn windows_apply_download_inhibit(downloading: bool) -> bool {
     let worker = windows_inhibit_worker();
     if let Err(err) = worker.tx.send(downloading) {
         tracing::warn!("Failed to update Windows sleep inhibit state: {}", err);
+        return false;
     }
+    downloading
 }
 
 pub fn cleanup_download_inhibit() {
@@ -403,10 +515,7 @@ pub fn cleanup_download_inhibit() {
 
     #[cfg(target_os = "macos")]
     {
-        let slot = macos_inhibit_slot();
-        if let Ok(mut child_guard) = slot.lock() {
-            clear_macos_inhibit_child(&mut child_guard);
-        }
+        macos_apply_download_inhibit(false);
     }
 
     #[cfg(target_os = "linux")]
@@ -417,7 +526,41 @@ pub fn cleanup_download_inhibit() {
 
 #[cfg(test)]
 mod tests {
+    use super::changed;
     use crate::cli::progress::format_size;
+    use std::sync::Mutex;
+
+    #[test]
+    fn changed_reports_only_new_values() {
+        let slot = Mutex::new(None);
+        assert!(changed(&slot, "a".to_string()));
+        assert!(!changed(&slot, "a".to_string()));
+        assert!(changed(&slot, "b".to_string()));
+        assert!(changed(&slot, "a".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caffeinate_is_tied_to_our_pid() {
+        let args = super::caffeinate_args(4242);
+        assert_eq!(args, ["-ims", "-w", "4242"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dbus_calls_carry_a_reply_timeout() {
+        let args = super::screensaver_args("UnInhibit", &["uint32:7".to_string()]);
+        assert!(args.iter().any(|a| a.starts_with("--reply-timeout=")));
+        assert_eq!(args.last().map(String::as_str), Some("uint32:7"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_inhibit_watches_our_pid() {
+        let args = super::systemd_inhibit_args(99);
+        assert_eq!(args.last().map(String::as_str), Some("99"));
+        assert!(args.contains(&"--what=sleep:idle".to_string()));
+    }
 
     #[test]
     fn format_size_bytes() {

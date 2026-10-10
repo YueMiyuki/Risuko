@@ -88,7 +88,6 @@ pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
             let app = tray.app_handle();
-            // Cache the tray icon rect from any positional event so the flyout can anchor near the tray even when opened from the menu item
             if let Some((rect, point)) = tray_event_rect(&event) {
                 let scale = app
                     .monitor_from_point(point.0, point.1)

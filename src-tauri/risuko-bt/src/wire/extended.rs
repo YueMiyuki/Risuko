@@ -1,5 +1,3 @@
-//! BEP-10 extension protocol: handshake dict + ut_metadata (BEP-9) and ut_pex (BEP-11) payloads; framed as `Message::Extended` where `ext_id == 0` is the extended-handshake and higher ids map to types negotiated via the handshake's `m` dict
-
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -47,14 +45,11 @@ pub struct ExtHandshake {
     pub port: Option<u16>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
-    /// `e`: prefers MSE-encrypted connections
     pub prefers_encryption: bool,
-    /// BEP 21 `upload_only`: the peer is a (partial) seed
     pub upload_only: bool,
 }
 
 impl ExtHandshake {
-    /// Build our outgoing extended handshake; caller supplies the message ids peers should use to send us each extension
     pub fn new_outgoing(ut_metadata_id: u8, ut_pex_id: u8, metadata_size: Option<u64>) -> Self {
         let mut supported = HashMap::new();
         supported.insert(EXT_NAME_UT_METADATA.to_vec(), ut_metadata_id);
@@ -73,13 +68,11 @@ impl ExtHandshake {
         }
     }
 
-    /// Advertise `e: 1` when our policy prefers MSE
     pub fn with_encryption_preference(mut self, prefers: bool) -> Self {
         self.prefers_encryption = prefers;
         self
     }
 
-    /// Set `yourip` to the peer's address (compact-encoded on the wire); builder helper used by the connection layer per dial / accept
     pub fn with_yourip(mut self, ip: IpAddr) -> Self {
         self.yourip = Some(ip);
         self
@@ -96,11 +89,18 @@ impl ExtHandshake {
         self
     }
 
+    pub fn with_reqq(mut self, reqq: u32) -> Self {
+        self.reqq = Some(reqq);
+        self
+    }
+
+    #[cfg(test)]
     pub fn with_ipv4(mut self, addr: Ipv4Addr) -> Self {
         self.ipv4 = Some(addr);
         self
     }
 
+    #[cfg(test)]
     pub fn with_ipv6(mut self, addr: Ipv6Addr) -> Self {
         self.ipv6 = Some(addr);
         self
@@ -113,7 +113,6 @@ impl ExtHandshake {
             .map(|(k, v)| (k.clone(), Value::Int(*v as i64)))
             .collect();
         m_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        // Bencode dicts must be lexicographically sorted by key; `m`, `metadata_size`, `v`, `yourip` are distinct and pushed in that fixed sorted order
         let mut dict = vec![(b"m".to_vec(), Value::Dict(m_entries))];
         if self.prefers_encryption {
             dict.push((b"e".to_vec(), Value::Int(1)));
@@ -133,6 +132,9 @@ impl ExtHandshake {
                 IpAddr::V6(v6) => v6.octets().to_vec(),
             };
             dict.push((b"yourip".to_vec(), Value::Bytes(bytes)));
+        }
+        if let Some(reqq) = self.reqq {
+            dict.push((b"reqq".to_vec(), Value::Int(reqq as i64)));
         }
         if let Some(port) = self.port {
             dict.push((b"p".to_vec(), Value::Int(port as i64)));
@@ -154,7 +156,6 @@ impl ExtHandshake {
             if let Some(m_dict) = m.as_dict() {
                 for (k, v) in m_dict {
                     if let Some(id) = v.as_int() {
-                        // Extension ID 0 is reserved for the BEP-10 handshake itself and must not appear in the `m` dict
                         if (1..=255).contains(&id) {
                             supported.insert(k.clone(), id as u8);
                         }
@@ -241,7 +242,6 @@ impl ExtHandshake {
     }
 }
 
-/// Build a `ut_metadata` request for a given piece index
 pub fn ut_metadata_request(piece: i64) -> Bytes {
     let dict = Value::Dict(vec![
         (b"msg_type".to_vec(), Value::Int(ut_metadata_type::REQUEST)),
@@ -250,7 +250,6 @@ pub fn ut_metadata_request(piece: i64) -> Bytes {
     Bytes::from(encode_to_vec(&dict))
 }
 
-/// Build a `ut_metadata` data response
 pub fn ut_metadata_data(piece: i64, total_size: i64, block: &[u8]) -> Bytes {
     let header = Value::Dict(vec![
         (b"msg_type".to_vec(), Value::Int(ut_metadata_type::DATA)),
@@ -262,7 +261,6 @@ pub fn ut_metadata_data(piece: i64, total_size: i64, block: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
-/// Build a `ut_metadata` reject response (out-of-range pieces or when we cannot serve the request)
 pub fn ut_metadata_reject(piece: i64) -> Bytes {
     let dict = Value::Dict(vec![
         (b"msg_type".to_vec(), Value::Int(ut_metadata_type::REJECT)),
@@ -271,7 +269,6 @@ pub fn ut_metadata_reject(piece: i64) -> Bytes {
     Bytes::from(encode_to_vec(&dict))
 }
 
-/// Parse a `ut_metadata` message, returning the parsed header and any trailing data block (for DATA messages)
 pub struct UtMetadataMsg {
     pub msg_type: i64,
     pub piece: i64,
@@ -280,7 +277,6 @@ pub struct UtMetadataMsg {
 }
 
 pub fn parse_ut_metadata(payload: Bytes) -> Option<UtMetadataMsg> {
-    // ut_metadata carries a bencoded dict followed by raw data for DATA messages; we need how many bytes the dict consumed
     let mut p = decode_external(&payload, EXTENSION_DECODE_LIMITS).ok()?;
     let block = payload.slice(p.span.end..);
     let dict = match &mut p.value {
@@ -317,26 +313,33 @@ fn valid_pex_endpoint(addr: SocketAddr) -> bool {
     addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
 }
 
+fn decode_compact_addr(chunk: &[u8], v6: bool) -> Option<SocketAddr> {
+    let addr = if v6 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(chunk.get(..16)?);
+        SocketAddr::from((
+            std::net::Ipv6Addr::from(octets),
+            u16::from_be_bytes([*chunk.get(16)?, *chunk.get(17)?]),
+        ))
+    } else {
+        SocketAddr::from((
+            std::net::Ipv4Addr::new(
+                *chunk.first()?,
+                *chunk.get(1)?,
+                *chunk.get(2)?,
+                *chunk.get(3)?,
+            ),
+            u16::from_be_bytes([*chunk.get(4)?, *chunk.get(5)?]),
+        ))
+    };
+    valid_pex_endpoint(addr).then_some(addr)
+}
+
 fn parse_compact_pex(bytes: &[u8], v6: bool) -> Vec<SocketAddr> {
     let width = if v6 { 18 } else { 6 };
     bytes
         .chunks_exact(width)
-        .filter_map(|chunk| {
-            let addr = if v6 {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&chunk[..16]);
-                SocketAddr::from((
-                    std::net::Ipv6Addr::from(octets),
-                    u16::from_be_bytes([chunk[16], chunk[17]]),
-                ))
-            } else {
-                SocketAddr::from((
-                    std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
-                    u16::from_be_bytes([chunk[4], chunk[5]]),
-                ))
-            };
-            valid_pex_endpoint(addr).then_some(addr)
-        })
+        .filter_map(|chunk| decode_compact_addr(chunk, v6))
         .collect()
 }
 
@@ -351,20 +354,8 @@ fn parse_compact_pex_flagged(
         .chunks_exact(width)
         .enumerate()
         .filter_map(|(index, chunk)| {
-            let addr = if v6 {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&chunk[..16]);
-                SocketAddr::from((
-                    std::net::Ipv6Addr::from(octets),
-                    u16::from_be_bytes([chunk[16], chunk[17]]),
-                ))
-            } else {
-                SocketAddr::from((
-                    std::net::Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
-                    u16::from_be_bytes([chunk[4], chunk[5]]),
-                ))
-            };
-            valid_pex_endpoint(addr).then_some((addr, flags.get(index).copied().unwrap_or(0)))
+            decode_compact_addr(chunk, v6)
+                .map(|addr| (addr, flags.get(index).copied().unwrap_or(0)))
         })
         .take(remaining)
         .collect()
@@ -406,23 +397,6 @@ pub fn parse_ut_pex_full(payload: &[u8]) -> Option<UtPex> {
     Some(UtPex { added, dropped })
 }
 
-pub fn parse_ut_pex(
-    payload: &[u8],
-) -> Option<(Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>)> {
-    let pex = parse_ut_pex_full(payload)?;
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for (addr, _) in pex.added {
-        if addr.is_ipv4() {
-            v4.push(addr);
-        } else {
-            v6.push(addr);
-        }
-    }
-    Some((v4, v6))
-}
-
-/// Encode a BEP 11 message with each added contact's flags
 pub fn build_ut_pex(added: &[(SocketAddr, u8)], dropped: &[SocketAddr]) -> Bytes {
     fn split(addrs: &[SocketAddr]) -> (Vec<u8>, Vec<u8>) {
         let mut v4 = Vec::new();
@@ -476,7 +450,6 @@ pub fn build_ut_pex(added: &[(SocketAddr, u8)], dropped: &[SocketAddr]) -> Bytes
     Bytes::from(encode_to_vec(&Value::Dict(dict)))
 }
 
-/// A decoded BEP-55 ut_holepunch message
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HolepunchMsg {
     pub msg_type: u8,
@@ -509,7 +482,6 @@ pub fn build_holepunch(msg_type: u8, addr: SocketAddr, err_code: u32) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Decode a BEP-55 ut_holepunch message; `None` on a malformed/short payload or an unknown address family
 pub fn parse_holepunch(payload: &[u8]) -> Option<HolepunchMsg> {
     if payload.len() < 2 {
         return None;
@@ -566,9 +538,6 @@ mod tests {
         let v6a: SocketAddr = "[2001:db8::7]:51413".parse().unwrap();
         let gone: SocketAddr = "10.9.9.9:1000".parse().unwrap();
         let payload = build_ut_pex(&[(v4a, 0x11), (v6a, 0x06)], &[gone]);
-        let (v4, v6) = parse_ut_pex(&payload).unwrap();
-        assert_eq!(v4, vec![v4a]);
-        assert_eq!(v6, vec![v6a]);
         let full = parse_ut_pex_full(&payload).unwrap();
         assert_eq!(full.added, vec![(v4a, 0x11), (v6a, 0x06)]);
         assert_eq!(full.dropped, vec![gone]);
@@ -608,6 +577,15 @@ mod tests {
         assert_eq!(parsed.ut_pex_id(), Some(4));
         assert_eq!(parsed.metadata_size, Some(1024));
         assert!(parsed.client.is_some());
+    }
+
+    #[test]
+    fn outgoing_handshake_round_trips_reqq() {
+        let hs = ExtHandshake::new_outgoing(2, 1, None).with_reqq(512);
+        let parsed = ExtHandshake::decode(&hs.encode()).unwrap();
+        assert_eq!(parsed.reqq, Some(512));
+        let plain = ExtHandshake::new_outgoing(2, 1, None);
+        assert_eq!(ExtHandshake::decode(&plain.encode()).unwrap().reqq, None);
     }
 
     #[test]
@@ -689,7 +667,6 @@ mod tests {
         let bytes = out.encode();
         let parsed = ExtHandshake::decode(&bytes).unwrap();
         assert_eq!(parsed.ut_holepunch_id(), Some(5));
-        // Existing extensions remain advertised alongside it
         assert_eq!(parsed.ut_metadata_id(), Some(3));
         assert_eq!(parsed.ut_pex_id(), Some(4));
     }
@@ -726,7 +703,7 @@ mod tests {
     fn holepunch_error_carries_code() {
         let addr: SocketAddr = "198.51.100.9:1337".parse().unwrap();
         let bytes = build_holepunch(holepunch_type::ERROR, addr, holepunch_err::NO_SUCH_PEER);
-        assert_eq!(bytes.len(), 12); // ...+ err_code(4)
+        assert_eq!(bytes.len(), 12);
         let parsed = parse_holepunch(&bytes).unwrap();
         assert_eq!(parsed.msg_type, holepunch_type::ERROR);
         assert_eq!(parsed.addr, addr);
@@ -738,7 +715,6 @@ mod tests {
         assert!(parse_holepunch(&[]).is_none());
         assert!(parse_holepunch(&[holepunch_type::CONNECT]).is_none());
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 0, 1, 2, 3, 4]).is_none());
-        // unknown address family
         assert!(parse_holepunch(&[holepunch_type::CONNECT, 9, 1, 2, 3, 4, 0, 0]).is_none());
     }
 

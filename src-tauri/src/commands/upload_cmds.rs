@@ -1,6 +1,5 @@
-//! Tauri commands for cloud upload sinks; handler shape mirrors `rss_cmds` so the frontend wrapper layer stays consistent
-
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tauri::State;
 
 use risuko_engine::engine::upload::{SinkConfig, UploadRule, UploadSinkManager, UploadSinkRecord};
@@ -8,7 +7,6 @@ use risuko_engine::engine::upload::{SinkConfig, UploadRule, UploadSinkManager, U
 use crate::managers::vault::VaultManager;
 use crate::state::AppState;
 
-/// Extract a sink config's secret fields into a JSON object for keychain storage; `None` when no secret is set so callers can `remove()` instead of writing an empty object
 fn extract_sink_secrets(config: &SinkConfig) -> Option<Value> {
     let mut obj = serde_json::Map::new();
     match config {
@@ -43,7 +41,6 @@ fn extract_sink_secrets(config: &SinkConfig) -> Option<Value> {
     }
 }
 
-/// Apply keychain secrets onto a sink config, filling only fields currently empty so updating one secret doesn't wipe another left blank ("unchanged")
 fn apply_sink_secrets(config: &mut SinkConfig, secrets: &Value) {
     let obj = match secrets.as_object() {
         Some(o) => o,
@@ -97,14 +94,12 @@ fn apply_sink_secrets(config: &mut SinkConfig, secrets: &Value) {
     }
 }
 
-/// Fill blank secret fields from the vault (or local fallback when unavailable); mirrors the engine's `merge_secrets` (empty means "unchanged") so editing a sink without retyping the password keeps working
 async fn fill_from_vault(
     vault: &VaultManager,
     mgr: &UploadSinkManager,
     id: &str,
     config: &mut SinkConfig,
 ) {
-    // On `Ok(None)` or `Err(_)`, fall through to the durable local fallback so secrets written during a prior vault failure stay recoverable
     if vault.enabled() {
         match vault.get_sink(id) {
             Ok(Some(secrets)) => {
@@ -122,7 +117,6 @@ async fn fill_from_vault(
     }
 }
 
-/// Persist a record's secrets to the vault, or remove the entry when none is set; if the vault is disabled or errors, write to a durable fallback store in the upload manager so they survive restarts, logging (never blocking) failures since the engine still has the runtime value in memory
 async fn persist_sink_secrets(
     vault: &VaultManager,
     mgr: &UploadSinkManager,
@@ -134,7 +128,6 @@ async fn persist_sink_secrets(
             if vault.enabled() {
                 match vault.put_sink(id, &v) {
                     Ok(()) => {
-                        // Vault succeeded — clear any stale fallback entry
                         if let Err(e) = mgr.remove_sink_secret_fallback(id).await {
                             tracing::warn!("Failed to clear stale fallback for sink {id}: {e}");
                         }
@@ -164,22 +157,29 @@ async fn persist_sink_secrets(
     }
 }
 
-/// Rehydrate every loaded sink's secrets from the vault (or local fallback when unavailable); runs once at startup after the upload manager loads on-disk records, which omit secrets by design (`skip_serializing` on the protocol Configs)
-pub async fn rehydrate_upload_sinks(mgr: &UploadSinkManager, vault: &VaultManager) {
+pub async fn rehydrate_upload_sinks(mgr: &UploadSinkManager, vault: &Arc<VaultManager>) {
     let sinks = mgr.list_sinks().await;
     for mut record in sinks {
-        // Try vault first, but fall through to local fallback when it has no entry or errors, else secrets written during a prior vault outage would be unrecoverable
         let mut secrets: Option<Value> = None;
-        if vault.enabled() {
-            match vault.get_sink(&record.id) {
-                Ok(Some(v)) => secrets = Some(v),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load vault entry for sink {}: {e}, trying fallback",
-                        record.id
-                    );
-                }
+        let lookup = {
+            let vault = vault.clone();
+            let id = record.id.clone();
+            tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get_sink(&id))).await
+        };
+        match lookup {
+            Ok(Some(Ok(Some(v)))) => secrets = Some(v),
+            Ok(Some(Ok(None))) | Ok(None) => {}
+            Ok(Some(Err(e))) => {
+                tracing::warn!(
+                    "Failed to load vault entry for sink {}: {e}, trying fallback",
+                    record.id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Vault lookup for sink {} did not complete: {e}, trying fallback",
+                    record.id
+                );
             }
         }
         if secrets.is_none() {
@@ -193,8 +193,6 @@ pub async fn rehydrate_upload_sinks(mgr: &UploadSinkManager, vault: &VaultManage
         }
     }
 }
-
-// -- sinks
 
 #[tauri::command]
 pub async fn list_upload_sinks(state: State<'_, AppState>) -> Result<Value, String> {
@@ -222,7 +220,6 @@ pub async fn update_upload_sink(
 ) -> Result<(), String> {
     let mgr = state.upload_sinks.clone();
     let vault = state.vault.clone();
-    // Empty incoming secrets mean "unchanged"; fill from vault before the engine's own merge_secrets fallback runs against a disk copy that never held the secret
     fill_from_vault(&vault, &mgr, &record.id, &mut record.config).await;
     let id = record.id.clone();
     let config_for_vault = record.config.clone();
@@ -264,17 +261,6 @@ pub async fn set_default_upload_sink(
 }
 
 #[tauri::command]
-pub async fn set_upload_max_concurrency(
-    state: State<'_, AppState>,
-    n: usize,
-) -> Result<(), String> {
-    let mgr = state.upload_sinks.clone();
-    mgr.set_max_concurrency(n).await
-}
-
-// -- rules
-
-#[tauri::command]
 pub async fn list_upload_rules(state: State<'_, AppState>) -> Result<Value, String> {
     let mgr = state.upload_sinks.clone();
     let rules = mgr.list_rules().await;
@@ -305,8 +291,6 @@ pub async fn remove_upload_rule(state: State<'_, AppState>, id: String) -> Resul
     let mgr = state.upload_sinks.clone();
     mgr.remove_rule(&id).await
 }
-
-// -- jobs
 
 #[tauri::command]
 pub async fn list_upload_jobs(state: State<'_, AppState>) -> Result<Value, String> {
@@ -398,7 +382,6 @@ mod tests {
     #[test]
     fn apply_does_not_clobber_with_empty() {
         let mut cfg = sftp("existing", "");
-        // Empty fields in payload must NOT overwrite a value already typed
         let payload = serde_json::json!({"password": "", "privateKey": ""});
         apply_sink_secrets(&mut cfg, &payload);
         match cfg {
@@ -416,7 +399,7 @@ mod tests {
             password: String::new(),
             insecure: false,
         });
-        let payload = serde_json::json!({"privateKey": "x"}); // wrong field
+        let payload = serde_json::json!({"privateKey": "x"});
         apply_sink_secrets(&mut cfg, &payload);
         match cfg {
             SinkConfig::Webdav(c) => assert_eq!(c.password, ""),
@@ -424,7 +407,6 @@ mod tests {
         }
     }
 
-    /// Regression: when the vault is enabled but its read returns no entry (or errors), `fill_from_vault` must still consult the local fallback, else secrets written there during a prior vault outage become unrecoverable on the next edit
     #[tokio::test]
     async fn fill_from_vault_falls_back_when_vault_misses() {
         use risuko_engine::traits::{FileStorage, NoopEventSink};
@@ -436,12 +418,10 @@ mod tests {
         let event_sink: Arc<dyn risuko_engine::traits::EventSink> = Arc::new(NoopEventSink);
         let mgr = UploadSinkManager::new(storage, event_sink);
 
-        // Seed the manager's fallback store with a secret for an id the OS keychain cannot possibly know about (random uuid-ish suffix)
         let id = format!("test-sink-{}-{}", std::process::id(), uuid_like());
         let stored = json!({"password": "from-fallback", "privateKey": "pk"});
         mgr.put_sink_secret_fallback(&id, &stored).await.unwrap();
 
-        // Force the vault "enabled" without a real keychain probe; `vault.get_sink(&id)` then returns either Ok(None) (backend reachable, no entry) or Err(_) (no backend), both paths we want to confirm fall through to the fallback
         let vault = crate::managers::vault::VaultManager::for_test(true);
         assert!(vault.enabled());
 
@@ -456,7 +436,6 @@ mod tests {
         }
     }
 
-    /// Tiny helper: avoids pulling in the `uuid` crate just for a unique string in a single test
     fn uuid_like() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         format!(

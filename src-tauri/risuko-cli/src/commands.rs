@@ -1,13 +1,12 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
 use risuko_engine::config::defaults;
-use risuko_engine::engine::events::EventBroadcaster;
-use risuko_engine::engine::manager::TaskManager;
 use risuko_engine::engine::options::EngineOptions;
-use risuko_engine::engine::rpc::{RpcCompatMode, RpcServer};
+use risuko_engine::standalone::{
+    load_config, standalone_config_dir, StandaloneConfig, StandaloneEngine,
+};
 
 use crate::{
     ConfigAction, ConfigCommand, DownloadArgs, GidArgs, PauseArgs, RemoveArgs, ResumeArgs, RpcArgs,
@@ -31,7 +30,6 @@ fn resolve_rpc_host() -> String {
     read_options_from_config().rpc_host()
 }
 
-/// Read rpc-secret from the config files (user.json takes precedence over system.json), returning None if empty or absent
 fn read_secret_from_config() -> Option<String> {
     let secret = read_options_from_config().rpc_secret();
     if secret.is_empty() {
@@ -48,24 +46,35 @@ fn read_options_from_config() -> EngineOptions {
     EngineOptions::from_config(&system, &user)
 }
 
-// Download
-
 pub async fn download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
-    let client = rpc_client(args.rpc_port, secret.clone());
+    let mut client = rpc_client(args.rpc_port, secret.clone());
     let mut headless_engine = None;
 
-    if !client.is_engine_running().await {
+    let status = client.engine_status().await;
+    if let Some(problem) = status.problem() {
+        return Err(problem.into());
+    }
+    if !status.is_present() {
         eprintln!("No running Risuko instance found. Starting headless engine...");
-        // `start_headless_engine` waits for the RPC bind and task manager init, so no readiness sleep is needed
         let engine = start_headless_engine(args.rpc_port).await?;
+        if secret.is_none() {
+            client = rpc_client(args.rpc_port, engine.rpc_secret.clone());
+        }
         headless_engine = Some(engine);
     }
 
-    let result = do_download(&client, &args).await;
+    // Ctrl+C must still reach the shutdown below so an embedded engine saves its session
+    let result = tokio::select! {
+        r = do_download(&client, &args) => r,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nInterrupted");
+            Err("Interrupted".into())
+        }
+    };
 
     if let Some(engine) = headless_engine {
-        engine.shutdown().await;
+        engine.stop().await;
     }
 
     result
@@ -186,8 +195,6 @@ async fn do_download(
     progress::watch_download(client, &gid, args.json).await
 }
 
-// Status
-
 pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
     let client = rpc_client(args.rpc_port, secret);
@@ -242,8 +249,6 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-// Pause / Resume / Remove
-
 pub async fn pause(args: PauseArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
     let client = rpc_client(args.rpc_port, secret);
@@ -275,8 +280,6 @@ pub async fn remove(args: RemoveArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-// Pause All / Resume All
-
 pub async fn pause_all(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
     let client = rpc_client(args.rpc_port, secret);
@@ -294,8 +297,6 @@ pub async fn resume_all(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>>
     println!("All downloads resumed.");
     Ok(())
 }
-
-// Global Stat
 
 pub async fn global_stat(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
@@ -325,8 +326,6 @@ pub async fn global_stat(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>
 
     Ok(())
 }
-
-// Files / Peers
 
 pub async fn files(args: GidArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
@@ -394,8 +393,6 @@ pub async fn peers(args: GidArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Purge
-
 pub async fn purge(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
     let client = rpc_client(args.rpc_port, secret);
@@ -405,15 +402,12 @@ pub async fn purge(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Config
-
 pub async fn config(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd.action {
         ConfigAction::Get { key } => {
             let config_dir = get_config_dir();
             let system = load_config(&config_dir.join("system.json"), defaults::system_defaults());
             let user = load_config(&config_dir.join("user.json"), defaults::user_defaults());
-            // Merge: user overrides system
             let mut merged = system;
             for (k, v) in user {
                 merged.insert(k, v);
@@ -427,12 +421,12 @@ pub async fn config(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>
         ConfigAction::Set { key, value } => {
             let config_dir = get_config_dir();
             let path = config_dir.join("user.json");
-            let mut config = load_config(&path, Map::new());
+            let mut config = load_user_config_for_edit(&path)?;
             let parsed: Value =
                 serde_json::from_str(&value).unwrap_or_else(|_| Value::String(value.clone()));
             config.insert(key.clone(), parsed);
             std::fs::create_dir_all(&config_dir)?;
-            std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+            write_atomically(&path, serde_json::to_string_pretty(&config)?.as_bytes())?;
             println!("Set {} = {}", key, value);
             Ok(())
         }
@@ -457,8 +451,6 @@ pub async fn config(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>
         }
     }
 }
-
-// RSS
 
 pub async fn rss(cmd: RssCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd.action {
@@ -525,28 +517,24 @@ pub async fn rss(cmd: RssCommand) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-// Serve (headless engine)
-
 pub async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Risuko engine on port {}", args.rpc_port);
     let engine = start_headless_engine(args.rpc_port).await?;
     tracing::info!("Risuko engine running, press Ctrl+C to stop");
 
-    // Shut down on Ctrl+C or RPC `risuko.shutdown`; the `shutdown_requested()` borrow ends with `select!` so `engine.shutdown()` can consume `engine`
+    let signal = engine.shutdown_signal();
     tokio::select! {
         res = tokio::signal::ctrl_c() => {
             res?;
             tracing::info!("Received Ctrl+C, shutting down...");
         }
-        _ = engine.shutdown_requested() => {
+        _ = signal.notified() => {
             tracing::info!("Shutdown requested via RPC, shutting down...");
         }
     }
-    engine.shutdown().await;
+    engine.stop().await;
     Ok(())
 }
-
-// Shutdown
 
 pub async fn shutdown(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = resolve_rpc_secret(args.rpc_secret.clone());
@@ -557,157 +545,24 @@ pub async fn shutdown(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Headless engine (embedded)
-
-struct HeadlessEngine {
-    manager: Arc<TaskManager>,
-    rpc_server: RpcServer,
-    pbh_rpc_server: Option<RpcServer>,
-    progress_task: tokio::task::JoinHandle<()>,
-    auto_save_task: tokio::task::JoinHandle<()>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
-}
-
-impl HeadlessEngine {
-    /// Future resolved by an RPC shutdown request
-    fn shutdown_requested(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.shutdown_notify.notified()
-    }
-
-    async fn shutdown(mut self) {
-        self.progress_task.abort();
-        self.auto_save_task.abort();
-        self.rpc_server.stop();
-        if let Some(mut pbh) = self.pbh_rpc_server {
-            pbh.stop();
-        }
-        self.manager.shutdown().await;
-        tracing::info!("Headless engine stopped");
-    }
-}
-
 async fn start_headless_engine(
     rpc_port: u16,
-) -> Result<HeadlessEngine, Box<dyn std::error::Error>> {
-    let config_dir = get_config_dir();
-    std::fs::create_dir_all(&config_dir)?;
-    tracing::debug!("Config directory: {}", config_dir.display());
-    risuko_engine::engine::set_file_usenet_credential_resolver(config_dir.clone()).await;
-
-    let system_config = load_config(&config_dir.join("system.json"), defaults::system_defaults());
-    let user_config = load_config(&config_dir.join("user.json"), defaults::user_defaults());
-
-    let mut options = EngineOptions::from_config(&system_config, &user_config);
-    options.set("rpc-listen-port".into(), Value::from(rpc_port));
-
-    let dir = options.dir();
-    if !dir.is_empty() {
-        std::fs::create_dir_all(&dir).ok();
-        tracing::debug!("Download directory: {}", dir);
-    }
-
-    let events = EventBroadcaster::default();
-    let rpc_host = options.rpc_host();
-    let rpc_secret = options.rpc_secret();
-    let pbh_config = options.pbh_rpc_config(rpc_port)?;
-
-    tracing::info!("Initializing task manager");
-
-    let manager = Arc::new(
-        TaskManager::new(&config_dir, options, events.clone())
-            .await
-            .map_err(|e| format!("Failed to create task manager: {}", e))?,
-    );
-
-    tracing::info!("Task manager ready");
-
-    let (rpc_shutdown_tx, mut rpc_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    let mut rpc_server = RpcServer::new(
-        rpc_host.clone(),
-        rpc_port,
-        rpc_secret,
-        manager.clone(),
-        events.clone(),
-        rpc_shutdown_tx.clone(),
-    );
-    rpc_server
-        .start()
-        .await
-        .map_err(|e| format!("Failed to start RPC server: {}", e))?;
-
-    let pbh_rpc_server = if let Some(pbh) = pbh_config {
-        let mut server = RpcServer::new_with_compat(
-            rpc_host.clone(),
-            pbh.port,
-            pbh.secret,
-            manager.clone(),
-            events.clone(),
-            rpc_shutdown_tx,
-            RpcCompatMode::Aria2Next,
-        );
-        if let Err(e) = server.start().await {
-            rpc_server.stop();
-            manager.shutdown().await;
-            return Err(format!("Failed to start PeerBanHelper RPC server: {e}").into());
-        }
-        tracing::info!(
-            "PeerBanHelper Aria2Next RPC listening on {}:{}",
-            rpc_host,
-            pbh.port
-        );
-        Some(server)
-    } else {
-        drop(rpc_shutdown_tx);
-        None
-    };
-
-    tracing::info!("RPC server listening on {}:{}", rpc_host, rpc_port);
-
-    let mgr_progress = manager.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            mgr_progress.update_progress().await;
-        }
-    });
-
-    let mgr_save = manager.clone();
-    let auto_save_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(e) = mgr_save.save_session().await {
-                tracing::warn!("Auto-save session failed: {}", e);
-            }
-        }
-    });
-
-    // Monitor RPC shutdown requests, such as `risuko shutdown`
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let shutdown_notify_clone = shutdown_notify.clone();
-    tokio::spawn(async move {
-        if rpc_shutdown_rx.recv().await.is_some() {
-            tracing::info!("Shutdown requested via RPC");
-            shutdown_notify_clone.notify_one();
-        }
-    });
-
-    Ok(HeadlessEngine {
-        manager,
-        rpc_server,
-        pbh_rpc_server,
-        progress_task,
-        auto_save_task,
-        shutdown_notify,
+) -> Result<StandaloneEngine, Box<dyn std::error::Error>> {
+    Ok(StandaloneEngine::start(StandaloneConfig {
+        config_dir: get_config_dir(),
+        rpc_port: Some(rpc_port),
+        enable_rpc: true,
+        require_download_dir: false,
     })
+    .await?)
 }
 
-// Helpers
-
 async fn require_engine(client: &RpcClient) -> Result<(), Box<dyn std::error::Error>> {
-    if !client.is_engine_running().await {
+    let status = client.engine_status().await;
+    if let Some(problem) = status.problem() {
+        return Err(problem.into());
+    }
+    if !status.is_present() {
         return Err(
             "No Risuko instance running. Start the app or use `risuko serve` first.".into(),
         );
@@ -716,23 +571,32 @@ async fn require_engine(client: &RpcClient) -> Result<(), Box<dyn std::error::Er
 }
 
 fn get_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("dev.risuko.app"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    standalone_config_dir()
 }
 
-fn load_config(path: &std::path::Path, defaults: Map<String, Value>) -> Map<String, Value> {
-    if let Ok(data) = std::fs::read_to_string(path) {
-        if let Ok(Value::Object(mut map)) = serde_json::from_str(&data) {
-            for (k, v) in &defaults {
-                if !map.contains_key(k) {
-                    map.insert(k.clone(), v.clone());
-                }
-            }
-            return map;
-        }
+fn load_user_config_for_edit(
+    path: &std::path::Path,
+) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(format!("Cannot read {}: {}", path.display(), e).into()),
+    };
+    match serde_json::from_str(&data) {
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(_) => Err(format!("{} is not a JSON object; fix it first", path.display()).into()),
+        Err(e) => Err(format!("{} is not valid JSON ({}); fix it first", path.display(), e).into()),
     }
-    defaults
+}
+
+fn write_atomically(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 fn print_task_table(tasks: &[Value]) {
@@ -808,5 +672,25 @@ fn print_task_detail(task: &Value) {
         if !err.is_empty() {
             println!("Error:     {}", err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_edit_refuses_malformed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.json");
+        assert!(load_user_config_for_edit(&path).unwrap().is_empty());
+
+        std::fs::write(&path, "{ \"a\": 1,").unwrap();
+        assert!(load_user_config_for_edit(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ \"a\": 1,");
+
+        write_atomically(&path, b"{\"a\":1}").unwrap();
+        assert_eq!(load_user_config_for_edit(&path).unwrap()["a"], 1);
+        assert!(!dir.path().join("user.json.tmp").exists());
     }
 }

@@ -79,7 +79,6 @@ const namedCategories: SyncCategory[] = [
 			"auto-hide-window",
 			"dir",
 			"auto-file-renaming",
-			"continue",
 			"connect-timeout",
 			"file-allocation",
 			"max-concurrent-downloads",
@@ -98,7 +97,6 @@ const namedCategories: SyncCategory[] = [
 			"split",
 			"uri-selector",
 			"user-agent",
-			"follow-torrent",
 			"header",
 			"load-cookies",
 			"bt-create-subfolder",
@@ -107,10 +105,6 @@ const namedCategories: SyncCategory[] = [
 	{
 		id: "media",
 		keys: ["media-format", "youtube-format", "m3u8-output-format"],
-	},
-	{
-		id: "rss",
-		keys: ["rss-auto-update", "rss-update-interval"],
 	},
 	{
 		id: "stats",
@@ -190,21 +184,19 @@ const namedCategories: SyncCategory[] = [
 	{
 		id: "bittorrent",
 		keys: [
-			"bt-enable-lpd",
-			"bt-exclude-tracker",
 			"bt-force-encryption",
 			"bt-load-saved-metadata",
 			"bt-save-metadata",
 			"bt-max-peers-per-torrent",
 			"bt-max-outstanding-per-peer",
+			"bt-max-connections",
+			"bt-ban-corrupt-peers",
+			"bt-ban-corrupt-strikes",
 			"bt-enable-upnp",
 			"bt-upnp-lease",
 			"bt-enable-lsd",
 			"bt-encryption-policy",
 			"bt-listen-v6",
-			"enable-dht",
-			"enable-dht6",
-			"enable-peer-exchange",
 			"dht-listen-port",
 		],
 	},
@@ -235,16 +227,7 @@ const namedCategories: SyncCategory[] = [
 	},
 	{
 		id: "g2-gnutella",
-		keys: [
-			"gnutella-cache",
-			"g2-cache",
-			"gift-enabled",
-			"gift-host",
-			"gift-port",
-			"adc-hub",
-			"adc-nick",
-			"ed2k-server",
-		],
+		keys: ["gift-enabled", "gift-host", "gift-port", "ed2k-server"],
 	},
 ];
 

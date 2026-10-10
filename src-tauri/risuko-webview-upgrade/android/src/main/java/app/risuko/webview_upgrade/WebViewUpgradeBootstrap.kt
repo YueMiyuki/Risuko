@@ -70,7 +70,6 @@ internal object WebViewUpgradeBootstrap {
         }
     }
 
-    /** @return true if the swap was applied */
     private fun trySwap(context: Context, packageName: String): Boolean {
         return try {
             WebViewSwap.swapToInstalledPackage(context, packageName)
@@ -81,13 +80,11 @@ internal object WebViewUpgradeBootstrap {
         }
     }
 
-    /** Current system WebView as (packageName, versionName, major) or null */
     private fun currentWebView(context: Context): Triple<String, String?, Int>? {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val pi = runCatching { WebView.getCurrentWebViewPackage() }.getOrNull()
             if (pi != null) return Triple(pi.packageName, pi.versionName, majorOf(pi.versionName))
         }
-        // Pre-O fallback: probe known packages
         for (pkg in CANDIDATE_PACKAGES) {
             val major = installedMajor(context, pkg) ?: continue
             return Triple(pkg, installedVersionName(context, pkg), major)

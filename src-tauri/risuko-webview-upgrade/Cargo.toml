@@ -5,9 +5,6 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# `links` is the hook that makes the host app's `tauri-build` discover this
-# plugin's Android library and wire it into the generated Gradle project. It
-# must be unique across the whole dependency graph
 links = "risuko-webview-upgrade"
 
 [dependencies]

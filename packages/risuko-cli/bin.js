@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-
-const { execFileSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
+const os = require("node:os");
 const { join } = require("node:path");
 
 const { platform, arch } = process;
@@ -37,7 +37,6 @@ function getBinaryPath() {
 		const packageDir = require.resolve(`${packageName}/package.json`);
 		return join(packageDir, "..", binaryName);
 	} catch {
-		// Fallback: try local npm/<platform-arch>/ directory (development)
 		const localPath = join(__dirname, "npm", `${platform}-${arch}`, binaryName);
 		if (require("node:fs").existsSync(localPath)) {
 			return localPath;
@@ -51,16 +50,42 @@ function getBinaryPath() {
 	}
 }
 
-try {
-	const binaryPath = getBinaryPath();
-	execFileSync(binaryPath, process.argv.slice(2), {
+function main() {
+	let binaryPath;
+	try {
+		binaryPath = getBinaryPath();
+	} catch (error) {
+		console.error(error.message);
+		process.exit(1);
+	}
+
+	const child = spawn(binaryPath, process.argv.slice(2), {
 		stdio: "inherit",
 		env: process.env,
 	});
-} catch (error) {
-	if (error.status !== undefined) {
-		process.exit(error.status);
+
+	for (const sig of ["SIGTERM", "SIGHUP"]) {
+		process.on(sig, () => {
+			child.kill(sig);
+		});
 	}
-	console.error(error.message);
-	process.exit(1);
+	process.on("SIGINT", () => {
+		if (platform !== "win32") {
+			child.kill("SIGINT");
+		}
+	});
+
+	child.on("error", (error) => {
+		console.error(error.message);
+		process.exit(1);
+	});
+
+	child.on("exit", (code, signal) => {
+		if (signal) {
+			process.exit(128 + (os.constants.signals[signal] || 0));
+		}
+		process.exit(code ?? 1);
+	});
 }
+
+main();

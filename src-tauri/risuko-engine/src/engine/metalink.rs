@@ -1,11 +1,8 @@
-//! Metalink 4 (.meta4, RFC 5854) parsing
-
 use super::hasher::{Algo, WholeChecksum};
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use std::path::Path;
 
-// RFC 5854: url without a priority is the lowest, 999999
 const LOWEST_PRIORITY: u32 = 999_999;
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +65,8 @@ struct ResourcesV3 {
 
 #[derive(Debug, Deserialize)]
 struct UrlV3 {
+    #[serde(rename = "@type")]
+    kind: Option<String>,
     #[serde(rename = "@preference")]
     preference: Option<u32>,
     #[serde(rename = "$text")]
@@ -85,6 +84,30 @@ pub struct MetalinkFile {
     pub name: String,
     pub uris: Vec<String>,
     pub checksum: Option<WholeChecksum>,
+}
+
+fn url_scheme(v: &str) -> String {
+    v.split_once(':')
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_http_url(v: &str) -> bool {
+    matches!(url_scheme(v).as_str(), "http" | "https")
+}
+
+fn is_file_transfer_url(v: &str) -> bool {
+    matches!(url_scheme(v).as_str(), "ftp" | "ftps" | "sftp")
+}
+
+fn keep_fetchable(uris: Vec<String>) -> Vec<String> {
+    if uris.iter().any(|u| is_http_url(u)) {
+        uris.into_iter().filter(|u| is_http_url(u)).collect()
+    } else {
+        uris.into_iter()
+            .filter(|u| is_file_transfer_url(u))
+            .collect()
+    }
 }
 
 pub fn parse(xml: &str) -> Result<Vec<MetalinkFile>, String> {
@@ -109,7 +132,7 @@ fn parse_v4(xml: &str) -> Result<Vec<MetalinkFile>, String> {
             urls.sort_by_key(|(p, _)| *p);
             MetalinkFile {
                 name: sanitize_name(&f.name),
-                uris: urls.into_iter().map(|(_, v)| v).collect(),
+                uris: keep_fetchable(urls.into_iter().map(|(_, v)| v).collect()),
                 checksum: pick_strongest(&f.hashes),
             }
         })
@@ -138,18 +161,23 @@ fn parse_v3(xml: &str) -> Result<Vec<MetalinkFile>, String> {
                 .into_iter()
                 .filter_map(|u| {
                     let v = u.value?.trim().to_string();
-
-                    (!v.is_empty()).then_some((-(u.preference.unwrap_or(0) as i64), v))
+                    let typed_http = u.kind.as_deref().is_none_or(|k| {
+                        matches!(
+                            k.trim().to_ascii_lowercase().as_str(),
+                            "http" | "https" | ""
+                        )
+                    });
+                    (typed_http && is_http_url(&v))
+                        .then_some((-(u.preference.unwrap_or(0) as i64), v))
                 })
                 .collect();
             urls.sort_by_key(|(k, _)| *k);
             MetalinkFile {
                 name: sanitize_name(f.name.as_deref().unwrap_or("")),
-                uris: urls.into_iter().map(|(_, v)| v).collect(),
+                uris: keep_fetchable(urls.into_iter().map(|(_, v)| v).collect()),
                 checksum: pick_strongest(&f.verification.map(|v| v.hash).unwrap_or_default()),
             }
         })
-        // drop files with no usable <url> so they aren't scheduled with zero candidates
         .filter(|f| !f.uris.is_empty())
         .collect();
 
@@ -166,7 +194,6 @@ pub fn url_hints_metalink(uri: &str) -> bool {
 }
 
 fn sanitize_name(name: &str) -> String {
-    // strip directory components, then run through the shared filename guard so OS-reserved names / invalid chars can't break file creation
     let base = Path::new(name)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -274,11 +301,7 @@ mod tests {
 
         assert_eq!(
             f.uris,
-            vec![
-                "https://a/Fedora.iso",
-                "https://b/Fedora.iso",
-                "ftp://c/Fedora.iso"
-            ]
+            vec!["https://a/Fedora.iso", "https://b/Fedora.iso",]
         );
         assert_eq!(f.checksum.as_ref().unwrap().algo, Algo::Sha256);
     }
@@ -294,5 +317,23 @@ mod tests {
 
         assert!(!url_hints_metalink("https://x/metalink.zip"));
         assert!(!url_hints_metalink("https://x/big.iso"));
+    }
+
+    #[test]
+    fn drops_non_http_mirrors() {
+        let v4 = r#"<metalink xmlns="urn:ietf:params:xml:ns:metalink"><file name="a.bin">
+            <url priority="1">rsync://h/a.bin</url><url priority="2">ftp://h/a.bin</url>
+            <url priority="3">magnet:?xt=urn:btih:abc</url><url priority="4">https://h/a.bin</url>
+            </file></metalink>"#;
+        let files = parse(v4).unwrap();
+        assert_eq!(files[0].uris, vec!["https://h/a.bin".to_string()]);
+
+        let v3 = r#"<metalink version="3.0"><files><file name="a.bin"><resources>
+            <url type="bittorrent" preference="100">http://h/a.torrent</url>
+            <url type="ftp" preference="90">ftp://h/a.bin</url>
+            <url type="http" preference="10">http://h/a.bin</url>
+            </resources></file></files></metalink>"#;
+        let files = parse(v3).unwrap();
+        assert_eq!(files[0].uris, vec!["http://h/a.bin".to_string()]);
     }
 }

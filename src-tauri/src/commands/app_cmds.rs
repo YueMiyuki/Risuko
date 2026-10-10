@@ -22,18 +22,6 @@ pub fn hide_main_window(handle: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn relaunch_app(handle: AppHandle) -> Result<(), String> {
-    handle
-        .state::<crate::state::AppState>()
-        .is_quitting
-        .store(true, Ordering::SeqCst);
-    risuko_engine::engine::stop_engine()
-        .await
-        .map_err(|e| e.to_string())?;
-    handle.restart();
-}
-
-#[tauri::command]
 pub async fn quit_app(handle: AppHandle) -> Result<(), String> {
     handle
         .state::<crate::state::AppState>()
@@ -47,13 +35,24 @@ pub async fn quit_app(handle: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn show_window(handle: AppHandle) -> Result<(), String> {
-    show_main_window(&handle)
+pub async fn relaunch_app(handle: AppHandle) -> Result<(), String> {
+    let state = handle.state::<crate::state::AppState>();
+    state.is_quitting.store(true, Ordering::SeqCst);
+    let stop = risuko_engine::engine::stop_engine();
+    match tokio::time::timeout(std::time::Duration::from_secs(15), stop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            state.is_quitting.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
+        Err(_) => tracing::warn!("Timed out stopping engine before relaunch"),
+    }
+    handle.restart()
 }
 
 #[tauri::command]
-pub fn hide_window(handle: AppHandle) -> Result<(), String> {
-    hide_main_window(&handle)
+pub fn show_window(handle: AppHandle) -> Result<(), String> {
+    show_main_window(&handle)
 }
 
 #[tauri::command]
@@ -67,7 +66,7 @@ pub fn log_frontend(level: String, message: String) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn factory_reset(
     handle: AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
@@ -87,7 +86,6 @@ pub async fn reset_session(handle: AppHandle) -> Result<(), String> {
         let session_path = config_dir.join(risuko_engine::engine::SESSION_FILENAME);
         let _ = std::fs::remove_file(&session_path);
     }
-    // Restart engine with fresh config
     let config_dir = handle
         .path()
         .app_config_dir()
@@ -115,7 +113,7 @@ pub fn toggle_app_menu(handle: AppHandle, hidden: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn is_opened_at_login() -> bool {
-    std::env::args().any(|arg| arg == "--opened-at-login=1")
+    std::env::args_os().any(|arg| arg == "--opened-at-login=1")
 }
 
 #[tauri::command]
@@ -178,13 +176,11 @@ pub async fn shutdown_system(handle: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "android")]
     {
-        // Android does not support OS-level shutdown from apps
         return quit_app(handle).await;
     }
 
     #[cfg(not(target_os = "android"))]
     {
-        // Set quit flag but don't stop engine; if OS shutdown fails the engine stays running so the app remains functional
         let state = handle.state::<crate::state::AppState>();
         state.is_quitting.store(true, Ordering::SeqCst);
 
@@ -193,15 +189,25 @@ pub async fn shutdown_system(handle: AppHandle) -> Result<(), String> {
         #[cfg(not(target_os = "windows"))]
         let args = ["-h", "now"];
 
-        // Attempt OS shutdown; rollback quit flag on failure
+        if let Some(manager) = risuko_engine::engine::get_manager().await {
+            if let Err(e) = manager.save_session().await {
+                tracing::warn!("shutdown_system: failed to save session: {}", e);
+            }
+        }
+
         let rollback = || state.is_quitting.store(false, Ordering::SeqCst);
-        let status = std::process::Command::new("shutdown")
-            .args(args)
-            .status()
-            .map_err(|e| {
-                rollback();
-                format!("shutdown failed: {e}")
-            })?;
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            std::process::Command::new("shutdown").args(args).status()
+        })
+        .await
+        .map_err(|e| {
+            rollback();
+            format!("shutdown failed: {e}")
+        })?
+        .map_err(|e| {
+            rollback();
+            format!("shutdown failed: {e}")
+        })?;
         if !status.success() {
             rollback();
             return Err(format!("shutdown command failed: {:?}", status));

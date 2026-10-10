@@ -35,6 +35,7 @@ export default {
 		i18next.on("languageChanged", this.onLang);
 		window.addEventListener("keydown", this.onKey);
 		this.playEntrance();
+		invoke("panel_ready").catch(() => {});
 	},
 	beforeUnmount() {
 		this.unlisten?.();

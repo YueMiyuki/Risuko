@@ -11,7 +11,7 @@ import { usePreferenceStore } from "@/store/preference";
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_ENDPOINT = "https://risuko.app/api/update";
 
-export type UpdateStatus =
+type UpdateStatus =
 	| "idle"
 	| "checking"
 	| "available"
@@ -244,8 +244,7 @@ async function askToInstall(
 			return;
 		}
 
-		const { relaunch } = await import("@tauri-apps/plugin-process");
-		await relaunch();
+		await invoke("relaunch_app");
 	} catch (error) {
 		updaterState.status = "error";
 		updaterState.error = errorMessage(error);

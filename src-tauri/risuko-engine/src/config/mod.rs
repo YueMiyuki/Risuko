@@ -97,7 +97,6 @@ pub fn normalize_proxy_config(value: &Value) -> Value {
     json!({ "http": http, "p2p": p2p })
 }
 
-/// Whether a proxy value uses the pre-profile, top-level HTTP fields
 pub fn proxy_has_legacy_fields(value: &Value) -> bool {
     value.as_object().is_some_and(|root| {
         ["enable", "server", "bypass", "scope"]
@@ -126,9 +125,6 @@ pub fn proxy_http_profile_is_explicit(value: &Value) -> bool {
     })
 }
 
-/// Whether a proxy value contains a non-default nested P2P profile.  A
-/// default profile must not erase legacy/system P2P engine keys while older
-/// configurations are being migrated
 pub fn proxy_p2p_profile_is_explicit(value: &Value) -> bool {
     let normalized = normalize_proxy_config(value);
     normalized.get("p2p")
@@ -144,15 +140,9 @@ pub fn proxy_p2p_profile_is_explicit(value: &Value) -> bool {
 }
 
 fn value_as_bool(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Number(value)) => value.as_f64().is_some_and(|value| value != 0.0),
-        Some(Value::String(value)) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        ),
-        _ => false,
-    }
+    value
+        .and_then(crate::engine::options::json_bool)
+        .unwrap_or(false)
 }
 
 fn normalize_proxy_bypass_value(value: Option<&Value>) -> String {
@@ -215,6 +205,51 @@ fn normalize_proxy_scopes(value: Option<&Value>) -> Vec<String> {
     result
 }
 
+pub const RPC_SECRET_INIT_KEY: &str = "rpc-secret-initialized";
+
+pub fn generate_rpc_secret() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    format!("{:032x}{:032x}", rng.random::<u128>(), rng.random::<u128>())
+}
+
+pub fn ensure_rpc_secret(system: &mut Map<String, Value>) -> bool {
+    if value_as_bool(system.get(RPC_SECRET_INIT_KEY)) {
+        return false;
+    }
+    let has_secret = system
+        .get("rpc-secret")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if !has_secret {
+        system.insert("rpc-secret".into(), json!(generate_rpc_secret()));
+    }
+    system.insert(RPC_SECRET_INIT_KEY.into(), json!(true));
+    true
+}
+
+pub fn ensure_rpc_secret_on_disk(config_dir: &Path) {
+    let path = config_dir.join("system.json");
+    let mut map = match fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str::<Value>(&data) {
+            Ok(Value::Object(map)) => map,
+            _ => return,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => defaults::system_defaults(),
+        Err(_) => return,
+    };
+    if !ensure_rpc_secret(&mut map) {
+        return;
+    }
+    let written = fs::create_dir_all(config_dir)
+        .map_err(|e| e.to_string())
+        .and_then(|()| serde_json::to_string_pretty(&map).map_err(|e| e.to_string()))
+        .and_then(|data| write_file_atomically(&path, data.as_bytes()));
+    if let Err(err) = written {
+        tracing::warn!("Failed to persist generated RPC secret: {}", err);
+    }
+}
+
 pub struct ConfigManager {
     system_config: Map<String, Value>,
     user_config: Map<String, Value>,
@@ -226,7 +261,6 @@ impl ConfigManager {
         Self::with_dir(provider.config_dir())
     }
 
-    /// Create a ConfigManager with an explicit config directory path
     pub fn with_dir(config_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(&config_dir)?;
         cleanup_stale_atomic_write_files(&config_dir);
@@ -298,6 +332,12 @@ impl ConfigManager {
             }
         }
 
+        if ensure_rpc_secret(&mut manager.system_config) {
+            if let Err(err) = manager.save_system() {
+                tracing::warn!("Failed to persist generated RPC secret: {}", err);
+            }
+        }
+
         if manager.migrate_legacy_keep_seeding_defaults() {
             if let Err(err) = manager.save_system() {
                 tracing::warn!(
@@ -326,7 +366,6 @@ impl ConfigManager {
         let mut merged = self.system_config.clone();
         merged.extend(self.user_config.clone());
 
-        // Add runtime context without clobbering a user/system key of the same name (insert only when absent)
         merged
             .entry("platform".to_string())
             .or_insert_with(|| json!(std::env::consts::OS));
@@ -359,7 +398,12 @@ impl ConfigManager {
         system: &Map<String, Value>,
         user: &Map<String, Value>,
     ) -> Result<(), String> {
+        let was_initialized = value_as_bool(self.system_config.get(RPC_SECRET_INIT_KEY));
         self.system_config = system.clone();
+        if was_initialized && !self.system_config.contains_key(RPC_SECRET_INIT_KEY) {
+            self.system_config
+                .insert(RPC_SECRET_INIT_KEY.into(), json!(true));
+        }
         self.user_config = normalize_user_map(user);
         self.save_system()?;
         self.save_user()
@@ -367,6 +411,7 @@ impl ConfigManager {
 
     pub fn reset(&mut self) -> Result<(), String> {
         self.system_config = defaults::system_defaults();
+        ensure_rpc_secret(&mut self.system_config);
         self.user_config = defaults::user_defaults();
         self.save_system()?;
         self.save_user()?;
@@ -414,7 +459,6 @@ fn load_or_default(path: &Path, defaults: Map<String, Value>) -> Map<String, Val
     match fs::read_to_string(path) {
         Ok(data) => {
             if let Ok(Value::Object(mut map)) = serde_json::from_str(&data) {
-                // Fill in missing keys from defaults
                 for (k, v) in &defaults {
                     if !map.contains_key(k) {
                         map.insert(k.clone(), v.clone());
@@ -422,7 +466,6 @@ fn load_or_default(path: &Path, defaults: Map<String, Value>) -> Map<String, Val
                 }
                 return map;
             }
-            // File exists but is corrupt/unparseable: back it up so the user's broken settings aren't silently overwritten, then fall back
             let backup = path.with_extension("json.bak");
             match fs::rename(path, &backup) {
                 Ok(()) => tracing::warn!(
@@ -479,8 +522,6 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    // -- parse_keep_seeding_option --
-
     #[test]
     fn keep_seeding_bool() {
         assert_eq!(parse_keep_seeding_option(Some(&json!(true))), Some(true));
@@ -498,8 +539,6 @@ mod tests {
             );
         }
     }
-
-    // -- proxy profile normalization --
 
     #[test]
     fn normalize_proxy_config_migrates_legacy_fields_into_http() {
@@ -725,13 +764,10 @@ mod tests {
             .is_none());
     }
 
-    // -- ConfigManager --
-
     #[test]
     fn config_manager_with_dir_uses_defaults_when_missing() {
         let dir = TempDir::new().unwrap();
         let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
-        // Defaults should be present when files are missing
         assert!(mgr.get_system_config().contains_key("all-proxy"));
         assert!(mgr.get_user_config().contains_key("theme"));
     }
@@ -775,7 +811,6 @@ mod tests {
             mgr.set_system_config_map(&serde_json::from_str(r#"{"persisted": true}"#).unwrap())
                 .unwrap();
         }
-        // Re-open and verify
         let mgr2 = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
         assert_eq!(
             mgr2.get_system_config().get("persisted"),
@@ -804,7 +839,6 @@ mod tests {
         mgr.remove_system_config_key("a").unwrap();
         assert!(!mgr.get_system_config().contains_key("a"));
         assert!(mgr.get_system_config().contains_key("b"));
-        // Verify persistence by reopening
         let mgr2 = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
         assert!(!mgr2.get_system_config().contains_key("a"));
         assert!(mgr2.get_system_config().contains_key("b"));
@@ -834,7 +868,127 @@ mod tests {
         let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
         let user = mgr.get_user_config();
         assert_eq!(user.get("locale"), Some(&json!("fr-FR")));
-        // theme should be filled from defaults
         assert!(user.contains_key("theme"));
+    }
+
+    #[test]
+    fn legacy_aria2_keys_in_saved_system_config_still_load() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("system.json"),
+            r#"{"continue": false, "follow-torrent": "mem", "allow-overwrite": true, "bt-enable-lpd": false, "enable-dht": false}"#,
+        )
+        .unwrap();
+
+        let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        let sys = mgr.get_system_config();
+        assert_eq!(sys.get("continue"), Some(&json!(false)));
+        assert_eq!(sys.get("follow-torrent"), Some(&json!("mem")));
+        assert_eq!(sys.get("allow-overwrite"), Some(&json!(true)));
+        assert_eq!(sys.get("bt-enable-lpd"), Some(&json!(false)));
+        assert_eq!(sys.get("enable-dht"), Some(&json!(false)));
+        assert_eq!(sys.get("gift-port"), Some(&json!(1213)));
+    }
+
+    fn secret_of(mgr: &ConfigManager) -> String {
+        mgr.get_system_config()
+            .get("rpc-secret")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn first_run_generates_and_persists_rpc_secret() {
+        let dir = TempDir::new().unwrap();
+        let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        let secret = secret_of(&mgr);
+        assert_eq!(secret.len(), 64);
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            mgr.get_system_config().get(RPC_SECRET_INIT_KEY),
+            Some(&json!(true))
+        );
+
+        let on_disk: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("system.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk["rpc-secret"], json!(secret));
+        let again = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&again), secret);
+        assert_ne!(generate_rpc_secret(), generate_rpc_secret());
+    }
+
+    #[test]
+    fn cleared_rpc_secret_is_not_regenerated() {
+        let dir = TempDir::new().unwrap();
+        let mut mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        let mut patch = Map::new();
+        patch.insert("rpc-secret".into(), json!(""));
+        mgr.set_system_config_map(&patch).unwrap();
+
+        let again = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&again), "");
+
+        ensure_rpc_secret_on_disk(dir.path());
+        let reread = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&reread), "");
+    }
+
+    #[test]
+    fn existing_secret_is_kept_and_marked() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("system.json"), r#"{"rpc-secret": "mine"}"#).unwrap();
+        let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&mgr), "mine");
+        assert_eq!(
+            mgr.get_system_config().get(RPC_SECRET_INIT_KEY),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn upgrade_without_marker_and_empty_secret_gets_one() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("system.json"), r#"{"rpc-secret": ""}"#).unwrap();
+        let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&mgr).len(), 64);
+    }
+
+    #[test]
+    fn on_disk_helper_generates_for_config_file_clients() {
+        let dir = TempDir::new().unwrap();
+        ensure_rpc_secret_on_disk(dir.path());
+        let on_disk: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("system.json")).unwrap())
+                .unwrap();
+        let secret = on_disk["rpc-secret"].as_str().unwrap().to_string();
+        assert_eq!(secret.len(), 64);
+        ensure_rpc_secret_on_disk(dir.path());
+        let mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&mgr), secret);
+    }
+
+    #[test]
+    fn on_disk_helper_leaves_corrupt_file_alone() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("system.json"), "{not json").unwrap();
+        ensure_rpc_secret_on_disk(dir.path());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("system.json")).unwrap(),
+            "{not json"
+        );
+    }
+
+    #[test]
+    fn import_without_marker_does_not_rearm_generation() {
+        let dir = TempDir::new().unwrap();
+        let mut mgr = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        let mut system = defaults::system_defaults();
+        system.remove(RPC_SECRET_INIT_KEY);
+        system.insert("rpc-secret".into(), json!(""));
+        mgr.replace_config_maps(&system, &Map::new()).unwrap();
+        let again = ConfigManager::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(secret_of(&again), "");
     }
 }

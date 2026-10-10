@@ -1,5 +1,3 @@
-//! Request/response body types
-
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -7,10 +5,8 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 
 use crate::error::Error;
 
-/// Factory that produces a fresh outgoing body each time it's called; used by `ReqBody::Stream` so retries/redirects can replay the body without requiring it to be `Clone` (typically opens a fresh `tokio::fs::File` wrapped in `tokio_util::io::ReaderStream`)
 pub type StreamBodyFactory = Arc<dyn Fn() -> BoxBody<Bytes, Error> + Send + Sync + 'static>;
 
-/// Body sent in requests: `Bytes` is a buffered payload; `Stream` is produced on demand by a factory closure (large uploads) that keeps the body cheaply clonable for redirect/retry while supporting one-shot reads
 #[derive(Clone)]
 pub enum ReqBody {
     Empty,
@@ -39,7 +35,6 @@ impl ReqBody {
         ReqBody::Bytes(b.into())
     }
 
-    /// Build a streaming request body from a factory closure that must produce a fresh, full body each send (including on redirect replay)
     pub fn from_stream<F>(factory: F, content_length: Option<u64>) -> Self
     where
         F: Fn() -> BoxBody<Bytes, Error> + Send + Sync + 'static,
@@ -50,7 +45,6 @@ impl ReqBody {
         }
     }
 
-    /// Content-Length hint, when known
     pub fn content_length(&self) -> Option<u64> {
         match self {
             ReqBody::Empty => Some(0),
@@ -70,5 +64,4 @@ impl ReqBody {
     }
 }
 
-/// A boxed `HttpBody<Data = Bytes, Error = Error>` response body after decompression / chunked decoding
 pub type RespBody = http_body_util::combinators::BoxBody<Bytes, Error>;

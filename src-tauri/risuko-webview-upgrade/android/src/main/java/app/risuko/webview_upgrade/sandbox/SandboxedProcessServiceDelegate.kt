@@ -360,7 +360,6 @@ internal class SandboxedProcessServiceDelegate {
         }
     }
 
-    /** `org.chromium.*` resolves against the WebView kernel; everything else via the host CL */
     private class ChromiumDelegatingClassLoader(
         private val appClassLoader: ClassLoader,
         private val chromiumClassLoader: ClassLoader,
@@ -381,7 +380,6 @@ internal class SandboxedProcessServiceDelegate {
         }
     }
 
-    /** Keeps the kernel's resources but routes getApplicationContext to a host-backed proxy */
     private class SandboxedWebViewServiceContext(
         webViewPackageContext: Context,
         hostAppContext: Context,
@@ -392,7 +390,6 @@ internal class SandboxedProcessServiceDelegate {
         override fun getApplicationContext(): Context = appContextProxy
     }
 
-    /** Host application context whose assets/resources come from the WebView kernel APK */
     private class SandboxedApplicationContext(
         hostAppContext: Context,
         private val webViewContext: Context,

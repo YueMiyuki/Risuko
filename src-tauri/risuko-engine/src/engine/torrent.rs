@@ -14,23 +14,55 @@ use tokio_util::sync::CancellationToken;
 
 use super::options::TASK_P2P_PROXY_OVERRIDE_KEY;
 
-/// BitTorrent session tuning passed from the user/system config; all fields are optional, missing entries fall back to `risuko-bt` defaults
 #[derive(Clone, Debug, Default)]
 pub struct BtTuning {
     pub max_outstanding_per_peer: Option<usize>,
     pub max_peers_per_torrent: Option<usize>,
-    pub upload_rate_limit: Option<u64>,
+    pub hash_fail_ban_strikes: Option<u8>,
+    pub max_connections: Option<usize>,
+    pub download_limiter: Option<Arc<bt::limiter::RateLimiter>>,
+    pub upload_limiter: Option<Arc<bt::limiter::RateLimiter>>,
     pub enable_upnp: Option<bool>,
     pub upnp_lease: Option<Duration>,
-    /// Accepts "plaintext", "prefer", or "require". Anything else is ignored
     pub encryption_policy: Option<String>,
     pub listen_ipv6: Option<bool>,
     pub enable_lsd: Option<bool>,
-    /// Process-wide P2P route for shared DHT and torrent-owned connections
+    pub listen_port: Option<u16>,
     pub p2p_proxy: Option<risuko_http::ProxyConnector>,
 }
 
-/// Read-only BT session diagnostics used by the `/health` panel
+impl BtTuning {
+    pub fn from_options(
+        options: &super::options::EngineOptions,
+        download_limiter: Arc<bt::limiter::RateLimiter>,
+        upload_limiter: Arc<bt::limiter::RateLimiter>,
+        p2p_proxy: Option<risuko_http::ProxyConnector>,
+    ) -> Self {
+        Self {
+            max_outstanding_per_peer: options.bt_max_outstanding_per_peer(),
+            max_peers_per_torrent: options.bt_max_peers_per_torrent(),
+            hash_fail_ban_strikes: options.bt_hash_fail_ban_strikes(),
+            max_connections: Some(options.bt_max_connections()),
+            download_limiter: Some(download_limiter),
+            upload_limiter: Some(upload_limiter),
+            enable_upnp: Some(options.bt_enable_upnp()),
+            upnp_lease: options.bt_upnp_lease(),
+            encryption_policy: Some(options.bt_encryption_policy().to_string()),
+            listen_ipv6: Some(options.bt_listen_v6()),
+            enable_lsd: Some(options.bt_enable_lsd()),
+            listen_port: options.bt_listen_port(),
+            p2p_proxy,
+        }
+    }
+}
+
+pub fn task_limit(options: &Map<String, Value>, key: &str) -> u64 {
+    options
+        .get(key)
+        .map(super::speed_limiter::parse_speed_limit)
+        .unwrap_or(0)
+}
+
 pub struct BtHealthSnapshot {
     pub listen_port: u16,
     pub lsd_active: bool,
@@ -86,7 +118,8 @@ struct MagnetMetaCache {
     state: Arc<Mutex<MagnetMetaCacheState>>,
 }
 
-const MAGNET_META_CACHE_TTL: Duration = Duration::from_secs(120);
+const MAGNET_META_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const MAGNET_META_CACHE_MAX: usize = 16;
 
 impl MagnetMetaCache {
     async fn get_or_resolve<F, Fut>(
@@ -157,6 +190,17 @@ impl MagnetMetaCache {
                                         expires_at: Instant::now() + MAGNET_META_CACHE_TTL,
                                     },
                                 );
+                                while state.completed.len() > MAGNET_META_CACHE_MAX {
+                                    let oldest = state
+                                        .completed
+                                        .iter()
+                                        .min_by_key(|(_, e)| e.expires_at)
+                                        .map(|(k, _)| *k);
+                                    match oldest {
+                                        Some(k) => state.completed.remove(&k),
+                                        None => break,
+                                    };
+                                }
                             }
                             if state
                                 .in_flight
@@ -179,10 +223,6 @@ impl MagnetMetaCache {
         Self::await_result(receiver).await
     }
 
-    /// Return the current route generation and its cancellation token as one
-    /// snapshot. Reload invalidates both while holding the same state lock,
-    /// so callers can safely reject a resolver that was queued before a
-    /// profile swap but only started afterward
     async fn route_snapshot(&self) -> (u64, CancellationToken) {
         let state = self.state.lock().await;
         (state.generation, state.cancellation.clone())
@@ -233,13 +273,15 @@ impl MagnetMetaCache {
     }
 }
 
-/// BitTorrent download management via the in-tree `risuko-bt` engine
+type FileDetailsEntry = (Arc<bt::TorrentMeta>, Arc<Vec<TorrentFileInfo>>);
+
 #[derive(Clone)]
 pub struct TorrentEngine {
     session: Option<Arc<bt::Session>>,
     output_dir: PathBuf,
     magnet_cache: MagnetMetaCache,
     p2p_route_lock: Arc<Mutex<()>>,
+    file_details_cache: Arc<parking_lot::Mutex<HashMap<usize, FileDetailsEntry>>>,
 }
 
 impl TorrentEngine {
@@ -249,26 +291,42 @@ impl TorrentEngine {
 
         let encryption = encryption_policy_from_str(tuning.encryption_policy.as_deref());
 
-        let session = bt::Session::new_with_opts(
+        let session_opts = |port: u16| bt::SessionOptions {
+            listen: Some(bt::ListenerOptions {
+                listen_addr: Some((Ipv4Addr::UNSPECIFIED, port).into()),
+                enable_upnp_port_forwarding: tuning.enable_upnp.unwrap_or(true),
+                upnp_lease: tuning.upnp_lease,
+                listen_ipv6: tuning.listen_ipv6.unwrap_or(false),
+            }),
+            max_outstanding_requests_per_peer: tuning.max_outstanding_per_peer,
+            max_peers_per_torrent: tuning.max_peers_per_torrent,
+            max_connections: tuning.max_connections,
+            hash_fail_ban_strikes: tuning.hash_fail_ban_strikes,
+            download_limiter: tuning.download_limiter.clone(),
+            upload_limiter: tuning.upload_limiter.clone(),
+            disable_local_service_discovery: !tuning.enable_lsd.unwrap_or(true),
+            encryption,
+            p2p_proxy: tuning.p2p_proxy.clone(),
+            ..Default::default()
+        };
+        let preferred_port = tuning.listen_port.unwrap_or(0);
+        let session = match bt::Session::new_with_opts(
             output_dir.to_path_buf(),
-            bt::SessionOptions {
-                listen: Some(bt::ListenerOptions {
-                    listen_addr: Some((Ipv4Addr::UNSPECIFIED, 0).into()),
-                    enable_upnp_port_forwarding: tuning.enable_upnp.unwrap_or(true),
-                    upnp_lease: tuning.upnp_lease,
-                    listen_ipv6: tuning.listen_ipv6.unwrap_or(false),
-                }),
-                max_outstanding_requests_per_peer: tuning.max_outstanding_per_peer,
-                max_peers_per_torrent: tuning.max_peers_per_torrent,
-                upload_rate_limit: tuning.upload_rate_limit,
-                disable_local_service_discovery: !tuning.enable_lsd.unwrap_or(true),
-                encryption,
-                p2p_proxy: tuning.p2p_proxy.clone(),
-                ..Default::default()
-            },
+            session_opts(preferred_port),
         )
         .await
-        .map_err(|e| format!("Failed to create torrent session: {}", e))?;
+        {
+            Ok(session) => session,
+            Err(e) if preferred_port != 0 => {
+                tracing::warn!(
+                    "BT listen port {preferred_port} unavailable ({e}); using a random port"
+                );
+                bt::Session::new_with_opts(output_dir.to_path_buf(), session_opts(0))
+                    .await
+                    .map_err(|e| format!("Failed to create torrent session: {}", e))?
+            }
+            Err(e) => return Err(format!("Failed to create torrent session: {}", e)),
+        };
 
         tracing::info!(
             "Torrent engine initialized, output_dir={}",
@@ -280,6 +338,7 @@ impl TorrentEngine {
             output_dir: output_dir.to_path_buf(),
             magnet_cache: MagnetMetaCache::default(),
             p2p_route_lock: Arc::new(Mutex::new(())),
+            file_details_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -287,6 +346,26 @@ impl TorrentEngine {
         self.session
             .as_ref()
             .ok_or_else(|| "Torrent engine not initialized".to_string())
+    }
+
+    pub fn set_max_connections(&self, max: Option<usize>) {
+        if let Some(session) = self.session.as_ref() {
+            session.set_max_connections(max);
+        }
+    }
+
+    pub fn max_connections(&self) -> Option<usize> {
+        self.session.as_ref().map(|s| s.max_connections())
+    }
+
+    pub fn set_torrent_limits(&self, torrent_id: usize, download: u64, upload: u64) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if let Some(t) = session.get(bt::TorrentIdOrHash::Id(torrent_id)) {
+            t.set_download_limit(download);
+            t.set_upload_limit(upload);
+        }
     }
 
     pub fn list_managed_torrents(&self) -> Vec<(usize, String)> {
@@ -299,7 +378,6 @@ impl TorrentEngine {
         })
     }
 
-    /// Snapshot of BitTorrent session health for the `/health` panel; `None` when the torrent engine has been torn down
     pub fn health_snapshot(&self) -> Option<BtHealthSnapshot> {
         let session = self.session.as_ref()?;
         let upnp = session.upnp_status();
@@ -322,12 +400,10 @@ impl TorrentEngine {
         Ok(self.get_session()?.set_peer_blocklist(entries).await)
     }
 
-    /// 0-based user-facing file indices from the `select-file` option
     fn parse_select_files(options: &Map<String, Value>) -> Option<Vec<usize>> {
         parse_select_file(options.get("select-file").and_then(|v| v.as_str())?)
     }
 
-    /// Apply `select-file` (aria2 syntax, `None` or empty = every file) to a running torrent
     pub async fn set_select_file(
         &self,
         torrent_id: usize,
@@ -369,7 +445,6 @@ impl TorrentEngine {
             .await
     }
 
-    /// `magnet_select` is a magnet's BEP 53 `so=`, used when the task has no `select-file` key
     async fn add_torrent_bytes_with_peer_sources(
         &self,
         data: &[u8],
@@ -385,16 +460,19 @@ impl TorrentEngine {
             .and_then(|v| v.as_str())
             .unwrap_or(self.output_dir.to_str().unwrap_or("."));
 
-        let trackers = Self::parse_trackers(options);
+        let parsed = bt::parse_torrent(data).ok();
+        let trackers = Self::extra_trackers(
+            options,
+            parsed.as_ref().is_some_and(|meta| meta.info.private),
+        );
         let task_p2p_proxy = p2p_proxy_from_options(options)?;
         let task_p2p_proxy_is_override = options
             .get(TASK_P2P_PROXY_OVERRIDE_KEY)
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // `select-file` counts visible files; the BT engine counts every entry including padding
-        let selectable = bt::parse_torrent(data)
-            .map(|meta| meta.info.selectable_file_indices())
-            .ok();
+        let selectable = parsed
+            .as_ref()
+            .map(|meta| meta.info.selectable_file_indices());
         let (only_files, adopted_select_file) =
             initial_file_selection(options, magnet_select, selectable.as_deref());
         let create_subfolder = options
@@ -410,12 +488,13 @@ impl TorrentEngine {
                 Some(trackers)
             },
             only_files,
-            list_only: false,
             create_subfolder,
             initial_peers,
             initial_tracker_peers,
             p2p_proxy: task_p2p_proxy,
             p2p_proxy_is_task_override: task_p2p_proxy_is_override,
+            download_limit: task_limit(options, "max-download-limit"),
+            upload_limit: task_limit(options, "max-upload-limit"),
         };
 
         tracing::info!("Adding torrent bytes ({} bytes) to dir={}", data.len(), dir);
@@ -428,7 +507,6 @@ impl TorrentEngine {
             .await
             .map_err(|e| format!("Failed to add torrent: {}", e))?;
 
-        // An already-managed torrent keeps its own selection, so only a fresh add reports `so=`
         let added = matches!(response, bt::AddTorrentResponse::Added(..));
         let mut handle = extract_handle(response)?;
         if added {
@@ -458,9 +536,6 @@ impl TorrentEngine {
         .await
     }
 
-    /// Resolve and add a magnet only when it belongs to the supplied route
-    /// generation. The generation check and cancellation-token capture happen
-    /// under the cache lock, which is also used by route invalidation
     pub async fn resolve_and_add_magnet_at_generation(
         &self,
         magnet_uri: &str,
@@ -492,20 +567,28 @@ impl TorrentEngine {
         timeout_secs: u64,
         cancellation: CancellationToken,
     ) -> Result<TorrentHandle, String> {
-        let (bytes, peers, tracker_peers) = self
-            .resolve_magnet_bytes_with_cancellation(
-                magnet_uri,
-                options,
-                timeout_secs,
-                cancellation.clone(),
-            )
-            .await?;
+        let saved = load_saved_torrent_metadata(magnet_uri, options, &self.output_dir).await;
+        let loaded = saved.is_some();
+        let (bytes, peers, tracker_peers) = match saved {
+            Some(bytes) => (bytes, Vec::new(), Vec::new()),
+            None => {
+                self.resolve_magnet_bytes_with_cancellation(
+                    magnet_uri,
+                    options,
+                    timeout_secs,
+                    cancellation.clone(),
+                )
+                .await?
+            }
+        };
 
         if cancellation.is_cancelled() {
             return Err(MAGNET_ROUTE_CHANGED.to_string());
         }
 
-        save_torrent_metadata_if_enabled(&bytes, options, &self.output_dir).await;
+        if !loaded {
+            save_torrent_metadata_if_enabled(&bytes, options, &self.output_dir).await;
+        }
 
         if cancellation.is_cancelled() {
             return Err(MAGNET_ROUTE_CHANGED.to_string());
@@ -542,6 +625,33 @@ impl TorrentEngine {
         options: &Map<String, Value>,
         timeout_secs: u64,
     ) -> Result<Vec<TorrentFileInfo>, String> {
+        let (_, cancellation) = self.magnet_cache.route_snapshot().await;
+        self.resolve_magnet_with_cancellation(magnet_uri, options, timeout_secs, cancellation)
+            .await
+    }
+
+    pub async fn resolve_magnet_at_generation(
+        &self,
+        magnet_uri: &str,
+        options: &Map<String, Value>,
+        timeout_secs: u64,
+        expected_generation: u64,
+    ) -> Result<Vec<TorrentFileInfo>, String> {
+        let cancellation = self
+            .magnet_cache
+            .route_snapshot_for(expected_generation)
+            .await?;
+        self.resolve_magnet_with_cancellation(magnet_uri, options, timeout_secs, cancellation)
+            .await
+    }
+
+    async fn resolve_magnet_with_cancellation(
+        &self,
+        magnet_uri: &str,
+        options: &Map<String, Value>,
+        timeout_secs: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<TorrentFileInfo>, String> {
         let session = self.get_session()?;
 
         if let Ok(magnet) = bt::Magnet::parse(magnet_uri) {
@@ -558,7 +668,6 @@ impl TorrentEngine {
 
         tracing::info!("Resolving magnet metadata: {}", magnet_uri);
         let start = std::time::Instant::now();
-        let (_, cancellation) = self.magnet_cache.route_snapshot().await;
         let (torrent_bytes, _, _) = self
             .resolve_magnet_bytes_with_cancellation(
                 magnet_uri,
@@ -597,6 +706,7 @@ impl TorrentEngine {
         );
         let session = self.get_session()?;
         let listen_port = session.listen_port();
+        let conn_budget = session.conn_budget();
         let task_proxy_override = options
             .get(TASK_P2P_PROXY_OVERRIDE_KEY)
             .and_then(Value::as_bool)
@@ -629,6 +739,7 @@ impl TorrentEngine {
                 enc,
                 utp,
                 p2p_proxy,
+                conn_budget,
             )
             .await
         };
@@ -681,17 +792,20 @@ impl TorrentEngine {
         enc: bt::EncryptionPolicy,
         utp: Option<Arc<bt::utp::UtpSocket>>,
         p2p_proxy: Option<risuko_http::ProxyConnector>,
+        conn_budget: Arc<bt::conn_budget::ConnBudget>,
     ) -> Result<ResolvedMagnetMeta, String> {
         let resolved = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            bt::magnet::resolve_with_port_and_utp_and_proxy(
+            bt::magnet::resolve_with_conn_budget(
                 &magnet_uri,
                 &trackers,
+                &[],
                 listen_port,
                 Duration::from_secs(timeout_secs),
                 enc,
                 utp,
                 p2p_proxy,
+                Some(conn_budget),
             ),
         )
         .await
@@ -717,18 +831,31 @@ impl TorrentEngine {
             .get("bt-tracker")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for part in raw.split([',', '\n', '\r']) {
-            let t = part.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if seen.insert(t.to_string()) {
-                out.push(t.to_string());
+        bt::torrent::split_tracker_lists([raw])
+    }
+
+    fn extra_trackers(options: &Map<String, Value>, private: bool) -> Vec<String> {
+        if private {
+            Vec::new()
+        } else {
+            Self::parse_trackers(options)
+        }
+    }
+
+    fn file_details_for(
+        &self,
+        torrent_id: usize,
+        meta: &Arc<bt::TorrentMeta>,
+    ) -> Arc<Vec<TorrentFileInfo>> {
+        let mut cache = self.file_details_cache.lock();
+        if let Some((cached_meta, details)) = cache.get(&torrent_id) {
+            if Arc::ptr_eq(cached_meta, meta) {
+                return details.clone();
             }
         }
-        out
+        let details = Arc::new(extract_file_details(&meta.info));
+        cache.insert(torrent_id, (meta.clone(), details.clone()));
+        details
     }
 
     pub fn get_torrent_stats(&self, torrent_id: usize) -> Option<TorrentStats> {
@@ -736,45 +863,27 @@ impl TorrentEngine {
         let handle = session.get(bt::TorrentIdOrHash::Id(torrent_id))?;
         let stats = handle.stats();
 
-        let (download_speed, upload_speed, num_peers, peers, num_seeders) = match &stats.live {
+        let (download_speed, upload_speed, num_peers, num_seeders) = match &stats.live {
             Some(live) => {
                 let count = live.snapshot.peer_stats.live;
                 let dl = (live.download_speed.mbps * 1_048_576.0) as u64;
                 let ul = (live.upload_speed.mbps * 1_048_576.0) as u64;
-                let mapped: Vec<PeerSnapshot> = stats
-                    .peers
-                    .iter()
-                    .map(|p| PeerSnapshot {
-                        addr: p.addr,
-                        bitfield: p.bitfield.clone(),
-                        am_choking: p.am_choking,
-                        am_interested: p.am_interested,
-                        peer_choking: p.peer_choking,
-                        peer_interested: p.peer_interested,
-                        seeder: p.seeder,
-                        peer_id: p.peer_id,
-                        client: p.client.clone(),
-                        downloaded: p.downloaded,
-                        uploaded: p.uploaded,
-                        dl_speed: p.dl_speed,
-                        up_speed: p.up_speed,
-                        incoming: p.incoming,
-                        snubbed: p.snubbed,
-                        progress: p.progress,
-                        optimistic_unchoke: p.optimistic_unchoke,
-                    })
-                    .collect();
-                let seeders = mapped.iter().filter(|p| p.seeder).count() as u32;
-                (dl, ul, count, mapped, seeders)
+                let seeders = stats.peers.iter().filter(|p| p.seeder).count() as u32;
+                (dl, ul, count, seeders)
             }
-            None => (0, 0, 0, Vec::new(), 0),
+            None => (0, 0, 0, 0),
+        };
+        let peers = if stats.live.is_some() {
+            stats.peers
+        } else {
+            Arc::from(Vec::new())
         };
 
         let name = handle.name();
 
         let metadata_payload = handle.metadata.load();
         let metadata = metadata_payload.as_ref().map(|meta| {
-            let total_pieces = (meta.info.pieces.len() / 20) as u32;
+            let total_pieces = meta.info.piece_count();
             TorrentMetadataInfo {
                 piece_length: meta.info.piece_length,
                 num_pieces: total_pieces,
@@ -785,7 +894,7 @@ impl TorrentEngine {
         });
         let file_details = metadata_payload
             .as_ref()
-            .map(|meta| extract_file_details(&meta.info));
+            .map(|meta| self.file_details_for(torrent_id, meta));
         let single_file_mode = metadata_payload
             .as_ref()
             .map(|meta| meta.info.single_file_mode)
@@ -806,7 +915,9 @@ impl TorrentEngine {
             resolved_root: Some(handle.root_dir.to_string_lossy().into_owned()),
             single_file_mode,
             peers,
+            peers_seq: stats.peers_seq,
             metadata,
+            error: stats.error,
         })
     }
 
@@ -817,6 +928,17 @@ impl TorrentEngine {
             .ok_or("Torrent not found")?;
         session
             .pause(&handle)
+            .await
+            .map_err(|e| format!("Failed to pause: {}", e))
+    }
+
+    pub async fn pause_if_halted(&self, torrent_id: usize) -> Result<(), String> {
+        let session = self.get_session()?;
+        let handle = session
+            .get(bt::TorrentIdOrHash::Id(torrent_id))
+            .ok_or("Torrent not found")?;
+        session
+            .pause_if_halted(&handle)
             .await
             .map_err(|e| format!("Failed to pause: {}", e))
     }
@@ -862,9 +984,9 @@ impl TorrentEngine {
         self.magnet_cache.invalidate().await;
     }
 
-    /// Drop a torrent from the bt session; `with_files=true` also wipes the on-disk payload, `with_files=false` keeps files but still releases the `by_hash` reservation so re-adding the same magnet isn't blocked as `AlreadyManaged`
     pub async fn remove(&self, torrent_id: usize, with_files: bool) -> Result<(), String> {
         let session = self.get_session()?;
+        self.file_details_cache.lock().remove(&torrent_id);
         session
             .delete(bt::TorrentIdOrHash::Id(torrent_id), with_files)
             .await
@@ -873,12 +995,14 @@ impl TorrentEngine {
 
     pub async fn shutdown(&mut self) {
         if let Some(session) = self.session.take() {
+            session.shutdown().await;
             drop(session);
         }
     }
 }
 
 fn extract_handle(response: bt::AddTorrentResponse) -> Result<TorrentHandle, String> {
+    let already_managed = matches!(response, bt::AddTorrentResponse::AlreadyManaged(..));
     match response {
         bt::AddTorrentResponse::Added(id, handle)
         | bt::AddTorrentResponse::AlreadyManaged(id, handle) => Ok(TorrentHandle {
@@ -887,14 +1011,23 @@ fn extract_handle(response: bt::AddTorrentResponse) -> Result<TorrentHandle, Str
             info_hash_v2: handle.info_hash_v2().map(|h| h.to_hex()),
             meta_version: handle.meta_version().map(|s| s.to_string()),
             select_file: None,
+            already_managed,
         }),
-        bt::AddTorrentResponse::ListOnly(_) => {
-            Err("Torrent was added in list-only mode".to_string())
-        }
     }
 }
 
-/// File list without BEP 47 padding; `torrent_index` keeps each file's position in the torrent
+pub fn disk_component(name: &str) -> String {
+    bt::core::metainfo::fs_component(name).into_owned()
+}
+
+pub fn disk_path(rel: &str) -> String {
+    map_path_components(rel, disk_component)
+}
+
+fn map_path_components(rel: &str, map: impl Fn(&str) -> String) -> String {
+    rel.split('/').map(map).collect::<Vec<_>>().join("/")
+}
+
 fn extract_file_details(info: &bt::ValidatedTorrentMetaV1Info) -> Vec<TorrentFileInfo> {
     info.iter_file_details()
         .enumerate()
@@ -909,7 +1042,6 @@ fn extract_file_details(info: &bt::ValidatedTorrentMetaV1Info) -> Vec<TorrentFil
         .collect()
 }
 
-/// Initial `only_files` plus the `select-file` adopted from a magnet's `so=`
 fn initial_file_selection(
     options: &Map<String, Value>,
     magnet_select: Option<&[usize]>,
@@ -922,7 +1054,6 @@ fn initial_file_selection(
         };
         return (Some(only_files), None);
     }
-    // Any task `select-file`, even an empty one meaning every file, overrides `so=`
     if options.contains_key("select-file") {
         return (None, None);
     }
@@ -930,7 +1061,6 @@ fn initial_file_selection(
         return (None, None);
     };
     let display = torrent_to_display_indices(so, selectable);
-    // A `so=` naming only padding or missing entries would select nothing
     if display.is_empty() {
         return (None, None);
     }
@@ -938,10 +1068,8 @@ fn initial_file_selection(
     (Some(only_files), Some(format_select_file(&display)))
 }
 
-/// Cap on indices one `select-file` may expand to
 const MAX_SELECT_FILE_INDICES: usize = 1_000_000;
 
-/// Parse aria2 `select-file` (`1,3-5`, 1-based) into sorted 0-based indices
 pub(crate) fn parse_select_file(raw: &str) -> Option<Vec<usize>> {
     let mut out = std::collections::BTreeSet::new();
     for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -971,7 +1099,6 @@ pub(crate) fn parse_select_file(raw: &str) -> Option<Vec<usize>> {
     (!out.is_empty()).then(|| out.into_iter().collect())
 }
 
-/// Format 0-based indices as aria2 `select-file`, collapsing runs into ranges
 pub(crate) fn format_select_file(indices: &[usize]) -> String {
     let mut sorted = indices.to_vec();
     sorted.sort_unstable();
@@ -992,7 +1119,6 @@ pub(crate) fn format_select_file(indices: &[usize]) -> String {
     parts.join(",")
 }
 
-/// User-facing (padding-free) indices to positions in the torrent's file list
 pub(crate) fn display_to_torrent_indices(display: &[usize], selectable: &[usize]) -> Vec<usize> {
     display
         .iter()
@@ -1000,7 +1126,6 @@ pub(crate) fn display_to_torrent_indices(display: &[usize], selectable: &[usize]
         .collect()
 }
 
-/// Torrent file positions (e.g. BEP 53 `so=`) to user-facing indices; `selectable` is ascending
 pub(crate) fn torrent_to_display_indices(torrent: &[usize], selectable: &[usize]) -> Vec<usize> {
     torrent
         .iter()
@@ -1008,7 +1133,6 @@ pub(crate) fn torrent_to_display_indices(torrent: &[usize], selectable: &[usize]
         .collect()
 }
 
-/// Aggregate `announce` and `announce_list` into the BEP-12 nested-tier shape the frontend expects (`string[][]`), falling back to a single tier with the primary announce URL when no list is present
 fn build_announce_list(meta: &bt::TorrentMeta) -> Vec<Vec<String>> {
     if !meta.announce_list.is_empty() {
         return meta
@@ -1029,14 +1153,12 @@ pub struct TorrentHandle {
     pub info_hash: Option<String>,
     pub info_hash_v2: Option<String>,
     pub meta_version: Option<String>,
-    /// `select-file` derived from a magnet's `so=`, for tasks without one
     pub select_file: Option<String>,
+    pub already_managed: bool,
 }
 
 pub struct TorrentFileInfo {
-    /// Position among visible files, as `select-file` counts
     pub index: usize,
-    /// Position in the torrent's file list and its per-file progress
     pub torrent_index: usize,
     pub path: String,
     pub length: u64,
@@ -1052,34 +1174,17 @@ pub struct TorrentStats {
     pub num_seeders: u32,
     pub is_finished: bool,
     pub name: Option<String>,
-    pub file_progress: Vec<u64>,
-    pub file_details: Option<Vec<TorrentFileInfo>>,
+    pub file_progress: Arc<Vec<u64>>,
+    pub file_details: Option<Arc<Vec<TorrentFileInfo>>>,
     pub resolved_root: Option<String>,
     pub single_file_mode: bool,
-    pub peers: Vec<PeerSnapshot>,
+    pub peers: Arc<[PeerSnapshot]>,
+    pub peers_seq: u64,
     pub metadata: Option<TorrentMetadataInfo>,
+    pub error: Option<String>,
 }
 
-pub struct PeerSnapshot {
-    pub addr: std::net::SocketAddr,
-    /// Raw bitfield bytes; manager hex-encodes for the RPC payload
-    pub bitfield: std::sync::Arc<[u8]>,
-    pub am_choking: bool,
-    pub am_interested: bool,
-    pub peer_choking: bool,
-    pub peer_interested: bool,
-    pub seeder: bool,
-    pub peer_id: Option<[u8; 20]>,
-    pub client: Option<String>,
-    pub downloaded: u64,
-    pub uploaded: u64,
-    pub dl_speed: u64,
-    pub up_speed: u64,
-    pub incoming: bool,
-    pub snubbed: bool,
-    pub progress: f64,
-    pub optimistic_unchoke: bool,
-}
+pub use bt::PeerSnapshot;
 
 pub struct MagnetInfo {
     pub info_hash: String,
@@ -1223,6 +1328,57 @@ pub fn inspect_magnet(uri: &str) -> Result<MagnetInfo, String> {
         display_name: magnet.display_name.clone(),
     })
 }
+const MAX_SAVED_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
+async fn load_saved_torrent_metadata(
+    magnet_uri: &str,
+    options: &Map<String, Value>,
+    output_dir: &Path,
+) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    if !options
+        .get("bt-load-saved-metadata")
+        .and_then(super::options::json_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let magnet = bt::Magnet::parse(magnet_uri).ok()?;
+    let want_v1 = magnet.info_hash_v1()?;
+    let want_v2 = magnet.info_hash_v2();
+    let name = format!("{}.torrent", want_v1.to_hex());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = options.get("dir").and_then(Value::as_str) {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.push(output_dir.to_path_buf());
+    for dir in dirs {
+        let file = match tokio::fs::File::open(dir.join(&name)).await {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_SAVED_METADATA_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+            || bytes.len() as u64 > MAX_SAVED_METADATA_BYTES
+        {
+            continue;
+        }
+        let Ok(meta) = bt::parse_torrent(&bytes) else {
+            continue;
+        };
+        if meta.info_hash == want_v1 && want_v2.is_none_or(|v2| meta.info_hash_v2 == Some(v2)) {
+            tracing::info!("Using saved torrent metadata from {}", dir.display());
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 async fn save_torrent_metadata_if_enabled(
     bytes: &[u8],
     options: &Map<String, Value>,
@@ -1230,7 +1386,7 @@ async fn save_torrent_metadata_if_enabled(
 ) {
     let save_metadata = options
         .get("bt-save-metadata")
-        .and_then(|v| v.as_bool())
+        .and_then(super::options::json_bool)
         .unwrap_or(false);
     if !save_metadata {
         return;
@@ -1257,7 +1413,6 @@ async fn save_torrent_metadata_if_enabled(
     }
 }
 
-/// Map an optional config string to a concrete BitTorrent encryption policy; unknown/missing values fall back to `Prefer` (MSE first, plaintext fallback) matching the system default
 fn encryption_policy_from_str(s: Option<&str>) -> bt::EncryptionPolicy {
     match s {
         Some("plaintext") => bt::EncryptionPolicy::PlaintextOnly,
@@ -1295,6 +1450,19 @@ pub(crate) fn p2p_proxy_from_options(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disk_path_maps_each_component() {
+        let win = |c: &str| bt::core::metainfo::sanitize_windows_component(c);
+        assert_eq!(
+            map_path_components("CON/a:b/ok.txt", win),
+            "_CON/a_b/ok.txt"
+        );
+        if !cfg!(windows) {
+            assert_eq!(disk_path("a:b/c"), "a:b/c");
+        }
+        assert_eq!(disk_component("plain"), "plain");
+    }
+
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1336,13 +1504,11 @@ mod tests {
         assert_eq!(shown, vec![(0, 0, "a"), (1, 2, "b")]);
 
         let selectable = info.selectable_file_indices();
-        // The second visible file is torrent entry 2
         assert_eq!(display_to_torrent_indices(&[1], &selectable), vec![2]);
         assert_eq!(
             display_to_torrent_indices(&[5], &selectable),
             Vec::<usize>::new()
         );
-        // BEP 53 so=0,1,2 names the padding entry too; it drops out
         assert_eq!(
             torrent_to_display_indices(&[0, 1, 2], &selectable),
             vec![0, 1]
@@ -1355,7 +1521,6 @@ mod tests {
 
     #[test]
     fn task_select_file_overrides_magnet_so() {
-        // Torrent entry 1 is padding
         let selectable = [0, 2, 3];
         let so: &[usize] = &[2, 3];
         let mut opts = Map::new();
@@ -1367,7 +1532,6 @@ mod tests {
             initial_file_selection(&opts, Some(&[1, 7]), Some(&selectable)),
             (None, None)
         );
-        // An explicitly empty selection means every file
         opts.insert("select-file".into(), json!(""));
         assert_eq!(
             initial_file_selection(&opts, Some(so), Some(&selectable)),
@@ -1444,6 +1608,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn magnet_cache_is_bounded() {
+        let cache = MagnetMetaCache::default();
+        for i in 0..(MAGNET_META_CACHE_MAX as u8 + 4) {
+            cache
+                .get_or_resolve([i; 20], move || async move { Ok(resolved_meta(i)) })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            cache.state.lock().await.completed.len(),
+            MAGNET_META_CACHE_MAX
+        );
+    }
+
+    #[tokio::test]
     async fn magnet_cache_panic_does_not_leave_in_flight_entry() {
         let cache = MagnetMetaCache::default();
         let key = [4; 20];
@@ -1515,8 +1694,6 @@ mod tests {
         let cache = MagnetMetaCache::default();
         let (old_generation, old_cancellation) = cache.route_snapshot().await;
 
-        // Model a resolver that was spawned before the reload, then delayed
-        // until after invalidation has installed a fresh cancellation token
         cache.invalidate().await;
         assert!(old_cancellation.is_cancelled());
 
@@ -1548,6 +1725,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn polled_stats_share_file_details_and_peers() {
+        use bt::bencode::{encode_to_vec, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let tuning = BtTuning {
+            enable_upnp: Some(false),
+            enable_lsd: Some(false),
+            ..Default::default()
+        };
+        let mut engine = TorrentEngine::new_with_tuning(dir.path(), tuning)
+            .await
+            .unwrap();
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(1024)),
+            (b"name".to_vec(), Value::Bytes(b"polled.bin".to_vec())),
+            (b"piece length".to_vec(), Value::Int(1024)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
+        ]);
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let mut options = Map::new();
+        options.insert("dir".into(), json!(dir.path().to_string_lossy()));
+        let handle = engine.add_torrent_bytes(&bytes, &options).await.unwrap();
+
+        let first = engine.get_torrent_stats(handle.id).unwrap();
+        let second = engine.get_torrent_stats(handle.id).unwrap();
+        let (a, b) = (first.file_details.unwrap(), second.file_details.unwrap());
+        assert_eq!(a.len(), 1);
+        assert!(Arc::ptr_eq(&a, &b), "file list is rebuilt per poll");
+        assert_eq!(first.peers_seq, second.peers_seq);
+        assert!(Arc::ptr_eq(&first.peers, &second.peers));
+
+        engine.remove(handle.id, false).await.unwrap();
+        assert!(engine.file_details_cache.lock().is_empty());
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn private_torrents_skip_the_global_tracker_list() {
+        let mut opts = Map::new();
+        opts.insert("bt-tracker".into(), json!("udp://a:1/announce"));
+        assert_eq!(
+            TorrentEngine::extra_trackers(&opts, false),
+            vec!["udp://a:1/announce".to_string()]
+        );
+        assert!(TorrentEngine::extra_trackers(&opts, true).is_empty());
+    }
+
     #[test]
     fn encryption_policy_known_values() {
         assert!(matches!(
@@ -1574,7 +1798,6 @@ mod tests {
             encryption_policy_from_str(Some("garbage")),
             bt::EncryptionPolicy::Prefer
         ));
-        // case-sensitive: uppercase is not recognised
         assert!(matches!(
             encryption_policy_from_str(Some("REQUIRE")),
             bt::EncryptionPolicy::Prefer

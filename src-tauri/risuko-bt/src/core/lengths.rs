@@ -1,6 +1,3 @@
-//! Piece / chunk length arithmetic: fixed-size pieces (per torrent) split into 16 KiB chunks (BEP-3 convention)
-
-/// Standard chunk (block) size; BEP-3 requires accepting requests up to this size and peers refuse anything larger
 pub const CHUNK_SIZE: u32 = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,22 +8,18 @@ pub enum LengthError {
     ZeroPieceLength,
     #[error("piece index {0} is out of range")]
     BadPieceIndex(u32),
+    #[error("torrent has too many pieces")]
+    TooManyPieces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkInfo {
     pub piece_index: ValidPieceIndex,
-    /// Index of chunk within the piece
     pub chunk_index: u32,
-    /// Global chunk index starting at 0 for the first chunk of piece 0
-    pub absolute_index: u64,
-    /// Number of bytes in this chunk
     pub size: u32,
-    /// Offset of the chunk's first byte within the piece
     pub offset: u32,
 }
 
-/// A piece index validated against a given [`Lengths`], acting as a proof obligation for downstream arithmetic
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValidPieceIndex(u32);
 
@@ -56,7 +49,6 @@ pub struct Lengths {
     piece_length: u32,
     last_piece_index: u32,
     last_piece_length: u32,
-    chunks_per_piece: u32,
 }
 
 impl Lengths {
@@ -68,7 +60,9 @@ impl Lengths {
             return Err(LengthError::ZeroPieceLength);
         }
         let total_pieces = total_length.div_ceil(piece_length as u64);
-        let chunks_per_piece = (piece_length as u64).div_ceil(CHUNK_SIZE as u64) as u32;
+        if total_pieces > u32::MAX as u64 {
+            return Err(LengthError::TooManyPieces);
+        }
         let rem = (total_length % piece_length as u64) as u32;
         let last_piece_length = if rem == 0 { piece_length } else { rem };
         Ok(Self {
@@ -76,7 +70,6 @@ impl Lengths {
             piece_length,
             last_piece_index: (total_pieces - 1) as u32,
             last_piece_length,
-            chunks_per_piece,
         })
     }
 
@@ -88,9 +81,6 @@ impl Lengths {
     }
     pub const fn total_pieces(&self) -> u32 {
         self.last_piece_index + 1
-    }
-    pub const fn chunks_per_piece(&self) -> u32 {
-        self.chunks_per_piece
     }
     pub const fn piece_bitfield_bytes(&self) -> usize {
         (self.total_pieces() as usize).div_ceil(8)
@@ -112,24 +102,35 @@ impl Lengths {
         }
     }
 
-    /// Absolute byte offset of a piece's first byte within the torrent
     pub fn piece_offset(&self, idx: ValidPieceIndex) -> u64 {
         idx.0 as u64 * self.piece_length as u64
     }
 
-    /// Iterate chunks that make up a piece
+    pub fn chunk_info(&self, idx: ValidPieceIndex, chunk: u32) -> Option<ChunkInfo> {
+        let piece_len = self.piece_length_of(idx);
+        let offset = chunk.checked_mul(CHUNK_SIZE)?;
+        if offset >= piece_len {
+            return None;
+        }
+        Some(ChunkInfo {
+            piece_index: idx,
+            chunk_index: chunk,
+            size: (piece_len - offset).min(CHUNK_SIZE),
+            offset,
+        })
+    }
+
+    #[cfg(test)]
     pub fn chunks_of(&self, idx: ValidPieceIndex) -> impl Iterator<Item = ChunkInfo> + '_ {
         let piece_len = self.piece_length_of(idx);
         let chunk_count = piece_len.div_ceil(CHUNK_SIZE);
         let piece_index = idx;
-        let chunks_per_normal = self.chunks_per_piece as u64;
         (0..chunk_count).map(move |c| {
             let offset = c * CHUNK_SIZE;
             let size = piece_len.saturating_sub(offset).min(CHUNK_SIZE);
             ChunkInfo {
                 piece_index,
                 chunk_index: c,
-                absolute_index: piece_index.0 as u64 * chunks_per_normal + c as u64,
                 size,
                 offset,
             }
@@ -179,6 +180,10 @@ mod tests {
     fn reject_zero() {
         assert!(Lengths::new(0, 1024).is_err());
         assert!(Lengths::new(1024, 0).is_err());
+        assert!(matches!(
+            Lengths::new(u64::MAX, 1),
+            Err(LengthError::TooManyPieces)
+        ));
     }
 
     #[test]

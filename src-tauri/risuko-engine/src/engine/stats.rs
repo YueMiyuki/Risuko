@@ -143,7 +143,7 @@ impl DownloadStatsManager {
             let mut data: DownloadStatsStore = serde_json::from_value(data_val)
                 .map_err(|e| format!("Failed to parse stats data: {e}"))?;
             data.version = STATS_VERSION;
-            // Uncontended at single-threaded startup before the Arc is shared; try_lock avoids blocking_lock() panicking on a Tokio worker thread
+            // `try_lock` avoids the `blocking_lock()` panic on a Tokio worker
             let mut store = self
                 .store
                 .try_lock()
@@ -245,7 +245,6 @@ impl DownloadStatsManager {
     }
 
     pub fn clear_sync(&self) -> Result<(), String> {
-        // See load(): startup, uncontended lock; try_lock avoids the blocking_lock() panic risk inside a Tokio runtime
         let mut store = self
             .store
             .try_lock()
@@ -343,7 +342,6 @@ fn merge_store(store: &mut DownloadStatsStore, incoming: DownloadStatsStore) {
             .or_insert(baseline);
     }
 
-    // ponytail: no per-device bucket ids; max keeps full-snapshot sync idempotent; add bucket ids if cross-device additive merge matters
     for (month, protocols) in incoming.monthly {
         let target = store.monthly.entry(month).or_default();
         for (protocol, bytes) in protocols {
