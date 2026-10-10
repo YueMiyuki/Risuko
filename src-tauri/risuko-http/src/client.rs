@@ -46,10 +46,6 @@ struct ClientInner {
 }
 
 impl Client {
-    pub fn new() -> Self {
-        ClientBuilder::new().build().expect("default client build")
-    }
-
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
     }
@@ -68,10 +64,6 @@ impl Client {
 
     pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::DELETE, url)
-    }
-
-    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder {
-        self.request(Method::HEAD, url)
     }
 
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
@@ -95,7 +87,6 @@ impl Client {
                 headers.insert(USER_AGENT, ua.clone());
             }
         }
-        // `drain` yields the name only on a group's first entry (`None` after belongs to it): track last name so multi-valued request headers survive and drop defaults the request overrides
         let mut last_name: Option<http::HeaderName> = None;
         let mut overridden: std::collections::HashSet<http::HeaderName> =
             std::collections::HashSet::new();
@@ -155,14 +146,13 @@ impl Client {
             let location = resp
                 .headers()
                 .get(http::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
+                .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
                 .ok_or_else(|| Error::Redirect("missing Location header".into()))?
                 .to_string();
             let next = url
                 .join(&location)
                 .map_err(|e| Error::Redirect(e.to_string()))?;
 
-            // RFC 7231 §6.4: 301/302/303 may downgrade method to GET, 307/308 preserve method and body
             if matches!(
                 status,
                 StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER
@@ -173,19 +163,16 @@ impl Client {
                 body = ReqBody::Empty;
                 headers.remove(CONTENT_LENGTH);
                 headers.remove(http::header::CONTENT_TYPE);
-                // Strip caller-supplied body-framing headers too. Forwarding `Transfer-Encoding: chunked` together with `ReqBody::Empty` would produce a malformed request the upstream may reject or interpret ambiguously
                 headers.remove(http::header::TRANSFER_ENCODING);
             }
 
-            // Drop sensitive headers on cross-origin redirect
             if !same_origin(&url, &next) {
                 headers.remove(http::header::AUTHORIZATION);
                 headers.remove(http::header::COOKIE);
-                // Always strip an explicit Host so `send_once` can regenerate it from the new origin. Otherwise an explicit Host (set by the caller or via `default_headers`) would leak the old origin to the redirect target
                 headers.remove(HOST);
             }
 
-            resp.drain().await?;
+            resp.drain_bounded().await;
             url = next;
         }
     }
@@ -206,24 +193,9 @@ impl Client {
         let req_headers = builder
             .headers_mut()
             .ok_or_else(|| Error::Builder("no headers".into()))?;
-        // `HeaderMap::iter` yields the header name on every entry (unlike `drain`, which only yields it on the first entry of a group), so appending each (k, v) is enough to preserve multi-valued headers
         for (k, v) in headers.iter() {
             req_headers.append(k.clone(), v.clone());
         }
-        // Hyper requires a Host header; fill from URL if absent
-        if !req_headers.contains_key(HOST) {
-            if let Some(host) = url.host_str() {
-                let value = if let Some(port) = url.port() {
-                    format!("{host}:{port}")
-                } else {
-                    host.to_string()
-                };
-                if let Ok(v) = HeaderValue::from_str(&value) {
-                    req_headers.insert(HOST, v);
-                }
-            }
-        }
-
         if let Some(proxy) = &self.inner.proxy {
             let bypassed = self
                 .inner
@@ -241,13 +213,11 @@ impl Client {
                 }
             }
         }
-        // Auto Accept-Encoding when the user enabled compression and didn't override it themselves. Skip when no codec is enabled so we don't emit an empty header (which servers may treat as ambiguous)
         if !self.inner.accepts.is_empty()
             && !req_headers.contains_key(http::header::ACCEPT_ENCODING)
         {
             req_headers.insert(http::header::ACCEPT_ENCODING, self.inner.accepts.clone());
         }
-        // Cookie jar injection. Preserve any caller-provided Cookie header (matching reqwest's behaviour) so manual overrides win over the jar and we never silently clobber the user's value
         if let Some(jar) = &self.inner.cookie_jar {
             if !req_headers.contains_key(http::header::COOKIE) {
                 if let Some(cookie) = jar.cookies(url) {
@@ -256,10 +226,8 @@ impl Client {
             }
         }
 
-        // For streaming bodies with a known length, advertise Content-Length when the caller didn't already set framing headers. Without either Content-Length or Transfer-Encoding hyper would buffer the entire body to compute one — defeating streaming. Bytes/Empty bodies are sized automatically by hyper from the body's `size_hint`
         if matches!(body, ReqBody::Stream { .. }) {
             let has_length = req_headers.contains_key(CONTENT_LENGTH);
-            // RFC 9112: a request that already carries Transfer-Encoding *must not* also advertise Content-Length, regardless of which codings appear (the final coding is implicitly chunked). Detect both an explicit "chunked" token and the broader "any TE header present at all" case so we never inject a conflicting Content-Length on top of the caller's framing
             let has_chunked = req_headers
                 .get_all(http::header::TRANSFER_ENCODING)
                 .iter()
@@ -273,7 +241,6 @@ impl Client {
                         req_headers.insert(CONTENT_LENGTH, v);
                     }
                 } else {
-                    // Unknown length — let hyper send chunked
                     req_headers.insert(
                         http::header::TRANSFER_ENCODING,
                         HeaderValue::from_static("chunked"),
@@ -290,7 +257,6 @@ impl Client {
 
         let (parts, body) = resp.into_parts();
 
-        // Capture Set-Cookie before we move headers into Response
         if let Some(jar) = &self.inner.cookie_jar {
             let mut iter = parts.headers.get_all(http::header::SET_COOKIE).into_iter();
             jar.set_cookies(&mut iter, url);
@@ -315,7 +281,6 @@ impl Client {
             body.map_err(Error::from).boxed()
         };
 
-        // Strip Content-Length / Content-Encoding when we decoded so callers don't trust stale lengths
         let mut response_headers = parts.headers;
         if should_decode {
             response_headers.remove(CONTENT_LENGTH);
@@ -329,12 +294,6 @@ impl Client {
             url.clone(),
             resp_body,
         ))
-    }
-}
-
-impl Default for Client {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -355,8 +314,6 @@ fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-// --- Builder --
-
 pub struct ClientBuilder {
     user_agent: Option<HeaderValue>,
     default_headers: HeaderMap,
@@ -375,9 +332,9 @@ pub struct ClientBuilder {
     no_proxy: Option<NoProxy>,
     cookie_jar: Option<SharedJar>,
     resolver: Option<SharedResolver>,
-    extra_root_certs: Vec<Vec<u8>>,
     local_addr: Option<SocketAddr>,
     direct_address_filter: Option<Arc<dyn Fn(IpAddr) -> bool + Send + Sync>>,
+    http1_only: bool,
 }
 
 impl ClientBuilder {
@@ -400,10 +357,15 @@ impl ClientBuilder {
             no_proxy: None,
             cookie_jar: None,
             resolver: None,
-            extra_root_certs: Vec::new(),
             local_addr: None,
             direct_address_filter: None,
+            http1_only: false,
         }
+    }
+
+    pub fn http1_only(mut self, b: bool) -> Self {
+        self.http1_only = b;
+        self
     }
 
     pub fn user_agent<V: TryInto<HeaderValue>>(mut self, ua: V) -> Self {
@@ -482,11 +444,6 @@ impl ClientBuilder {
         self
     }
 
-    pub fn no_proxy_str(mut self, value: impl AsRef<str>) -> Self {
-        self.no_proxy = Some(NoProxy::parse(value));
-        self
-    }
-
     pub fn cookie_provider(mut self, jar: Arc<dyn crate::cookies::CookieStore>) -> Self {
         self.cookie_jar = Some(jar);
         self
@@ -507,7 +464,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Filter resolved addresses used for direct destination connections
     pub fn direct_address_filter<F>(mut self, filter: F) -> Self
     where
         F: Fn(IpAddr) -> bool + Send + Sync + 'static,
@@ -516,13 +472,8 @@ impl ClientBuilder {
         self
     }
 
-    pub fn add_root_certificate(mut self, der: impl Into<Vec<u8>>) -> Self {
-        self.extra_root_certs.push(der.into());
-        self
-    }
-
     pub fn build(self) -> Result<Client> {
-        let tls = build_tls(self.danger_accept_invalid_certs, &self.extra_root_certs)?;
+        let tls = build_tls(self.danger_accept_invalid_certs, self.http1_only);
 
         let no_proxy_matcher = self
             .no_proxy
@@ -536,7 +487,7 @@ impl ClientBuilder {
         let proxy = self.proxy.map(Arc::new);
         let no_proxy = has_proxy.then(|| Arc::new(no_proxy_matcher));
         let connector = Connector {
-            tls: Arc::new(tls),
+            tls,
             resolver: self.resolver.unwrap_or_else(|| Arc::new(GlobalResolver)),
             proxy: proxy.clone(),
             no_proxy: no_proxy.clone(),
@@ -548,6 +499,10 @@ impl ClientBuilder {
         };
 
         let mut hyper_builder = HyperClient::builder(TokioExecutor::new());
+        hyper_builder
+            .pool_timer(hyper_util::rt::TokioTimer::new())
+            .http2_initial_stream_window_size(H2_STREAM_WINDOW)
+            .http2_initial_connection_window_size(H2_CONN_WINDOW);
         if let Some(d) = self.pool_idle_timeout {
             hyper_builder.pool_idle_timeout(d);
         }
@@ -596,7 +551,21 @@ impl Default for ClientBuilder {
     }
 }
 
-fn build_tls(danger_accept_invalid: bool, extra: &[Vec<u8>]) -> Result<ClientConfig> {
+const H2_STREAM_WINDOW: u32 = 6 << 20;
+const H2_CONN_WINDOW: u32 = 15 << 20;
+
+fn build_tls(danger_accept_invalid: bool, http1_only: bool) -> Arc<ClientConfig> {
+    static VERIFIED: [std::sync::OnceLock<Arc<ClientConfig>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    if danger_accept_invalid {
+        return Arc::new(make_tls(true, http1_only));
+    }
+    VERIFIED[usize::from(http1_only)]
+        .get_or_init(|| Arc::new(make_tls(false, http1_only)))
+        .clone()
+}
+
+fn make_tls(danger_accept_invalid: bool, http1_only: bool) -> ClientConfig {
     static INSTALL_PROVIDER: std::sync::Once = std::sync::Once::new();
     INSTALL_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -604,17 +573,15 @@ fn build_tls(danger_accept_invalid: bool, extra: &[Vec<u8>]) -> Result<ClientCon
 
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for der in extra {
-        let cert = CertificateDer::from(der.clone());
-        roots
-            .add(cert)
-            .map_err(|e| Error::Tls(format!("invalid extra root: {e}")))?;
-    }
 
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = if http1_only {
+        vec![b"http/1.1".to_vec()]
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
 
     if danger_accept_invalid {
         config
@@ -622,7 +589,7 @@ fn build_tls(danger_accept_invalid: bool, extra: &[Vec<u8>]) -> Result<ClientCon
             .set_certificate_verifier(Arc::new(NoCertVerifier));
     }
 
-    Ok(config)
+    config
 }
 
 #[derive(Debug)]
@@ -696,11 +663,18 @@ mod tests {
 
     #[test]
     fn build_tls_advertises_h2_then_http11_alpn() {
-        let config = build_tls(false, &[]).unwrap();
+        let config = build_tls(false, false);
         assert_eq!(
             config.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+    }
+
+    #[test]
+    fn build_tls_http1_only_advertises_http11_alpn() {
+        let config = build_tls(false, true);
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert!(Client::builder().http1_only(true).build().is_ok());
     }
 
     #[tokio::test]
@@ -839,8 +813,6 @@ mod tests {
 
         let client = Client::builder()
             .proxy(Proxy::all(format!("http://{address}")).unwrap())
-            // A v6 source cannot connect to this v4 proxy. The request must
-            // still succeed because only direct destination routes are bound
             .local_address(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
             .build()
             .unwrap();
@@ -921,5 +893,181 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "direct");
         proxy.await.unwrap();
         direct.await.unwrap();
+    }
+
+    async fn serve_once(listener: TcpListener, response: Vec<u8>) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let _ = socket.write_all(&response).await;
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_host_connects_without_brackets() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ));
+        let client = Client::builder().build().unwrap();
+        let body = client
+            .get(format!("http://[::1]:{port}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_accepts_utf8_location_and_truncated_body() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_port = second.local_addr().unwrap().port();
+
+        let mut redirect =
+            format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{second_port}/").into_bytes();
+        redirect.extend_from_slice("文件".as_bytes());
+        redirect.extend_from_slice(b"\r\nContent-Length: 100\r\n\r\npartial");
+        let a = tokio::spawn(serve_once(first, redirect));
+        let b = tokio::spawn(async move {
+            let (mut socket, _) = second.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let n = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..n]).to_string();
+            assert!(
+                request.starts_with("GET /%E6%96%87%E4%BB%B6 HTTP/1.1\r\n"),
+                "{request}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let body = client
+            .get(format!("http://127.0.0.1:{first_port}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        a.await.unwrap();
+        b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bytes_limited_rejects_oversized_bodies() {
+        for headers in ["Content-Length: 10\r\n", "Connection: close\r\n"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = format!("HTTP/1.1 200 OK\r\n{headers}\r\n0123456789");
+            let server = tokio::spawn(serve_once(listener, response.into_bytes()));
+            let client = Client::builder().build().unwrap();
+            let get = || client.get(format!("http://127.0.0.1:{port}/"));
+            let error = get()
+                .send()
+                .await
+                .unwrap()
+                .bytes_limited(4)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds"), "{error}");
+            server.await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd".to_vec(),
+        ));
+        let client = Client::builder().build().unwrap();
+        let bytes = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap()
+            .bytes_limited(4)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"abcd");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snippet_truncates_instead_of_failing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 500 Oops\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789"
+                .to_vec(),
+        ));
+        let client = Client::builder().build().unwrap();
+        let text = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap()
+            .snippet(4)
+            .await;
+        assert_eq!(text, "0123");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_address_filter_resolves_once_per_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>, SocketAddr);
+        impl crate::resolver::Resolve for Counting {
+            fn resolve(&self, _host: &str) -> crate::resolver::Resolving {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let address = self.1;
+                Box::pin(
+                    async move { Ok(Box::new(std::iter::once(address)) as crate::resolver::Addrs) },
+                )
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let client = Client::builder()
+            .resolver_arc(Arc::new(Counting(lookups.clone(), address)))
+            .direct_address_filter(|_| true)
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://filtered.example:{}/", address.port()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 }

@@ -1,5 +1,3 @@
-//! BEP-19 WebSeed metadata, URL construction and HTTP range validation
-
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use std::collections::HashSet;
@@ -9,6 +7,7 @@ use url::Url;
 use crate::bencode::Value;
 pub const DEFAULT_MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_URL_LIST_ENTRIES: usize = 64;
+const BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn is_allowed_destination(ip: IpAddr) -> bool {
     match ip {
@@ -64,7 +63,6 @@ pub enum WebSeedError {
     Http(String),
 }
 
-/// A validated inclusive HTTP byte range
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
     pub start: u64,
@@ -92,7 +90,6 @@ impl ByteRange {
     }
 }
 
-/// Parse BEP-19's top-level `url-list` value
 pub fn parse_url_list(value: &Value) -> Vec<String> {
     let values = match value {
         Value::Bytes(_) => std::slice::from_ref(value),
@@ -125,7 +122,6 @@ pub fn parse_url_list(value: &Value) -> Vec<String> {
     out
 }
 
-/// Validate and normalize one WebSeed base URL
 pub fn parse_base_url(raw: &str) -> Result<Url, WebSeedError> {
     let mut url = Url::parse(raw.trim()).map_err(|e| WebSeedError::InvalidUrl(e.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -266,17 +262,6 @@ pub fn validate_range_response(
     Ok(returned)
 }
 
-pub async fn fetch_range(
-    client: &risuko_http::Client,
-    url: &Url,
-    requested: ByteRange,
-    max_body: u64,
-) -> Result<Bytes, WebSeedError> {
-    Ok(fetch_range_response(client, url, requested, max_body)
-        .await?
-        .body)
-}
-
 pub async fn fetch_range_response(
     client: &risuko_http::Client,
     url: &Url,
@@ -315,9 +300,13 @@ pub async fn fetch_range_response(
         }
     }
     let mut stream = response.bytes_stream();
-    let mut collected = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| WebSeedError::Http(e.to_string()))?;
+    let mut collected = BytesMut::with_capacity(requested.len().min(max_body) as usize);
+    loop {
+        let chunk = match tokio::time::timeout(BODY_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(chunk)) => chunk.map_err(|e| WebSeedError::Http(e.to_string()))?,
+            Ok(None) => break,
+            Err(_) => return Err(WebSeedError::Http("response body stalled".into())),
+        };
         let next_len = collected.len().saturating_add(chunk.len());
         if next_len as u64 > max_body {
             return Err(WebSeedError::BodyTooLarge {
@@ -339,11 +328,7 @@ pub async fn fetch_range_response(
 }
 
 pub fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
-}
-
-pub fn is_permanent_status(status: u16) -> bool {
-    matches!(status, 400 | 401 | 403 | 404 | 405 | 410 | 416)
+    matches!(status, 403 | 408 | 425 | 429 | 500..=599)
 }
 
 #[cfg(test)]

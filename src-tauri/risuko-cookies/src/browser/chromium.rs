@@ -1,8 +1,8 @@
-// Chromium-family cookie extraction
-
+use crate::utils::host::{cookie_covers_host, host_key_candidates};
 use crate::utils::{paths, time};
 use eyre::Result;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -18,6 +18,25 @@ pub struct Cookie {
 
 pub struct BrowserConfig {
     pub cookie_paths: Vec<&'static str>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub keychain: (&'static str, &'static str),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub secret_app: &'static str,
+}
+
+const HOST_HASH_DB_VERSION: i64 = 24;
+const HOST_HASH_LEN: usize = 32;
+
+fn strip_host_hash(mut plain: Vec<u8>, encrypted: &[u8], db_version: i64) -> Option<Vec<u8>> {
+    let prefixed = encrypted.len() >= 3 && matches!(&encrypted[..3], b"v10" | b"v11" | b"v20");
+    if !prefixed || db_version < HOST_HASH_DB_VERSION {
+        return Some(plain);
+    }
+    if plain.len() < HOST_HASH_LEN {
+        return None;
+    }
+    plain.drain(..HOST_HASH_LEN);
+    Some(plain)
 }
 
 impl BrowserConfig {
@@ -36,6 +55,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/google-chrome/*/Cookies"]
             },
+            keychain: ("Chrome Safe Storage", "Chrome"),
+            secret_app: "chrome",
         }
     }
 
@@ -54,6 +75,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/microsoft-edge/*/Cookies"]
             },
+            keychain: ("Microsoft Edge Safe Storage", "Microsoft Edge"),
+            secret_app: "microsoft-edge",
         }
     }
 
@@ -69,6 +92,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/BraveSoftware/Brave-Browser/*/Cookies"]
             },
+            keychain: ("Brave Safe Storage", "Brave"),
+            secret_app: "brave",
         }
     }
 
@@ -84,6 +109,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/chromium/*/Cookies"]
             },
+            keychain: ("Chromium Safe Storage", "Chromium"),
+            secret_app: "chromium",
         }
     }
 
@@ -99,6 +126,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/vivaldi/*/Cookies"]
             },
+            keychain: ("Vivaldi Safe Storage", "Vivaldi"),
+            secret_app: "vivaldi",
         }
     }
 
@@ -114,6 +143,8 @@ impl BrowserConfig {
             } else {
                 vec!["~/.config/opera/Cookies"]
             },
+            keychain: ("Opera Safe Storage", "Opera"),
+            secret_app: "opera",
         }
     }
 
@@ -124,12 +155,13 @@ impl BrowserConfig {
                 "~/Library/Application Support/Arc/User Data/*/Cookies",
                 "~/Library/Application Support/Arc/User Data/*/Network/Cookies",
             ],
+            keychain: ("Arc Safe Storage", "Arc"),
+            secret_app: "arc",
         }
     }
 }
 
-pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec<Cookie>> {
-    // Chromium browsers can have multiple profiles (Default, Profile 1, etc.); read all of them and merge cookies since the active profile isn't always "Default"
+pub fn find_cookie_dbs(config: &BrowserConfig) -> Vec<PathBuf> {
     let mut all_dbs = Vec::new();
     for pattern in &config.cookie_paths {
         if let Ok(paths) = paths::find_matching(pattern) {
@@ -140,49 +172,81 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
             }
         }
     }
+    all_dbs
+}
+
+pub fn is_available(config: &BrowserConfig) -> bool {
+    !find_cookie_dbs(config).is_empty()
+}
+
+fn load_master_key(config: &BrowserConfig, ls: &std::path::Path) -> Option<Vec<u8>> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = config;
+        let key = crate::platform::windows::extract_master_key(ls).ok();
+        tracing::debug!(target: "risuko_cookies", "chromium: windows master_key len = {:?}", key.as_ref().map(|k| k.len()));
+        key
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let key = crate::platform::macos::extract_master_key(ls, config.keychain).ok();
+        tracing::debug!(target: "risuko_cookies", "chromium: macos master_key len = {:?}", key.as_ref().map(|k| k.len()));
+        key
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let key = crate::platform::linux::extract_master_key(ls, config.secret_app).ok();
+        tracing::debug!(target: "risuko_cookies", "chromium: linux master_key len = {:?}", key.as_ref().map(|k| k.len()));
+        key
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (config, ls);
+        tracing::debug!(target: "risuko_cookies", "chromium: unsupported platform, no master key");
+        None
+    }
+}
+
+pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec<Cookie>> {
+    let all_dbs = find_cookie_dbs(config);
     if all_dbs.is_empty() {
         return Err(eyre::eyre!("cookie database not found"));
     }
 
+    let mut keys: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut all_cookies = Vec::new();
+    let mut last_err = None;
+    let mut failed = 0usize;
     for cookie_db in &all_dbs {
         tracing::debug!(target: "risuko_cookies", "chromium: using db path {}", cookie_db.display());
 
-        // "Local State" lives next to the profile directory and holds the encrypted master key
         let local_state = paths::find_local_state(cookie_db);
         tracing::debug!(target: "risuko_cookies", "chromium: local_state path = {:?}", local_state.as_ref().map(|p| p.display().to_string()));
 
-        let master_key = if let Some(ls) = local_state {
-            #[cfg(target_os = "windows")]
-            {
-                let key = crate::platform::windows::extract_master_key(&ls).ok();
-                tracing::debug!(target: "risuko_cookies", "chromium: windows master_key len = {:?}", key.as_ref().map(|k| k.len()));
-                key
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let key = crate::platform::macos::extract_master_key(&ls).ok();
-                tracing::debug!(target: "risuko_cookies", "chromium: macos master_key len = {:?}", key.as_ref().map(|k| k.len()));
-                key
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let key = crate::platform::linux::extract_master_key(&ls).ok();
-                tracing::debug!(target: "risuko_cookies", "chromium: linux master_key len = {:?}", key.as_ref().map(|k| k.len()));
-                key
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-            {
-                tracing::debug!(target: "risuko_cookies", "chromium: unsupported platform, no master key");
+        let master_key = match local_state {
+            Some(ls) => keys
+                .entry(ls.clone())
+                .or_insert_with(|| load_master_key(config, &ls))
+                .as_deref(),
+            None => {
+                tracing::debug!(target: "risuko_cookies", "chromium: no local_state found, cookies will be raw");
                 None
             }
-        } else {
-            tracing::debug!(target: "risuko_cookies", "chromium: no local_state found, cookies will be raw");
-            None
         };
 
-        let mut cookies = read_cookies_from_db(cookie_db, master_key.as_deref(), host)?;
-        all_cookies.append(&mut cookies);
+        match read_cookies_from_db(cookie_db, master_key, host) {
+            Ok(mut cookies) => all_cookies.append(&mut cookies),
+            Err(e) => {
+                tracing::debug!(target: "risuko_cookies", "chromium: skipping db {}: {}", cookie_db.display(), e);
+                failed += 1;
+                last_err = Some(e);
+            }
+        }
+    }
+    if failed == all_dbs.len() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
 
     tracing::debug!(target: "risuko_cookies",
@@ -194,25 +258,36 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
 }
 
 fn read_cookies_from_db(
-    db_path: &PathBuf,
+    db_path: &std::path::Path,
     master_key: Option<&[u8]>,
     host: Option<&str>,
 ) -> Result<Vec<Cookie>> {
-    // Copy to a temp file because the browser keeps the real DB locked while running
-    let temp = tempfile::NamedTempFile::new()?;
-    std::fs::copy(db_path, temp.path())?;
+    let temp = paths::copy_db_snapshot(db_path)?;
 
-    let conn = Connection::open(temp.path())?;
+    let conn = Connection::open(temp.db_path())?;
 
-    // Count total rows first for debugging
+    let db_version: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
     let total_count: i64 = conn.query_row("SELECT COUNT(*) FROM cookies", [], |row| row.get(0))?;
     tracing::debug!(target: "risuko_cookies", "chromium: total rows in db = {}", total_count);
 
-    // Read all cookies
-    let mut stmt = conn.prepare(
-        "SELECT name, encrypted_value, value, host_key, path, is_secure, is_httponly, expires_utc FROM cookies"
-    )?;
-    let cookie_iter = stmt.query_map([], parse_row)?;
+    let mut sql = String::from(
+        "SELECT name, encrypted_value, value, host_key, path, is_secure, is_httponly, expires_utc FROM cookies",
+    );
+    let candidates = host.map(host_key_candidates).unwrap_or_default();
+    if host.is_some() {
+        sql.push_str(" WHERE host_key IN (");
+        sql.push_str(&vec!["?"; candidates.len()].join(","));
+        sql.push(')');
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let cookie_iter = stmt.query_map(rusqlite::params_from_iter(candidates.iter()), parse_row)?;
 
     let mut cookies = Vec::new();
     let mut skipped_empty = 0usize;
@@ -222,13 +297,11 @@ fn read_cookies_from_db(
     let mut no_key = 0usize;
 
     for raw in cookie_iter.flatten() {
-        // Skip only when both encrypted and plaintext values are empty
         if raw.raw_value.is_empty() && raw.plaintext_value.is_empty() {
             skipped_empty += 1;
             continue;
         }
 
-        // Skip cookies that don't cover the requested host
         if let Some(request_host) = host {
             if !cookie_covers_host(request_host, &raw.domain) {
                 tracing::trace!(target: "risuko_cookies", "chromium: skip cookie '{}' host_key={} (does not cover {})", raw.name, raw.domain, request_host);
@@ -237,13 +310,23 @@ fn read_cookies_from_db(
             }
         }
 
-        // Decrypt the encrypted value if present, otherwise fall back to plaintext
         let value = if !raw.raw_value.is_empty() {
             if let Some(key) = master_key {
                 match decrypt_cookie_value(&raw.raw_value, key) {
                     Ok(decrypted) => {
-                        decrypted_ok += 1;
-                        String::from_utf8_lossy(&decrypted).to_string()
+                        let plain = strip_host_hash(decrypted, &raw.raw_value, db_version)
+                            .and_then(|p| String::from_utf8(p).ok());
+                        match plain {
+                            Some(v) => {
+                                decrypted_ok += 1;
+                                v
+                            }
+                            None => {
+                                tracing::trace!(target: "risuko_cookies", "chromium: invalid plaintext for '{}' host_key={}", raw.name, raw.domain);
+                                decrypted_fail += 1;
+                                continue;
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::trace!(target: "risuko_cookies", "chromium: decrypt failed for '{}' host_key={}: {}", raw.name, raw.domain, e);
@@ -256,12 +339,10 @@ fn read_cookies_from_db(
                 if !raw.plaintext_value.is_empty() {
                     raw.plaintext_value
                 } else {
-                    // No master key and no plaintext: the raw bytes are an encrypted blob, not a usable value, so skip rather than hand a corrupt cookie to callers
                     continue;
                 }
             }
         } else {
-            // Plaintext cookie
             decrypted_ok += 1;
             raw.plaintext_value
         };
@@ -287,17 +368,6 @@ fn read_cookies_from_db(
     }
 
     Ok(cookies)
-}
-
-fn cookie_covers_host(request_host: &str, cookie_host_key: &str) -> bool {
-    let r = request_host.to_lowercase();
-    let c = cookie_host_key.to_lowercase();
-
-    if let Some(domain) = c.strip_prefix('.') {
-        r == domain || r.ends_with(&format!(".{domain}"))
-    } else {
-        r == c
-    }
 }
 
 struct RawCookie {
@@ -356,24 +426,21 @@ fn decrypt_cookie_value(encrypted: &[u8], master_key: &[u8]) -> Result<Vec<u8>> 
 
 #[cfg(test)]
 mod tests {
-    use super::cookie_covers_host;
+    use super::strip_host_hash;
 
     #[test]
-    fn domain_cookie_with_dot_covers_subdomain() {
-        assert!(cookie_covers_host("www.spigotmc.org", ".spigotmc.org"));
-        assert!(cookie_covers_host("dl.spigotmc.org", ".spigotmc.org"));
-        assert!(cookie_covers_host("spigotmc.org", ".spigotmc.org"));
-    }
-
-    #[test]
-    fn host_only_cookie_exact_match() {
-        assert!(cookie_covers_host("www.spigotmc.org", "www.spigotmc.org"));
-        assert!(!cookie_covers_host("dl.spigotmc.org", "www.spigotmc.org"));
-    }
-
-    #[test]
-    fn no_false_match_on_suffix() {
-        assert!(!cookie_covers_host("notspigotmc.org", ".spigotmc.org"));
-        assert!(!cookie_covers_host("evil.spigotmc.org", ".example.com"));
+    fn host_hash_stripped_for_v24_encrypted() {
+        let mut plain = vec![7u8; 32];
+        plain.extend_from_slice(b"value");
+        assert_eq!(
+            strip_host_hash(plain.clone(), b"v10xxxx", 24),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            strip_host_hash(plain.clone(), b"v10xxxx", 23),
+            Some(plain.clone())
+        );
+        assert_eq!(strip_host_hash(plain.clone(), b"rawxxxx", 24), Some(plain));
+        assert_eq!(strip_host_hash(vec![1; 5], b"v11xxxx", 24), None);
     }
 }

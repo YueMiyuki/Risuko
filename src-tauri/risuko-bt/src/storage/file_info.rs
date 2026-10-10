@@ -1,16 +1,12 @@
-//! File layout: maps absolute torrent offsets to (file_index, file_offset, len)
-
 use std::path::{Path, PathBuf};
 
-use super::super::core::metainfo::ValidatedTorrentMetaV1Info;
+use super::super::core::metainfo::{fs_component, ValidatedTorrentMetaV1Info};
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
     pub path: PathBuf,
     pub length: u64,
-    /// Absolute offset of this file's first byte within the torrent
     pub offset: u64,
-    /// BEP 47 padding: reads as zeros and never touches disk
     pub padding: bool,
 }
 
@@ -35,9 +31,8 @@ impl FileSet {
             .iter()
             .map(|f| {
                 let mut path = root.to_path_buf();
-                // For single-file torrents the parsed file already has the torrent name as its sole path component — don't double it
                 for c in &f.path {
-                    path.push(c);
+                    path.push(&*fs_component(c));
                 }
                 let info = FileInfo {
                     path,
@@ -63,7 +58,6 @@ impl FileSet {
         self.total_length
     }
 
-    /// Iterate the contiguous file spans touched by a range
     pub fn spans_for(&self, offset: u64, len: u64) -> SpansIter<'_> {
         SpansIter {
             files: &self.files,
@@ -74,7 +68,6 @@ impl FileSet {
     }
 
     fn file_index_for(&self, offset: u64) -> usize {
-        // Binary search for the file whose range covers `offset`
         let r = self.files.binary_search_by(|f| {
             if offset < f.offset {
                 std::cmp::Ordering::Greater
@@ -102,7 +95,6 @@ impl Iterator for SpansIter<'_> {
         if self.remaining == 0 {
             return None;
         }
-        // Skip over zero-length files iteratively to avoid unbounded recursion on torrents containing many empty entries
         while self.idx < self.files.len() && self.files[self.idx].length == 0 {
             self.idx += 1;
         }
@@ -162,7 +154,6 @@ mod tests {
     #[test]
     fn contiguous_spans() {
         let set = FileSet::from_meta(&fixture(), Path::new("/tmp"));
-        // offset 8, len 20 — ends at byte 28, within file 1 (which covers 10..30)
         let spans: Vec<_> = set.spans_for(8, 20).collect();
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].file_index, 0);
@@ -176,7 +167,6 @@ mod tests {
     #[test]
     fn spans_three_files() {
         let set = FileSet::from_meta(&fixture(), Path::new("/tmp"));
-        // Range 5..33 spans all three files
         let spans: Vec<_> = set.spans_for(5, 28).collect();
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].len, 5);

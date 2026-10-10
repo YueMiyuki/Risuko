@@ -1,5 +1,3 @@
-//! UDP tracker (BEP-15): client sends `Connect` (magic) to get a 64-bit `connection_id`, then `Announce` quoting it to get peers + interval + seeders/leechers; retransmits shortened to 3 tries to fit our async budget
-
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -10,9 +8,8 @@ use tokio::net::{lookup_host, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, ScrapeResponse, TrackerError};
+use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, TrackerError};
 
-/// Big-endian read/write helpers over byte slices, replacing `byteorder`; each maps 1:1 to `std` be-bytes and slices are sized exactly by the caller so `try_into` never fails
 mod be {
     pub fn read_u32(b: &[u8]) -> u32 {
         u32::from_be_bytes(b[..4].try_into().unwrap())
@@ -34,13 +31,12 @@ mod be {
 const PROTOCOL_ID: u64 = 0x41727101980;
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
-const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
 const RETRANSMIT_ATTEMPTS: u32 = 4;
 
 fn retransmit_timeout(attempt: u32) -> Duration {
-    Duration::from_secs(15u64.saturating_mul(1u64 << attempt.min(2)))
+    Duration::from_secs(3u64 << attempt.min(3))
 }
 
 #[derive(Clone, Copy)]
@@ -57,18 +53,6 @@ struct ConnectionCacheKey {
 
 static CONNECTION_CACHE: LazyLock<Mutex<HashMap<ConnectionCacheKey, CachedConnection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy(url, req, None).await
-}
-
-pub async fn announce_with_proxy(
-    url: &str,
-    req: &AnnounceRequest,
-    proxy: Option<&risuko_http::ProxyConnector>,
-) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy_and_source(url, req, proxy, None).await
-}
 
 pub async fn announce_with_proxy_and_source(
     url: &str,
@@ -101,7 +85,6 @@ pub async fn announce_with_proxy_and_source(
     race_endpoints(targets, &host, req, source, url_data).await
 }
 
-/// Announce from one address family only (BEP 7)
 pub async fn announce_for_family(
     url: &str,
     req: &AnnounceRequest,
@@ -117,7 +100,6 @@ pub async fn announce_for_family(
     race_endpoints(targets, &host, req, None, url_data).await
 }
 
-/// Whether datagrams to the tracker at `url` go through the UDP proxy rather than direct
 pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
     proxy.udp_proxy().is_some()
         && !parse_udp_url(url).is_ok_and(|(host, port)| is_bypassed(proxy, &host, port))
@@ -130,7 +112,6 @@ fn is_bypassed(proxy: &risuko_http::ProxyConnector, host: &str, port: u16) -> bo
         .is_some_and(|no_proxy| no_proxy.matches_host_port(host, Some(port)))
 }
 
-/// UDP announces can't carry BEP 8's `sha_ih`
 fn reject_obfuscation(req: &AnnounceRequest, url: &str) -> Result<(), TrackerError> {
     if req.obfuscate {
         return Err(TrackerError::UnsupportedScheme(format!(
@@ -140,7 +121,6 @@ fn reject_obfuscation(req: &AnnounceRequest, url: &str) -> Result<(), TrackerErr
     Ok(())
 }
 
-/// Announce to every endpoint concurrently and keep the first answer
 async fn race_endpoints(
     targets: Vec<SocketAddr>,
     host: &str,
@@ -174,221 +154,6 @@ async fn race_endpoints(
     }
     Err(last_error
         .unwrap_or_else(|| TrackerError::Url(format!("no usable DNS endpoint for {host}"))))
-}
-
-const MAX_SCRAPE_HASHES_PER_REQUEST: usize = 74;
-
-pub async fn scrape(
-    url: &str,
-    info_hashes: &[super::super::core::Id20],
-    source: Option<SocketAddr>,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    let mut results = Vec::with_capacity(info_hashes.len());
-    for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
-        results.extend(scrape_direct_batch(url, batch, source).await?);
-    }
-    Ok(results)
-}
-
-async fn scrape_direct_batch(
-    url: &str,
-    info_hashes: &[super::super::core::Id20],
-    source: Option<SocketAddr>,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    if info_hashes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if info_hashes.len() > MAX_SCRAPE_HASHES_PER_REQUEST {
-        return Err(TrackerError::Url(
-            "UDP scrape batch exceeds 74 info-hashes".into(),
-        ));
-    }
-    let (host, port) = parse_udp_url(url)?;
-    let targets = dedupe_endpoints(lookup_host((host.as_str(), port)).await?)
-        .into_iter()
-        .filter(|target| {
-            source.is_none_or(|source| {
-                source.ip().is_unspecified() || source.is_ipv4() == target.is_ipv4()
-            })
-        })
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        return Err(TrackerError::Url(format!("no DNS result for {host}")));
-    }
-
-    let mut last_error = None;
-    for target in targets {
-        match scrape_direct_endpoint(target, info_hashes, source).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or(TrackerError::Timeout))
-}
-
-async fn scrape_direct_endpoint(
-    target: SocketAddr,
-    info_hashes: &[super::super::core::Id20],
-    source: Option<SocketAddr>,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    let bind_addr = direct_bind_addr(target, source);
-    let cache_key = ConnectionCacheKey {
-        target,
-        source: bind_addr,
-    };
-    let sock = UdpSocket::bind(bind_addr).await?;
-    sock.connect(target).await?;
-
-    let conn_id = match cached_connection(cache_key) {
-        Some(id) => id,
-        None => {
-            let id = connect(&sock).await?;
-            cache_connection(cache_key, id);
-            id
-        }
-    };
-    match scrape_inner(&sock, conn_id, info_hashes).await {
-        Ok(response) => Ok(response),
-        Err(TrackerError::Timeout | TrackerError::Rejected(_)) => {
-            invalidate_connection(cache_key);
-            let id = connect(&sock).await?;
-            cache_connection(cache_key, id);
-            scrape_inner(&sock, id, info_hashes).await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn scrape_inner(
-    sock: &UdpSocket,
-    conn_id: u64,
-    info_hashes: &[super::super::core::Id20],
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    let txn = rand::rng().random::<u32>();
-    let mut body = Vec::with_capacity(16 + info_hashes.len() * 20);
-    body.extend_from_slice(&conn_id.to_be_bytes());
-    body.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
-    body.extend_from_slice(&txn.to_be_bytes());
-    for hash in info_hashes {
-        body.extend_from_slice(hash.as_bytes());
-    }
-    let mut buf = vec![0u8; 8 + info_hashes.len() * 12];
-    for attempt in 0..RETRANSMIT_ATTEMPTS {
-        sock.send(&body).await?;
-        match timeout(retransmit_timeout(attempt), sock.recv(&mut buf)).await {
-            Ok(Ok(n)) if n >= 8 => {
-                let action = be::read_u32(&buf[..4]);
-                let rtxn = be::read_u32(&buf[4..8]);
-                if rtxn != txn {
-                    continue;
-                }
-                if action == ACTION_ERROR {
-                    return Err(TrackerError::Rejected(read_error(&buf[8..n])));
-                }
-                let expected = 8 + info_hashes.len() * 12;
-                if action != ACTION_SCRAPE || n != expected {
-                    continue;
-                }
-                let mut out = Vec::with_capacity(info_hashes.len());
-                for chunk in buf[8..expected].chunks_exact(12) {
-                    out.push(ScrapeResponse {
-                        complete: be::read_u32(&chunk[0..4]),
-                        downloaded: be::read_u32(&chunk[4..8]),
-                        incomplete: be::read_u32(&chunk[8..12]),
-                    });
-                }
-                return Ok(out);
-            }
-            _ => {}
-        }
-    }
-    Err(TrackerError::Timeout)
-}
-
-pub async fn scrape_with_proxy(
-    url: &str,
-    info_hashes: &[super::super::core::Id20],
-    proxy: Option<&risuko_http::ProxyConnector>,
-    source: Option<SocketAddr>,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    let Some(proxy) = proxy else {
-        return scrape(url, info_hashes, source).await;
-    };
-    if !proxy.has_proxy() {
-        return scrape(url, info_hashes, source).await;
-    }
-    if source.is_some_and(|source| !source.ip().is_unspecified()) {
-        let (host, port) = parse_udp_url(url)?;
-        if is_bypassed(proxy, &host, port) {
-            return scrape(url, info_hashes, source).await;
-        }
-    }
-    let mut results = Vec::with_capacity(info_hashes.len());
-    for batch in info_hashes.chunks(MAX_SCRAPE_HASHES_PER_REQUEST) {
-        results.extend(scrape_proxy_batch(url, batch, proxy).await?);
-    }
-    Ok(results)
-}
-
-async fn scrape_proxy_batch(
-    url: &str,
-    info_hashes: &[super::super::core::Id20],
-    proxy: &risuko_http::ProxyConnector,
-) -> Result<Vec<ScrapeResponse>, TrackerError> {
-    if info_hashes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if info_hashes.len() > MAX_SCRAPE_HASHES_PER_REQUEST {
-        return Err(TrackerError::Url(
-            "UDP scrape batch exceeds 74 info-hashes".into(),
-        ));
-    }
-    let (host, port) = parse_udp_url(url)?;
-    let sock = proxy
-        .bind_udp_with_bypass()
-        .await
-        .map_err(|e| TrackerError::Http(e.to_string()))?;
-    let conn_id = connect_socket(&sock, &host, port).await?;
-    let txn = rand::rng().random::<u32>();
-    let mut body = Vec::with_capacity(16 + info_hashes.len() * 20);
-    body.extend_from_slice(&conn_id.to_be_bytes());
-    body.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
-    body.extend_from_slice(&txn.to_be_bytes());
-    for hash in info_hashes {
-        body.extend_from_slice(hash.as_bytes());
-    }
-    let mut buf = vec![0u8; 8 + info_hashes.len() * 12];
-    for attempt in 0..RETRANSMIT_ATTEMPTS {
-        sock.send_to_host(&body, &host, port)
-            .await
-            .map_err(|e| TrackerError::Http(e.to_string()))?;
-        match timeout(retransmit_timeout(attempt), sock.recv_from_target(&mut buf)).await {
-            Ok(Ok((n, _))) if n >= 8 => {
-                let action = be::read_u32(&buf[..4]);
-                let rtxn = be::read_u32(&buf[4..8]);
-                if rtxn != txn {
-                    continue;
-                }
-                if action == ACTION_ERROR {
-                    return Err(TrackerError::Rejected(read_error(&buf[8..n])));
-                }
-                let expected = 8 + info_hashes.len() * 12;
-                if action != ACTION_SCRAPE || n != expected {
-                    continue;
-                }
-                return Ok(buf[8..expected]
-                    .chunks_exact(12)
-                    .map(|chunk| ScrapeResponse {
-                        complete: be::read_u32(&chunk[0..4]),
-                        downloaded: be::read_u32(&chunk[4..8]),
-                        incomplete: be::read_u32(&chunk[8..12]),
-                    })
-                    .collect());
-            }
-            _ => {}
-        }
-    }
-    Err(TrackerError::Timeout)
 }
 
 fn dedupe_endpoints(endpoints: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
@@ -644,7 +409,6 @@ fn announce_response_buffer_len(is_ipv6: bool, num_want: u32) -> usize {
 
 const MAX_UDP_PAYLOAD: usize = 65_507;
 
-/// BEP 41 option types appended after the 98-byte announce
 const OPTION_URL_DATA: u8 = 0x2;
 
 fn build_announce_body(conn_id: u64, req: &AnnounceRequest, url_data: &[u8]) -> (Vec<u8>, u32) {
@@ -663,7 +427,6 @@ fn build_announce_body(conn_id: u64, req: &AnnounceRequest, url_data: &[u8]) -> 
     be::write_u32(&mut body[88..92], req.key);
     be::write_u32(&mut body[92..96], req.num_want);
     be::write_u16(&mut body[96..98], req.port);
-    // BEP 41 URLData, split into options of at most 255 bytes
     for chunk in url_data.chunks(u8::MAX as usize) {
         body.push(OPTION_URL_DATA);
         body.push(chunk.len() as u8);
@@ -672,7 +435,6 @@ fn build_announce_body(conn_id: u64, req: &AnnounceRequest, url_data: &[u8]) -> 
     (body, txn)
 }
 
-/// Path and query of a `udp://` URL, sent as BEP 41 URLData
 fn udp_url_data(url: &str) -> Vec<u8> {
     let Some(rest) = url.strip_prefix("udp://") else {
         return Vec::new();
@@ -690,7 +452,6 @@ fn parse_announce_response(buf: &[u8], is_ipv6: bool) -> AnnounceResponse {
     let seeders = be::read_u32(&buf[16..20]);
     let mut peers = Vec::new();
     if is_ipv6 {
-        // BEP-15 IPv6 extension: 18-byte compact peer entries (16 addr + 2 port)
         for chunk in buf[20..].chunks_exact(18) {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&chunk[0..16]);
@@ -736,7 +497,6 @@ fn parse_udp_url(url: &str) -> Result<(String, u16), TrackerError> {
     let rest = url
         .strip_prefix("udp://")
         .ok_or_else(|| TrackerError::UnsupportedScheme(url.to_string()))?;
-    // Trim trailing path like `/announce` and any query string; UDP trackers ignore both
     let rest = rest.split('/').next().unwrap_or(rest);
     let rest = rest.split('?').next().unwrap_or(rest);
     let (host, port) = match rest.rsplit_once(':') {
@@ -845,16 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn scrape_splits_large_requests_at_the_protocol_batch_limit() {
-        let hashes = vec![crate::core::Id20([7u8; 20]); 149];
-        let sizes: Vec<usize> = hashes
-            .chunks(MAX_SCRAPE_HASHES_PER_REQUEST)
-            .map(|batch| batch.len())
-            .collect();
-        assert_eq!(sizes, vec![74, 74, 1]);
-    }
-
-    #[test]
     fn announce_response_buffer_fits_requested_ipv6_peers() {
         assert_eq!(announce_response_buffer_len(false, 200), 2048);
         assert_eq!(announce_response_buffer_len(true, 200), 3620);
@@ -910,10 +660,11 @@ mod tests {
     }
 
     #[test]
-    fn bep15_retransmit_timeout_doubles_then_caps() {
-        assert_eq!(retransmit_timeout(0), Duration::from_secs(15));
-        assert_eq!(retransmit_timeout(1), Duration::from_secs(30));
-        assert_eq!(retransmit_timeout(2), Duration::from_secs(60));
-        assert_eq!(retransmit_timeout(3), Duration::from_secs(60));
+    fn retransmit_timeout_doubles_then_caps() {
+        assert_eq!(retransmit_timeout(0), Duration::from_secs(3));
+        assert_eq!(retransmit_timeout(1), Duration::from_secs(6));
+        assert_eq!(retransmit_timeout(2), Duration::from_secs(12));
+        assert_eq!(retransmit_timeout(3), Duration::from_secs(24));
+        assert_eq!(retransmit_timeout(9), Duration::from_secs(24));
     }
 }

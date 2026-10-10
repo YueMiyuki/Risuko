@@ -96,7 +96,12 @@ import {
 	Trash2,
 } from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
-import { checkTaskIsBT, checkTaskIsSeeder, getTaskName } from "@shared/utils";
+import {
+	checkTaskIsBT,
+	checkTaskIsSeeder,
+	getDisplayTaskStatus,
+	getTaskName,
+} from "@shared/utils";
 import { commands } from "@/components/CommandManager/instance";
 import {
 	DropdownMenu,
@@ -216,12 +221,7 @@ export default {
 			return usePreferenceStore().taskListStyle === "card";
 		},
 		taskStatus() {
-			const { task, isSeeder } = this;
-			if (isSeeder) {
-				return TASK_STATUS.SEEDING;
-			} else {
-				return task.status;
-			}
+			return getDisplayTaskStatus(this.task);
 		},
 		isBT() {
 			return checkTaskIsBT(this.task);

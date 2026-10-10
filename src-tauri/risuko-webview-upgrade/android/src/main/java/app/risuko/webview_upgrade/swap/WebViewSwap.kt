@@ -14,7 +14,6 @@ import java.io.File
 
 internal object WebViewSwap {
 
-    /** The PackageInfo of the kernel we swapped to; read by [ActivityManagerHook] */
     @Volatile
     var replaceWebViewPackageInfo: PackageInfo? = null
         private set
@@ -24,11 +23,6 @@ internal object WebViewSwap {
 
     class PreconditionException(message: String) : Exception(message)
 
-    /**
-     * @return the PackageInfo now backing WebView (its `versionName` is the new
-     *   kernel version), or null if read-back failed
-     * @throws PreconditionException if called too late / off the main thread
-     */
     @Synchronized
     fun swapToInstalledPackage(context: Context, packageName: String): PackageInfo? {
         checkPreconditions()

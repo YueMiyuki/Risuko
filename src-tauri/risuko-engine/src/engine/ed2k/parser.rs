@@ -1,18 +1,15 @@
 use super::types::{Ed2kFileLink, Ed2kSource};
 
-/// Check if a URI is an ed2k link
 pub fn is_ed2k_uri(uri: &str) -> bool {
     uri.trim().to_lowercase().starts_with("ed2k://")
 }
 
-/// Parse `ed2k://|file|<name>|<size>|<hash>|/` (optional `|h=<AICH>|`, `|sources,<ip>:<port>[,...]|`) into structured data
 pub fn parse_ed2k_link(uri: &str) -> Result<Ed2kFileLink, String> {
     let trimmed = uri.trim();
     if !trimmed.to_lowercase().starts_with("ed2k://|file|") {
         return Err("Not a valid ed2k file link".to_string());
     }
 
-    // Strip prefix and trailing "|/"
     let body = &trimmed["ed2k://|file|".len()..];
     let body = body.strip_suffix("|/").unwrap_or(body);
     let body = body.strip_suffix('/').unwrap_or(body);

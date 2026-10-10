@@ -144,6 +144,8 @@ import { useTaskStore } from "@/store/task";
 import { copyText } from "@/utils/clipboard";
 import { moveTaskFilesToTrash, showItemInFolder } from "@/utils/native";
 
+const DELETE_FILES_CONCURRENCY = 8;
+
 export default {
 	name: "task-page",
 	components: {
@@ -390,28 +392,40 @@ export default {
 			appStore.updateAddTaskOptions(newOptions);
 			appStore.showAddTaskDialog(ADD_TASK_TYPE.URI);
 		},
-		async deleteTaskFiles(task) {
-			let targetTask = task;
-			if (targetTask?.gid && !targetTask._isFileEntry) {
-				try {
-					const fullTask = await api.fetchTaskItem({
-						gid: targetTask.gid,
-					});
-					if (fullTask) {
-						targetTask = {
-							...targetTask,
-							...fullTask,
-						};
-					}
-				} catch (err) {
-					logger.warn(
-						"[Risuko] fetch full task before delete files failed:",
-						err,
-					);
-				}
+		async resolveFullTask(task) {
+			if (!task?.gid || task._isFileEntry) {
+				return task;
 			}
-
-			const result = await moveTaskFilesToTrash(targetTask);
+			try {
+				const fullTask = await api.fetchTaskItem({ gid: task.gid });
+				return fullTask ? { ...task, ...fullTask } : task;
+			} catch (err) {
+				logger.warn(
+					"[Risuko] fetch full task before delete files failed:",
+					err,
+				);
+				return task;
+			}
+		},
+		async resolveFullTasks(taskList) {
+			const resolved = new Array(taskList.length);
+			let next = 0;
+			const worker = async () => {
+				while (next < taskList.length) {
+					const i = next++;
+					resolved[i] = await this.resolveFullTask(taskList[i]);
+				}
+			};
+			await Promise.all(
+				Array.from(
+					{ length: Math.min(DELETE_FILES_CONCURRENCY, taskList.length) },
+					worker,
+				),
+			);
+			return resolved;
+		},
+		async deleteTaskFiles(task) {
+			const result = await moveTaskFilesToTrash(task);
 			if (!result) {
 				throw new Error("task.remove-task-file-fail");
 			}
@@ -420,10 +434,13 @@ export default {
 		async removeTask(task, taskName, isRemoveWithFiles = false) {
 			const loadingText = this.$t("task.loading-delete-task");
 			return this.withTaskActionLoading(loadingText, async () => {
+				const fileTarget = isRemoveWithFiles
+					? await this.resolveFullTask(task)
+					: task;
 				await this.removeTaskItem(task, taskName);
 				if (isRemoveWithFiles) {
 					try {
-						await this.deleteTaskFiles(task);
+						await this.deleteTaskFiles(fileTarget);
 					} catch (err) {
 						logger.warn("[Risuko] file delete failed:", err);
 						this.$msg.error(
@@ -436,10 +453,13 @@ export default {
 		async removeTaskRecord(task, taskName, isRemoveWithFiles = false) {
 			const loadingText = this.$t("task.loading-remove-record");
 			return this.withTaskActionLoading(loadingText, async () => {
+				const fileTarget = isRemoveWithFiles
+					? await this.resolveFullTask(task)
+					: task;
 				await this.removeTaskRecordItem(task, taskName);
 				if (isRemoveWithFiles) {
 					try {
-						await this.deleteTaskFiles(task);
+						await this.deleteTaskFiles(fileTarget);
 					} catch (err) {
 						logger.warn("[Risuko] file delete failed:", err);
 						this.$msg.error(
@@ -491,10 +511,13 @@ export default {
 				const gids = [...new Set(taskList.map((task) => task.gid))];
 				const fileEntries = taskList.filter((task) => task._isFileEntry);
 				const taskEntries = taskList.filter((task) => !task._isFileEntry);
+				const fileTargets = isRemoveWithFiles
+					? await this.resolveFullTasks([...fileEntries, ...taskEntries])
+					: [];
 				await this.removeTaskItems(gids);
 				if (isRemoveWithFiles) {
 					try {
-						await this.batchDeleteTaskFiles([...fileEntries, ...taskEntries]);
+						await this.batchDeleteTaskFiles(fileTargets);
 					} catch (err) {
 						logger.warn("[Risuko] batch file delete failed:", err);
 						this.$msg.error(
@@ -505,8 +528,28 @@ export default {
 			});
 		},
 		async batchDeleteTaskFiles(taskList) {
-			const results = await Promise.allSettled(
-				taskList.map((task) => this.deleteTaskFiles(task)),
+			const results: PromiseSettledResult<boolean>[] = new Array(
+				taskList.length,
+			);
+			let next = 0;
+			const worker = async () => {
+				while (next < taskList.length) {
+					const i = next++;
+					try {
+						results[i] = {
+							status: "fulfilled",
+							value: await this.deleteTaskFiles(taskList[i]),
+						};
+					} catch (reason) {
+						results[i] = { status: "rejected", reason };
+					}
+				}
+			};
+			await Promise.all(
+				Array.from(
+					{ length: Math.min(DELETE_FILES_CONCURRENCY, taskList.length) },
+					worker,
+				),
 			);
 			let failed = false;
 			results.forEach((r, i) => {

@@ -1,5 +1,3 @@
-//! µTP (BEP-29) packet header + extension codec
-
 use std::io;
 
 pub const UTP_VERSION: u8 = 1;
@@ -150,7 +148,7 @@ mod tests {
         let bytes = h.encode(payload);
         assert_eq!(bytes.len(), HEADER_LEN + payload.len());
         assert_eq!(bytes[0], (PacketType::Data as u8) << 4 | UTP_VERSION);
-        assert_eq!(bytes[1], 0); // no extension
+        assert_eq!(bytes[1], 0);
         let (decoded, rest) = UtpHeader::decode(&bytes).unwrap();
         assert_eq!(decoded, h);
         assert_eq!(rest, payload);
@@ -205,14 +203,14 @@ mod tests {
     #[test]
     fn decode_rejects_bad_version() {
         let mut bytes = sample(PacketType::Data).encode(&[]);
-        bytes[0] = (PacketType::Data as u8) << 4 | 2; // version 2
+        bytes[0] = (PacketType::Data as u8) << 4 | 2;
         assert!(UtpHeader::decode(&bytes).is_err());
     }
 
     #[test]
     fn decode_rejects_truncated_extension() {
         let mut bytes = sample(PacketType::State).encode(&[]);
-        bytes[1] = EXT_SELECTIVE_ACK; // claim an extension that isn't there
+        bytes[1] = EXT_SELECTIVE_ACK;
         assert!(UtpHeader::decode(&bytes).is_err());
     }
 }

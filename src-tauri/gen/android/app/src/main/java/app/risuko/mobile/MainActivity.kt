@@ -104,13 +104,6 @@ class MainActivity : TauriActivity() {
   }
 
   private fun setSystemBarsForTheme(darkMode: Boolean) {
-    // Android 15 (API 35) deprecated the `window.statusBarColor` and
-    // `window.navigationBarColor` setters. On those releases the framework
-    // draws system bars edge-to-edge and supplies its own scrim when needed.
-    // The androidx `enableEdgeToEdge(statusBarStyle, navigationBarStyle)`
-    // overload handles both cases: it sets the scrim color explicitly on
-    // API < 29/32, and on API >= 30 it flips icon appearance via
-    // `SystemBarStyle.dark`/`light` without going near the deprecated setters
     val navScrimLight = Color.rgb(253, 248, 255)
     val navScrimDark = Color.rgb(20, 18, 24)
     val statusBarStyle = if (darkMode) {
@@ -124,11 +117,6 @@ class MainActivity : TauriActivity() {
       SystemBarStyle.light(navScrimLight, navScrimDark)
     }
     enableEdgeToEdge(statusBarStyle, navigationBarStyle)
-    // `SystemBarStyle` handles icon appearance on API >= 30, but on older
-    // releases the inset controller is still the documented surface for
-    // flipping light/dark icons. Setting it explicitly also catches the
-    // rare case where the activity is rebuilt after a config change with a
-    // stale appearance. The call is cheap and idempotent either way
     WindowCompat.getInsetsController(window, window.decorView).apply {
       isAppearanceLightStatusBars = !darkMode
       isAppearanceLightNavigationBars = !darkMode
@@ -436,14 +424,6 @@ class MainActivity : TauriActivity() {
       }
       Log.i(REVEAL_TAG, "revealFolder path=$path docUri=$docUri treeUri=$treeUri treeDocUri=$treeDocUri")
 
-      // We deliberately do NOT add FLAG_GRANT_READ_URI_PERMISSION here.
-      // Adding it makes the system enforce that the calling app already
-      // has permission on the URI, which we never asked for: the only
-      // SAF grant we hold is for the picker-selected download root, not
-      // this arbitrary subfolder. Files by Google and AOSP DocumentsUI
-      // both query the documents provider with their own credentials,
-      // so dropping the grant flag lets them resolve the URI on their
-      // own instead of failing with a SecurityException at startActivity
       val dirMime = DocumentsContract.Document.MIME_TYPE_DIR
       val newViewIntent: (uri: Uri, mime: String?) -> Intent = { target, mime ->
         Intent(Intent.ACTION_VIEW).apply {
@@ -455,16 +435,6 @@ class MainActivity : TauriActivity() {
           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
       }
-      // Each attempt has two halves:
-      //   - probe: the ACTION_VIEW intent we run `queryIntentActivities`
-      //     against to decide if there's a real handler. We always probe
-      //     the inner ACTION_VIEW; querying `Intent.ACTION_CHOOSER` would
-      //     just return the system ChooserActivity and tell us nothing
-      //   - launchFactory: builds the intent we actually `startActivity`
-      //     on. For the chooser variant we wrap a fresh ACTION_VIEW in
-      //     `Intent.createChooser`, which lets the user pick between
-      //     multiple file managers and bypass any "always open with"
-      //     default the system has stored
       data class Attempt(
         val label: String,
         val probe: Intent,

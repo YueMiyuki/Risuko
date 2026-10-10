@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Cross-compile setup for aarch64-unknown-linux-gnu on an amd64 Ubuntu host.
-# The self-hosted linux-arm64 runner is x86_64 with an arm64 label, so rustc
-# still needs the aarch64 GNU toolchain (and arm64 GTK/WebKit for Tauri).
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -18,8 +15,6 @@ done
 
 export DEBIAN_FRONTEND=noninteractive
 
-# archive.ubuntu.com has no arm64 Packages files; pin those lines to amd64
-# and pull arm64 from ports.ubuntu.com (see Tauri Debian cross-compile docs).
 if [ -f /etc/apt/sources.list ]; then
   sed -i -E \
     '/\[arch=/! s|^deb http://archive.ubuntu.com/ubuntu/|deb [arch=amd64] http://archive.ubuntu.com/ubuntu/|' \

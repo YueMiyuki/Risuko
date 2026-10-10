@@ -1,5 +1,3 @@
-//! FTP / FTPS upload sink. Reuses suppaftp + rustls
-
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -63,9 +61,29 @@ impl FtpSink {
     fn tls_connector(&self) -> AsyncRustlsConnector {
         crate::engine::ftp::tls::ftps_tls_connector(self.cfg.insecure)
     }
+
+    async fn connect_secure(&self) -> Result<AsyncRustlsFtpStream, String> {
+        let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
+        let connector = self.tls_connector();
+        if is_implicit_ftps_port(self.cfg.port) {
+            AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &self.cfg.host)
+                .await
+                .map_err(|e| format!("FTPS connect failed: {e}"))
+        } else {
+            AsyncRustlsFtpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("FTPS connect failed: {e}"))?
+                .into_secure(connector, &self.cfg.host)
+                .await
+                .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))
+        }
+    }
 }
 
-/// Walk parent dirs creating each segment. Tolerates "already exists"
+fn is_implicit_ftps_port(port: u16) -> bool {
+    port == 990
+}
+
 macro_rules! ensure_dirs {
     ($ftp:expr, $full_path:expr) => {{
         let parent = match $full_path.rsplit_once('/') {
@@ -95,7 +113,6 @@ macro_rules! copy_to {
             .await
             .map_err(|e| format!("open {}: {e}", $local.display()))?;
 
-        // Stage to ".part" and rename only after finalize, so failures never commit a truncated file
         let part_remote = format!("{}.part", $remote);
         let mut writer = $ftp
             .put_with_stream(&part_remote)
@@ -131,7 +148,6 @@ macro_rules! copy_to {
         }
         .await;
 
-        // On copy, flush, or cancel failure, close the stream and remove the staged file
         if let Err(e) = copy_res {
             let _ = $ftp.finalize_put_stream(writer).await;
             let _ = $ftp.rm(part_remote.as_str()).await;
@@ -141,12 +157,16 @@ macro_rules! copy_to {
             .await
             .map_err(|e| format!("FTP finalize: {e}"))?;
 
-        // Remove any stale target before RNTO; some servers refuse overwrite
-        let _ = $ftp.rm($remote.as_str()).await;
-        $ftp
+        if $ftp
             .rename(part_remote.as_str(), $remote.as_str())
             .await
-            .map_err(|e| format!("FTP rename {} -> {}: {e}", part_remote, $remote))?;
+            .is_err()
+        {
+            let _ = $ftp.rm($remote.as_str()).await;
+            $ftp.rename(part_remote.as_str(), $remote.as_str())
+                .await
+                .map_err(|e| format!("FTP rename {} -> {}: {e}", part_remote, $remote))?;
+        }
     }};
 }
 
@@ -165,14 +185,9 @@ impl UploadSink for FtpSink {
         let pass = self.pass();
 
         if self.cfg.secure {
-            let connector = self.tls_connector();
-            let mut ftp = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &self.cfg.host),
-            )
-            .await
-            .map_err(|_| "FTPS connect timed out".to_string())?
-            .map_err(|e| format!("FTPS connect failed: {e}"))?;
+            let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, self.connect_secure())
+                .await
+                .map_err(|_| "FTPS connect timed out".to_string())??;
             ftp.login(&user, &pass)
                 .await
                 .map_err(|e| format!("FTP login failed: {e}"))?;
@@ -207,19 +222,10 @@ impl UploadSink for FtpSink {
         let user = self.user();
         let pass = self.pass();
         let secure = self.cfg.secure;
-        let host = self.cfg.host.clone();
-        let connector = if secure {
-            Some(self.tls_connector())
-        } else {
-            None
-        };
 
         tokio::time::timeout(Duration::from_secs(20), async move {
             if secure {
-                let mut ftp =
-                    AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector.unwrap(), &host)
-                        .await
-                        .map_err(|e| format!("FTPS connect failed: {e}"))?;
+                let mut ftp = self.connect_secure().await?;
                 ftp.login(&user, &pass)
                     .await
                     .map_err(|e| format!("FTP login failed: {e}"))?;
@@ -259,6 +265,13 @@ mod tests {
     }
 
     #[test]
+    fn only_port_990_is_implicit_ftps() {
+        assert!(is_implicit_ftps_port(990));
+        assert!(!is_implicit_ftps_port(21));
+        assert!(!is_implicit_ftps_port(2121));
+    }
+
+    #[test]
     fn rejects_empty_host() {
         assert!(FtpSink::new(cfg("", "u", "p", "", false)).is_err());
         assert!(FtpSink::new(cfg("   ", "u", "p", "", false)).is_err());
@@ -266,7 +279,6 @@ mod tests {
 
     #[test]
     fn accepts_anonymous() {
-        // Empty user/pass is allowed
         assert!(FtpSink::new(cfg("ftp.example.com", "", "", "", false)).is_ok());
     }
 

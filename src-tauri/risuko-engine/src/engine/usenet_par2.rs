@@ -1,9 +1,7 @@
-//! PAR2 verification and repair
-
 use crate::engine::archive_pipeline::{Par2Outcome, Par2Report};
 use crate::engine::archive_safety::{validate_member_path, ArchiveLimits};
 use md5::{Digest, Md5};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -95,7 +93,6 @@ impl From<io::Error> for Par2Error {
     }
 }
 
-/// Verify a PAR2 set and repair it in a private stage when necessary
 pub fn verify_or_repair(request: &Par2RepairRequest) -> Result<Par2RepairResult, Par2Error> {
     verify_or_repair_with_cancel(request, None)
 }
@@ -121,7 +118,7 @@ pub fn verify_or_repair_with_cancel(
     )?;
     validate_task_budget(request, source, parity.total)?;
     validate_verification_resources(&file_set)?;
-    ensure_staging_space(request, source.bytes, parity.total.bytes)?;
+    ensure_staging_space(request, 0, parity.total.bytes)?;
     let stage = tempfile::Builder::new()
         .prefix(".risuko-par2-")
         .tempdir_in(&request.destination)
@@ -129,7 +126,12 @@ pub fn verify_or_repair_with_cancel(
     let probe = stage.path().join("probe");
     fs::create_dir(&probe)?;
     stage_parity_files(&probe, &request.parity_files, cancel)?;
-    stage_data_files(&probe, &file_set, &data_by_name, None, cancel)?;
+    let all_names = file_set
+        .files
+        .values()
+        .map(|file| file.filename.as_str())
+        .collect::<HashSet<_>>();
+    stage_data_files(&probe, &file_set, &data_by_name, Some(&all_names), cancel)?;
 
     check_cancel(cancel)?;
     check_active_time(request)?;
@@ -138,7 +140,19 @@ pub fn verify_or_repair_with_cancel(
     check_active_time(request)?;
     if verification.all_correct() {
         let names = file_set_names(&file_set)?;
-        let promoted_outputs = promote_outputs(&probe, &names, &data_by_name, cancel)?;
+        let mut moved = BTreeSet::new();
+        let mut promoted_outputs = Vec::new();
+        for name in &names {
+            let input = data_by_name
+                .get(name)
+                .ok_or_else(|| Par2Error::UnsafePath(name.clone()))?;
+            if input.source_path == input.output_path {
+                promoted_outputs.push(input.output_path.clone());
+            } else {
+                moved.insert(name.clone());
+            }
+        }
+        promoted_outputs.extend(promote_outputs(&probe, &moved, &data_by_name, cancel)?);
         return Ok(Par2RepairResult {
             report: Par2Report {
                 outcome: Par2Outcome::Verified,
@@ -161,6 +175,19 @@ pub fn verify_or_repair_with_cancel(
         .map(|file| file.filename.as_str())
         .collect();
     fs::remove_dir_all(&probe)?;
+    let changed_bytes = file_set
+        .files
+        .values()
+        .filter(|file| {
+            verification
+                .damaged
+                .iter()
+                .map(|damaged| &damaged.filename)
+                .chain(verification.missing.iter().map(|missing| &missing.filename))
+                .any(|name| name == &file.filename)
+        })
+        .fold(0u64, |total, file| total.saturating_add(file.size));
+    ensure_staging_space(request, changed_bytes, parity.total.bytes)?;
     let repair_dir = stage.path().join("repair");
     fs::create_dir(&repair_dir)?;
     stage_parity_files(&repair_dir, &request.parity_files, cancel)?;
@@ -204,13 +231,12 @@ fn check_cancel(cancel: Option<&CancellationToken>) -> Result<(), Par2Error> {
     }
 }
 
-// rust-par2's verify/repair entry points are blocking and expose no cancellation hook, so keep the work chunked to observe worker cancellation during hashing, decoding, and writes
 fn verify_with_cancel(
     file_set: &rust_par2::Par2FileSet,
     dir: &Path,
     cancel: Option<&CancellationToken>,
 ) -> Result<rust_par2::VerifyResult, Par2Error> {
-    verify_with_cancel_inner(file_set, dir, cancel, None)
+    verify_with_cancel_inner(file_set, dir, cancel, None, None)
 }
 
 #[cfg(test)]
@@ -220,16 +246,21 @@ fn verify_with_cancel_hook(
     cancel: Option<&CancellationToken>,
     hook: &mut dyn FnMut(),
 ) -> Result<rust_par2::VerifyResult, Par2Error> {
-    verify_with_cancel_inner(file_set, dir, cancel, Some(hook))
+    verify_with_cancel_inner(file_set, dir, cancel, None, Some(hook))
 }
 
 fn verify_with_cancel_inner(
     file_set: &rust_par2::Par2FileSet,
     dir: &Path,
     cancel: Option<&CancellationToken>,
+    only: Option<&HashSet<String>>,
     mut hook: Option<&mut dyn FnMut()>,
 ) -> Result<rust_par2::VerifyResult, Par2Error> {
-    let mut files: Vec<_> = file_set.files.values().collect();
+    let mut files: Vec<_> = file_set
+        .files
+        .values()
+        .filter(|file| only.is_none_or(|names| names.contains(&file.filename)))
+        .collect();
     files.sort_by_key(|file| &file.filename);
     let mut intact = Vec::new();
     let mut damaged = Vec::new();
@@ -296,7 +327,11 @@ fn verify_with_cancel_inner(
         });
     }
 
-    let recovery_blocks_available = recovery_block_count_with_cancel(dir, file_set, cancel)?;
+    let recovery_blocks_available = if only.is_some() {
+        file_set.recovery_block_count
+    } else {
+        recovery_block_count_with_cancel(dir, file_set, cancel)?
+    };
     let blocks_needed = damaged
         .iter()
         .map(|file| file.damaged_block_count)
@@ -392,32 +427,19 @@ fn recovery_block_count_with_cancel(
     file_set: &rust_par2::Par2FileSet,
     cancel: Option<&CancellationToken>,
 ) -> Result<u32, Par2Error> {
-    let mut count = 0u32;
-    let read_dir = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(file_set.recovery_block_count),
-    };
-    let mut entries = read_dir
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("par2"))
-        })
-        .collect::<Vec<_>>();
-    entries.sort();
-    for path in entries {
-        check_cancel(cancel)?;
-        if let Ok(parsed) = rust_par2::parse(&path) {
-            if parsed.recovery_set_id == file_set.recovery_set_id {
-                count = count.saturating_add(parsed.recovery_block_count);
-            }
-        }
+    if fs::read_dir(dir).is_err() {
+        return Ok(file_set.recovery_block_count);
     }
-    Ok(if count == 0 {
+    let index =
+        match index_recovery_packets(dir, &file_set.recovery_set_id, file_set.slice_size, cancel) {
+            Ok((_, index)) => index,
+            Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
+            Err(_) => return Ok(file_set.recovery_block_count),
+        };
+    Ok(if index.is_empty() {
         file_set.recovery_block_count
     } else {
-        count
+        index.len() as u32
     })
 }
 
@@ -434,10 +456,14 @@ fn repair_from_verify_with_cancel(
         ));
     }
     let blocks_needed = verification.blocks_needed() as usize;
-    let recovery_blocks = load_recovery_blocks_with_cancel(
+    let block_map = CancellableBlockMap::new(file_set);
+    let damaged_indices = cancellable_damaged_indices(verification, &block_map);
+    let damaged_count = damaged_indices.len();
+    let mut recovery_blocks = load_recovery_blocks_with_cancel(
         dir,
         &file_set.recovery_set_id,
         file_set.slice_size,
+        blocks_needed.max(damaged_count),
         cancel,
     )?;
     if recovery_blocks.len() < blocks_needed {
@@ -447,15 +473,8 @@ fn repair_from_verify_with_cancel(
             recovery_blocks.len()
         )));
     }
-
-    let block_map = CancellableBlockMap::new(file_set);
-    let damaged_indices = cancellable_damaged_indices(verification, &block_map);
-    let damaged_count = damaged_indices.len();
-    let recovery_to_use = recovery_blocks
-        .iter()
-        .take(damaged_count)
-        .collect::<Vec<_>>();
-    let recovery_exponents = recovery_to_use
+    recovery_blocks.truncate(damaged_count);
+    let recovery_exponents = recovery_blocks
         .iter()
         .map(|block| block.exponent)
         .collect::<Vec<_>>();
@@ -470,9 +489,9 @@ fn repair_from_verify_with_cancel(
     let inverse = invert_matrix_with_cancel(&matrix, cancel)?;
     let slice_size = file_set.slice_size as usize;
     let damaged_set = damaged_indices.iter().copied().collect::<HashSet<_>>();
-    let mut adjusted = recovery_to_use
-        .iter()
-        .map(|block| block.data.clone())
+    let mut adjusted = recovery_blocks
+        .into_iter()
+        .map(|block| block.data)
         .collect::<Vec<_>>();
     let intact_indices = (0..block_map.total_blocks as usize)
         .filter(|index| !damaged_set.contains(index))
@@ -544,7 +563,20 @@ fn repair_from_verify_with_cancel(
         files_touched.insert(filename);
     }
 
-    let post_repair = verify_with_cancel(file_set, dir, cancel)?;
+    let mut recheck = files_touched.clone();
+    recheck.extend(
+        verification
+            .damaged
+            .iter()
+            .map(|file| file.filename.clone())
+            .chain(
+                verification
+                    .missing
+                    .iter()
+                    .map(|file| file.filename.clone()),
+            ),
+    );
+    let post_repair = verify_with_cancel_inner(file_set, dir, cancel, Some(&recheck), None)?;
     if !post_repair.all_correct() {
         return Err(Par2Error::Repair(format!(
             "Verification after repair failed: {post_repair}"
@@ -633,12 +665,14 @@ fn mul_add_cancellable(
     Ok(())
 }
 
-fn load_recovery_blocks_with_cancel(
+type RecoveryIndex = BTreeMap<u32, (usize, u64)>;
+
+fn index_recovery_packets(
     dir: &Path,
     set_id: &[u8; 16],
     slice_size: u64,
     cancel: Option<&CancellationToken>,
-) -> Result<Vec<rust_par2::recovery::RecoveryBlock>, Par2Error> {
+) -> Result<(Vec<PathBuf>, RecoveryIndex), Par2Error> {
     let mut paths = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -648,13 +682,13 @@ fn load_recovery_blocks_with_cancel(
         })
         .collect::<Vec<_>>();
     paths.sort();
-    let mut blocks = Vec::new();
-    for path in paths {
+    let mut index = RecoveryIndex::new();
+    let mut header = [0u8; PAR2_HEADER_BYTES as usize];
+    for (path_index, path) in paths.iter().enumerate() {
         check_cancel(cancel)?;
         let mut file = fs::File::open(path)?;
         let file_size = file.metadata()?.len();
         let mut position = 0u64;
-        let mut header = [0u8; PAR2_HEADER_BYTES as usize];
         while position + PAR2_HEADER_BYTES <= file_size {
             check_cancel(cancel)?;
             file.seek(SeekFrom::Start(position))?;
@@ -677,16 +711,46 @@ fn load_recovery_blocks_with_cancel(
             let body_length = packet_length - PAR2_HEADER_BYTES;
             let expected_body = 4u64.saturating_add(slice_size);
             if body_length >= expected_body && expected_body <= usize::MAX as u64 {
-                file.seek(SeekFrom::Start(position + PAR2_HEADER_BYTES))?;
-                let mut body = vec![0u8; expected_body as usize];
-                read_exact_with_cancel(&mut file, &mut body, cancel)?;
-                blocks.push(rust_par2::recovery::RecoveryBlock {
-                    exponent: u32::from_le_bytes(body[..4].try_into().unwrap()),
-                    data: body[4..].to_vec(),
-                });
+                let mut exponent = [0u8; 4];
+                file.read_exact(&mut exponent)?;
+                index
+                    .entry(u32::from_le_bytes(exponent))
+                    .or_insert((path_index, position + PAR2_HEADER_BYTES + 4));
             }
             position = position.saturating_add(packet_length);
         }
+    }
+    Ok((paths, index))
+}
+
+fn load_recovery_blocks_with_cancel(
+    dir: &Path,
+    set_id: &[u8; 16],
+    slice_size: u64,
+    wanted: usize,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<rust_par2::recovery::RecoveryBlock>, Par2Error> {
+    let (paths, index) = index_recovery_packets(dir, set_id, slice_size, cancel)?;
+    let mut chosen = index
+        .into_iter()
+        .take(wanted)
+        .map(|(exponent, (path_index, offset))| (path_index, offset, exponent))
+        .collect::<Vec<_>>();
+    chosen.sort_unstable();
+    let mut blocks = Vec::with_capacity(chosen.len());
+    let mut open: Option<(usize, fs::File)> = None;
+    for (path_index, offset, exponent) in chosen {
+        check_cancel(cancel)?;
+        if open.as_ref().map(|(index, _)| *index) != Some(path_index) {
+            open = Some((path_index, fs::File::open(&paths[path_index])?));
+        }
+        let Some((_, file)) = open.as_mut() else {
+            continue;
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut data = vec![0u8; slice_size as usize];
+        read_exact_with_cancel(file, &mut data, cancel)?;
+        blocks.push(rust_par2::recovery::RecoveryBlock { exponent, data });
     }
     blocks.sort_by_key(|block| block.exponent);
     Ok(blocks)
@@ -987,7 +1051,6 @@ fn validate_repair_resources(
     verification: &rust_par2::VerifyResult,
     file_set: &rust_par2::Par2FileSet,
 ) -> Result<(), Par2Error> {
-    // This estimate matches rust-par2 0.1.3: recovery blocks, repair matrix, paired repair buffers, and verification worker buffers are all live during repair
     let needed = verification.blocks_needed();
     let available = verification.recovery_blocks_available;
     if needed > MAX_PAR2_REPAIR_BLOCKS || available > MAX_PAR2_RECOVERY_BLOCKS {
@@ -996,7 +1059,6 @@ fn validate_repair_resources(
         ));
     }
     let needed = u64::from(needed);
-    let available = u64::from(available);
     let slice_size = file_set.slice_size;
     let matrix_cells = needed
         .checked_mul(needed)
@@ -1004,7 +1066,7 @@ fn validate_repair_resources(
     let matrix_bytes = matrix_cells
         .checked_mul(PAR2_REPAIR_MATRIX_BYTES_PER_CELL)
         .ok_or_else(|| Par2Error::Limits("PAR2 repair matrix memory overflowed".into()))?;
-    let recovery_bytes = available
+    let recovery_bytes = needed
         .checked_mul(slice_size)
         .ok_or_else(|| Par2Error::Limits("PAR2 recovery memory calculation overflowed".into()))?;
     let repair_buffers = needed
@@ -1748,7 +1810,7 @@ fn rollback_promotions(promotions: &mut Vec<OutputPromotion>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const TYPE_MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
@@ -1773,7 +1835,12 @@ mod tests {
         Md5::digest(bytes).into()
     }
 
-    fn write_fixture(parity_dir: &Path, name: &str, data: &[u8], recovery: bool) -> Vec<PathBuf> {
+    pub(crate) fn write_fixture(
+        parity_dir: &Path,
+        name: &str,
+        data: &[u8],
+        recovery: bool,
+    ) -> Vec<PathBuf> {
         let set_id = [0x5a; 16];
         let file_id = [0x11; 16];
         let slice_size = 4usize;
@@ -1981,6 +2048,41 @@ mod tests {
 
         assert!(matches!(error, Par2Error::Cancelled));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn subset_verification_skips_files_outside_the_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("data.bin"), [7u8]).unwrap();
+        let file_id = [1u8; 16];
+        let file_set = rust_par2::Par2FileSet {
+            recovery_set_id: [2u8; 16],
+            slice_size: 1,
+            file_order: vec![file_id],
+            files: HashMap::from([(
+                file_id,
+                rust_par2::Par2File {
+                    file_id,
+                    hash: [0u8; 16],
+                    hash_16k: [0u8; 16],
+                    size: 1,
+                    filename: "data.bin".into(),
+                    slices: Vec::new(),
+                },
+            )]),
+            recovery_block_count: 0,
+            creator: None,
+        };
+        let full = verify_with_cancel(&file_set, dir.path(), None).unwrap();
+        assert_eq!(full.damaged.len(), 1);
+        let none = HashSet::new();
+        let subset =
+            verify_with_cancel_inner(&file_set, dir.path(), None, Some(&none), None).unwrap();
+        assert!(subset.all_correct());
+        let named = HashSet::from(["data.bin".to_string()]);
+        let subset =
+            verify_with_cancel_inner(&file_set, dir.path(), None, Some(&named), None).unwrap();
+        assert_eq!(subset.damaged.len(), 1);
     }
 
     #[test]

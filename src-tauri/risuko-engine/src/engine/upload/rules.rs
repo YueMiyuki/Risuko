@@ -1,5 +1,3 @@
-//! Rule data model + matching logic; call-site precedence (in `manager.rs`): 1. per-task explicit `upload_sink_id` override (not applied here), 2. first matching rule (this module), 3. global default sink id
-
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -7,19 +5,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleMatch {
-    /// File-category names (matching the existing `file-category-dirs` keys: "music", "video", "image", "document", "compressed", "program")
     #[serde(default)]
     pub categories: Vec<String>,
-    /// Lowercase file extensions without leading dot (e.g. "mp4", "iso")
     #[serde(default)]
     pub extensions: Vec<String>,
-    /// Inclusive lower bound on file size in bytes
     #[serde(default)]
     pub min_size: Option<u64>,
-    /// Inclusive upper bound on file size in bytes
     #[serde(default)]
     pub max_size: Option<u64>,
-    /// Restrict to specific `TaskKind` debug-string values: "Http", "Torrent", "M3u8", "Ftp", "Ed2k"; empty = match any
     #[serde(default)]
     pub task_kinds: Vec<String>,
 }
@@ -29,11 +22,9 @@ pub struct RuleMatch {
 pub struct UploadRule {
     pub id: String,
     pub label: String,
-    /// Sink id this rule routes to; must reference an existing sink — the manager skips rules whose sink id is unknown
     pub sink_id: String,
     #[serde(default)]
     pub r#match: RuleMatch,
-    /// Order is determined by array position; lower index = higher priority
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -42,7 +33,6 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Inputs the matcher needs from the engine side
 pub struct RuleInput<'a> {
     pub file_path: &'a Path,
     pub size: u64,
@@ -100,7 +90,6 @@ impl UploadRule {
     }
 }
 
-/// Returns the id of the first rule matching `input`, or `None`
 pub fn select_rule_sink<'a>(rules: &'a [UploadRule], input: &RuleInput<'_>) -> Option<&'a str> {
     rules
         .iter()

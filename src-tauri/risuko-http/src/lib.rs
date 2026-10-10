@@ -1,5 +1,3 @@
-//! HTTP client used by Risuko
-
 mod body;
 mod client;
 mod connector;
@@ -17,7 +15,8 @@ mod response;
 pub use body::ReqBody;
 pub use client::{Client, ClientBuilder};
 pub use connector::{
-    datagram_source_matches, BoxedIo, ProxyConnector, ProxyDatagram, ProxyDatagramSource,
+    datagram_source_matches, BoxedIo, ProxyAssociation, ProxyConnector, ProxyDatagram,
+    ProxyDatagramSource,
 };
 pub use cookies::{CookieStore, Jar};
 pub use doh::{DohConfig, DohResolver};
@@ -83,7 +82,6 @@ fn file_stream_body_range_inner(
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    // Stat the file now so the advertised `Content-Length` matches what the body delivers; doing it only in the lazy stream factory was too late (headers were already framed from the possibly-stale caller length, so a shrunk file or over-large `take` produced disagreeing framing). If the stat fails (missing, permission denied) fall back to the caller-supplied length so the deferred open still surfaces the IO error one layer deeper
     let verified_length = match std::fs::metadata(&path) {
         Ok(meta) => {
             let remaining = meta.len().saturating_sub(offset);
@@ -102,12 +100,10 @@ fn file_stream_body_range_inner(
             let on_progress = on_progress.clone();
             let cancel = cancel.clone();
             let counter = Arc::new(AtomicU64::new(0));
-            // Lazily open the file the first time the body is polled; any IO error becomes a body error that hyper surfaces to the caller
             let stream = async_stream::try_stream! {
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
                 let mut file = tokio::fs::File::open(&path).await
                     .map_err(|e| Error::Body(format!("open {}: {e}", path.display())))?;
-                // Defense-in-depth: re-validate the requested range against the file's actual size at send time, since a shrink between construction and now would otherwise hang the connection after a short body
                 let file_size = file.metadata().await
                     .map_err(|e| Error::Body(format!("stat {}: {e}", path.display())))?
                     .len();
@@ -131,7 +127,7 @@ fn file_stream_body_range_inner(
                     Some(n) => Box::new(file.take(n)),
                     None => Box::new(file),
                 };
-                let reader = tokio_util::io::ReaderStream::new(reader);
+                let reader = tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024);
                 let mut reader = std::pin::pin!(reader);
                 use futures_util::StreamExt;
                 while let Some(chunk) = reader.next().await {

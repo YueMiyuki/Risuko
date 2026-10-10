@@ -1,11 +1,8 @@
-//! Wires DNS-over-HTTPS config into the shared HTTP stack: reads the `doh-*` engine options and installs (or clears) the process-wide resolver over [`risuko_http`], so one call here changes DNS behaviour for every `risuko-http` client (including the long-lived `OnceLock` clients in RSS, UPnP and BitTorrent HTTP trackers) without touching any call site; on a config change it parses options into a [`DohSettings`], no-ops if nothing moved, and only on a real change builds a fresh cache-owning [`risuko_http::DohResolver`] and hands it to `set_global_resolver`
-
 use std::net::IpAddr;
 use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
-/// Parsed, normalised DoH config; `enabled == false` means system DNS, but we still parse the rest so flipping it back on is cheap
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DohSettings {
     pub enabled: bool,
@@ -15,7 +12,6 @@ pub struct DohSettings {
 }
 
 impl DohSettings {
-    /// Pull DoH settings out of a merged engine-options map
     pub fn from_options(opts: &Map<String, Value>) -> Self {
         let enabled =
             crate::config::parse_keep_seeding_option(opts.get("doh-enable")).unwrap_or(false);
@@ -40,13 +36,11 @@ impl DohSettings {
         }
     }
 
-    /// True when these settings should actually spin up a DoH resolver
     fn is_active(&self) -> bool {
         self.enabled && !self.url.is_empty()
     }
 }
 
-/// Parse a comma/space/newline-separated list of IPs, quietly dropping any that don't parse so one typo doesn't throw away the rest
 fn parse_bootstrap(s: &str) -> Vec<IpAddr> {
     s.split([',', ' ', '\t', '\r', '\n'])
         .map(str::trim)
@@ -55,10 +49,8 @@ fn parse_bootstrap(s: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// Tracks the last settings we applied, so repeated config saves that don't touch DoH leave the resolver (and its cache) alone
 static APPLIED: Mutex<Option<DohSettings>> = Mutex::new(None);
 
-/// Extract just the host part of a URL for logging
 fn redacted_url_host(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -66,11 +58,9 @@ fn redacted_url_host(url: &str) -> String {
         .unwrap_or_else(|| "<invalid-url>".to_string())
 }
 
-/// Apply DoH settings to the global HTTP resolver; idempotent, so it no-ops when nothing changed since the last call, and if the endpoint URL is bad the resolver won't build so we log it and leave the previous resolver alone rather than quietly dropping back to system DNS
 pub fn apply_settings(settings: &DohSettings) {
     let mut guard = APPLIED.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Check if settings are unchanged while holding the lock to prevent races
     if guard.as_ref() == Some(settings) {
         return;
     }
@@ -108,7 +98,6 @@ pub fn apply_settings(settings: &DohSettings) {
     *guard = Some(settings.clone());
 }
 
-/// Parse DoH settings out of a merged options map and apply them in one step
 pub fn apply_from_options(opts: &Map<String, Value>) {
     apply_settings(&DohSettings::from_options(opts));
 }
@@ -136,7 +125,7 @@ mod tests {
     fn settings_defaults() {
         let s = DohSettings::from_options(&Map::new());
         assert!(!s.enabled);
-        assert!(s.fallback); // fallback is on unless you turn it off
+        assert!(s.fallback);
         assert!(!s.is_active());
     }
 

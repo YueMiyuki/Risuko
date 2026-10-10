@@ -40,9 +40,10 @@ import { ArrowDown, ArrowUp, Magnet, Network } from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
 import {
 	bytesToSize,
-	calcProgress,
 	checkTaskIsBT,
 	checkTaskIsSeeder,
+	formatProgressPercent,
+	getDisplayDownloadSpeed,
 	timeFormat,
 	timeRemaining,
 } from "@shared/utils";
@@ -74,10 +75,7 @@ export default {
 			return Number(this.task?.uploadSpeed || 0);
 		},
 		displayDownloadSpeed() {
-			if (this.isSeeder) {
-				return 0;
-			}
-			return Number(this.task?.downloadSpeed || 0);
+			return getDisplayDownloadSpeed(this.task);
 		},
 		showDownloadSpeed() {
 			return !this.isSeeder;
@@ -102,12 +100,10 @@ export default {
 			});
 		},
 		progressPercent() {
-			const result = calcProgress(
+			return formatProgressPercent(
 				this.task.totalLength,
 				this.task.completedLength,
-				1,
 			);
-			return `${result}`.replace(/\.0$/, "");
 		},
 	},
 	methods: {

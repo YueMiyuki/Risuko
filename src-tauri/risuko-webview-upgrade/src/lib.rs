@@ -1,5 +1,3 @@
-//! Android WebView kernel-upgrade plugin
-
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Runtime,

@@ -1,7 +1,6 @@
 pub mod commands;
 pub mod headless;
 
-// Shared with the standalone risuko-cli binary; the app crate reuses its progress rendering and JSON-RPC client instead of keeping drifted copies
 pub use risuko_cli::{progress, rpc_client};
 
 use clap::{Parser, Subcommand};
@@ -210,5 +209,55 @@ pub async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Remove(args) => commands::remove(args).await,
         Command::Serve(args) => commands::serve(args).await,
         Command::ExtractCookies(args) => commands::extract_cookies(args).await,
+    }
+}
+
+pub fn is_cli_invocation(args: &[String]) -> bool {
+    matches!(
+        args.get(1).map(String::as_str),
+        Some(
+            "download"
+                | "status"
+                | "pause"
+                | "resume"
+                | "remove"
+                | "serve"
+                | "extract-cookies"
+                | "help"
+                | "-h"
+                | "--help"
+                | "-V"
+                | "--version"
+        )
+    )
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::is_cli_invocation;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn subcommands_and_help_are_cli() {
+        assert!(is_cli_invocation(&argv(&["risuko", "download", "x"])));
+        assert!(is_cli_invocation(&argv(&["risuko", "--help"])));
+        assert!(is_cli_invocation(&argv(&["risuko", "serve"])));
+    }
+
+    #[test]
+    fn paths_links_and_flags_launch_gui() {
+        assert!(!is_cli_invocation(&argv(&["risuko"])));
+        assert!(!is_cli_invocation(&argv(&["risuko", "/tmp/a.torrent"])));
+        assert!(!is_cli_invocation(&argv(&[
+            "risuko",
+            "magnet:?xt=urn:btih:abc"
+        ])));
+        assert!(!is_cli_invocation(&argv(&[
+            "risuko",
+            "--opened-at-login=1"
+        ])));
     }
 }

@@ -1,23 +1,23 @@
 {
-  "name": "@risuko/cli-darwin-arm64",
-  "version": "0.7.1",
-  "description": "Risuko CLI binary for macOS ARM64",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/YueMiyuki/Risuko.git",
-    "directory": "packages/risuko-cli/npm/darwin-arm64"
-  },
-  "license": "MIT",
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ],
-  "scripts": {
-    "prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
-  },
-  "files": [
-    "risuko"
-  ]
+	"name": "@risuko/cli-darwin-arm64",
+	"version": "0.7.1",
+	"description": "Risuko CLI binary for macOS ARM64",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/YueMiyuki/Risuko.git",
+		"directory": "packages/risuko-cli/npm/darwin-arm64"
+	},
+	"license": "MIT",
+	"os": [
+		"darwin"
+	],
+	"cpu": [
+		"arm64"
+	],
+	"scripts": {
+		"prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
+	},
+	"files": [
+		"risuko"
+	]
 }

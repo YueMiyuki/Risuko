@@ -1,5 +1,3 @@
-//! Tauri commands exposing the OS-keychain credential vault to the renderer Mirrors the shape of `upload_cmds` so the frontend wrapper layer stays consistent
-
 use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
@@ -12,7 +10,7 @@ pub struct VaultStatus {
     pub backend: &'static str,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vault_status(state: State<'_, AppState>) -> VaultStatus {
     VaultStatus {
         enabled: state.vault.enabled(),
@@ -20,7 +18,7 @@ pub fn vault_status(state: State<'_, AppState>) -> VaultStatus {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vault_put_credential(
     state: State<'_, AppState>,
     id: String,
@@ -29,7 +27,7 @@ pub fn vault_put_credential(
     state.vault.put(&id, &secrets)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vault_get_credential(
     state: State<'_, AppState>,
     id: String,
@@ -37,7 +35,7 @@ pub fn vault_get_credential(
     state.vault.get(&id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vault_remove_credential(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.vault.remove(&id)
 }

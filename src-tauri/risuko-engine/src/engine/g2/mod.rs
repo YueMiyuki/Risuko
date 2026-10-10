@@ -1,18 +1,13 @@
-//! Gnutella2 (G2) — Phase 4. Single-file module (wire format is tightly scoped here); URI scheme `g2://host:port/sha1/<base32>?xl=...&dn=...`
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use percent_encoding::percent_decode_str;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::gnutella::peer::fetch_by_urn_with_proxy;
-use crate::engine::gnutella::types::GnutellaError;
+use crate::engine::gnutella::download::{run_urn_fetch, UrnFetch};
+use crate::engine::gnutella::types::{split_uri, url_decode, GnutellaError};
 use crate::engine::options::EngineOptions;
 
-/// Parsed `g2://` content URI carrying a SHA-1 URN, optional display name and file size hint
 pub struct G2Link {
     pub host: String,
     pub port: u16,
@@ -21,34 +16,17 @@ pub struct G2Link {
     pub file_size: u64,
 }
 
-/// True when the input begins with `g2://` (case-insensitive)
 pub fn is_g2_uri(uri: &str) -> bool {
     let lower = uri.trim().to_ascii_lowercase();
     lower.starts_with("g2://")
 }
 
-/// Parse a `g2://host[:port]/sha1/<base32>[?xl=&dn=&urn=]` URI; returns `None` for malformed input or non-G2 schemes
 pub fn parse_g2_uri(uri: &str) -> Option<G2Link> {
     let s = uri.trim();
     let rest = s
         .strip_prefix("g2://")
         .or_else(|| s.strip_prefix("G2://"))?;
-    let (host_port, path_query) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = if let Some(idx) = host_port.find(':') {
-        (
-            host_port[..idx].to_string(),
-            host_port[idx + 1..].parse().ok()?,
-        )
-    } else {
-        (host_port.to_string(), 6346)
-    };
-    let (path, query) = match path_query.find('?') {
-        Some(idx) => (&path_query[..idx], &path_query[idx + 1..]),
-        None => (path_query, ""),
-    };
+    let (host, port, path, query) = split_uri(rest)?;
     let mut urn: Option<String> = None;
     if let Some(rest) = path.strip_prefix("/sha1/") {
         urn = Some(format!("urn:sha1:{}", rest.trim_end_matches('/')));
@@ -83,14 +61,6 @@ pub fn parse_g2_uri(uri: &str) -> Option<G2Link> {
     })
 }
 
-fn url_decode(s: &str) -> String {
-    let normalized = s.replace('+', " ");
-    percent_decode_str(&normalized)
-        .decode_utf8_lossy()
-        .to_string()
-}
-
-/// Run a single G2 download to completion, reusing the Gnutella HTTP `uri-res/N2R` fetch path since both networks serve content over the same peer-to-peer HTTP/1.1 endpoint; returns the output path on success or a typed `GnutellaError`
 pub async fn run_g2_download(
     uri: &str,
     dir: &str,
@@ -118,53 +88,24 @@ pub async fn run_g2_download(
     if cancel_token.is_cancelled() {
         return Err(GnutellaError::Network("cancelled".into()));
     }
-    connections.store(1, Ordering::Relaxed);
-    let sampler_cancel = CancellationToken::new();
-    let sampler_cancel_task = sampler_cancel.clone();
-    let cancel_token_sampler = cancel_token.clone();
-    let sampler_speed = speed.clone();
-    let sampler_completed = completed.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(1000));
-        let mut prev = sampler_completed.load(Ordering::Relaxed);
-        loop {
-            tokio::select! {
-                _ = sampler_cancel_task.cancelled() => break,
-                _ = cancel_token_sampler.cancelled() => break,
-                _ = interval.tick() => {
-                    let current = sampler_completed.load(Ordering::Relaxed);
-                    sampler_speed.store(current.saturating_sub(prev), Ordering::Relaxed);
-                    prev = current;
-                }
-            }
-        }
-    });
-    let safe = crate::engine::util::safe_filename(
-        if link.file_name.is_empty() {
-            urn.trim_start_matches("urn:sha1:")
-        } else {
-            &link.file_name
+    run_urn_fetch(
+        UrnFetch {
+            host: &link.host,
+            port: link.port,
+            n2r_path: "/uri-res/N2R",
+            urn,
+            file_size: link.file_size,
+            file_name: &link.file_name,
+            default_name: "g2-download",
+            dir,
         },
-        "g2-download",
-    );
-    let out_path = PathBuf::from(dir).join(safe);
-    let download_result = fetch_by_urn_with_proxy(
-        &link.host,
-        link.port,
-        "/uri-res/N2R",
-        urn,
-        link.file_size,
-        &out_path,
         completed,
+        speed,
+        connections,
         cancel_token,
         proxy,
     )
-    .await;
-    sampler_cancel.cancel();
-    connections.store(0, Ordering::Relaxed);
-    speed.store(0, Ordering::Relaxed);
-    download_result?;
-    Ok(out_path)
+    .await
 }
 
 #[cfg(test)]

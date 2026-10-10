@@ -1,4 +1,4 @@
-export type PreferenceSearchRoute =
+type PreferenceSearchRoute =
 	| "basic"
 	| "appearance"
 	| "advanced"
@@ -76,6 +76,7 @@ const ADVANCED_PREFIXES = [
 	"ed2k-server",
 	"ed2k-kad",
 	"ed2k-enable-kad",
+	"gift-",
 	"ftp-",
 	"sftp-",
 	"saved-credentials",
@@ -196,6 +197,9 @@ const TARGETS: Record<string, string> = {
 	"preferences.protocols-adc": "preferences.download-protocol",
 	"preferences.protocols-gnutella": "preferences.download-protocol",
 	"preferences.protocols-g2": "preferences.download-protocol",
+	"preferences.gift-integration": "preferences.gift-enabled",
+	"preferences.gift-host": "preferences.gift-enabled",
+	"preferences.gift-port": "preferences.gift-enabled",
 	"preferences.mock-user-agent": "preferences.user-agent",
 	"preferences.saved-cookies": "preferences.cookies",
 	"preferences.no-netrc": "preferences.netrc",
@@ -357,6 +361,9 @@ const ADVANCED_KEYS = [
 	"preferences.auto-sync-tracker",
 	"preferences.bt-max-peers-per-torrent",
 	"preferences.bt-max-outstanding-per-peer",
+	"preferences.bt-max-connections",
+	"preferences.bt-ban-corrupt-peers",
+	"preferences.bt-ban-corrupt-strikes",
 	"preferences.bt-enable-upnp",
 	"preferences.bt-upnp-lease",
 	"preferences.bt-enable-lsd",
@@ -384,6 +391,10 @@ const ADVANCED_KEYS = [
 	"preferences.ed2k-kad",
 	"preferences.ed2k-enable-kad",
 	"preferences.ed2k-kad-port",
+	"preferences.gift-integration",
+	"preferences.gift-enabled",
+	"preferences.gift-host",
+	"preferences.gift-port",
 	"preferences.ftp-sftp-settings",
 	"preferences.ftp-username",
 	"preferences.ftp-password",

@@ -141,6 +141,8 @@ import {
 	calcRatio,
 	checkTaskIsBT,
 	checkTaskIsSeeder,
+	getDisplayDownloadSpeed,
+	getDisplayTaskStatus,
 	timeFormat,
 	timeRemaining,
 } from "@shared/utils";
@@ -156,6 +158,9 @@ import {
 const DEFAULT_SPLIT_SEGMENTS = 32;
 const MAX_SPLIT_SEGMENTS = 128;
 const SPEED_VERTICAL_GRID_COUNT = 6;
+
+const hexNibble = (code: number): number =>
+	code <= 57 ? code - 48 : (code | 32) - 87;
 
 export default {
 	name: "task-activity",
@@ -192,18 +197,10 @@ export default {
 			return Number(this.task?.uploadSpeed || 0);
 		},
 		displayDownloadSpeed() {
-			if (this.isSeeder) {
-				return 0;
-			}
-			return Number(this.task?.downloadSpeed || 0);
+			return getDisplayDownloadSpeed(this.task);
 		},
 		taskStatus() {
-			const { task, isSeeder } = this;
-			if (isSeeder) {
-				return TASK_STATUS.SEEDING;
-			} else {
-				return task.status;
-			}
+			return getDisplayTaskStatus(this.task);
 		},
 		isActive() {
 			return this.taskStatus === TASK_STATUS.ACTIVE;
@@ -278,11 +275,13 @@ export default {
 			const sums = new Array(segmentCount).fill(0);
 			const counts = new Array(segmentCount).fill(0);
 
+			let nibble = 0;
 			for (let bitIndex = 0; bitIndex < validBitLen; bitIndex++) {
-				const nibbleIndex = Math.trunc(bitIndex / 4);
 				const bitInNibble = 3 - (bitIndex % 4);
-				const nibble = parseInt(normalizedBitfield[nibbleIndex] || "0", 16);
-				const bit = Number.isNaN(nibble) ? 0 : (nibble >> bitInNibble) & 1;
+				if (bitInNibble === 3) {
+					nibble = hexNibble(normalizedBitfield.charCodeAt(bitIndex >> 2));
+				}
+				const bit = (nibble >> bitInNibble) & 1;
 				const bucket = Math.min(
 					Math.floor((bitIndex * segmentCount) / validBitLen),
 					segmentCount - 1,

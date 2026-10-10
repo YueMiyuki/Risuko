@@ -1,7 +1,12 @@
 export default {
-	"engine-version": "バージョンを確認",
+	tagline: "多機能ダウンロードマネージャー",
+	"engine-version": "エンジンバージョン",
+	features: "機能",
+	"check-updates": "アップデートを確認",
+	"copy-info": "バージョン情報をコピー",
+	copied: "コピーしました",
+	"copy-failed": "バージョン情報をコピーできませんでした",
 	license: "ライセンス",
-	about: "私たちについて",
 	release: "リリースノート",
 	support: "サポート",
 };

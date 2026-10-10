@@ -1,5 +1,3 @@
-//! A bounded eMule Kad 2.0 client used for ED2K source discovery; it implements only the client side of Kad (sending bootstrap/routing/source-search requests and consuming responses) and does not publish files or provide an inbound ED2K transfer service
-
 pub mod routing;
 pub mod state;
 pub mod wire;
@@ -11,6 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use risuko_http::{ProxyDatagram, ProxyDatagramSource};
+use risuko_http::{ProxyAssociation, ProxyDatagramSource};
 
 use self::routing::{
     is_public_ipv4, KadId, LookupConfig, LookupTracker, NodeId, RoutingTable, SourceSet,
@@ -44,6 +43,7 @@ const MAX_SOURCE_RESPONSE_PACKETS: usize = 6;
 const SOURCE_RESPONSE_IDLE: Duration = Duration::from_millis(250);
 const MAX_LIVENESS_PROBES: usize = routing::ALPHA;
 const STATE_CHECKPOINT_DEBOUNCE: Duration = Duration::from_secs(2);
+const WARM_ROUTING_WINDOW_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug, Error)]
 pub enum KadError {
@@ -176,7 +176,6 @@ impl Default for KadLookupStatus {
 
 #[derive(Debug, Clone)]
 pub struct KadSource {
-    /// ED2K client hash advertised by the source, not the Kad routing ID
     pub client_hash: KadId,
     pub addr: SocketAddrV4,
     pub source_type: u8,
@@ -204,7 +203,110 @@ impl KadLookup {
     }
 }
 
-/// Kad has no transaction ID in these request packets; the socket endpoint, expected opcode, and the target carried by routing/source responses form the correlation key for each in-flight request
+const MAX_SHORTLIST: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeState {
+    Unqueried,
+    InFlight,
+    Responded,
+    Failed,
+}
+
+struct ShortlistEntry {
+    contact: routing::Contact,
+    state: NodeState,
+    source_sent: bool,
+}
+
+struct Shortlist {
+    target: KadId,
+    entries: Vec<ShortlistEntry>,
+    known: HashSet<NodeId>,
+}
+
+impl Shortlist {
+    fn new(target: KadId, contacts: Vec<routing::Contact>) -> Self {
+        let mut list = Self {
+            target,
+            entries: Vec::new(),
+            known: HashSet::new(),
+        };
+        for contact in contacts {
+            list.add(contact);
+        }
+        list
+    }
+
+    fn add(&mut self, contact: routing::Contact) -> bool {
+        if !self.known.insert(contact.id) {
+            return false;
+        }
+        self.entries.push(ShortlistEntry {
+            contact,
+            state: NodeState::Unqueried,
+            source_sent: false,
+        });
+        let target = self.target;
+        self.entries.sort_by(|left, right| {
+            routing::compare_distance(&target, &left.contact.id.0, &right.contact.id.0)
+        });
+        self.entries.truncate(MAX_SHORTLIST);
+        true
+    }
+
+    fn window(&mut self) -> impl Iterator<Item = &mut ShortlistEntry> {
+        self.entries
+            .iter_mut()
+            .filter(|entry| entry.state != NodeState::Failed)
+            .take(routing::K)
+    }
+
+    fn set_state(&mut self, id: NodeId, state: NodeState) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.contact.id == id) {
+            entry.state = state;
+        }
+    }
+
+    fn next_unqueried(&mut self) -> Option<routing::Contact> {
+        self.window()
+            .find(|entry| entry.state == NodeState::Unqueried)
+            .map(|entry| {
+                entry.state = NodeState::InFlight;
+                entry.contact.clone()
+            })
+    }
+
+    fn has_pending_routing(&mut self) -> bool {
+        self.window()
+            .any(|entry| entry.state == NodeState::Unqueried)
+    }
+
+    fn next_source_candidate(&mut self) -> Option<routing::Contact> {
+        self.window()
+            .find(|entry| {
+                entry.state == NodeState::Responded
+                    && !entry.source_sent
+                    && entry.contact.version >= MIN_SOURCE_SEARCH_KAD_VERSION
+            })
+            .map(|entry| {
+                entry.source_sent = true;
+                entry.contact.clone()
+            })
+    }
+}
+
+enum LookupReply {
+    Routing(NodeId, Result<KadPacket, KadError>),
+    Source(Result<Vec<KadPacket>, KadError>),
+}
+
+#[derive(Default)]
+struct SourceSink {
+    seen_ids: HashSet<KadId>,
+    seen_addrs: SourceSet,
+}
+
 #[derive(Clone, Copy)]
 enum RequestExpectation {
     Bootstrap,
@@ -222,7 +324,6 @@ impl RequestExpectation {
             OP_ROUTING_REQ => {
                 let (kind, target, _) =
                     parse_routing_request(&packet.payload).map_err(KadError::Wire)?;
-                // FIND_VALUE (kind 2) responses are bounded to the two contacts requested by Kad2.0; other routing operations use the codec's general 32-contact safety bound
                 let max_contacts = if kind == 2 { 2 } else { 32 };
                 Ok(Self::Routing {
                     target,
@@ -285,7 +386,7 @@ struct KadRuntime {
 
 enum KadSocket {
     Direct(Arc<UdpSocket>),
-    Proxied(Arc<ProxyDatagram>),
+    Proxied(Arc<ProxyAssociation>),
 }
 
 impl KadSocket {
@@ -327,7 +428,6 @@ fn kad_source_matches(target: SocketAddr, source: &ProxyDatagramSource) -> bool 
     risuko_http::datagram_source_matches(source, target)
 }
 
-/// Tracks work that may mutate the routing table; shutdown closes the tracker before the final state write so no lookup or liveness task can publish a newer in-memory table after it has been persisted
 struct KadTaskTracker {
     state: parking_lot::Mutex<KadTaskTrackerState>,
     active_tx: watch::Sender<usize>,
@@ -367,7 +467,6 @@ impl KadTaskTracker {
             state.closing = true;
         }
         while *active.borrow() != 0 {
-            // The sender is owned by the tracker for its full lifetime, so a closed watch channel is not an expected shutdown path
             let _ = active.changed().await;
         }
     }
@@ -394,7 +493,6 @@ impl Drop for KadTaskGuard {
     }
 }
 
-/// A pending request is matched by endpoint, expected response opcode, and (for routing/source responses) the target embedded in the response; Kad2 has no transaction ID, so the dispatcher keeps this correlation state centrally while allowing unrelated requests to progress concurrently
 struct PendingRequest {
     id: u64,
     target: SocketAddr,
@@ -407,7 +505,6 @@ enum PendingResponse {
     Stream(mpsc::Sender<KadPacket>),
 }
 
-/// Shared Kad service; the UDP socket is bound once for the engine and every download creates a bounded lookup task over that socket
 pub struct KadService {
     runtime: Arc<KadRuntime>,
 }
@@ -443,7 +540,8 @@ impl KadService {
                 let has_explicit_bypass = proxy
                     .udp_no_proxy()
                     .is_some_and(|matcher| !matcher.is_empty());
-                let datagram = if proxy.supports_udp() || has_explicit_bypass {
+                let with_bypass = proxy.supports_udp() || has_explicit_bypass;
+                let datagram = if with_bypass {
                     proxy.bind_udp_with_bypass().await
                 } else {
                     proxy.bind_udp().await
@@ -454,7 +552,11 @@ impl KadService {
                         error.to_string(),
                     ))
                 })?;
-                KadSocket::Proxied(Arc::new(datagram))
+                KadSocket::Proxied(Arc::new(ProxyAssociation::new(
+                    proxy,
+                    with_bypass,
+                    datagram,
+                )))
             }
             None => KadSocket::Direct(Arc::new(
                 UdpSocket::bind(SocketAddrV4::new(config.bind_addr, config.udp_port))
@@ -544,7 +646,6 @@ impl KadService {
         self.lookup_sources_inner(file_hash, file_size, None, cancel, SOURCE_CHANNEL_CAPACITY)
     }
 
-    /// Start a source lookup for an ED2K client identity; Kad source records carry ED2K user hashes rather than Kad node IDs, so supplying the local hash lets the service exclude a source record which points back to this download client
     pub fn lookup_sources_for_client(
         self: &Arc<Self>,
         file_hash: KadId,
@@ -621,31 +722,19 @@ impl KadService {
         }
     }
 
-    pub fn find_sources(
-        self: &Arc<Self>,
-        file_hash: KadId,
-        file_size: u64,
-        cancel: CancellationToken,
-    ) -> mpsc::Receiver<KadSource> {
-        self.lookup_sources(file_hash, file_size, cancel).sources
-    }
-
     pub async fn health_snapshot(&self) -> KadHealthSnapshot {
         self.runtime.health.read().await.clone()
     }
 
     pub async fn shutdown(&self) {
         self.runtime.shutdown.cancel();
-        // Wait for lookup/liveness tasks (they update routing) before the final persistence snapshot
         self.runtime.active_tasks.close_and_wait().await;
-        // Wait for the receiver task so the UDP port is released and pending response senders drop, waking waiting requests
         if let Some(dispatcher) = self.runtime.dispatcher.lock().await.take() {
             let _ = dispatcher.await;
         }
         if let Some(worker) = self.runtime.checkpoint_worker.lock().await.take() {
             let _ = worker.await;
         }
-        // Dispatcher owns the only other socket clone; dropping this clone releases the UDP port even if a caller still holds an `Arc<KadService>`
         self.runtime.socket.lock().await.take();
         persist_runtime_state(&self.runtime).await;
         let contact_count = self.runtime.routing.lock().await.len();
@@ -653,6 +742,15 @@ impl KadService {
         health.state = KadState::Stopped;
         health.bound = false;
         health.routing_contacts = contact_count;
+    }
+
+    async fn routing_is_warm(&self) -> bool {
+        let (last_at, success) = {
+            let health = self.runtime.health.read().await;
+            (health.last_lookup_at_ms, health.last_lookup_success)
+        };
+        let recent = last_at.is_some_and(|at| now_ms().saturating_sub(at) < WARM_ROUTING_WINDOW_MS);
+        recent && success == Some(true) && self.runtime.routing.lock().await.len() >= routing::K
     }
 
     fn lookup_is_cancelled(&self, cancel: &CancellationToken) -> bool {
@@ -676,12 +774,15 @@ impl KadService {
             let _ = status_tx.send(status);
             return Ok(());
         }
+        let warm = self.routing_is_warm().await;
         self.begin_lookup_health().await;
 
-        let result = match self
-            .bootstrap_if_needed(&cancel, deadline, &mut status, &status_tx)
-            .await
-        {
+        let result = match if warm {
+            Ok(())
+        } else {
+            self.bootstrap_if_needed(&cancel, deadline, &mut status, &status_tx)
+                .await
+        } {
             Ok(()) => {
                 status.state = KadState::Searching;
                 let _ = status_tx.send(status.clone());
@@ -707,7 +808,6 @@ impl KadService {
                 self.update_lookup_health(true, None).await;
             }
             Err(KadError::Cancelled) => {
-                // Lookup cancellation belongs to one download/shutdown path, not the shared Kad socket; do not turn it into a service-wide timeout diagnostic
                 status.state = KadState::Stopped;
             }
             Err(error) => {
@@ -741,7 +841,6 @@ impl KadService {
         status: &mut KadLookupStatus,
         status_tx: &watch::Sender<KadLookupStatus>,
     ) -> Result<(), KadError> {
-        // Probe the persisted cache first; ten validated responders avoid touching the bundled seed snapshot for a healthy cache
         let mut cached_targets: Vec<_> = self
             .runtime
             .routing
@@ -817,7 +916,6 @@ impl KadService {
                 break;
             }
 
-            // Parse all replies in the round before issuing hello exchanges; both use the shared response dispatcher
             let mut hello_targets = Vec::new();
             while let Some((target, response)) = round.next().await {
                 let Ok(packet) = response else {
@@ -832,8 +930,7 @@ impl KadService {
                 let peer_addr = SocketAddrV4::new(*target.ip(), target.port());
                 peer.ip = *peer_addr.ip();
                 peer.udp_port = peer_addr.port();
-                // A valid bootstrap reply does not prove a usable Kad node; count only responders passing routing validation, else a bad cached reply could suppress bundled seed probing
-                if !self.is_valid_bootstrap_responder(&peer) {
+                if !self.is_valid_wire_contact(&peer) {
                     continue;
                 }
                 successful += 1;
@@ -924,13 +1021,13 @@ impl KadService {
         source_tx: &mpsc::Sender<KadSource>,
     ) -> Result<(), KadError> {
         let target = NodeId(file_hash);
-        let contacts = self
+        let initial = self
             .runtime
             .routing
             .lock()
             .await
             .closest_with_replacements(target, routing::MAX_LOOKUP_QUERIES);
-        if contacts.is_empty() {
+        if initial.is_empty() {
             return Err(KadError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Kad routing table is empty",
@@ -939,183 +1036,194 @@ impl KadService {
 
         let lookup = self.runtime.config.lookup.clone().bounded();
         let alpha = lookup.alpha;
-
-        // Walk the routing table in alpha-sized rounds; responses queue closer contacts for the next round while the shared UDP dispatcher keeps each request correlated
-        let mut candidates = contacts;
-        let mut queued = candidates
-            .iter()
-            .map(|contact| contact.id)
-            .collect::<HashSet<_>>();
+        let source_limit = lookup.max_sources.min(MAX_SOURCE_QUERIES);
+        let mut shortlist = Shortlist::new(file_hash, initial);
         let mut tracker = LookupTracker::new(&lookup);
-        while !candidates.is_empty() && tracker.queried_count() < lookup.max_queries {
-            if self.lookup_is_cancelled(cancel) {
-                return Err(KadError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(KadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Kad lookup deadline exceeded",
-                )));
-            }
+        let mut sink = SourceSink::default();
+        let mut source_queries = 0usize;
+        let mut routing_inflight = 0usize;
+        let mut source_inflight = 0usize;
+        let mut inflight: FuturesUnordered<BoxFuture<'_, LookupReply>> = FuturesUnordered::new();
+        let mut abort = None;
+        let mut deadline_hit = false;
 
-            let mut round = FuturesUnordered::new();
-            while round.len() < alpha
-                && !candidates.is_empty()
-                && tracker.queried_count() < lookup.max_queries
-            {
-                let contact = candidates.remove(0);
-                if !tracker.mark_queried(contact.id) {
-                    continue;
+        loop {
+            if abort.is_none() && !deadline_hit {
+                if self.lookup_is_cancelled(cancel) {
+                    abort = Some(KadError::Cancelled);
+                } else if Instant::now() >= deadline {
+                    deadline_hit = shortlist.has_pending_routing();
                 }
-                status.queried_nodes = tracker.queried_count();
-                let _ = status_tx.send(status.clone());
-                // Kad2 requests include the recipient's ID as a sanity check; a node drops mismatches, so this must be the queried contact, not our local Kad identity
-                let request = build_routing_request(2, &file_hash, &contact.id.0);
-                round.push(async {
-                    let result = self
-                        .request(contact.udp_addr(), request, cancel, deadline)
-                        .await;
-                    (contact, result)
-                });
             }
-            if round.is_empty() {
+            if abort.is_none() && !deadline_hit && Instant::now() < deadline {
+                while routing_inflight < alpha {
+                    let Some(contact) = shortlist.next_unqueried() else {
+                        break;
+                    };
+                    if !tracker.mark_queried(contact.id) {
+                        shortlist.set_state(contact.id, NodeState::Unqueried);
+                        break;
+                    }
+                    routing_inflight += 1;
+                    status.queried_nodes = tracker.queried_count();
+                    let _ = status_tx.send(status.clone());
+                    let request = build_routing_request(2, &file_hash, &contact.id.0);
+                    let addr = contact.udp_addr();
+                    inflight.push(
+                        async move {
+                            let result = self.request(addr, request, cancel, deadline).await;
+                            LookupReply::Routing(contact.id, result)
+                        }
+                        .boxed(),
+                    );
+                }
+                while source_inflight < alpha && source_queries < source_limit {
+                    let Some(contact) = shortlist.next_source_candidate() else {
+                        break;
+                    };
+                    source_queries += 1;
+                    source_inflight += 1;
+                    let request = build_source_search_request(&file_hash, file_size, 0);
+                    let addr = contact.udp_addr();
+                    inflight.push(
+                        async move {
+                            let result = self.source_request(addr, request, cancel, deadline).await;
+                            LookupReply::Source(result)
+                        }
+                        .boxed(),
+                    );
+                }
+            }
+            let Some(reply) = inflight.next().await else {
                 break;
-            }
-
-            let mut discovered = Vec::new();
-            let mut cancelled = false;
-            while let Some((contact, result)) = round.next().await {
-                match result {
-                    Ok(packet) if packet.opcode == OP_ROUTING_RES => {
-                        if let Ok(response) = parse_routing_response_with_limit(&packet.payload, 2)
-                        {
-                            discovered.extend(response.contacts);
+            };
+            match reply {
+                LookupReply::Routing(id, result) => {
+                    routing_inflight -= 1;
+                    match result {
+                        Ok(packet) => {
+                            shortlist.set_state(id, NodeState::Responded);
+                            if packet.opcode != OP_ROUTING_RES {
+                                continue;
+                            }
+                            let Ok(response) =
+                                parse_routing_response_with_limit(&packet.payload, 2)
+                            else {
+                                continue;
+                            };
+                            for wire_contact in response.contacts {
+                                if !self.is_valid_wire_contact(&wire_contact) {
+                                    continue;
+                                }
+                                let candidate = wire_contact.to_contact();
+                                self.insert_wire_contact(wire_contact).await;
+                                shortlist.add(candidate);
+                            }
+                        }
+                        Err(KadError::Cancelled) => abort = Some(KadError::Cancelled),
+                        Err(_) => {
+                            shortlist.set_state(id, NodeState::Failed);
+                            self.runtime.routing.lock().await.mark_failed(id);
                         }
                     }
-                    Err(KadError::Cancelled) => cancelled = true,
-                    Err(_) => {
-                        self.runtime.routing.lock().await.mark_failed(contact.id);
+                }
+                LookupReply::Source(result) => {
+                    source_inflight -= 1;
+                    match result {
+                        Ok(packets) if abort.is_none() => {
+                            if let Err(error) = self
+                                .deliver_source_packets(
+                                    packets,
+                                    file_hash,
+                                    client_hash,
+                                    lookup.max_sources,
+                                    &mut sink,
+                                    status,
+                                    status_tx,
+                                    source_tx,
+                                    cancel,
+                                )
+                                .await
+                            {
+                                abort = Some(error);
+                            }
+                        }
+                        Err(KadError::Cancelled) => abort = Some(KadError::Cancelled),
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-            if cancelled || self.lookup_is_cancelled(cancel) {
-                return Err(KadError::Cancelled);
-            }
-
-            for wire_contact in discovered {
-                let candidate = wire_contact.to_contact();
-                self.insert_wire_contact(wire_contact).await;
-                if candidate.is_valid_for_routing(self.runtime.node_id)
-                    && queued.insert(candidate.id)
-                {
-                    candidates.push(candidate);
-                }
-            }
-            candidates.sort_by(|left, right| {
-                routing::compare_distance(&file_hash, &left.id.0, &right.id.0)
-            });
         }
 
-        // Source requests have their own hard cap (32) and run in alpha-sized rounds; a non-answering node is skipped and source discovery stays non-fatal
-        let source_limit = lookup.max_sources.min(MAX_SOURCE_QUERIES);
-        let source_contacts = self
-            .runtime
-            .routing
-            .lock()
-            .await
-            .closest_with_replacements(target, routing::MAX_LOOKUP_QUERIES)
-            .into_iter()
-            .filter(|contact| contact.version >= MIN_SOURCE_SEARCH_KAD_VERSION)
-            .take(source_limit)
-            .collect::<Vec<_>>();
-        let mut source_candidates = source_contacts;
-        let source_tracker_config = LookupConfig {
-            max_queries: source_limit,
-            ..lookup.clone()
-        };
-        let mut source_tracker = LookupTracker::new(&source_tracker_config);
-        let mut seen_sources = SourceSet::default();
-        let mut seen_source_ids = HashSet::new();
-        while !source_candidates.is_empty() && source_tracker.queried_count() < source_limit {
-            if self.lookup_is_cancelled(cancel) {
-                return Err(KadError::Cancelled);
+        if let Some(error) = abort {
+            return Err(error);
+        }
+        if self.lookup_is_cancelled(cancel) {
+            return Err(KadError::Cancelled);
+        }
+        if deadline_hit && status.discovered_sources == 0 {
+            return Err(KadError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Kad lookup deadline exceeded",
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_source_packets(
+        &self,
+        packets: Vec<KadPacket>,
+        file_hash: KadId,
+        client_hash: Option<KadId>,
+        max_sources: usize,
+        sink: &mut SourceSink,
+        status: &mut KadLookupStatus,
+        status_tx: &watch::Sender<KadLookupStatus>,
+        source_tx: &mpsc::Sender<KadSource>,
+        cancel: &CancellationToken,
+    ) -> Result<(), KadError> {
+        for packet in packets {
+            if packet.opcode != OP_SEARCH_RES {
+                continue;
             }
-            if Instant::now() >= deadline {
-                break;
-            }
-            let mut round = FuturesUnordered::new();
-            while round.len() < alpha
-                && !source_candidates.is_empty()
-                && source_tracker.queried_count() < source_limit
-            {
-                let contact = source_candidates.remove(0);
-                if !source_tracker.mark_queried(contact.id) {
+            let response = match parse_source_search_response(&packet.payload) {
+                Ok(response) if response.target == file_hash => response,
+                _ => continue,
+            };
+            for source in response.sources {
+                if source.id == [0; 16]
+                    || client_hash.is_some_and(|client_hash| source.id == client_hash)
+                {
                     continue;
                 }
-                let request = build_source_search_request(&file_hash, file_size, 0);
-                let addr = contact.udp_addr();
-                round.push(
-                    async move { self.source_request(addr, request, cancel, deadline).await },
-                );
-            }
-            if round.is_empty() {
-                break;
-            }
-            let mut cancelled = false;
-            while let Some(result) = round.next().await {
-                let Ok(packets) = result else {
-                    if matches!(result, Err(KadError::Cancelled)) {
-                        cancelled = true;
-                    }
+                let Some(addr) = usable_source(&source) else {
                     continue;
                 };
-                for packet in packets {
-                    if packet.opcode != OP_SEARCH_RES {
-                        continue;
-                    }
-                    let response = match parse_source_search_response(&packet.payload) {
-                        Ok(response) if response.target == file_hash => response,
-                        _ => continue,
-                    };
-                    for source in response.sources {
-                        if source.id == [0; 16]
-                            || client_hash.is_some_and(|client_hash| source.id == client_hash)
-                        {
-                            continue;
-                        }
-                        let Some(addr) = usable_source(&source) else {
-                            continue;
-                        };
-                        if status.discovered_sources >= lookup.max_sources {
-                            break;
-                        }
-                        if !seen_source_ids.insert(source.id) {
-                            continue;
-                        }
-                        if !seen_sources.insert(addr) {
-                            continue;
-                        }
-                        let delivered = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => return Err(KadError::Cancelled),
-                            _ = self.runtime.shutdown.cancelled() => return Err(KadError::Cancelled),
-                            result = source_tx.send(KadSource {
-                                client_hash: source.id,
-                                addr,
-                                source_type: source.source_type().unwrap_or(0),
-                            }) => result,
-                        };
-                        if delivered.is_err() || self.lookup_is_cancelled(cancel) {
-                            return Err(KadError::Cancelled);
-                        }
-                        status.discovered_sources += 1;
-                        let _ = status_tx.send(status.clone());
-                    }
+                if status.discovered_sources >= max_sources {
+                    break;
                 }
-            }
-            if cancelled || self.lookup_is_cancelled(cancel) {
-                return Err(KadError::Cancelled);
+                if !sink.seen_ids.insert(source.id) {
+                    continue;
+                }
+                if !sink.seen_addrs.insert(addr) {
+                    continue;
+                }
+                let delivered = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(KadError::Cancelled),
+                    _ = self.runtime.shutdown.cancelled() => return Err(KadError::Cancelled),
+                    result = source_tx.send(KadSource {
+                        client_hash: source.id,
+                        addr,
+                        source_type: source.source_type().unwrap_or(0),
+                    }) => result,
+                };
+                if delivered.is_err() || self.lookup_is_cancelled(cancel) {
+                    return Err(KadError::Cancelled);
+                }
+                status.discovered_sources += 1;
+                let _ = status_tx.send(status.clone());
             }
         }
         Ok(())
@@ -1212,7 +1320,6 @@ impl KadService {
                 }
             }
             self.remove_pending(request_id).await;
-            // Cancellation may race the inactivity timeout; re-check after removing the registration so a scoped lookup never reports sources after its owner stopped waiting
             if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
                 return Err(KadError::Cancelled);
             }
@@ -1274,7 +1381,6 @@ impl KadService {
                 }
             };
             if let Err(error) = socket.send_to(&encoded, SocketAddr::V4(target)).await {
-                // Do not leave an orphaned sender in the dispatcher when the datagram cannot be sent
                 self.remove_pending(request_id).await;
                 return Err(KadError::Io(error));
             }
@@ -1374,16 +1480,6 @@ impl KadService {
         is_valid_kad_contact(contact, self.runtime.node_id)
     }
 
-    fn is_valid_bootstrap_responder(&self, contact: &KadWireContact) -> bool {
-        #[cfg(test)]
-        if self.runtime.config.allow_private_contacts {
-            return contact
-                .to_contact()
-                .is_valid_for_routing_allow_private(self.runtime.node_id);
-        }
-        is_valid_kad_bootstrap_responder(contact, self.runtime.node_id)
-    }
-
     async fn insert_wire_contact(self: &Arc<Self>, contact: KadWireContact) -> bool {
         if !self.is_valid_wire_contact(&contact) {
             return false;
@@ -1454,7 +1550,7 @@ impl KadService {
     }
 
     async fn set_health_state(&self, state: KadState, error: Option<String>) {
-        // Keep lock order routing -> health everywhere; the bootstrap path takes them in that order while recording a response, so reversing here can deadlock shutdown or a concurrent bootstrap round
+        // Lock order routing -> health everywhere; reversing can deadlock against bootstrap
         let routing_contacts = self.runtime.routing.lock().await.len();
         let mut health = self.runtime.health.write().await;
         health.state = state;
@@ -1480,42 +1576,61 @@ impl KadService {
     }
 }
 
-/// Receive all datagrams for the shared Kad socket and route each valid response to the request holding the matching correlation key; a single `recv_from` task is required because Tokio sockets give no safe way for multiple consumers to match responses to requests
 async fn run_dispatcher(
     socket: Arc<KadSocket>,
     pending: Arc<Mutex<Vec<PendingRequest>>>,
     shutdown: CancellationToken,
 ) {
     let mut buffer = vec![0u8; wire::MAX_DATAGRAM_SIZE];
+    let mut consecutive_errors = 0u32;
     loop {
         let received = tokio::select! {
             _ = shutdown.cancelled() => break,
             result = socket.recv_from(&mut buffer) => result,
         };
-        let Ok((length, source)) = received else {
-            break;
-        };
-        let Ok(packet) = KadPacket::decode(&buffer[..length]) else {
-            continue;
+        let (length, source) = match received {
+            Ok(received) => {
+                consecutive_errors = 0;
+                received
+            }
+            Err(error) => {
+                // Transient errors (ICMP port-unreachable surfacing as ECONNRESET, ENOBUFS) must not end Kad
+                consecutive_errors += 1;
+                tracing::debug!("[ed2k-kad] recv_from failed: {}", error);
+                if consecutive_errors > 8 {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+                continue;
+            }
         };
 
-        // Resolve domain-form relay sources outside the pending lock. DNS can
-        // await, and holding this lock would prevent new Kad requests from
-        // registering while one malformed/unresolvable source is examined
         let candidates = {
             let entries = pending.lock().await;
             entries
                 .iter()
-                .filter(|entry| entry.expectation.matches(&packet))
-                .map(|entry| (entry.id, entry.target))
-                .collect::<Vec<_>>()
+                .filter(|entry| kad_source_matches(entry.target, &source))
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>()
         };
-        let mut matching_ids = HashSet::new();
-        for (id, target) in candidates {
-            if kad_source_matches(target, &source) {
-                matching_ids.insert(id);
-            }
+        if candidates.is_empty() {
+            continue;
         }
+        let Ok(packet) = KadPacket::decode(&buffer[..length]) else {
+            continue;
+        };
+        let matching_ids = {
+            let entries = pending.lock().await;
+            entries
+                .iter()
+                .filter(|entry| {
+                    candidates.contains(&entry.id) && entry.expectation.matches(&packet)
+                })
+                .map(|entry| entry.id)
+                .collect::<HashSet<_>>()
+        };
 
         let (oneshot_senders, stream_senders) = {
             let mut entries = pending.lock().await;
@@ -1548,7 +1663,6 @@ async fn run_dispatcher(
             }
             (oneshot_senders, stream_senders)
         };
-        // A Kad packet has no transaction ID, so identical outstanding requests to the same node can share the matching response, preventing one download from making another retry unnecessarily
         for sender in oneshot_senders {
             let _ = sender.send(packet.clone());
         }
@@ -1557,11 +1671,9 @@ async fn run_dispatcher(
         }
     }
 
-    // Wake/drop any request receivers still waiting when shutdown begins
     pending.lock().await.clear();
 }
 
-/// Coalesce bursts of routing-table changes into one atomic state checkpoint; the final shutdown flush stays authoritative if the engine stops during the quiet-period timer
 async fn run_checkpoint_worker(runtime: Arc<KadRuntime>, mut signals: mpsc::Receiver<()>) {
     loop {
         let signal = tokio::select! {
@@ -1647,10 +1759,6 @@ fn usable_source(source: &KadSourceRecord) -> Option<SocketAddrV4> {
 
 fn is_valid_kad_contact(contact: &KadWireContact, local_id: NodeId) -> bool {
     contact.to_contact().is_valid_for_routing(local_id)
-}
-
-fn is_valid_kad_bootstrap_responder(contact: &KadWireContact, local_id: NodeId) -> bool {
-    is_valid_kad_contact(contact, local_id)
 }
 
 fn now_ms() -> u64 {
@@ -1859,6 +1967,295 @@ mod tests {
         }
     }
 
+    struct ScriptedNode {
+        id: KadId,
+        referrals: Vec<KadWireContact>,
+        silent_routing: bool,
+        source: Option<SocketAddrV4>,
+        compress_sources: bool,
+        routing_gate: Option<Arc<Barrier>>,
+        routing_delay: Duration,
+        events: Arc<LoopbackEvents>,
+    }
+
+    impl ScriptedNode {
+        fn new(id: KadId) -> Self {
+            Self {
+                id,
+                referrals: Vec::new(),
+                silent_routing: false,
+                source: None,
+                compress_sources: false,
+                routing_gate: None,
+                routing_delay: Duration::ZERO,
+                events: Arc::new(LoopbackEvents::default()),
+            }
+        }
+    }
+
+    fn compressed(packet: &KadPacket) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            vec![wire::KAD_PROTOCOL_COMPRESSED, packet.opcode],
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(&packet.payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn loopback_wire_contact(id: KadId, addr: SocketAddrV4) -> KadWireContact {
+        KadWireContact {
+            id,
+            ip: *addr.ip(),
+            udp_port: addr.port(),
+            tcp_port: 4662,
+            version: KAD_VERSION,
+        }
+    }
+
+    async fn spawn_scripted_node(
+        node: ScriptedNode,
+        shutdown: CancellationToken,
+    ) -> (SocketAddrV4, JoinHandle<()>) {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = match socket.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let handle = tokio::spawn(async move {
+            let mut buffer = vec![0u8; wire::MAX_DATAGRAM_SIZE];
+            loop {
+                let received = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = socket.recv_from(&mut buffer) => result,
+                };
+                let Ok((length, remote)) = received else {
+                    break;
+                };
+                let Ok(packet) = KadPacket::decode(&buffer[..length]) else {
+                    continue;
+                };
+                let events = &node.events;
+                let datagrams = match packet.opcode {
+                    OP_BOOTSTRAP_REQ => {
+                        events.bootstrap.fetch_add(1, Ordering::Relaxed);
+                        vec![bootstrap_response(node.id).encode()]
+                    }
+                    OP_HELLO_REQ => {
+                        events.hello.fetch_add(1, Ordering::Relaxed);
+                        vec![
+                            wire::build_hello_response(&node.id, addr.port(), 4662, KAD_VERSION)
+                                .encode(),
+                        ]
+                    }
+                    OP_ROUTING_REQ => {
+                        events.routing.fetch_add(1, Ordering::Relaxed);
+                        if node.silent_routing {
+                            continue;
+                        }
+                        sleep(node.routing_delay).await;
+                        if let Some(gate) = &node.routing_gate {
+                            gate.wait().await;
+                        }
+                        let Ok((_, target, _)) = wire::parse_routing_request(&packet.payload)
+                        else {
+                            continue;
+                        };
+                        vec![wire::build_routing_response(&target, &node.referrals).encode()]
+                    }
+                    OP_SEARCH_SOURCE_REQ => {
+                        events.source.fetch_add(1, Ordering::Relaxed);
+                        let (Some(source), Ok((target, _, _))) = (
+                            node.source,
+                            wire::parse_source_search_request(&packet.payload),
+                        ) else {
+                            continue;
+                        };
+                        let response = wire::build_source_search_response(
+                            &target,
+                            &[direct_source([node.id[0].wrapping_add(1); 16], source)],
+                        );
+                        if node.compress_sources {
+                            vec![compressed(&response)]
+                        } else {
+                            vec![response.encode()]
+                        }
+                    }
+                    OP_PING => {
+                        vec![KadPacket::new(OP_PONG, 4672u16.to_le_bytes().to_vec()).encode()]
+                    }
+                    _ => continue,
+                };
+                for datagram in datagrams {
+                    let _ = socket.send_to(&datagram, remote).await;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    fn fast_lookup() -> LookupConfig {
+        LookupConfig {
+            request_timeout: Duration::from_millis(300),
+            deadline: Duration::from_secs(10),
+            retries: 0,
+            ..LookupConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_converges_after_the_closest_nodes_have_responded() {
+        let stop = CancellationToken::new();
+        let hash = [0x44; 16];
+        let mut seed = ScriptedNode::new([0x80; 16]);
+        let mut near_a = ScriptedNode::new([0x45; 16]);
+        let mut near_b = ScriptedNode::new([0x46; 16]);
+        for node in [&mut seed, &mut near_a, &mut near_b] {
+            node.source = Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662));
+        }
+        let (a_events, b_events, seed_events) = (
+            near_a.events.clone(),
+            near_b.events.clone(),
+            seed.events.clone(),
+        );
+        let (a_addr, a_task) = spawn_scripted_node(near_a, stop.clone()).await;
+        let (b_addr, b_task) = spawn_scripted_node(near_b, stop.clone()).await;
+        seed.referrals = vec![
+            loopback_wire_contact([0x45; 16], a_addr),
+            loopback_wire_contact([0x46; 16], b_addr),
+        ];
+        let (seed_addr, seed_task) = spawn_scripted_node(seed, stop.clone()).await;
+        let (service, _directory, _) = test_service(fast_lookup()).await;
+        add_loopback_contact(&service, [0x80; 16], seed_addr).await;
+
+        let lookup = service.lookup_sources(hash, 1, CancellationToken::new());
+        let (_sources, status, completion) = lookup.into_parts();
+        timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        for events in [&seed_events, &a_events, &b_events] {
+            assert_eq!(events.routing.load(Ordering::Relaxed), 1);
+            assert_eq!(events.source.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(status.borrow().queried_nodes, 3);
+        assert_eq!(status.borrow().state, KadState::Ready);
+
+        service.shutdown().await;
+        stop.cancel();
+        for task in [a_task, b_task, seed_task] {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_node_is_not_queried_again_within_one_lookup() {
+        let stop = CancellationToken::new();
+        let mut silent = ScriptedNode::new([0x45; 16]);
+        silent.silent_routing = true;
+        let silent_events = silent.events.clone();
+        let (silent_addr, silent_task) = spawn_scripted_node(silent, stop.clone()).await;
+        let referral = loopback_wire_contact([0x45; 16], silent_addr);
+        let mut first = ScriptedNode::new([0x80; 16]);
+        first.referrals = vec![referral.clone()];
+        let mut second = ScriptedNode::new([0x81; 16]);
+        second.referrals = vec![referral];
+        second.routing_delay = Duration::from_millis(700);
+        let second_events = second.events.clone();
+        let (first_addr, first_task) = spawn_scripted_node(first, stop.clone()).await;
+        let (second_addr, second_task) = spawn_scripted_node(second, stop.clone()).await;
+        let (service, _directory, _) = test_service(fast_lookup()).await;
+        add_loopback_contact(&service, [0x80; 16], first_addr).await;
+        add_loopback_contact(&service, [0x81; 16], second_addr).await;
+
+        let lookup = service.lookup_sources([0x44; 16], 1, CancellationToken::new());
+        let (_sources, _status, completion) = lookup.into_parts();
+        timeout(Duration::from_secs(5), completion)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second_events.routing.load(Ordering::Relaxed), 1);
+        assert_eq!(silent_events.routing.load(Ordering::Relaxed), 1);
+        assert_eq!(silent_events.source.load(Ordering::Relaxed), 0);
+
+        service.shutdown().await;
+        stop.cancel();
+        for task in [silent_task, first_task, second_task] {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sources_stream_while_a_slow_node_is_still_pending() {
+        let stop = CancellationToken::new();
+        let gate = Arc::new(Barrier::new(2));
+        let mut slow = ScriptedNode::new([0x45; 16]);
+        slow.routing_gate = Some(gate.clone());
+        let mut fast = ScriptedNode::new([0x46; 16]);
+        fast.source = Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 4662));
+        let (slow_addr, slow_task) = spawn_scripted_node(slow, stop.clone()).await;
+        let (fast_addr, fast_task) = spawn_scripted_node(fast, stop.clone()).await;
+        let (service, _directory, _) = test_service(LookupConfig {
+            request_timeout: Duration::from_secs(5),
+            ..fast_lookup()
+        })
+        .await;
+        add_loopback_contact(&service, [0x45; 16], slow_addr).await;
+        add_loopback_contact(&service, [0x46; 16], fast_addr).await;
+
+        let lookup = service.lookup_sources([0x44; 16], 1, CancellationToken::new());
+        let (mut sources, _status, completion) = lookup.into_parts();
+        let source = timeout(Duration::from_secs(2), sources.recv())
+            .await
+            .expect("source should arrive before the slow node answers")
+            .unwrap();
+        assert_eq!(
+            source.addr,
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 4662)
+        );
+        assert!(!completion.is_finished());
+        gate.wait().await;
+        completion.await.unwrap().unwrap();
+
+        service.shutdown().await;
+        stop.cancel();
+        slow_task.await.unwrap();
+        fast_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_source_response_is_delivered() {
+        let stop = CancellationToken::new();
+        let mut node = ScriptedNode::new([0x80; 16]);
+        node.source = Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662));
+        node.compress_sources = true;
+        let (addr, task) = spawn_scripted_node(node, stop.clone()).await;
+        let (service, _directory, _) = test_service(fast_lookup()).await;
+        add_loopback_contact(&service, [0x80; 16], addr).await;
+
+        let lookup = service.lookup_sources([0x44; 16], 1, CancellationToken::new());
+        let (mut sources, _status, completion) = lookup.into_parts();
+        completion.await.unwrap().unwrap();
+        let source = timeout(Duration::from_secs(1), sources.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.addr,
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662)
+        );
+
+        service.shutdown().await;
+        stop.cancel();
+        task.await.unwrap();
+    }
+
     #[test]
     fn bundled_seed_asset_is_bounded() {
         assert!(bundled_seeds().len() <= MAX_BOOTSTRAP_SEEDS);
@@ -1890,46 +2287,37 @@ mod tests {
             version: KAD_VERSION,
         };
 
-        assert!(is_valid_kad_bootstrap_responder(&valid, local_id));
+        assert!(is_valid_kad_contact(&valid, local_id));
 
         let invalid_version = KadWireContact {
             version: 1,
             ..valid.clone()
         };
-        assert!(!is_valid_kad_bootstrap_responder(
-            &invalid_version,
-            local_id
-        ));
+        assert!(!is_valid_kad_contact(&invalid_version, local_id));
 
         let udp_only = KadWireContact {
             tcp_port: 0,
             ..valid.clone()
         };
-        assert!(is_valid_kad_bootstrap_responder(&udp_only, local_id));
+        assert!(is_valid_kad_contact(&udp_only, local_id));
 
         let missing_udp_port = KadWireContact {
             udp_port: 0,
             ..valid.clone()
         };
-        assert!(!is_valid_kad_bootstrap_responder(
-            &missing_udp_port,
-            local_id
-        ));
+        assert!(!is_valid_kad_contact(&missing_udp_port, local_id));
 
         let private_endpoint = KadWireContact {
             ip: Ipv4Addr::new(10, 0, 0, 1),
             ..valid.clone()
         };
-        assert!(!is_valid_kad_bootstrap_responder(
-            &private_endpoint,
-            local_id
-        ));
+        assert!(!is_valid_kad_contact(&private_endpoint, local_id));
 
         let self_endpoint = KadWireContact {
             id: local_id.0,
             ..valid
         };
-        assert!(!is_valid_kad_bootstrap_responder(&self_endpoint, local_id));
+        assert!(!is_valid_kad_contact(&self_endpoint, local_id));
     }
 
     #[test]
@@ -2223,7 +2611,6 @@ mod tests {
         .await;
         add_loopback_contact(&service, [0x80; 16], node_addr).await;
 
-        // The loopback fixture derives its response source hash from the node ID: [0x80; 16] becomes [0x81; 16]
         let lookup = service.lookup_sources_for_client(
             [0x44; 16],
             1234,

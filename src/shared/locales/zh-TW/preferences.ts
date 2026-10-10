@@ -175,7 +175,16 @@ export default {
 		"每個種子允許的最大對等節點數，值越大 peer 涵蓋越廣（需重啟引擎生效）",
 	"bt-max-outstanding-per-peer": "每個對等節點最大並發請求數",
 	"bt-max-outstanding-per-peer-tips":
-		"每個 peer 的 pipeline 並發請求上限（最高 256）。0 表示使用 6–96 的自適應預設值；活躍 peer 會共享單一種子的總請求預算。需重啟引擎生效",
+		"每個 peer 的 pipeline 並發請求上限（最高 500）。0 表示使用 6–500 的自適應預設值；活躍 peer 會共享單一種子的總請求預算。需重啟引擎生效",
+	"bt-max-connections": "最大對等連線數",
+	"bt-max-connections-tips":
+		"所有種子合計的對等連線數上限（20–5000）。調低不會中斷既有連線，只會暫緩建立新連線。實際生效值還受系統檔案描述符上限的一半限制",
+	"bt-ban-corrupt-peers": "封鎖傳送損壞資料的對等節點",
+	"bt-ban-corrupt-peers-tips":
+		"當某個 IP 參與傳送的分片多次未通過雜湊校驗時，在本次工作階段內封鎖該 IP。多位使用者可能共用同一 IP（如行動網路、共用網路），封鎖可能誤傷正常的 peer（需重啟引擎生效）",
+	"bt-ban-corrupt-strikes": "封鎖前允許的失敗分片數",
+	"bt-ban-corrupt-strikes-tips":
+		"一個 IP 參與的分片校驗失敗多少次後被封鎖。值越大越能容忍偶發的資料損壞（需重啟引擎生效）",
 	"bt-enable-upnp": "UPnP 連接埠轉發",
 	"bt-enable-upnp-tips":
 		"透過 UPnP IGD 自動在路由器開放 BT 監聽連接埠（需重啟引擎生效）",

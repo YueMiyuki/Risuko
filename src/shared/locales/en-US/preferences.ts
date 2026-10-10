@@ -323,7 +323,16 @@ export default {
 		"Maximum concurrent peer connections per torrent. Higher values improve swarm discovery (requires engine restart)",
 	"bt-max-outstanding-per-peer": "Max Outstanding Requests per Peer",
 	"bt-max-outstanding-per-peer-tips":
-		"Maximum concurrent chunk requests pipelined to each peer (cap, up to 256). 0 uses the adaptive 6–96 default; a torrent-wide request budget is shared across active peers. Requires engine restart",
+		"Maximum concurrent chunk requests pipelined to each peer (cap, up to 500). 0 uses the adaptive 6–500 default; a torrent-wide request budget is shared across active peers. Requires engine restart",
+	"bt-max-connections": "Max Peer Connections",
+	"bt-max-connections-tips":
+		"Total peer connections across all torrents, 20 to 5000. Lowering it never drops connections already open, it only holds back new ones. The effective value is also capped at half of the system file descriptor limit",
+	"bt-ban-corrupt-peers": "Ban Peers Sending Corrupt Data",
+	"bt-ban-corrupt-peers-tips":
+		"Block an IP address for the rest of the session once pieces it helped send keep failing their hash check. Many users can share one IP (mobile carriers, shared networks), so a ban may cut off innocent peers too (requires engine restart)",
+	"bt-ban-corrupt-strikes": "Failed Pieces Before Ban",
+	"bt-ban-corrupt-strikes-tips":
+		"How many failed pieces an IP address may contribute to before it is banned. Higher values tolerate occasional corruption (requires engine restart)",
 	"bt-enable-upnp": "UPnP Port Forwarding",
 	"bt-enable-upnp-tips":
 		"Automatically open the BitTorrent listen port on the router via UPnP IGD (requires engine restart)",

@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::speed_limiter::parse_speed_limit;
 
-// Cached ffmpeg lookup
 static FFMPEG_PATH: OnceCell<Option<PathBuf>> = OnceCell::const_new();
+static YT_DLP_READY: OnceCell<()> = OnceCell::const_new();
 
 pub fn is_youtube_uri(uri: &str) -> bool {
     let trimmed = uri.trim();
@@ -71,7 +71,6 @@ pub fn is_media_uri(uri: &str) -> bool {
         Err(_) => return false,
     };
 
-    // Only http(s) URLs are candidates; other schemes belong to dedicated protocol handlers (magnet, ed2k, ftp, ...)
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return false,
@@ -87,17 +86,10 @@ pub fn is_media_uri(uri: &str) -> bool {
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
-/// Read the per-task `force-ytdlp` flag (accepts bool or "true"/"false" case-insensitive)
 pub fn is_force_ytdlp(options: &Map<String, Value>) -> bool {
     options
         .get("force-ytdlp")
-        .map(|v| {
-            v.as_bool().unwrap_or_else(|| {
-                v.as_str()
-                    .map(|s| s.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false)
-            })
-        })
+        .and_then(crate::engine::options::json_bool)
         .unwrap_or(false)
 }
 
@@ -115,7 +107,22 @@ pub async fn check_yt_dlp_available() -> Result<(), String> {
     }
 }
 
-/// Probe for an ffmpeg binary on PATH, returning its path if usable; the result is cached for the process lifetime
+async fn ensure_yt_dlp() -> Result<(), String> {
+    YT_DLP_READY
+        .get_or_try_init(check_yt_dlp_available)
+        .await
+        .map(|_| ())
+}
+
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pgid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 pub async fn find_ffmpeg() -> Option<PathBuf> {
     FFMPEG_PATH
         .get_or_init(|| async {
@@ -136,11 +143,17 @@ pub async fn find_ffmpeg() -> Option<PathBuf> {
         .clone()
 }
 
+fn yt_dlp_retries(max_tries: u64) -> String {
+    match max_tries {
+        0 => "infinite".to_string(),
+        n => (n - 1).to_string(),
+    }
+}
+
 fn parse_na_u64(s: &str) -> Option<u64> {
     if s == "NA" || s.is_empty() {
         return None;
     }
-    // yt-dlp may emit floats
     s.parse::<f64>().ok().map(|f| f.max(0.0) as u64)
 }
 
@@ -174,7 +187,6 @@ fn apply_yt_dlp_network_options(
         let bypassed = risuko_http::Url::parse(target_url)
             .ok()
             .is_some_and(|target| matcher.matches_url(&target));
-        // Validate the proxy URL like the native downloader, then drop the client — yt-dlp gets the raw URL via --proxy, so this call only rejects a malformed proxy up front
         risuko_http::Proxy::all(proxy_url).map_err(|e| format!("Invalid configured proxy: {e}"))?;
         if !bypassed {
             cmd.arg("--proxy").arg(proxy_url);
@@ -212,7 +224,7 @@ pub async fn run_media_download(
     cancel_token: CancellationToken,
     dest_tx: watch::Sender<String>,
 ) -> Result<PathBuf, String> {
-    check_yt_dlp_available().await?;
+    ensure_yt_dlp().await?;
 
     let mut cmd = Command::new("yt-dlp");
     cmd.arg("--newline")
@@ -225,7 +237,6 @@ pub async fn run_media_download(
         .arg("--progress-template")
         .arg("download:__YTPROG__%(progress.downloaded_bytes)s %(progress.total_bytes,progress.total_bytes_estimate)s %(progress.speed)s");
 
-    // The web player client avoids "not available on this app" errors
     if is_youtube_uri(url) {
         cmd.arg("--extractor-args")
             .arg("youtube:player_client=web,default");
@@ -233,7 +244,6 @@ pub async fn run_media_download(
 
     apply_yt_dlp_network_options(&mut cmd, options, url)?;
 
-    // ffmpeg is required to merge separate video+audio streams
     let ffmpeg = find_ffmpeg().await;
     if let Some(ffmpeg_path) = ffmpeg.as_ref() {
         cmd.arg("--ffmpeg-location").arg(ffmpeg_path);
@@ -251,10 +261,8 @@ pub async fn run_media_download(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
     if let Some(fmt) = format_opt {
-        // Honour an explicit user format selector even without ffmpeg
         cmd.arg("--format").arg(fmt);
     } else if ffmpeg.is_none() {
-        // No explicit format and no merger
         cmd.arg("--format")
             .arg("best[ext=mp4]/best[ext=webm]/best/b");
     }
@@ -276,13 +284,33 @@ pub async fn run_media_download(
         cmd.arg("-o").arg(out);
     }
 
-    // Restrict to the single matched video
+    let fragments = options
+        .get("split")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        })
+        .unwrap_or(8)
+        .clamp(1, 16);
+    cmd.arg("--concurrent-fragments").arg(fragments.to_string());
+
     cmd.arg("--no-playlist");
+
+    if let Some(tries) = options.get("max-tries").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    }) {
+        let retries = yt_dlp_retries(tries);
+        cmd.arg("--retries").arg(&retries);
+        cmd.arg("--fragment-retries").arg(&retries);
+    }
 
     cmd.arg(url);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd
         .spawn()
@@ -312,7 +340,6 @@ pub async fn run_media_download(
     let mut lines = BufReader::new(stdout).lines();
     let mut last_path: Option<PathBuf> = None;
 
-    // Multi-stage progress accumulation
     let mut base_bytes: u64 = 0;
     let mut last_stage_total: u64 = 0;
     let mut last_dl_bytes: u64 = 0;
@@ -320,8 +347,7 @@ pub async fn run_media_download(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_tree(&mut child).await;
                 let _ = stderr_task.await;
                 return Err("cancelled".to_string());
             }
@@ -331,20 +357,17 @@ pub async fn run_media_download(
                         let trimmed = line.trim();
 
                         if let Some(rest) = trimmed.strip_prefix("__YTDEST__") {
-                            // Planned destination path, update task name immediately
                             let path_str = rest.trim().to_string();
                             if !path_str.is_empty() {
                                 last_path = Some(PathBuf::from(&path_str));
                                 let _ = dest_tx.send(path_str);
                             }
                         } else if let Some(rest) = trimmed.strip_prefix("__YTPATH__") {
-                            // Final path after merge/move
                             let path_str = rest.trim();
                             if !path_str.is_empty() {
                                 last_path = Some(PathBuf::from(path_str));
                             }
                         } else if let Some(rest) = trimmed.strip_prefix("__YTPROG__") {
-                            // downloaded_bytes total_bytes_estimate speed
                             let parts: Vec<&str> = rest.split_ascii_whitespace().collect();
                             if parts.len() >= 2 {
                                 let dl_bytes = parse_na_u64(parts[0]);
@@ -357,7 +380,6 @@ pub async fn run_media_download(
 
                                 if let Some(dl) = dl_bytes {
                                     if dl < last_dl_bytes && last_dl_bytes > 65536 {
-                                        // Advance by the finished stage size, or last downloaded bytes when total is unknown
                                         base_bytes += last_stage_total.max(last_dl_bytes);
                                     }
                                     last_dl_bytes = dl;
@@ -383,8 +405,7 @@ pub async fn run_media_download(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
+                        kill_tree(&mut child).await;
                         let _ = stderr_task.await;
                         return Err(format!("failed reading yt-dlp output: {e}"));
                     }
@@ -423,7 +444,6 @@ pub async fn run_media_download(
         Path::new(dir).to_path_buf()
     };
 
-    // Only sync completed to total if total is known
     let total_val = total.load(Ordering::Relaxed);
     if total_val > 0 {
         completed.store(total_val, Ordering::Relaxed);
@@ -529,7 +549,7 @@ fn extract_format(obj: &serde_json::Value) -> Option<MediaFormat> {
 }
 
 pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<MediaInfo, String> {
-    check_yt_dlp_available().await?;
+    ensure_yt_dlp().await?;
 
     let mut cmd = Command::new("yt-dlp");
     cmd.arg("--dump-json")
@@ -538,7 +558,6 @@ pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<M
         .arg(url)
         .kill_on_drop(true);
 
-    // YouTube-specific extractor arg
     if is_youtube_uri(url) {
         cmd.arg("--extractor-args")
             .arg("youtube:player_client=web,default");
@@ -634,6 +653,13 @@ pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<M
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_tries_maps_to_yt_dlp_retries() {
+        assert_eq!(super::yt_dlp_retries(0), "infinite");
+        assert_eq!(super::yt_dlp_retries(1), "0");
+        assert_eq!(super::yt_dlp_retries(5), "4");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -659,13 +685,11 @@ mod tests {
 
     #[test]
     fn media_allowlist_rejects_non_media() {
-        // Plain file links and other protocols must stay on native handlers
         assert!(!is_media_uri("https://example.com/file.zip"));
         assert!(!is_media_uri("magnet:?xt=urn:btih:abc"));
         assert!(!is_media_uri("ftp://example.com/file.bin"));
         assert!(!is_media_uri("ed2k://|file|x|1|H|/"));
         assert!(!is_media_uri(""));
-        // Suffix matching must not be fooled by lookalike domains
         assert!(!is_media_uri("https://notyoutube.com/watch"));
         assert!(!is_media_uri("https://youtube.com.evil.test/watch"));
     }

@@ -1,4 +1,3 @@
-// macOS Chromium cookie decryption
 use aes::Aes128;
 use cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 use eyre::{bail, Result};
@@ -25,7 +24,6 @@ fn decrypt_v10(data: &[u8], master_key: &[u8]) -> Result<Vec<u8>> {
         bail!("v10 data too short");
     }
 
-    // v10 format: "v10" + 16-byte IV + ciphertext
     let iv: [u8; 16] = data[3..19].try_into()?;
     let ciphertext = &data[19..];
 
@@ -39,10 +37,11 @@ fn decrypt_v10(data: &[u8], master_key: &[u8]) -> Result<Vec<u8>> {
     Ok(decrypted)
 }
 
-pub fn extract_master_key(_local_state_path: &std::path::Path) -> Result<Vec<u8>> {
-    // Try "Chrome" first, then "Chromium" as fallback
-    get_generic_password("Chrome Safe Storage", "Chrome")
-        .or_else(|_| get_generic_password("Chromium Safe Storage", "Chromium"))
+pub fn extract_master_key(
+    _local_state_path: &std::path::Path,
+    (service, account): (&str, &str),
+) -> Result<Vec<u8>> {
+    get_generic_password(service, account)
         .map(|pw| pw.to_vec())
         .map_err(|e| eyre::eyre!("keychain access failed: {}", e))
 }

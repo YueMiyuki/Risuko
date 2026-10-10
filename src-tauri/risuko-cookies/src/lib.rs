@@ -1,5 +1,3 @@
-//! Browser cookie extraction: reads cookies straight from the browser's own store (Chromium and forks, the Firefox family, and Safari on macOS)
-
 mod browser;
 mod platform;
 mod utils;
@@ -7,7 +5,7 @@ mod utils;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-// Newer Chrome on Windows wraps the cookie key with app-bound encryption that only opens under an admin token; when hit we bail with this marker so the Tauri side can offer a UAC retry instead of just saying "failed"
+// Marker the Tauri side matches to offer a UAC retry
 #[cfg(target_os = "windows")]
 pub const ELEVATION_REQUIRED: &str = platform::windows::ELEVATION_REQUIRED;
 
@@ -74,10 +72,9 @@ pub async fn list_browsers() -> Vec<BrowserInfo> {
 fn list_browsers_sync() -> Vec<BrowserInfo> {
     let mut browsers = Vec::new();
 
-    // Probe each browser by trying to open its cookie store — no cookies fetched, just a "can we open the database" check to set the available flag
     macro_rules! probe {
         ($id:literal, $name:literal, $ua:expr, $config:expr) => {{
-            let available = browser::chromium::extract_cookies(&$config, None).is_ok();
+            let available = browser::chromium::is_available(&$config);
             browsers.push(BrowserInfo {
                 id: $id.into(),
                 name: $name.into(),
@@ -86,7 +83,7 @@ fn list_browsers_sync() -> Vec<BrowserInfo> {
             });
         }};
         (firefox: $id:literal, $name:literal, $ua:expr, $config:expr) => {{
-            let available = browser::firefox::extract_cookies(&$config, None).is_ok();
+            let available = browser::firefox::is_available(&$config);
             browsers.push(BrowserInfo {
                 id: $id.into(),
                 name: $name.into(),
@@ -147,7 +144,7 @@ fn list_browsers_sync() -> Vec<BrowserInfo> {
 
     #[cfg(target_os = "macos")]
     {
-        let available = browser::safari::extract_cookies(None).is_ok();
+        let available = browser::safari::is_available();
         browsers.push(BrowserInfo {
             id: "safari".into(),
             name: "Safari".into(),
@@ -255,7 +252,6 @@ fn cookies_for_host_sync(browser: &str, host: &str) -> Result<Vec<Cookie>, Strin
 }
 
 pub async fn cookies_for_url(browser: &str, target: &str) -> Result<HostCookies, String> {
-    // Accept bare hostnames or full URLs
     let url = Url::parse(target)
         .or_else(|_| Url::parse(&format!("https://{}", target)))
         .map_err(|e| e.to_string())?;

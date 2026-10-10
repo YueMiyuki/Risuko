@@ -1,7 +1,6 @@
-//! Bounded NNTP transport and provider selection
-
 use crate::engine::usenet::{UsenetCredentials, UsenetProviderProfile};
 use parking_lot::Mutex;
+use risuko_bt::limiter::Throttle;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use std::collections::{BTreeMap, HashMap};
@@ -22,8 +21,10 @@ use tokio_rustls::TlsConnector;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LINE: usize = 64 * 1024;
-const MAX_ARTICLE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_MULTILINE_LINES: usize = MAX_ARTICLE_BYTES / MAX_LINE;
+const MAX_ARTICLE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MULTILINE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_MULTILINE_LINES: usize = MAX_MULTILINE_BYTES / MAX_LINE;
+const READ_BUFFER_BYTES: usize = 64 * 1024;
 const HEALTH_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +141,10 @@ pub struct NntpConnection {
     reader: BufReader<BoxedStream>,
     profile_id: String,
     greeted: bool,
+    throttle: Option<Throttle>,
 }
+
+const THROTTLE_BATCH_BYTES: usize = 16 * 1024;
 
 impl fmt::Debug for NntpConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -154,6 +158,10 @@ impl fmt::Debug for NntpConnection {
 impl NntpConnection {
     pub fn profile_id(&self) -> &str {
         &self.profile_id
+    }
+
+    pub fn set_throttle(&mut self, throttle: Throttle) {
+        self.throttle = Some(throttle);
     }
 
     pub async fn connect(
@@ -193,13 +201,15 @@ impl NntpConnection {
                 )
                 .await
                 .map_err(|_| NntpError::Timeout)?
-                .map_err(NntpError::Io)?,
+                .map_err(NntpError::Io)
+                .and_then(nodelay)?,
             )),
         };
         let mut connection = Self {
-            reader: BufReader::new(stream),
+            reader: BufReader::with_capacity(READ_BUFFER_BYTES, stream),
             profile_id: profile.id.clone(),
             greeted: false,
+            throttle: None,
         };
         let greeting = connection.read_response().await?;
         if greeting.code != 200 && greeting.code != 201 {
@@ -242,7 +252,8 @@ impl NntpConnection {
                 )
                 .await
                 .map_err(|_| NntpError::Timeout)?
-                .map_err(NntpError::Io)?,
+                .map_err(NntpError::Io)
+                .and_then(nodelay)?,
             )),
         };
         let tls = timeout(
@@ -253,9 +264,10 @@ impl NntpConnection {
         .map_err(|_| NntpError::Timeout)?
         .map_err(|e| NntpError::Tls(e.to_string()))?;
         let mut connection = Self {
-            reader: BufReader::new(BoxedStream(Box::new(tls))),
+            reader: BufReader::with_capacity(READ_BUFFER_BYTES, BoxedStream(Box::new(tls))),
             profile_id: profile.id.clone(),
             greeted: false,
+            throttle: None,
         };
         let greeting = connection.read_response().await?;
         if greeting.code != 200 && greeting.code != 201 {
@@ -280,7 +292,7 @@ impl NntpConnection {
         .await
         .map_err(|_| NntpError::Timeout)?
         .map_err(|e| NntpError::Tls(e.to_string()))?;
-        self.reader = BufReader::new(BoxedStream(Box::new(tls)));
+        self.reader = BufReader::with_capacity(READ_BUFFER_BYTES, BoxedStream(Box::new(tls)));
         Ok(self)
     }
 
@@ -326,10 +338,6 @@ impl NntpConnection {
         })
     }
 
-    pub async fn get_capabilities(&mut self) -> Result<NntpCapabilities, NntpError> {
-        self.capabilities().await
-    }
-
     pub async fn group(&mut self, group: &str) -> Result<NntpResponse, NntpError> {
         if group.trim().is_empty()
             || group
@@ -348,38 +356,85 @@ impl NntpConnection {
         Ok(response)
     }
 
-    pub async fn select_group(&mut self, group: &str) -> Result<NntpResponse, NntpError> {
-        self.group(group).await
+    pub async fn article(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
+        self.send_article_requests(&[message_id.to_string()])
+            .await?;
+        self.read_article().await
     }
 
-    pub async fn article(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
-        let message_id = canonical_message_id(message_id)?;
-        let response = self.command(&format!("ARTICLE {message_id}")).await?;
+    pub async fn send_article_requests(&mut self, message_ids: &[String]) -> Result<(), NntpError> {
+        let mut wire = Vec::new();
+        for message_id in message_ids {
+            let message_id = canonical_message_id(message_id)?;
+            wire.extend_from_slice(format!("ARTICLE {message_id}\r\n").as_bytes());
+        }
+        let stream = self.reader.get_mut();
+        timeout(IO_TIMEOUT, async {
+            stream.write_all(&wire).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| NntpError::Timeout)?
+        .map_err(NntpError::Io)
+    }
+
+    pub async fn read_article(&mut self) -> Result<Vec<u8>, NntpError> {
+        let response = self.read_response().await?;
         if response.code != 220 && response.code != 221 && response.code != 222 {
             return Err(article_error(response));
         }
         let mut bytes = Vec::new();
+        let throttle = self.throttle.clone();
+        let mut unpaid = 0usize;
+        let mut partial: Vec<u8> = Vec::new();
         loop {
-            let line = self.read_line_bytes().await?;
-            if line == b"." {
+            if self.reader.buffer().is_empty() {
+                timeout(IO_TIMEOUT, self.reader.fill_buf())
+                    .await
+                    .map_err(|_| NntpError::Timeout)?
+                    .map_err(NntpError::Io)?;
+            }
+            let available = self.reader.buffer();
+            if available.is_empty() {
+                return Err(NntpError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "NNTP server closed the connection",
+                )));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            unpaid += take;
+            let Some(index) = newline else {
+                if partial.len().saturating_add(take) > MAX_LINE {
+                    return Err(NntpError::ResponseTooLong);
+                }
+                partial.extend_from_slice(available);
+                self.reader.consume(take);
+                continue;
+            };
+            let finished = if partial.is_empty() {
+                let done = push_article_line(&mut bytes, &available[..index])?;
+                self.reader.consume(take);
+                done
+            } else {
+                if partial.len().saturating_add(index) > MAX_LINE {
+                    return Err(NntpError::ResponseTooLong);
+                }
+                partial.extend_from_slice(&available[..index]);
+                self.reader.consume(take);
+                let done = push_article_line(&mut bytes, &partial)?;
+                partial.clear();
+                done
+            };
+            if finished {
+                pay(throttle.as_ref(), unpaid).await;
                 break;
             }
-            let line = if line.first() == Some(&b'.') {
-                &line[1..]
-            } else {
-                &line[..]
-            };
-            if bytes.len().saturating_add(line.len()).saturating_add(1) > MAX_ARTICLE_BYTES {
-                return Err(NntpError::ArticleTooLarge);
+            if unpaid >= THROTTLE_BATCH_BYTES {
+                pay(throttle.as_ref(), std::mem::take(&mut unpaid)).await;
             }
-            bytes.extend_from_slice(line);
-            bytes.push(b'\n');
         }
         Ok(bytes)
-    }
-
-    pub async fn fetch_article(&mut self, message_id: &str) -> Result<Vec<u8>, NntpError> {
-        self.article(message_id).await
     }
 
     async fn command(&mut self, command: &str) -> Result<NntpResponse, NntpError> {
@@ -389,21 +444,17 @@ impl NntpConnection {
                 message: "invalid NNTP command".into(),
             });
         }
-        timeout(
-            IO_TIMEOUT,
-            self.reader.get_mut().write_all(command.as_bytes()),
-        )
+        let mut wire = Vec::with_capacity(command.len() + 2);
+        wire.extend_from_slice(command.as_bytes());
+        wire.extend_from_slice(b"\r\n");
+        let stream = self.reader.get_mut();
+        timeout(IO_TIMEOUT, async {
+            stream.write_all(&wire).await?;
+            stream.flush().await
+        })
         .await
         .map_err(|_| NntpError::Timeout)?
         .map_err(NntpError::Io)?;
-        timeout(IO_TIMEOUT, self.reader.get_mut().write_all(b"\r\n"))
-            .await
-            .map_err(|_| NntpError::Timeout)?
-            .map_err(NntpError::Io)?;
-        timeout(IO_TIMEOUT, self.reader.get_mut().flush())
-            .await
-            .map_err(|_| NntpError::Timeout)?
-            .map_err(NntpError::Io)?;
         self.read_response().await
     }
 
@@ -443,7 +494,7 @@ impl NntpConnection {
                 return Err(NntpError::ArticleTooLarge);
             }
             total_bytes = total_bytes.saturating_add(line.len().saturating_add(1));
-            if total_bytes > MAX_ARTICLE_BYTES {
+            if total_bytes > MAX_MULTILINE_BYTES {
                 return Err(NntpError::ArticleTooLarge);
             }
             lines.push(line);
@@ -451,16 +502,6 @@ impl NntpConnection {
         Ok(lines)
     }
 
-    async fn read_line_bytes(&mut self) -> Result<Vec<u8>, NntpError> {
-        let mut line = Vec::new();
-        self.read_line_into(&mut line).await?;
-        while matches!(line.last(), Some(b'\r' | b'\n')) {
-            line.pop();
-        }
-        Ok(line)
-    }
-
-    /// Read at most `MAX_LINE` bytes without letting an unterminated line grow an unbounded temporary buffer
     async fn read_line_into(&mut self, line: &mut Vec<u8>) -> Result<(), NntpError> {
         loop {
             let available = timeout(IO_TIMEOUT, self.reader.fill_buf())
@@ -487,6 +528,31 @@ impl NntpConnection {
                 return Ok(());
             }
         }
+    }
+}
+
+fn push_article_line(bytes: &mut Vec<u8>, line: &[u8]) -> Result<bool, NntpError> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line == b"." {
+        return Ok(true);
+    }
+    let line = line.strip_prefix(b".").unwrap_or(line);
+    if bytes.len().saturating_add(line.len()).saturating_add(1) > MAX_ARTICLE_BYTES {
+        return Err(NntpError::ArticleTooLarge);
+    }
+    bytes.extend_from_slice(line);
+    bytes.push(b'\n');
+    Ok(false)
+}
+
+fn nodelay(stream: TcpStream) -> Result<TcpStream, NntpError> {
+    stream.set_nodelay(true).map_err(NntpError::Io)?;
+    Ok(stream)
+}
+
+async fn pay(throttle: Option<&Throttle>, bytes: usize) {
+    if let Some(throttle) = throttle {
+        throttle.acquire(bytes).await;
     }
 }
 
@@ -526,7 +592,7 @@ fn server_name(host: &str) -> Result<ServerName<'static>, NntpError> {
         .map_err(|e| NntpError::Tls(format!("invalid server name: {e}")))
 }
 
-fn canonical_message_id(message_id: &str) -> Result<String, NntpError> {
+pub(crate) fn canonical_message_id(message_id: &str) -> Result<String, NntpError> {
     if message_id.trim().is_empty()
         || message_id
             .chars()
@@ -821,6 +887,7 @@ impl ProviderPool {
         })
     }
 
+    #[cfg(test)]
     pub fn profiles(&self) -> &[UsenetProviderProfile] {
         &self.profiles
     }
@@ -897,7 +964,10 @@ impl ProviderPool {
     }
 
     pub fn mark_failure(&self, profile_id: &str, error: &NntpError) {
-        if matches!(error, NntpError::ArticleUnavailable { .. }) {
+        if matches!(
+            error,
+            NntpError::ArticleUnavailable { .. } | NntpError::ArticleCorrupt { .. }
+        ) {
             return;
         }
         let mut health = self.health.lock();
@@ -908,6 +978,7 @@ impl ProviderPool {
         }
     }
 
+    #[cfg(test)]
     pub async fn run_with_failover<T, F, Fut>(&self, operation: F) -> Result<T, NntpError>
     where
         F: Fn(UsenetProviderProfile) -> Fut,
@@ -1175,6 +1246,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn article_bytes_are_charged_to_the_throttle() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let line = format!("{}\r\n", "x".repeat(1022));
+        let body = line.repeat(96);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            let response = format!("220 follows\r\n{body}.\r\n");
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut p = profile("plain", 0);
+        p.port = port;
+        let mut connection = NntpConnection::connect(&p, None).await.unwrap();
+        connection.set_throttle(Throttle::new(
+            Arc::new(risuko_bt::limiter::RateLimiter::unlimited()),
+            Arc::new(risuko_bt::limiter::RateLimiter::new(64 * 1024)),
+        ));
+        let start = std::time::Instant::now();
+        let article = connection.article("id@example").await.unwrap();
+        assert_eq!(article.len(), 96 * 1023);
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            start.elapsed()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_an_unterminated_response_line_without_buffering_past_the_cap() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1248,12 +1356,51 @@ mod tests {
             reader: BufReader::new(BoxedStream(Box::new(stream))),
             profile_id: "buffered".into(),
             greeted: true,
+            throttle: None,
         };
         connection.reader.fill_buf().await.unwrap();
 
         let error = connection.upgrade_tls("localhost").await.unwrap_err();
 
         assert!(matches!(error, NntpError::Protocol { code: 0, .. }));
+    }
+
+    #[test]
+    fn corrupt_article_does_not_cool_down_a_provider() {
+        let pool = ProviderPool::new(vec![profile("a", 0), profile("b", 1)]).unwrap();
+        pool.mark_failure(
+            "a",
+            &NntpError::ArticleCorrupt {
+                message: "bad crc".into(),
+            },
+        );
+        assert_eq!(pool.ordered_profiles()[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn article_unstuffs_dots_and_spans_buffer_boundaries() {
+        let (mut peer, stream) = tokio::io::duplex(64);
+        let mut body = b"220 0 <a@b>\r\n..dot\r\nplain\r\n".to_vec();
+        let long = vec![b'x'; 200];
+        body.extend_from_slice(&long);
+        body.extend_from_slice(b"\r\n.\r\n");
+        tokio::spawn(async move {
+            peer.write_all(&body).await.unwrap();
+            peer.flush().await.unwrap();
+            let mut sink = [0u8; 64];
+            let _ = tokio::io::AsyncReadExt::read(&mut peer, &mut sink).await;
+        });
+        let mut connection = NntpConnection {
+            reader: BufReader::with_capacity(16, BoxedStream(Box::new(stream))),
+            profile_id: "article".into(),
+            greeted: true,
+            throttle: None,
+        };
+        let bytes = connection.article("<a@b>").await.unwrap();
+        let mut expected = b".dot\nplain\n".to_vec();
+        expected.extend_from_slice(&long);
+        expected.push(b'\n');
+        assert_eq!(bytes, expected);
     }
 
     #[tokio::test]

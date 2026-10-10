@@ -5,15 +5,11 @@ use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, Result};
 
-/// Iterator over resolved socket addresses
 pub type Addrs = Box<dyn Iterator<Item = SocketAddr> + Send>;
 
-/// Future returned by a `Resolve` implementation
 pub type Resolving = Pin<Box<dyn Future<Output = Result<Addrs>> + Send>>;
 
-/// Pluggable DNS resolver (default uses `tokio::net::lookup_host`); port-0 contract: implementations resolve a bare hostname and every returned [`SocketAddr`] carries port 0, which the caller (connector) must overwrite via `SocketAddr::new(addr.ip(), port)` before connecting
 pub trait Resolve: Send + Sync {
-    /// Resolve `host` to [`SocketAddr`]s whose port field is unspecified and must be overwritten by the caller before connecting
     fn resolve(&self, host: &str) -> Resolving;
 }
 
@@ -35,22 +31,18 @@ impl Resolve for GaiResolver {
 
 pub(crate) type SharedResolver = Arc<dyn Resolve>;
 
-/// Process-wide resolver override read by [`GlobalResolver`] on every `resolve()` call, so a swap takes hold right away even for clients built once and cached for the process lifetime; `None` falls back to system DNS
 static GLOBAL_RESOLVER: RwLock<Option<SharedResolver>> = RwLock::new(None);
 
-/// Install the process-wide resolver (or clear it with `None`); from then on any client that didn't pin its own resolver uses it, which is how DNS-over-HTTPS gets wired in from the engine's config layer
 pub fn set_global_resolver(resolver: Option<SharedResolver>) {
     if let Ok(mut slot) = GLOBAL_RESOLVER.write() {
         *slot = resolver;
     }
 }
 
-/// Grab a snapshot of the current global resolver, if one is set
 fn global_resolver() -> Option<SharedResolver> {
     GLOBAL_RESOLVER.read().ok().and_then(|s| s.clone())
 }
 
-/// Default resolver for clients that don't pin one; uses the [`set_global_resolver`] override when set, otherwise system DNS, re-reading the slot every call so a runtime config change reaches already-built clients
 #[derive(Clone, Default)]
 pub(crate) struct GlobalResolver;
 
@@ -67,11 +59,9 @@ impl Resolve for GlobalResolver {
 mod tests {
     use super::*;
 
-    // Tests that mutate GLOBAL_RESOLVER must run serially to avoid flaky failures under parallel cargo test
     #[test]
     #[serial_test::serial]
     fn global_resolver_defaults_to_system() {
-        // With nothing installed GlobalResolver falls through to GaiResolver; check the slot is empty rather than hitting the network
         set_global_resolver(None);
         assert!(global_resolver().is_none());
     }
@@ -94,7 +84,7 @@ mod tests {
             .await
             .unwrap()
             .collect();
-        set_global_resolver(None); // put it back for the other tests
+        set_global_resolver(None);
         assert_eq!(got, vec![addr]);
     }
 }

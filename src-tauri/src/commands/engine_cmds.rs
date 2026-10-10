@@ -125,7 +125,6 @@ fn infer_out_from_uri_inner(uri: &str) -> String {
         return String::new();
     }
 
-    // M3U8 links: extract stem and use .ts extension
     let lower = raw.to_ascii_lowercase();
     let path_part = lower.split('?').next().unwrap_or(&lower);
     let path_part = path_part.split('#').next().unwrap_or(path_part);
@@ -170,7 +169,6 @@ fn infer_out_from_uri_inner(uri: &str) -> String {
     let decoded_candidate = crate::commands::file_cmds::percent_decode_lossy(candidate);
     let decoded_candidate = decoded_candidate.trim();
     if decoded_candidate.is_empty() || !decoded_candidate.contains('.') {
-        // Opaque URL like /resources/foo/download?version=N has no extension to hint at a name; drop in a placeholder so the task carries a stable display name (the engine swaps in the real filename once it sees Content-Disposition on the first response), the per-URL hash suffix keeping two distinct extensionless URLs queued together from colliding on `${dir}/download.part`
         return placeholder_download_name(raw);
     }
     if decoded_candidate.contains('/') || decoded_candidate.contains('\\') {
@@ -183,7 +181,6 @@ fn infer_out_from_uri_inner(uri: &str) -> String {
     decoded_candidate.to_string()
 }
 
-/// Unique-but-deterministic placeholder filename for opaque URLs. A URL hash beats a counter or UUID: re-adding the same link yields the same name (so retries / dedup behave) while distinct URLs get distinct names (so concurrent extensionless downloads don't share `download.part`). The engine's `filename_was_url_derived` recognizes the `download-` prefix and still adopts a real Content-Disposition name when one arrives
 fn placeholder_download_name(uri: &str) -> String {
     use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
@@ -191,21 +188,6 @@ fn placeholder_download_name(uri: &str) -> String {
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("download-{hex}")
-}
-
-#[tauri::command]
-pub fn infer_out_from_uri(uri: String) -> String {
-    infer_out_from_uri_inner(&uri)
-}
-
-#[tauri::command]
-pub fn resolve_file_category(filename: String) -> String {
-    resolve_file_category_inner(&filename)
-}
-
-fn resolve_file_category_inner(filename: &str) -> String {
-    // Delegate to the engine-side classifier so the rule-matching and the user-facing category-dirs feature can never disagree on extensions
-    risuko_engine::engine::upload::resolve_category(filename).unwrap_or_default()
 }
 
 fn ensure_temp_download_suffix(value: &str) -> String {
@@ -374,7 +356,14 @@ async fn add_torrent_by_path_inner(path: &str, options: Option<Value>) -> Result
         return Err("task.new-task-torrent-required".to_string());
     }
 
-    let bytes = std::fs::read(fs_path).map_err(|e| e.to_string())?;
+    const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
+    let meta = tokio::fs::metadata(fs_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    if meta.len() > MAX_TORRENT_BYTES {
+        return Err("Torrent file too large".to_string());
+    }
+    let bytes = tokio::fs::read(fs_path).await.map_err(|e| e.to_string())?;
     if bytes.is_empty() {
         return Err("Torrent payload is empty".to_string());
     }
@@ -449,7 +438,6 @@ pub async fn add_torrents_by_paths(
         return Err("task.new-task-torrent-required".to_string());
     }
 
-    // When adding multiple torrents, strip the per-task `out` filename so each torrent doesn't end up writing to the same .part file. Per-torrent filenames are inferred individually inside add_torrent_by_path_inner
     let per_call_options: Option<Value> = if paths.len() > 1 {
         match options.as_ref() {
             Some(Value::Object(map)) => {
@@ -569,7 +557,6 @@ fn is_nzb_url(uri: &str) -> bool {
         .ends_with(".nzb")
 }
 
-/// Best-effort source name for a URL-imported NZB, derived from the URL's last path segment so URL imports carry the same `usenet-source-name` that path imports set from the local filename
 fn nzb_source_name_from_url(uri: &str) -> String {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
     let name = path.rsplit('/').next().unwrap_or("").trim();
@@ -656,7 +643,6 @@ fn is_plain_http_mirror_uri(uri: &str, options: &Map<String, Value>) -> bool {
     {
         return false;
     }
-    // yt-dlp routing
     if engine::media::is_media_uri(uri) || engine::media::is_force_ytdlp(options) {
         return false;
     }
@@ -702,13 +688,11 @@ pub async fn add_uri(
         .cloned()
         .unwrap_or_default();
 
-    // Mirror group
     let mut distinct_outs = out_list
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .collect::<std::collections::HashSet<_>>();
-    // preferred_out falls back to options["out"], so the uniformity check must account for it too — otherwise a per-uri out that differs from the global "out" would be merged into one mirror group despite naming two outputs
     if let Some(out) = base_options
         .get("out")
         .and_then(|value| value.as_str())
@@ -768,10 +752,8 @@ pub async fn add_uri(
             })
             .unwrap_or_else(|| infer_out_from_uri_inner(uri));
 
-        // Route to the yt-dlp media engine for allowlisted sites, or any URL the user explicitly forced via the `force-ytdlp` option
         let is_media =
             engine::media::is_media_uri(uri) || engine::media::is_force_ytdlp(&task_options);
-        // M3u8 uses a temp directory for segments, not a .part file
         let is_m3u8 = engine::m3u8::is_m3u8_uri(uri);
         let legacy_kind = if engine::adc::is_adc_uri(uri) {
             Some(engine::task::TaskKind::Adc)
@@ -794,11 +776,9 @@ pub async fn add_uri(
             task_options.insert("out".to_string(), Value::String(preferred_out));
         }
 
-        // Check if this is a magnet link
         let result = if torrent::is_magnet_uri(uri) {
             manager.add_magnet_task(uri, task_options).await
         } else if is_nzb_url(uri) {
-            // URL imports happen before the task is created, so explicitly merge global defaults to preserve proxy, headers, cookies, and other HTTP request settings for this fetch
             let mut fetch_options = global_options.clone();
             fetch_options.extend(task_options.clone());
             match fetch_nzb_url(uri, &fetch_options).await {
@@ -829,7 +809,6 @@ pub async fn add_uri(
         }
     }
 
-    // Check for errors
     let mut failed_count = 0usize;
     let mut first_error_message: Option<String> = None;
 
@@ -957,7 +936,7 @@ pub async fn resolve_magnet(
                 "path": f.path,
                 "length": f.length,
                 "name": name,
-                "index": f.index + 1,  // Convert 0-based to 1-based for frontend
+                "index": f.index + 1,
             })
         })
         .collect();
@@ -968,7 +947,6 @@ pub async fn resolve_magnet(
     }))
 }
 
-/// Move a drag selection to sit before/after a neighbor task in the queue
 #[tauri::command]
 pub async fn reorder_tasks(
     gids: Vec<String>,
@@ -987,7 +965,6 @@ pub async fn reorder_tasks(
     Ok(())
 }
 
-/// Hold a task for a scheduled start
 #[tauri::command]
 pub async fn set_task_schedule(gid: String, start_at: u64) -> Result<(), String> {
     let manager = engine::get_manager().await.ok_or("Engine not running")?;
@@ -996,7 +973,6 @@ pub async fn set_task_schedule(gid: String, start_at: u64) -> Result<(), String>
     Ok(())
 }
 
-/// Start a scheduled task immediately + clearing its schedule
 #[tauri::command]
 pub async fn start_task_now(gid: String) -> Result<(), String> {
     let manager = engine::get_manager().await.ok_or("Engine not running")?;
@@ -1020,8 +996,6 @@ pub async fn tell_scheduled(
         )
         .await)
 }
-
-// Tauri commands wrapping TaskManager for direct invoke() calls
 
 const ENGINE_VERSION: &str = concat!("risuko-engine/", env!("CARGO_PKG_VERSION"));
 
@@ -1124,12 +1098,6 @@ pub async fn change_global_option_engine(options: Value) -> Result<(), String> {
 pub async fn get_option_engine(gid: String) -> Result<Value, String> {
     let manager = engine::get_manager().await.ok_or("Engine not running")?;
     manager.get_option(&gid).await
-}
-
-#[tauri::command]
-pub async fn get_global_option_engine() -> Result<Value, String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    Ok(manager.get_global_option().await)
 }
 
 #[tauri::command]
@@ -1239,52 +1207,6 @@ pub async fn multicall_engine(
     Ok(Value::Array(results))
 }
 
-#[tauri::command]
-pub async fn list_routing_rules() -> Result<Value, String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    let rules = manager.list_routing_rules().await;
-    serde_json::to_value(rules).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn add_routing_rule(rule: Value) -> Result<Value, String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    let rule = serde_json::from_value::<engine::routing::TaskRoutingRule>(rule)
-        .map_err(|e| format!("Invalid rule: {e}"))?;
-    let added = manager
-        .add_routing_rule(rule)
-        .await
-        .map_err(|e| e.to_string())?;
-    serde_json::to_value(added).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn update_routing_rule(rule: Value) -> Result<(), String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    let rule = serde_json::from_value::<engine::routing::TaskRoutingRule>(rule)
-        .map_err(|e| format!("Invalid rule: {e}"))?;
-    manager
-        .update_routing_rule(rule)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn remove_routing_rule(id: String) -> Result<(), String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    manager
-        .remove_routing_rule(&id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn resolve_routing(filename: String) -> Result<Value, String> {
-    let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    let decision = manager.preview_routing(&filename).await;
-    serde_json::to_value(decision).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,8 +1228,6 @@ mod tests {
         );
         assert_eq!(decode_thunder_uri("https://example.com".to_string()), None);
     }
-
-    // -- normalize_non_negative --
 
     #[test]
     fn normalize_non_negative_positive_float() {
@@ -1334,8 +1254,6 @@ mod tests {
     fn normalize_non_negative_large_value() {
         assert_eq!(normalize_non_negative(1e20), u64::MAX);
     }
-
-    // -- parse_length_like --
 
     #[test]
     fn parse_length_like_u64_number() {
@@ -1373,8 +1291,6 @@ mod tests {
         assert_eq!(parse_length_like(&json!(null)), 0);
     }
 
-    // -- parse_counter_like --
-
     #[test]
     fn parse_counter_like_normal() {
         assert_eq!(parse_counter_like(&json!(10)), 10);
@@ -1385,8 +1301,6 @@ mod tests {
         assert_eq!(parse_counter_like(&json!(u64::MAX)), u32::MAX);
         assert_eq!(parse_counter_like(&json!(u32::MAX as u64 + 1)), u32::MAX);
     }
-
-    // -- compute_auto_retry_delay_ms --
 
     #[test]
     fn retry_exponential_backoff() {
@@ -1420,11 +1334,8 @@ mod tests {
 
     #[test]
     fn retry_min_delay_clamp() {
-        // base_delay below 1000 is clamped to 1000
         assert_eq!(compute_auto_retry_delay_ms("static", 100, 1, 60_000), 1000);
     }
-
-    // -- infer_out_from_uri_inner --
 
     #[test]
     fn infer_out_empty() {
@@ -1462,7 +1373,6 @@ mod tests {
 
     #[test]
     fn infer_out_no_extension_falls_back_to_download() {
-        // Opaque URLs with no extension hint get a generic placeholder so the task carries a stable display name; Content-Disposition takes over once the engine sees the first response
         let r1 = infer_out_from_uri_inner("http://example.com/path/noext");
         assert!(
             r1.starts_with("download-"),
@@ -1485,40 +1395,6 @@ mod tests {
         let result = infer_out_from_uri_inner(uri);
         assert_eq!(result, "test file.bin");
     }
-
-    // -- resolve_file_category_inner --
-
-    #[test]
-    fn category_video() {
-        assert_eq!(resolve_file_category_inner("movie.mp4"), "video");
-        assert_eq!(resolve_file_category_inner("movie.MKV"), "video");
-    }
-
-    #[test]
-    fn category_music() {
-        assert_eq!(resolve_file_category_inner("song.mp3"), "music");
-        assert_eq!(resolve_file_category_inner("song.FLAC"), "music");
-    }
-
-    #[test]
-    fn category_document() {
-        assert_eq!(resolve_file_category_inner("report.pdf"), "document");
-    }
-
-    #[test]
-    fn category_compressed() {
-        assert_eq!(resolve_file_category_inner("archive.zip"), "compressed");
-        assert_eq!(resolve_file_category_inner("archive.7z"), "compressed");
-    }
-
-    #[test]
-    fn category_empty_and_no_ext() {
-        assert_eq!(resolve_file_category_inner(""), "");
-        assert_eq!(resolve_file_category_inner("noext"), "");
-        assert_eq!(resolve_file_category_inner("file.unknownext"), "");
-    }
-
-    // -- is_plain_http_mirror_uri --
 
     #[test]
     fn plain_http_urls_are_mirror_eligible() {

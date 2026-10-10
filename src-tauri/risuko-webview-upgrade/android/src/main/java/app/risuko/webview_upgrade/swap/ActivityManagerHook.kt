@@ -12,9 +12,6 @@ import app.risuko.webview_upgrade.reflect.Reflect
 import app.risuko.webview_upgrade.sandbox.SandboxExtras
 import java.util.regex.Pattern
 
-/**
- * Reroutes Chromium's multi-process renderer binds onto stub services
- */
 internal class ActivityManagerHook(
     private val context: Context,
     private val targetWebViewPackage: String,

@@ -71,14 +71,17 @@
     >
       <Transition name="flyout-page" mode="out-in">
         <div :key="currentList" class="flyout-list-page">
-          <template v-if="visibleTasks.length > 0">
-            <flyout-task-item
-              v-for="task in visibleTasks"
-              :key="task._displayKey || task.gid"
-              role="listitem"
-              :task="task"
-            />
-          </template>
+          <recycle-scroller
+            v-if="visibleTasks.length > 0"
+            class="flyout-scroller"
+            :items="visibleTasks"
+            :item-size="ITEM_PITCH"
+            key-field="_displayKey"
+          >
+            <template #default="{ item }">
+              <flyout-task-item role="listitem" :task="item" />
+            </template>
+          </recycle-scroller>
           <div v-else class="flyout-empty">
             <Inbox :size="34" aria-hidden="true" />
             <span>{{ search ? $t('app.flyout-no-match') : $t('app.flyout-empty') }}</span>
@@ -169,9 +172,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type Component, markRaw } from "vue";
+import { RecycleScroller } from "vue-virtual-scroller";
+import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import { useAppStore } from "@/store/app";
 import { useTaskStore } from "@/store/task";
 import FlyoutTaskItem from "./FlyoutTaskItem.vue";
+
+const ITEM_PITCH = 67;
 
 interface FlyoutTab {
 	key: string;
@@ -183,6 +190,7 @@ export default {
 	name: "tray-flyout",
 	components: {
 		[FlyoutTaskItem.name as string]: FlyoutTaskItem,
+		RecycleScroller,
 		ArrowDown,
 		ArrowUp,
 		ExternalLink,
@@ -201,6 +209,7 @@ export default {
 			addValue: "",
 			adding: false,
 			addError: "",
+			ITEM_PITCH,
 		};
 	},
 	computed: {
@@ -384,3 +393,43 @@ export default {
 	},
 };
 </script>
+
+<style>
+.flyout-root .flyout-list {
+  padding: 0;
+  overflow: hidden;
+}
+
+.flyout-root .flyout-list-page {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.flyout-root .flyout-empty {
+  margin: 6px 8px 8px;
+}
+
+.flyout-root .flyout-scroller {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 8px 8px;
+  box-sizing: border-box;
+}
+
+.flyout-root .flyout-scroller .flyout-task-item {
+  height: 65px;
+}
+
+.flyout-root .flyout-scroller::-webkit-scrollbar {
+  width: 8px;
+}
+
+.flyout-root .flyout-scroller::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+.flyout-root .flyout-scroller::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+}
+</style>

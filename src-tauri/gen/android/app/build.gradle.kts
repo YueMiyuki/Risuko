@@ -1,3 +1,4 @@
+import java.nio.file.Files
 import java.util.Properties
 
 plugins {
@@ -65,13 +66,13 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
         }
         jniLibs.walkTopDown().forEach { candidate ->
             val path = candidate.toPath()
-            if (java.nio.file.Files.isSymbolicLink(path)) {
+            if (Files.isSymbolicLink(path)) {
                 try {
                     val target = path.toRealPath()
-                    java.nio.file.Files.delete(path)
-                    java.nio.file.Files.copy(target, path)
+                    Files.delete(path)
+                    Files.copy(target, path)
                 } catch (_: Exception) {
-                    java.nio.file.Files.deleteIfExists(path)
+                    Files.deleteIfExists(path)
                 }
             }
         }

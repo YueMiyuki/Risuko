@@ -1,5 +1,3 @@
-// WebKit and Safari timestamp conversion
-
 const WEBKIT_EPOCH_OFFSET: u64 = 11644473600;
 
 pub fn webkit_to_unix(micros: u64) -> Option<u64> {

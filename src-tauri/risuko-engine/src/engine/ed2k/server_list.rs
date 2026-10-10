@@ -1,6 +1,5 @@
 use std::net::SocketAddrV4;
 
-/// Known ed2k server entry
 #[derive(Debug, Clone)]
 pub struct ServerEntry {
     pub ip: String,
@@ -23,7 +22,6 @@ impl ServerEntry {
     }
 }
 
-/// Build from user-configured "ip:port" strings, falling back to well-known public ed2k servers if the list is empty
 pub fn server_list(entries: &[String]) -> Vec<ServerEntry> {
     let servers: Vec<ServerEntry> = entries
         .iter()

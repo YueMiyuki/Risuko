@@ -115,6 +115,8 @@ const fallback = {
 		"bt-create-subfolder": "Create a subfolder for multi-file torrents",
 		"doh-url": "Endpoint URL",
 		"speed-limit-enabled": "Enable speed limits",
+		"gift-enabled": "Enable giFT delegation",
+		"gift-port": "giFT Port",
 	},
 	cloudSinks: {
 		s3Bucket: "Bucket",
@@ -194,7 +196,13 @@ test("gives conditional and dialog settings a stable visible fallback target", (
 		entries.find((entry) => entry.key === "cloudSinks.s3Bucket")?.target,
 		"cloudSinks.sinks",
 	);
-	assert.equal(filterPreferenceSearchEntries(entries, "gift").length, 0);
+	const gift = filterPreferenceSearchEntries(entries, "gift");
+	assert.ok(gift.length > 0);
+	assert.ok(gift.every((entry) => entry.route === "advanced"));
+	assert.equal(
+		entries.find((entry) => entry.key === "preferences.gift-port")?.target,
+		"preferences.gift-enabled",
+	);
 });
 
 test("filters platform-only controls and does not silently cap matching results", () => {

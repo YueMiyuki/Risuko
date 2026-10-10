@@ -66,7 +66,6 @@ internal object Framework {
         }
     }
 
-    /** Clear ContextImpl's cached PackageManager so later queries hit the proxy */
     fun flushContextImplPackageManager(context: Context) {
         var base: Context = context.applicationContext ?: return
         while (base is ContextWrapper) base = base.baseContext

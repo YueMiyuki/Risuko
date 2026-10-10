@@ -1,7 +1,6 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-/// Event types matching aria2 notification names
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     DownloadStart { gid: String },
@@ -35,7 +34,6 @@ impl EngineEvent {
         }
     }
 
-    /// Build the JSON-RPC notification body
     pub fn to_notification(&self) -> Value {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -45,7 +43,6 @@ impl EngineEvent {
     }
 }
 
-/// Broadcasts engine events to all WebSocket clients
 #[derive(Clone)]
 pub struct EventBroadcaster {
     sender: broadcast::Sender<EngineEvent>,
@@ -58,7 +55,6 @@ impl EventBroadcaster {
     }
 
     pub fn send(&self, event: EngineEvent) {
-        // Ignore error if no receivers are connected
         let _ = self.sender.send(event);
     }
 

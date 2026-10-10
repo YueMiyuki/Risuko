@@ -1,5 +1,3 @@
-//! Message Stream Encryption (MSE) / Protocol Encryption (PE)
-
 use std::io;
 use std::sync::OnceLock;
 
@@ -40,20 +38,16 @@ fn to_fixed_be(n: &BigUint, len: usize) -> Vec<u8> {
     }
 }
 
-/// A freshly generated DH private/public pair
 pub struct DhKeys {
     pub private: BigUint,
     pub public_be: [u8; DH_LEN],
 }
 
 impl DhKeys {
-    /// Generate a random 160-bit exponent X and derive Y = G^X mod P
     pub fn generate() -> Self {
         let mut rng = rand::rng();
-        // 160-bit private key is plenty per spec (saves CPU vs a full 768-bit one)
         let mut x_bytes = [0u8; 20];
         rng.fill_bytes(&mut x_bytes);
-        // Force the low bit of the most-significant byte so X is a large, non-zero exponent
         x_bytes[0] |= 0x01;
         let x = BigUint::from_bytes_be(&x_bytes);
         let p = modulus();
@@ -66,7 +60,6 @@ impl DhKeys {
         }
     }
 
-    /// Compute the shared secret S = Y_other^X mod P; errors if the peer's public key is invalid (0, 1, or >= p-1)
     pub fn shared_secret(&self, peer_public_be: &[u8; DH_LEN]) -> io::Result<[u8; DH_LEN]> {
         let y = BigUint::from_bytes_be(peer_public_be);
         let p = modulus();
@@ -127,7 +120,6 @@ pub fn init_rc4(key: &[u8; 20]) -> MseRc4 {
     c
 }
 
-/// Generate 0..=max_len random padding bytes
 pub fn gen_pad(max_len: usize) -> Vec<u8> {
     let mut rng = rand::rng();
     let len = (rng.random::<u32>() as usize) % (max_len + 1);
@@ -136,7 +128,6 @@ pub fn gen_pad(max_len: usize) -> Vec<u8> {
     v
 }
 
-/// Errors from the byte-level MSE handshake
 #[derive(Debug, thiserror::Error)]
 pub enum MseError {
     #[error("pad length too large: {0}")]
@@ -145,7 +136,6 @@ pub enum MseError {
     IaTooLarge(u16),
 }
 
-/// First occurrence of `needle` in `hay` at or after `start`, else `None`; used by the incoming side to locate `HASH('req1',S)`
 pub fn find_subsequence_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if needle.is_empty() || needle.len() > hay.len() {
         return None;
@@ -160,12 +150,10 @@ pub fn find_subsequence_from(hay: &[u8], needle: &[u8], start: usize) -> Option<
         .map(|off| off + start)
 }
 
-/// First candidate offset to rescan after appending bytes to a searched buffer; backs up by `needle_len - 1` to keep matches that cross the old/new boundary
 pub fn scan_start_after_append(previous_len: usize, needle_len: usize) -> usize {
     previous_len.saturating_sub(needle_len.saturating_sub(1))
 }
 
-/// Build the initiator's third message body (plaintext, RC4-encrypted by the caller): `VC || crypto_provide || len(PadC) || PadC || len(IA) || IA`
 pub fn build_initiator_payload(
     crypto_provide: u32,
     pad_c: &[u8],
@@ -187,7 +175,6 @@ pub fn build_initiator_payload(
     Ok(out)
 }
 
-/// Build the responder's reply body (plaintext, RC4-encrypted by the caller): `VC || crypto_select || len(PadD) || PadD`
 pub fn build_responder_payload(crypto_select: u32, pad_d: &[u8]) -> Result<Vec<u8>, MseError> {
     if pad_d.len() > u16::MAX as usize {
         return Err(MseError::PadTooLarge(pad_d.len() as u16));
@@ -226,7 +213,6 @@ mod tests {
         assert_ne!(&buf, b"hello bittorrent mse");
         dec_in.apply_keystream(&mut buf);
         assert_eq!(&buf, b"hello bittorrent mse");
-        // keyB stream is independent from keyA stream
         let mut other = init_rc4(&kba);
         let mut probe = [0u8; 4];
         other.apply_keystream(&mut probe);

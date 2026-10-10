@@ -1,9 +1,6 @@
-//! Fixed-length byte ids — primarily SHA-1 (20 bytes)
-
 use std::fmt;
 use std::str::FromStr;
 
-/// A 20-byte id used for info-hashes, peer ids and DHT node ids
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id20(pub [u8; 20]);
 
@@ -31,7 +28,6 @@ impl Id20 {
         hex::encode(self.0)
     }
 
-    /// XOR distance used by Kademlia routing
     pub fn distance(&self, other: &Self) -> Self {
         let mut d = [0u8; 20];
         for (i, slot) in d.iter_mut().enumerate() {
@@ -73,7 +69,6 @@ impl FromStr for Id20 {
                 Self::from_slice(&raw)
             }
             32 => {
-                // RFC 4648 base32 with padding stripped
                 let decoded = base32_decode_upper(s.as_bytes()).ok_or(HashParseError::BadBase32)?;
                 Self::from_slice(&decoded)
             }
@@ -82,7 +77,6 @@ impl FromStr for Id20 {
     }
 }
 
-/// Decode RFC 4648 base32 (uppercase, optional padding); None on invalid input; used for base32 BTIH magnet links
 fn base32_decode_upper(input: &[u8]) -> Option<Vec<u8>> {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let input: Vec<u8> = input
@@ -107,7 +101,6 @@ fn base32_decode_upper(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Convenience: SHA-1 hash of `data` as [`Id20`]
 pub fn sha1(data: &[u8]) -> Id20 {
     use sha1::Digest;
     let mut h = sha1::Sha1::new();
@@ -116,7 +109,6 @@ pub fn sha1(data: &[u8]) -> Id20 {
     Id20(out.into())
 }
 
-/// Id32 — 32-byte id used for BEP 52 (BitTorrent v2) info-hashes, per-file Merkle roots and SHA-256 piece-layer hashes
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id32(pub [u8; 32]);
 
@@ -138,7 +130,6 @@ impl Id32 {
         hex::encode(self.0)
     }
 
-    /// Leading 20 bytes for legacy 20-byte fields (BEP-3 handshake, MSE SKEY, tracker `info_hash`, v1-DHT); per BEP 52 pure-v2 clients send the truncated SHA-256 info-hash
     pub fn truncate_to_id20(&self) -> Id20 {
         let mut out = [0u8; 20];
         out.copy_from_slice(&self.0[..20]);
@@ -172,7 +163,6 @@ impl FromStr for Id32 {
     }
 }
 
-/// Convenience: SHA-256 hash of `data` as [`Id32`]
 pub fn sha256(data: &[u8]) -> Id32 {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -196,8 +186,7 @@ mod tests {
 
     #[test]
     fn base32_parse_known() {
-        // Well-known magnet BTIH base32 example: 20 zero bytes
-        let encoded = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 chars
+        let encoded = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let parsed: Id20 = encoded.parse().unwrap();
         assert_eq!(parsed.0, [0u8; 20]);
     }

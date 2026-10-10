@@ -188,7 +188,16 @@ export default {
 		"每个种子允许的最大对等节点数，值越大 peer 覆盖越广（需重启引擎生效）",
 	"bt-max-outstanding-per-peer": "每个对等节点最大并发请求数",
 	"bt-max-outstanding-per-peer-tips":
-		"每个 peer 的 pipeline 并发请求上限（最高 256）。0 表示使用 6–96 的自适应默认值；活跃 peer 会共享单个种子的总请求预算。需重启引擎生效",
+		"每个 peer 的 pipeline 并发请求上限（最高 500）。0 表示使用 6–500 的自适应默认值；活跃 peer 会共享单个种子的总请求预算。需重启引擎生效",
+	"bt-max-connections": "最大对等连接数",
+	"bt-max-connections-tips":
+		"所有种子合计的对等连接数上限（20–5000）。调低不会断开已有连接，只会暂缓建立新连接。实际生效值还受系统文件描述符上限的一半限制",
+	"bt-ban-corrupt-peers": "封禁发送损坏数据的对等节点",
+	"bt-ban-corrupt-peers-tips":
+		"当某个 IP 参与发送的分片多次未通过哈希校验时，在本次会话内封禁该 IP。多个用户可能共用同一 IP（如移动网络、共享网络），封禁可能误伤正常的 peer（需重启引擎生效）",
+	"bt-ban-corrupt-strikes": "封禁前允许的失败分片数",
+	"bt-ban-corrupt-strikes-tips":
+		"一个 IP 参与的分片校验失败多少次后被封禁。值越大越能容忍偶发的数据损坏（需重启引擎生效）",
 	"bt-enable-upnp": "UPnP 端口转发",
 	"bt-enable-upnp-tips":
 		"通过 UPnP IGD 自动在路由器开放 BT 监听端口（需重启引擎生效）",

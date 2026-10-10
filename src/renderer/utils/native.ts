@@ -135,6 +135,10 @@ export const openItem = async (fullPath: string) => {
 	return invoke("open_path", { path: fullPath });
 };
 
+const btFolderName = (bittorrent: {
+	info?: { name?: string; dirName?: string };
+}): string => bittorrent?.info?.dirName || bittorrent?.info?.name || "";
+
 export const getTaskFullPath = (
 	task: DownloadTask,
 	options: { normalizeCompletedPath?: boolean } = {},
@@ -150,7 +154,7 @@ export const getTaskFullPath = (
 	const isBtMultiFile =
 		!!bittorrent?.info?.name && Array.isArray(files) && files.length > 1;
 	if (isBtMultiFile) {
-		return joinPath(result, bittorrent.info.name);
+		return joinPath(result, btFolderName(bittorrent));
 	}
 
 	const file = Array.isArray(files) && files.length > 0 ? files[0] : undefined;
@@ -192,7 +196,7 @@ export const getTaskRevealDir = (task: DownloadTask): string => {
 	const isBtMultiFile =
 		!!bittorrent?.info?.name && Array.isArray(files) && files.length > 1;
 	if (isBtMultiFile) {
-		return joinPath(dir, bittorrent.info.name);
+		return joinPath(dir, btFolderName(bittorrent));
 	}
 	return dir;
 };
@@ -279,7 +283,7 @@ export const moveTaskFilesToTrash = async (
 
 	const isBtMultiFile = !!bittorrent?.info?.name && files.length > 1;
 	if (isBtMultiFile) {
-		const torrentFolder = joinPath(dir, bittorrent.info.name);
+		const torrentFolder = joinPath(dir, btFolderName(bittorrent));
 		logger.info(`[Risuko] trashing torrent folder: "${torrentFolder}"`);
 		try {
 			const found: boolean = await invoke("trash_item", {

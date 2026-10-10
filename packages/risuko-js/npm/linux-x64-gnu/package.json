@@ -1,27 +1,27 @@
 {
-  "name": "@risuko/js-linux-x64-gnu",
-  "version": "0.7.1",
-  "description": "Risuko JS native module for Linux x64",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/YueMiyuki/Risuko.git",
-    "directory": "packages/risuko-js/npm/linux-x64-gnu"
-  },
-  "license": "MIT",
-  "os": [
-    "linux"
-  ],
-  "cpu": [
-    "x64"
-  ],
-  "main": "risuko.linux-x64-gnu.node",
-  "scripts": {
-    "prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
-  },
-  "files": [
-    "risuko.linux-x64-gnu.node"
-  ],
-  "libc": [
-    "glibc"
-  ]
+	"name": "@risuko/js-linux-x64-gnu",
+	"version": "0.7.1",
+	"description": "Risuko JS native module for Linux x64",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/YueMiyuki/Risuko.git",
+		"directory": "packages/risuko-js/npm/linux-x64-gnu"
+	},
+	"license": "MIT",
+	"os": [
+		"linux"
+	],
+	"cpu": [
+		"x64"
+	],
+	"main": "risuko.linux-x64-gnu.node",
+	"scripts": {
+		"prepack": "node ../../../../scripts/ensure-package-artifacts.mjs"
+	},
+	"files": [
+		"risuko.linux-x64-gnu.node"
+	],
+	"libc": [
+		"glibc"
+	]
 }

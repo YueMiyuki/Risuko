@@ -1,5 +1,3 @@
-//! Peer-to-peer encrypted file sharing for Risuko
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -123,13 +121,10 @@ fn begin_send_transfer(
     }
 }
 
-/// Interval for polling the active connection path
 const PATH_POLL_INTERVAL: Duration = Duration::from_millis(700);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(6);
-/// Minimum interval between forwarded progress events; raw updates would flood the Tauri IPC bridge on fast links
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Bind an iroh endpoint with n0 relays but WITHOUT DNS-based discovery
 async fn bind_endpoint() -> Result<Endpoint> {
     Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Default)
@@ -138,52 +133,38 @@ async fn bind_endpoint() -> Result<Endpoint> {
         .context("failed to bind endpoint")
 }
 
-/// Bring an endpoint online
 fn spawn_online_warmup(endpoint: Endpoint) {
     tokio::spawn(async move {
         endpoint.online().await;
     });
 }
 
-/// Metadata about a single file in a share
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMeta {
     pub name: String,
     pub size: u64,
 }
 
-/// The kind of network path a live transfer is using
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PathKind {
     Direct,
     Relay,
     Mixed,
-    /// Not yet determined
     Unknown,
 }
 
-/// An event about a transfer, tagged with the transfer id by [`ShareEnvelope`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ShareEvent {
     Connected,
-    Path {
-        path: PathKind,
-    },
-    Progress {
-        transferred: u64,
-        total: u64,
-    },
+    Path { path: PathKind },
+    Progress { transferred: u64, total: u64 },
     Completed,
     Terminated,
-    /// The transfer failed
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
-/// A [`ShareEvent`] tagged with its transfer id, sent to the host application
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareEnvelope {
     pub id: String,
@@ -198,7 +179,6 @@ pub struct SendInfo {
 }
 
 struct ActiveTransfer {
-    /// Kept alive so the endpoint stays
     _router: Router,
     store: Store,
     blobs_dir: PathBuf,
@@ -223,7 +203,35 @@ struct ReceiveHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Manages all active P2P transfers and forwards their events to the host
+fn stale_dirs(data_dir: &Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    read.flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("send-") || name.starts_with("recv-"))
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct ShareManager {
     data_dir: PathBuf,
     events: UnboundedSender<ShareEnvelope>,
@@ -232,8 +240,15 @@ pub struct ShareManager {
 }
 
 impl ShareManager {
-    /// Create a manager
     pub fn new(data_dir: PathBuf, events: UnboundedSender<ShareEnvelope>) -> Self {
+        let stale = stale_dirs(&data_dir);
+        if !stale.is_empty() {
+            std::thread::spawn(move || {
+                for dir in stale {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            });
+        }
         Self {
             data_dir,
             events,
@@ -242,17 +257,28 @@ impl ShareManager {
         }
     }
 
-    /// Prepare a send
     pub async fn start_send(&self, id: String, paths: Vec<PathBuf>) -> Result<SendInfo> {
         anyhow::ensure!(!paths.is_empty(), "no files selected");
+        let blobs_dir = self.data_dir.join(format!("send-{id}"));
+        let result = self.start_send_inner(id, paths, blobs_dir.clone()).await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_dir_all(&blobs_dir).await;
+        }
+        result
+    }
 
+    async fn start_send_inner(
+        &self,
+        id: String,
+        paths: Vec<PathBuf>,
+        blobs_dir: PathBuf,
+    ) -> Result<SendInfo> {
         let endpoint_task = tokio::spawn(async {
             let endpoint = bind_endpoint().await?;
             let _ = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await;
             anyhow::Ok(endpoint)
         });
 
-        let blobs_dir = self.data_dir.join(format!("send-{id}"));
         tokio::fs::create_dir_all(&blobs_dir).await.ok();
 
         let mask = EventMask {
@@ -268,18 +294,22 @@ impl ShareManager {
             .context("failed to open blob store")?
             .into();
 
-        let mut entries: Vec<(String, PathBuf, u64)> = Vec::new();
-        let mut has_dir = false;
-        for path in &paths {
-            let abs = std::path::absolute(path)?;
-            let meta = std::fs::metadata(&abs).context("failed to stat selection")?;
-            if meta.is_dir() {
-                has_dir = true;
-                collect_dir(&abs, &file_name(&abs), &mut entries)?;
-            } else {
-                entries.push((file_name(&abs), abs, meta.len()));
+        let (entries, has_dir) = tokio::task::spawn_blocking(move || {
+            let mut entries: Vec<(String, PathBuf, u64)> = Vec::new();
+            let mut has_dir = false;
+            for path in &paths {
+                let abs = std::path::absolute(path)?;
+                let meta = std::fs::metadata(&abs).context("failed to stat selection")?;
+                if meta.is_dir() {
+                    has_dir = true;
+                    collect_dir(&abs, &file_name(&abs), &mut entries)?;
+                } else {
+                    entries.push((file_name(&abs), abs, meta.len()));
+                }
             }
-        }
+            anyhow::Ok((entries, has_dir))
+        })
+        .await??;
         anyhow::ensure!(!entries.is_empty(), "no files to send");
 
         let files: Vec<FileMeta> = entries
@@ -299,7 +329,6 @@ impl ShareManager {
         let ticket_hash;
         let ticket_format;
 
-        // A lone single file transfers as a raw blob
         if entries.len() == 1 && !has_dir {
             let tag = store
                 .blobs()
@@ -308,13 +337,27 @@ impl ShareManager {
             ticket_hash = tag.hash;
             ticket_format = tag.format;
         } else {
+            let limit = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+            let mut imports = tokio::task::JoinSet::new();
+            for (idx, (_, abs, _)) in entries.iter().enumerate() {
+                let store = store.clone();
+                let semaphore = semaphore.clone();
+                let opts = import_opts(abs.clone());
+                imports.spawn(async move {
+                    let _permit = semaphore.acquire_owned().await?;
+                    let tag = store.blobs().add_path_with_opts(opts).await?;
+                    anyhow::Ok((idx, tag.hash))
+                });
+            }
+            let mut hashes: Vec<Option<Hash>> = vec![None; entries.len()];
+            while let Some(joined) = imports.join_next().await {
+                let (idx, hash) = joined??;
+                hashes[idx] = Some(hash);
+            }
             let mut items: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
-            for (name, abs, _) in &entries {
-                let tag = store
-                    .blobs()
-                    .add_path_with_opts(import_opts(abs.clone()))
-                    .await?;
-                items.push((name.clone(), tag.hash));
+            for ((name, _, _), hash) in entries.iter().zip(hashes) {
+                items.push((name.clone(), hash.context("file import did not finish")?));
             }
             let collection = Collection::from_iter(items);
             let tt = collection.store(&store).await?;
@@ -351,6 +394,7 @@ impl ShareManager {
             let mut peer: Option<EndpointId> = None;
             let mut transferring = false;
             let mut completed = false;
+            let mut finished = false;
             let mut path_task: Option<tokio::task::JoinHandle<()>> = None;
 
             while let Some(msg) = event_rx.recv().await {
@@ -403,7 +447,6 @@ impl ShareManager {
                     ProviderMessage::ConnectionClosed(_) if transferring && !completed => {
                         completed = true;
                         if stop_for_events.load(Ordering::Relaxed) {
-                            // User cancelled
                         } else {
                             let transferred = progress_tracker.lock().unwrap().transferred();
                             if total_bytes == 0 || transferred >= total_bytes {
@@ -418,6 +461,7 @@ impl ShareManager {
                                     id: id_for_events.clone(),
                                     event: ShareEvent::Completed,
                                 });
+                                finished = true;
                             } else {
                                 let _ = events.send(ShareEnvelope {
                                     id: id_for_events.clone(),
@@ -428,15 +472,18 @@ impl ShareManager {
                     }
                     _ => {}
                 }
+                if finished {
+                    break;
+                }
             }
 
             if let Some(t) = path_task {
                 t.abort();
             }
-            if completed {
+            if finished {
                 let transfer = active.lock().unwrap().remove(&id_for_events);
                 if let Some(transfer) = transfer {
-                    transfer.shutdown().await;
+                    tokio::spawn(transfer.shutdown());
                 }
             }
         });
@@ -453,7 +500,6 @@ impl ShareManager {
         Ok(SendInfo { ticket, files })
     }
 
-    /// Start receiving from a ticket
     pub fn start_receive(
         &self,
         id: String,
@@ -551,7 +597,6 @@ async fn run_receive(
         .context("failed to open blob store")?
         .into();
 
-    // Seed the sender's addresses
     let lookup = MemoryLookup::new();
     lookup.add_endpoint_info(ticket.addr().clone());
     let endpoint = Endpoint::builder(presets::Minimal)
@@ -562,13 +607,13 @@ async fn run_receive(
         .context("failed to bind endpoint")?;
     spawn_online_warmup(endpoint.clone());
 
-    let path_handle = spawn_path_poll(
+    let path_handle = AbortOnDrop(spawn_path_poll(
         endpoint.clone(),
         provider,
         id.to_string(),
         events.clone(),
         stop.clone(),
-    );
+    ));
 
     let _ = events.send(ShareEnvelope {
         id: id.to_string(),
@@ -669,7 +714,6 @@ fn emit_receive_progress(
     });
 }
 
-/// Poll the active connection path for a remote and emit [`ShareEvent::Path`]
 fn spawn_path_poll(
     endpoint: Endpoint,
     remote: EndpointId,
@@ -698,7 +742,6 @@ fn spawn_path_poll(
     })
 }
 
-/// Classify a remote's active transport addresses as direct, relay, or mixed
 fn classify_path(info: &iroh::endpoint::RemoteInfo) -> PathKind {
     let mut direct = false;
     let mut relay = false;
@@ -721,7 +764,6 @@ fn classify_path(info: &iroh::endpoint::RemoteInfo) -> PathKind {
     }
 }
 
-/// Recursively collect files (with sizes) under `dir`
 fn collect_dir(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf, u64)>) -> Result<()> {
     let read = std::fs::read_dir(dir).with_context(|| format!("failed to read {dir:?}"))?;
     for entry in read {
@@ -738,12 +780,10 @@ fn collect_dir(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf, u64)>) 
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             out.push((rel, entry.path(), size));
         }
-        // symlinks (file_type.is_symlink()) are intentionally skipped
     }
     Ok(())
 }
 
-/// If `target` already exists, append ` (1)`, ` (2)`, ... before the extension until a free path is found
 async fn dedupe_path(target: PathBuf) -> PathBuf {
     if !tokio::fs::try_exists(&target).await.unwrap_or(false) {
         return target;
@@ -767,7 +807,6 @@ async fn dedupe_path(target: PathBuf) -> PathBuf {
     target
 }
 
-/// Extract a safe file name (final path component only) from a path
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -775,13 +814,16 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| "file".to_string())
 }
 
-/// Convert a peer-supplied name into a safe *relative* path; strips empty, `.`, `..`, and absolute/drive components to prevent traversal while preserving subdirectories
 fn sanitize_rel_path(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for component in name.split(['/', '\\']) {
         let component = component.trim();
         if component.is_empty() || component == "." || component == ".." || component.contains(':')
         {
+            continue;
+        }
+        if risuko_engine::engine::is_windows_device_name(component) {
+            out.push(format!("_{component}"));
             continue;
         }
         out.push(component);
@@ -795,6 +837,12 @@ fn sanitize_rel_path(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rel_path_neutralises_device_names() {
+        assert_eq!(sanitize_rel_path("a/CON.txt"), PathBuf::from("a/_CON.txt"));
+        assert_eq!(sanitize_rel_path("../x/y"), PathBuf::from("x/y"));
+    }
 
     #[test]
     fn receiver_forces_final_progress_emit() {
@@ -813,5 +861,29 @@ mod tests {
                 total: 100
             }
         ));
+    }
+
+    #[test]
+    fn sweep_removes_only_transfer_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["send-a", "recv-b", "keep"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("f"), b"x").unwrap();
+        }
+        let mut stale = stale_dirs(dir.path());
+        stale.sort();
+        assert_eq!(
+            stale,
+            [dir.path().join("recv-b"), dir.path().join("send-a")]
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_stops_task() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        drop(AbortOnDrop(task));
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
     }
 }

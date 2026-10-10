@@ -1,5 +1,3 @@
-//! Per-peer async actor
-
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,17 +11,15 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::super::core::Id20;
+use super::super::limiter::Throttle;
 use super::super::wire::mse::{self, DhKeys, MseRc4, DH_LEN};
 use super::super::wire::{Handshake, Message, MessageDecoder, MessageEncoder, HANDSHAKE_LEN};
 
-/// Encryption behaviour for a single peer connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncryptionPolicy {
     PlaintextOnly,
-    /// Plaintext handshake first, MSE on a fresh connection if that fails
     #[default]
     Prefer,
-    /// MSE first, plaintext on a fresh connection if that fails; for peers known to support MSE
     PreferEncrypted,
     RequireEncryption,
 }
@@ -35,7 +31,6 @@ pub enum PeerEvent {
         reserved: [u8; 8],
         info_hash: Id20,
         encrypted: bool,
-        /// Connection runs over µTP (BEP 29) rather than TCP
         utp: bool,
     },
     Message(Message),
@@ -44,25 +39,62 @@ pub enum PeerEvent {
     },
 }
 
-/// Commands sent from the torrent to the peer writer task
+#[derive(Debug, Clone)]
+pub struct PeerEventSink {
+    pid: u32,
+    tx: mpsc::Sender<(u32, PeerEvent)>,
+}
+
+impl PeerEventSink {
+    pub fn new(pid: u32, tx: mpsc::Sender<(u32, PeerEvent)>) -> Self {
+        Self { pid, tx }
+    }
+}
+
+enum EventOut {
+    Own(mpsc::Sender<PeerEvent>),
+    Sink(PeerEventSink),
+}
+
+impl EventOut {
+    async fn send(&self, ev: PeerEvent) -> bool {
+        match self {
+            EventOut::Own(tx) => tx.send(ev).await.is_ok(),
+            EventOut::Sink(sink) => sink.tx.send((sink.pid, ev)).await.is_ok(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PeerCommand {
     Send(Message),
-    /// Abort the connection
     Disconnect,
 }
 
-/// Opaque handle to a running peer task
 pub struct PeerHandle {
     pub addr: SocketAddr,
     pub tx: mpsc::Sender<PeerCommand>,
+    pub piece_tx: mpsc::Sender<Message>,
     pub io_abort: tokio::task::AbortHandle,
+    pub gate: Arc<RecvGate>,
+    pub bind: Option<tokio::sync::oneshot::Sender<PeerEventSink>>,
 }
 
-/// Builds the BEP-10 extended handshake bytes for a peer given that peer's IP, invoked once per dial/accept after the remote BT handshake so the message can set `yourip`
+#[derive(Default)]
+pub struct RecvGate(std::sync::OnceLock<Throttle>);
+
+impl RecvGate {
+    pub fn set(&self, throttle: Throttle) {
+        let _ = self.0.set(throttle);
+    }
+
+    fn get(&self) -> Option<&Throttle> {
+        self.0.get()
+    }
+}
+
 pub type ExtHandshakeBuilder = Arc<dyn Fn(IpAddr) -> Bytes + Send + Sync>;
 
-/// Parameters for spawning an outbound peer connection
 #[derive(Clone)]
 pub struct SpawnPeer {
     pub addr: SocketAddr,
@@ -75,6 +107,7 @@ pub struct SpawnPeer {
     pub advertise_dht: bool,
     pub ext_handshake_builder: Option<ExtHandshakeBuilder>,
     pub proxy: Option<risuko_http::ProxyConnector>,
+    pub deferred: bool,
 }
 
 #[derive(Clone)]
@@ -96,7 +129,6 @@ impl From<Id20> for KnownInfoHash {
     }
 }
 
-/// Connect to a peer, perform the BEP-3 handshake, and split the socket into reader/writer tasks; returns (handle, event receiver)
 pub async fn connect(spawn: SpawnPeer) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
     let stream = match &spawn.proxy {
         Some(proxy) => timeout(
@@ -119,7 +151,6 @@ pub async fn connect(spawn: SpawnPeer) -> std::io::Result<(PeerHandle, mpsc::Rec
     drive_handshake(stream, spawn).await
 }
 
-/// Plaintext BT handshake over an established µTP connection
 pub async fn connect_utp_plaintext(
     stream: crate::utp::UtpStream,
     spawn: SpawnPeer,
@@ -129,7 +160,6 @@ pub async fn connect_utp_plaintext(
     connect_plaintext(reader, writer, addr, &spawn, true).await
 }
 
-/// Dial over µTP and handshake per `spawn.encryption`, like the TCP path
 async fn connect_utp(
     utp: &crate::utp::UtpSocket,
     spawn: SpawnPeer,
@@ -151,9 +181,17 @@ async fn connect_utp(
         })?
     };
     match spawn.encryption {
-        EncryptionPolicy::PlaintextOnly => {
-            connect_utp_plaintext(dial().await?, spawn.clone()).await
-        }
+        EncryptionPolicy::PlaintextOnly => timeout(
+            spawn.connect_timeout,
+            connect_utp_plaintext(dial().await?, spawn.clone()),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "µTP plaintext handshake timeout",
+            )
+        })?,
         EncryptionPolicy::RequireEncryption => mse(dial().await?).await,
         EncryptionPolicy::PreferEncrypted => match mse(dial().await?).await {
             Ok(v) => Ok(v),
@@ -264,7 +302,6 @@ async fn dial_with_transport_order(
     }
 }
 
-/// Peer identity failure that no other transport or encryption mode can fix
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct TerminalDialError(&'static str);
@@ -278,7 +315,6 @@ fn alternate_dial_cannot_help(err: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.is::<TerminalDialError>())
 }
 
-/// Accept an inbound peer: peer sends handshake first, we reply. `known_hashes` lists info-hashes the responder hosts, used to validate plaintext handshakes and resolve the obfuscated req2 field in MSE. First byte peeked: `0x13` means plaintext BEP-3, any other byte starts an MSE handshake (Ya)
 pub async fn accept(
     stream: TcpStream,
     our_peer_id: Id20,
@@ -286,32 +322,53 @@ pub async fn accept(
     read_timeout: Duration,
     policy: EncryptionPolicy,
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
+    accept_with(
+        stream,
+        our_peer_id,
+        known_hashes,
+        read_timeout,
+        policy,
+        false,
+    )
+    .await
+}
+
+pub async fn accept_deferred(
+    stream: TcpStream,
+    our_peer_id: Id20,
+    known_hashes: Vec<KnownInfoHash>,
+    read_timeout: Duration,
+    policy: EncryptionPolicy,
+) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
+    accept_with(
+        stream,
+        our_peer_id,
+        known_hashes,
+        read_timeout,
+        policy,
+        true,
+    )
+    .await
+}
+
+async fn accept_with(
+    stream: TcpStream,
+    our_peer_id: Id20,
+    known_hashes: Vec<KnownInfoHash>,
+    read_timeout: Duration,
+    policy: EncryptionPolicy,
+    deferred: bool,
+) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
     let addr = stream.peer_addr()?;
 
-    // Peek 20 bytes (pstrlen + "BitTorrent protocol") to distinguish plaintext from MSE reliably; a single-byte check would misclassify ~1/256 MSE connections whose Ya starts with 0x13. `peek` may return fewer than 20 bytes on a slow peer, so loop until 20 bytes, a definitive non-plaintext first byte, or the read timeout
+    // Read 20 bytes: a one-byte check misclassifies ~1/256 MSE connections
+    let (mut reader, writer) = stream.into_split();
     let mut probe = [0u8; 20];
-    let plaintext_first_byte = timeout(read_timeout, async {
-        loop {
-            let n = stream.peek(&mut probe).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "eof before handshake",
-                ));
-            }
-            // A first byte other than 0x13 is definitely not a plaintext BT handshake — no need to wait for more data
-            if probe[0] != 0x13 {
-                return Ok(false);
-            }
-            if n >= 20 {
-                return Ok(&probe[1..20] == b"BitTorrent protocol");
-            }
-            // 0x13 lead but not enough bytes yet; yield and retry
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "peek timeout"))??;
+    timeout(read_timeout, reader.read_exact(&mut probe))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timeout"))??;
+    let plaintext_first_byte = probe[0] == 0x13 && &probe[1..20] == b"BitTorrent protocol";
+    let reader = std::io::Cursor::new(probe.to_vec()).chain(reader);
 
     if plaintext_first_byte {
         if matches!(policy, EncryptionPolicy::RequireEncryption) {
@@ -320,7 +377,6 @@ pub async fn accept(
                 "policy requires encryption; rejecting plaintext",
             ));
         }
-        let (reader, writer) = stream.into_split();
         accept_plaintext_generic(
             reader,
             writer,
@@ -329,6 +385,7 @@ pub async fn accept(
             known_hashes,
             read_timeout,
             false,
+            deferred,
         )
         .await
     } else {
@@ -338,7 +395,6 @@ pub async fn accept(
                 "policy forbids encryption; rejecting MSE",
             ));
         }
-        let (reader, writer) = stream.into_split();
         accept_mse(
             reader,
             writer,
@@ -348,12 +404,12 @@ pub async fn accept(
             read_timeout,
             policy,
             false,
+            deferred,
         )
         .await
     }
 }
 
-/// Accept an inbound µTP peer, plaintext only
 pub async fn accept_utp_plaintext(
     stream: crate::utp::UtpStream,
     our_peer_id: Id20,
@@ -370,13 +426,49 @@ pub async fn accept_utp_plaintext(
     .await
 }
 
-/// Accept an inbound µTP peer; µTP can't `peek`, so the first 20 bytes are read to choose plaintext or MSE and then replayed
 pub async fn accept_utp(
     stream: crate::utp::UtpStream,
     our_peer_id: Id20,
     known_hashes: Vec<KnownInfoHash>,
     read_timeout: Duration,
     policy: EncryptionPolicy,
+) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
+    accept_utp_with(
+        stream,
+        our_peer_id,
+        known_hashes,
+        read_timeout,
+        policy,
+        false,
+    )
+    .await
+}
+
+pub async fn accept_utp_deferred(
+    stream: crate::utp::UtpStream,
+    our_peer_id: Id20,
+    known_hashes: Vec<KnownInfoHash>,
+    read_timeout: Duration,
+    policy: EncryptionPolicy,
+) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
+    accept_utp_with(
+        stream,
+        our_peer_id,
+        known_hashes,
+        read_timeout,
+        policy,
+        true,
+    )
+    .await
+}
+
+async fn accept_utp_with(
+    stream: crate::utp::UtpStream,
+    our_peer_id: Id20,
+    known_hashes: Vec<KnownInfoHash>,
+    read_timeout: Duration,
+    policy: EncryptionPolicy,
+    deferred: bool,
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
     let addr = stream.peer_addr();
     let (mut reader, writer) = tokio::io::split(stream);
@@ -401,6 +493,7 @@ pub async fn accept_utp(
             known_hashes,
             read_timeout,
             true,
+            deferred,
         )
         .await
     } else {
@@ -419,12 +512,13 @@ pub async fn accept_utp(
             read_timeout,
             policy,
             true,
+            deferred,
         )
         .await
     }
 }
 
-/// Responder side of the plaintext BEP-3 handshake, generic over the transport so TCP (`into_split`) and µTP (`tokio::io::split`) share the exact logic: read the peer's handshake, validate the info-hash against `known_hashes`, reply with ours, optionally write the ext-handshake, then hand off to `finish_spawn`
+#[allow(clippy::too_many_arguments)]
 async fn accept_plaintext_generic<R, W>(
     mut reader: R,
     mut writer: W,
@@ -433,6 +527,7 @@ async fn accept_plaintext_generic<R, W>(
     known_hashes: Vec<KnownInfoHash>,
     read_timeout: Duration,
     utp: bool,
+    deferred: bool,
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -476,10 +571,10 @@ where
         utp,
         Box::new(reader),
         Box::new(writer),
+        deferred,
     )
 }
 
-/// Open a fresh TCP connection (through the proxy if set) for a handshake retry
 async fn dial_tcp(spawn: &SpawnPeer) -> std::io::Result<risuko_http::BoxedIo> {
     match &spawn.proxy {
         Some(proxy) => proxy
@@ -502,7 +597,14 @@ async fn drive_handshake(
     match spawn.encryption {
         EncryptionPolicy::PlaintextOnly => {
             let (reader, writer) = tokio::io::split(stream);
-            connect_plaintext(reader, writer, addr, &spawn, false).await
+            timeout(
+                spawn.connect_timeout,
+                connect_plaintext(reader, writer, addr, &spawn, false),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "plaintext handshake timeout")
+            })?
         }
         EncryptionPolicy::RequireEncryption => timeout(
             spawn.connect_timeout,
@@ -527,7 +629,6 @@ async fn drive_handshake(
                 Err(e) if alternate_dial_cannot_help(&e) => Err(e),
                 Err(e) => {
                     tracing::debug!("mse handshake to {addr} failed: {e}; trying plaintext");
-                    // The failed attempt spoiled the first connection
                     timeout(spawn.connect_timeout, async {
                         let (reader, writer) = tokio::io::split(dial_tcp(&spawn).await?);
                         connect_plaintext(reader, writer, addr, &spawn, false).await
@@ -563,7 +664,6 @@ async fn drive_handshake(
                 return Err(fallback_err);
             }
             tracing::debug!("plaintext handshake to {addr} failed: {fallback_err}; trying mse");
-            // Intentionally dial a fresh socket: the plaintext attempt already consumed (and likely corrupted, from the peer's view) the first connection, so the MSE retry cannot reuse it
             let mse = timeout(spawn.connect_timeout, async {
                 connect_mse(dial_tcp(&spawn).await?, addr, &spawn, false).await
             })
@@ -585,7 +685,6 @@ async fn drive_handshake(
     }
 }
 
-/// Run the plaintext BEP-3 handshake over an already-split byte stream and spawn the reader/writer tasks. Generic over the transport so both TCP (`OwnedReadHalf`/`OwnedWriteHalf`) and µTP (`tokio::io::split` halves) share the exact handshake logic
 async fn connect_plaintext<R, W>(
     mut reader: R,
     mut writer: W,
@@ -630,10 +729,10 @@ where
         utp,
         Box::new(reader),
         Box::new(writer),
+        spawn.deferred,
     )
 }
 
-/// Read from `r` until `buf` holds at least `n` bytes, bounded by `deadline`; `what` labels the phase in timeout/EOF error messages
 async fn read_until(
     r: &mut (impl AsyncRead + Unpin),
     buf: &mut Vec<u8>,
@@ -676,7 +775,6 @@ where
     let (mut read_h, mut write_h) = tokio::io::split(stream);
     let hs_timeout = spawn.connect_timeout;
 
-    // Step 1: A -> B: Ya || PadA (0..512 bytes)
     let keys = DhKeys::generate();
     let pad_a = mse::gen_pad(512);
     let mut out = Vec::with_capacity(DH_LEN + pad_a.len());
@@ -684,21 +782,18 @@ where
     out.extend_from_slice(&pad_a);
     write_h.write_all(&out).await?;
 
-    // Step 2: read Yb (96 bytes); PadB follows but its length is unknown until we sync on HASH('req1', S) — which is how PadB is implicitly delimited on our side
     let mut yb = [0u8; DH_LEN];
     timeout(hs_timeout, read_h.read_exact(&mut yb))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "mse yb timeout"))??;
     let s = keys.shared_secret(&yb)?;
 
-    // Derive RC4 keys now that we have S
     let skey: [u8; 20] = spawn.info_hash.0;
-    let key_a = mse::rc4_key(b"keyA", &s, &skey); // initiator writes with this
-    let key_b = mse::rc4_key(b"keyB", &s, &skey); // initiator reads with this
+    let key_a = mse::rc4_key(b"keyA", &s, &skey);
+    let key_b = mse::rc4_key(b"keyB", &s, &skey);
     let mut enc_out = mse::init_rc4(&key_a);
     let mut dec_in = mse::init_rc4(&key_b);
 
-    // Step 3: A -> B: HASH('req1',S) || HASH('req2',SKEY)^HASH('req3',S) || ENCRYPT(VC || crypto_provide || len(PadC) || PadC || len(IA) || IA)
     let req1 = mse::req1(&s);
     let req2 = mse::req2(&skey);
     let req3 = mse::req3(&s);
@@ -709,7 +804,6 @@ where
     if !matches!(spawn.encryption, EncryptionPolicy::RequireEncryption) {
         crypto_provide |= mse::crypto::PLAINTEXT;
     }
-    // Send IA = our BT handshake immediately so the responder can begin on its very first reply packet — saves a round trip
     let our_hs_bytes = Handshake::new_with_features(
         spawn.info_hash,
         spawn.our_peer_id,
@@ -762,7 +856,6 @@ where
         let scan_from = mse::scan_start_after_append(recv.len(), 8);
         recv.extend_from_slice(&chunk[..rn]);
 
-        // Scan new candidate offsets: the responder encrypts with keyB from keystream byte 0, so the first 8 encrypted bytes of its reply (VC = 00..00) equal keystream[0..8]. PadB is unencrypted and precedes the encrypted region, so the match offset in `recv` is `pad_b.len()`; detect it by scanning for any offset `off` where recv[off..off+8] == keystream[0..8]
         if recv.len() >= 8 && keystream.len() >= 8 {
             let needle = &keystream[..8];
             found_offset = mse::find_subsequence_from(&recv, needle, scan_from);
@@ -774,15 +867,11 @@ where
     let off = found_offset
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "mse vc not found"))?;
 
-    // Rebuild dec_in from the key. The encrypted region begins at `off` in `recv`, and B's cipher starts at its keystream byte 0 there — so we do NOT fast-forward; instead we simply discard the `off` bytes of PadB that preceded it
     let mut dec_in = mse::init_rc4(&key_b);
-    // We have recv[off..] pending; need at least 8 (VC) + 4 (select) + 2 (len) = 14 bytes
     let tail_start = off;
     let mut tail = recv[tail_start..].to_vec();
-    // If we don't yet have 14 bytes, read more encrypted bytes
     read_until(&mut read_h, &mut tail, 14, deadline, "mse header").await?;
     dec_in.apply_keystream(&mut tail[..14]);
-    // tail[0..8] now equals VC (sanity check already done)
     let crypto_select = u32::from_be_bytes([tail[8], tail[9], tail[10], tail[11]]);
     let pad_d_len = u16::from_be_bytes([tail[12], tail[13]]) as usize;
     if pad_d_len > 512 {
@@ -792,14 +881,12 @@ where
         ));
     }
 
-    // Ensure we have PadD buffered (and decrypt it), then anything after is already-plaintext-in-our-BT-sense data
     read_until(&mut read_h, &mut tail, 14 + pad_d_len, deadline, "mse padd").await?;
     if pad_d_len > 0 {
         dec_in.apply_keystream(&mut tail[14..14 + pad_d_len]);
     }
     let leftover = tail[14 + pad_d_len..].to_vec();
 
-    // Decide whether to use RC4 or plaintext for the ongoing stream
     let use_rc4 = if crypto_select & mse::crypto::RC4 != 0 {
         true
     } else if crypto_select & mse::crypto::PLAINTEXT != 0 {
@@ -817,14 +904,12 @@ where
         ));
     };
 
-    // Now read the peer's BT handshake from the still-encrypted (or now plaintext) stream, starting with any leftover bytes we already buffered
     let (reader_boxed, mut writer_boxed, remote_hs): (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
         Handshake,
     ) = if use_rc4 {
         let mut pending = leftover;
-        // Read BT handshake (68 bytes) from pending + stream, decrypting as we go
         let mut hs_bytes = Vec::with_capacity(HANDSHAKE_LEN);
         read_until(&mut read_h, &mut pending, HANDSHAKE_LEN, deadline, "mse hs").await?;
         hs_bytes.extend_from_slice(&pending[..HANDSHAKE_LEN]);
@@ -841,7 +926,6 @@ where
         let w = Rc4WriteHalf::new(write_h, enc_out);
         (Box::new(r), Box::new(w), remote_hs)
     } else {
-        // Plaintext after MSE negotiation. Leftover bytes are already BT handshake beginning
         let mut pending = leftover;
         read_until(
             &mut read_h,
@@ -879,10 +963,10 @@ where
         utp,
         reader_boxed,
         writer_boxed,
+        spawn.deferred,
     )
 }
 
-/// Accept an MSE connection as responder (B) over a split byte stream
 #[allow(clippy::too_many_arguments)]
 async fn accept_mse<R, W>(
     mut read_h: R,
@@ -893,29 +977,37 @@ async fn accept_mse<R, W>(
     read_timeout: Duration,
     policy: EncryptionPolicy,
     utp: bool,
+    deferred: bool,
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let deadline = tokio::time::Instant::now() + read_timeout;
+    if known_hashes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mse: no torrents hosted",
+        ));
+    }
 
-    // Read Ya (96 bytes)
     let mut ya = [0u8; DH_LEN];
     timeout(read_timeout, read_h.read_exact(&mut ya))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "mse ya timeout"))??;
 
-    // Generate our keys and send Yb || PadB
-    let keys = DhKeys::generate();
+    let keys = tokio::task::spawn_blocking(DhKeys::generate)
+        .await
+        .map_err(std::io::Error::other)?;
     let pad_b = mse::gen_pad(512);
     let mut out = Vec::with_capacity(DH_LEN + pad_b.len());
     out.extend_from_slice(&keys.public_be);
     out.extend_from_slice(&pad_b);
     write_h.write_all(&out).await?;
 
-    let s = keys.shared_secret(&ya)?;
-    // Search A's stream for HASH('req1', S) marker — this delimits PadA
+    let s = tokio::task::spawn_blocking(move || keys.shared_secret(&ya))
+        .await
+        .map_err(std::io::Error::other)??;
     let req1 = mse::req1(&s);
     let mut recv: Vec<u8> = Vec::with_capacity(1200);
     let mut chunk = [0u8; 256];
@@ -949,13 +1041,11 @@ where
         }
     };
 
-    // Fetch req2^req3 (20 bytes right after req1)
     read_until(&mut read_h, &mut recv, req1_off + 40, deadline, "mse req2").await?;
     let mut req23 = [0u8; 20];
     req23.copy_from_slice(&recv[req1_off + 20..req1_off + 40]);
     let req3_s = mse::req3(&s);
     let want_req2 = mse::xor20(&req23, &req3_s);
-    // Resolve SKEY by brute force over known info hashes
     let mut known_info: Option<KnownInfoHash> = None;
     for known in &known_hashes {
         if mse::req2(&known.info_hash.0) == want_req2 {
@@ -968,18 +1058,14 @@ where
     })?;
     let skey = known_info.info_hash;
 
-    // Now derive RC4 keys and decrypt the rest of A's third message
-    let key_a = mse::rc4_key(b"keyA", &s, &skey.0); // A writes (we decrypt with keyA)
-    let key_b = mse::rc4_key(b"keyB", &s, &skey.0); // we write with keyB
+    let key_a = mse::rc4_key(b"keyA", &s, &skey.0);
+    let key_b = mse::rc4_key(b"keyB", &s, &skey.0);
     let mut dec_in = mse::init_rc4(&key_a);
     let mut enc_out = mse::init_rc4(&key_b);
 
-    // After req1||req23 comes: ENCRYPT(VC||crypto_provide||len(PadC)||PadC||len(IA)||IA)
     let enc_start = req1_off + 40;
     let mut enc_buf = recv[enc_start..].to_vec();
-    // Need at least 8+4+2 = 14 bytes before we can learn PadC length
     read_until(&mut read_h, &mut enc_buf, 14, deadline, "mse ia-head").await?;
-    // Decrypt the 14-byte header
     dec_in.apply_keystream(&mut enc_buf[..14]);
     if enc_buf[0..8] != mse::VC {
         return Err(std::io::Error::new(
@@ -995,7 +1081,6 @@ where
             "pad_c too long",
         ));
     }
-    // Need PadC + len(IA) (2 bytes)
     read_until(
         &mut read_h,
         &mut enc_buf,
@@ -1028,14 +1113,12 @@ where
     let ia_bytes = enc_buf[ia_off..ia_off + ia_len].to_vec();
     let leftover = enc_buf[ia_off + ia_len..].to_vec();
 
-    // A spec-compliant peer may pack its BT handshake *and* further pipelined messages into IA. Bytes past the 68-byte handshake are already decrypted (the whole IA region had the keystream applied above) and must be replayed to the consumer ahead of the still-encrypted `leftover` tail
     let ia_extra: Vec<u8> = if ia_bytes.len() > HANDSHAKE_LEN {
         ia_bytes[HANDSHAKE_LEN..].to_vec()
     } else {
         Vec::new()
     };
 
-    // Choose crypto_select: prefer RC4; fall back to plaintext if allowed and requested. Require encryption policy forces RC4
     let allow_plain = !matches!(policy, EncryptionPolicy::RequireEncryption);
     let crypto_select = if crypto_provide & mse::crypto::RC4 != 0 {
         mse::crypto::RC4
@@ -1048,14 +1131,12 @@ where
         ));
     };
 
-    // Send ENCRYPT(VC || crypto_select || len(PadD) || PadD)
     let pad_d = mse::gen_pad(512);
     let mut reply = mse::build_responder_payload(crypto_select, &pad_d)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
     enc_out.apply_keystream(&mut reply);
     write_h.write_all(&reply).await?;
 
-    // IA may contain A's BT handshake. MSE peers are allowed to send an empty IA and defer the BT handshake to the encrypted stream
     if !ia_bytes.is_empty() && ia_bytes.len() < HANDSHAKE_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1078,7 +1159,6 @@ where
         None
     };
 
-    // Send our BT handshake, encrypted if RC4 selected
     let our_hs = Handshake::new_with_features(
         skey,
         our_peer_id,
@@ -1091,15 +1171,10 @@ where
         let mut encoded = our_hs.to_vec();
         enc_out.apply_keystream(&mut encoded);
         write_h.write_all(&encoded).await?;
-        let mut r = Rc4ReadHalf::new(
-            read_h, dec_in,
-            // Any bytes A sent after IA belong on the encrypted stream; they are already decrypted up to ia_off+ia_len (in enc_buf) but any after that are still encrypted. leftover is the raw, still-encrypted tail; the Rc4ReadHalf will decrypt as it streams
-            leftover,
-        );
+        let mut r = Rc4ReadHalf::new(read_h, dec_in, leftover);
         let remote_hs = match remote_hs_from_ia {
             Some(hs) => hs,
             None => {
-                // Peer deferred BT handshake; read it from the encrypted stream
                 let mut buf = [0u8; HANDSHAKE_LEN];
                 timeout(read_timeout, r.read_exact(&mut buf))
                     .await
@@ -1126,16 +1201,24 @@ where
             known_info.ext_handshake_builder.as_ref(),
         )
         .await?;
-        // `ia_extra` (plaintext, already decrypted) must precede anything the encrypted reader yields. It is only non-empty when IA carried the handshake, so the deferred-read branch above never touched `r`
+        // `ia_extra` must precede anything the encrypted reader yields
         let reader: Box<dyn AsyncRead + Unpin + Send> = if ia_extra.is_empty() {
             Box::new(r)
         } else {
             Box::new(std::io::Cursor::new(ia_extra).chain(r))
         };
-        finish_spawn(addr, our_peer_id, remote_hs, true, utp, reader, Box::new(w))
+        finish_spawn(
+            addr,
+            our_peer_id,
+            remote_hs,
+            true,
+            utp,
+            reader,
+            Box::new(w),
+            deferred,
+        )
     } else {
         write_h.write_all(&our_hs).await?;
-        // Prepend any extra IA bytes (past the handshake) to the leftover tail; both are plaintext here
         let mut prefix = ia_extra;
         prefix.extend_from_slice(&leftover);
         let r = std::io::Cursor::new(prefix).chain(read_h);
@@ -1163,11 +1246,11 @@ where
             utp,
             Box::new(r),
             Box::new(write_h),
+            deferred,
         )
     }
 }
 
-/// Write our BEP-10 extended handshake to the wire if the remote advertised the extension-protocol reserved bit. The bytes are produced by `builder` per-peer so the message can include the peer's IP in the `yourip` field Called inline by every connection-establishment path (plaintext + MSE, inbound + outbound) so the message ships in the same async frame that just completed the BT handshake — no event-channel hop, no writer-task hop. Some real-world peers RST the connection if our follow-up doesn't arrive promptly
 async fn write_ext_handshake_if_supported<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     remote_hs: &Handshake,
@@ -1184,6 +1267,7 @@ async fn write_ext_handshake_if_supported<W: AsyncWrite + Unpin + ?Sized>(
     writer.write_all(&bytes).await
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_spawn(
     addr: SocketAddr,
     our_peer_id: Id20,
@@ -1192,18 +1276,17 @@ fn finish_spawn(
     utp: bool,
     reader: Box<dyn AsyncRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
+    deferred: bool,
 ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
-    // Reject self-connections: the DHT can hand us our own externally-mapped address, and without this we complete a full handshake with ourselves, burning a peer slot on a connection that can never serve data
     if remote_hs.peer_id == our_peer_id {
         return Err(terminal_dial_error(
             "self-connection (peer_id matches ours)",
         ));
     }
-    // Sized for high-throughput pipelining: with up to ~64 outstanding chunk requests and Piece replies of 16 KiB arriving back-to-back, a 64-slot channel would backpressure the reader and cap throughput
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+    let (piece_tx, piece_rx) = mpsc::channel(PIECE_LANE_SLOTS);
 
-    // Deliver the handshake synchronously before spawning the reader so that consumers always observe `Handshook` before any peer messages. The channel was just created with capacity 1024 so this cannot block
     event_tx
         .try_send(PeerEvent::Handshook {
             peer_id: remote_hs.peer_id,
@@ -1213,12 +1296,28 @@ fn finish_spawn(
             utp,
         })
         .map_err(|e| std::io::Error::other(format!("{e}")))?;
+    let mut bind = None;
+    let target = if deferred {
+        let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
+        bind = Some(bind_tx);
+        IoTarget::Bind(bind_rx)
+    } else {
+        IoTarget::Ready(EventOut::Own(event_tx))
+    };
 
-    let reader_events = event_tx.clone();
+    let gate = Arc::new(RecvGate::default());
+    let reader_gate = gate.clone();
     let io_task = tokio::spawn(async move {
+        let out = match target {
+            IoTarget::Ready(out) => out,
+            IoTarget::Bind(rx) => match rx.await {
+                Ok(sink) => EventOut::Sink(sink),
+                Err(_) => return,
+            },
+        };
         let reason = {
-            let reader = reader_task(reader, reader_events);
-            let writer = writer_task(writer, cmd_rx);
+            let reader = reader_task(reader, &out, reader_gate);
+            let writer = writer_task(writer, cmd_rx, piece_rx);
             tokio::pin!(reader);
             tokio::pin!(writer);
             tokio::select! {
@@ -1226,20 +1325,27 @@ fn finish_spawn(
                 reason = &mut writer => reason,
             }
         };
-        let _ = event_tx.send(PeerEvent::Disconnected { reason }).await;
+        let _ = out.send(PeerEvent::Disconnected { reason }).await;
     });
 
     Ok((
         PeerHandle {
             addr,
             tx: cmd_tx,
+            piece_tx,
             io_abort: io_task.abort_handle(),
+            gate,
+            bind,
         },
         event_rx,
     ))
 }
 
-/// RC4-encrypting read half. Any residual bytes we already pulled from the socket while scanning the MSE handshake are replayed via the chained cursor prefix; they are *still encrypted* under the peer's key, so the same cipher applies to everything the chain yields
+enum IoTarget {
+    Ready(EventOut),
+    Bind(tokio::sync::oneshot::Receiver<PeerEventSink>),
+}
+
 struct Rc4ReadHalf {
     inner: tokio::io::Chain<std::io::Cursor<Vec<u8>>, Box<dyn AsyncRead + Unpin + Send>>,
     cipher: MseRc4,
@@ -1279,7 +1385,6 @@ impl AsyncRead for Rc4ReadHalf {
     }
 }
 
-/// RC4-encrypting write half. Writes are buffered into a small scratch vector, encrypted, then written through. We keep scratch sized to each call to avoid a long-lived heap buffer
 struct Rc4WriteHalf {
     inner: Box<dyn AsyncWrite + Unpin + Send>,
     cipher: MseRc4,
@@ -1300,7 +1405,6 @@ impl Rc4WriteHalf {
         }
     }
 
-    /// Write queued ciphertext through to the socket, in order. Clears the pending buffer once fully drained
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         while self.pending_off < self.pending.len() {
             match Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_off..]) {
@@ -1327,7 +1431,6 @@ impl AsyncWrite for Rc4WriteHalf {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // Flush any pending ciphertext first so we always commit bytes in order
         match self.poll_drain(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -1337,13 +1440,12 @@ impl AsyncWrite for Rc4WriteHalf {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // Encrypt the caller's buffer into pending, then try to write in the same poll
-        let mut scratch = buf.to_vec();
-        self.cipher.apply_keystream(&mut scratch);
-        self.pending = scratch;
-        self.pending_off = 0;
+        let me = &mut *self;
+        me.pending.clear();
+        me.pending.extend_from_slice(buf);
+        me.cipher.apply_keystream(&mut me.pending);
+        me.pending_off = 0;
         let consumed = buf.len();
-        // Opportunistically flush. If the socket is not ready, report the caller's bytes as consumed; the ciphertext is safely queued in `pending`
         match self.poll_drain(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(consumed)),
@@ -1358,7 +1460,6 @@ impl AsyncWrite for Rc4WriteHalf {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Drain any ciphertext that poll_write queued in `pending`
         match self.poll_drain(cx) {
             Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
             other => other,
@@ -1368,16 +1469,19 @@ impl AsyncWrite for Rc4WriteHalf {
 
 async fn reader_task(
     mut reader: Box<dyn AsyncRead + Unpin + Send>,
-    tx: mpsc::Sender<PeerEvent>,
+    out: &EventOut,
+    gate: Arc<RecvGate>,
 ) -> String {
-    // Larger temp buffer => fewer read syscalls per Piece message. Each Piece reply is up to 16 KiB of payload + 13 B header; 64 KiB lets us ingest several pipelined replies per syscall
     let mut buf = BytesMut::with_capacity(256 * 1024);
     loop {
-        // Try to decode any complete frame already buffered
+        let mut block_bytes = 0usize;
         loop {
             match MessageDecoder::try_decode(&mut buf) {
                 Ok(Some(msg)) => {
-                    if tx.send(PeerEvent::Message(msg)).await.is_err() {
+                    if let Message::Piece { data, .. } = &msg {
+                        block_bytes += data.len();
+                    }
+                    if !out.send(PeerEvent::Message(msg)).await {
                         return "event receiver closed".into();
                     }
                 }
@@ -1387,7 +1491,11 @@ async fn reader_task(
                 }
             }
         }
-        // Reserve the old 64 KiB scratch size so `read_buf` can absorb pipelined Piece replies without an extra copy
+        if block_bytes > 0 {
+            if let Some(throttle) = gate.get() {
+                throttle.acquire(block_bytes).await;
+            }
+        }
         buf.reserve(64 * 1024);
         match reader.read_buf(&mut buf).await {
             Ok(0) => {
@@ -1401,46 +1509,62 @@ async fn reader_task(
     }
 }
 
+pub const PIECE_LANE_SLOTS: usize = 8;
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn writer_task(
     mut writer: Box<dyn AsyncWrite + Unpin + Send>,
     mut rx: mpsc::Receiver<PeerCommand>,
+    mut piece_rx: mpsc::Receiver<Message>,
 ) -> String {
-    // Coalesce all commands currently queued into a single write_all so a burst of 128 pipelined Request frames becomes one syscall instead of 128. Per-message write_all + write_all overhead was a major bottleneck on high-fan-in torrents
     let mut batch = BytesMut::with_capacity(64 * 1024);
-    while let Some(first) = rx.recv().await {
+    let mut piece_open = true;
+    loop {
         batch.clear();
         let mut disconnect = false;
-        match first {
-            PeerCommand::Send(msg) => batch.extend_from_slice(&MessageEncoder::encode(&msg)),
-            PeerCommand::Disconnect => disconnect = true,
+        tokio::select! {
+            biased;
+            cmd = rx.recv() => match cmd {
+                Some(PeerCommand::Send(msg)) => MessageEncoder::encode_into(&mut batch, &msg),
+                Some(PeerCommand::Disconnect) => disconnect = true,
+                None => return "command channel closed".into(),
+            },
+            piece = piece_rx.recv(), if piece_open => match piece {
+                Some(msg) => MessageEncoder::encode_into(&mut batch, &msg),
+                None => piece_open = false,
+            },
         }
-        // Drain anything else already queued without awaiting
-        while !disconnect {
+        while !disconnect && batch.len() < 256 * 1024 {
             match rx.try_recv() {
-                Ok(PeerCommand::Send(msg)) => {
-                    batch.extend_from_slice(&MessageEncoder::encode(&msg));
-                    // Cap batch size so a flood doesn't grow unbounded
-                    if batch.len() >= 256 * 1024 {
-                        break;
-                    }
-                }
-                Ok(PeerCommand::Disconnect) => {
-                    disconnect = true;
-                    break;
-                }
+                Ok(PeerCommand::Send(msg)) => MessageEncoder::encode_into(&mut batch, &msg),
+                Ok(PeerCommand::Disconnect) => disconnect = true,
                 Err(_) => break,
             }
         }
+        while !disconnect && piece_open && batch.len() < 256 * 1024 {
+            match piece_rx.try_recv() {
+                Ok(msg) => MessageEncoder::encode_into(&mut batch, &msg),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    piece_open = false;
+                    break;
+                }
+            }
+        }
         if !batch.is_empty() {
-            if let Err(e) = writer.write_all(&batch).await {
-                return format!("write: {e}");
+            match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&batch)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return format!("write: {e}"),
+                Err(_) => return "write timeout".into(),
             }
         }
         if disconnect {
+            let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, writer.flush()).await;
             return "local disconnect".into();
         }
     }
-    "command channel closed".into()
 }
 
 #[cfg(test)]
@@ -1489,12 +1613,59 @@ mod tests {
             advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await
         .unwrap();
 
         let (handle_b, rx_b) = accept_fut.await.unwrap();
         (handle_a, rx_a, handle_b, rx_b)
+    }
+
+    #[tokio::test]
+    async fn writer_sends_control_frames_ahead_of_queued_pieces() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (piece_tx, piece_rx) = mpsc::channel(PIECE_LANE_SLOTS);
+        for i in 0..3u32 {
+            piece_tx
+                .send(Message::Piece {
+                    index: i,
+                    begin: 0,
+                    data: bytes::Bytes::from(vec![7u8; 16]),
+                })
+                .await
+                .unwrap();
+        }
+        cmd_tx
+            .send(PeerCommand::Send(Message::Interested))
+            .await
+            .unwrap();
+        cmd_tx.send(PeerCommand::Disconnect).await.unwrap();
+        let reason = writer_task(Box::new(client), cmd_rx, piece_rx).await;
+        assert_eq!(reason, "local disconnect");
+        let mut out = Vec::new();
+        server.read_to_end(&mut out).await.unwrap();
+        assert_eq!(&out[..5], &[0, 0, 0, 1, 2]);
+        drop(piece_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_evicts_a_peer_that_never_reads() {
+        let (client, _server) = tokio::io::duplex(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (piece_tx, piece_rx) = mpsc::channel(PIECE_LANE_SLOTS);
+        piece_tx
+            .send(Message::Piece {
+                index: 0,
+                begin: 0,
+                data: bytes::Bytes::from(vec![7u8; 1024]),
+            })
+            .await
+            .unwrap();
+        let reason = writer_task(Box::new(client), cmd_rx, piece_rx).await;
+        assert_eq!(reason, "write timeout");
     }
 
     #[test]
@@ -1558,10 +1729,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recv_gate_delays_reads_after_received_blocks() {
+        use crate::limiter::RateLimiter;
+
+        let (a, mut rx_a, b, mut rx_b) = run_pair().await;
+        assert!(matches!(
+            rx_a.recv().await.unwrap(),
+            PeerEvent::Handshook { .. }
+        ));
+        assert!(matches!(
+            rx_b.recv().await.unwrap(),
+            PeerEvent::Handshook { .. }
+        ));
+        b.gate.set(Throttle::new(
+            Arc::new(RateLimiter::unlimited()),
+            Arc::new(RateLimiter::new(64 * 1024)),
+        ));
+        let start = std::time::Instant::now();
+        for i in 0..8u32 {
+            a.tx.send(PeerCommand::Send(Message::Piece {
+                index: 0,
+                begin: i * 16 * 1024,
+                data: Bytes::from(vec![7u8; 16 * 1024]),
+            }))
+            .await
+            .unwrap();
+        }
+        for _ in 0..8 {
+            assert!(matches!(
+                rx_b.recv().await.unwrap(),
+                PeerEvent::Message(Message::Piece { .. })
+            ));
+        }
+        a.tx.send(PeerCommand::Send(Message::Have { piece_index: 9 }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx_b.recv().await.unwrap(),
+            PeerEvent::Message(Message::Have { .. })
+        ));
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(800), "waited {waited:?}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+    }
+
+    #[tokio::test]
     async fn handshake_and_message() {
         let (a, mut rx_a, b, mut rx_b) = run_pair().await;
 
-        // Both sides should see a Handshook event
         assert!(matches!(
             rx_a.recv().await.unwrap(),
             PeerEvent::Handshook { .. }
@@ -1589,13 +1804,78 @@ mod tests {
         }
     }
 
-    /// Returns whether a `PreferEncrypted` client ended up encrypted against `server_policy`
+    #[tokio::test]
+    async fn deferred_reader_waits_for_its_sink_then_feeds_it_directly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = Id20([1u8; 20]);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept(
+                stream,
+                Id20([3u8; 20]),
+                vec![info_hash.into()],
+                Duration::from_secs(5),
+                EncryptionPolicy::PlaintextOnly,
+            )
+            .await
+            .unwrap()
+        });
+        let (mut client, mut hello) = connect(SpawnPeer {
+            addr,
+            info_hash,
+            our_peer_id: Id20([2u8; 20]),
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            encryption: EncryptionPolicy::PlaintextOnly,
+            advertise_v2: true,
+            advertise_dht: true,
+            ext_handshake_builder: None,
+            proxy: None,
+            deferred: true,
+        })
+        .await
+        .unwrap();
+        let (remote, _remote_rx) = server.await.unwrap();
+        assert!(matches!(
+            hello.recv().await,
+            Some(PeerEvent::Handshook { .. })
+        ));
+        assert!(hello.recv().await.is_none());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        remote
+            .tx
+            .send(PeerCommand::Send(Message::Interested))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "nothing is delivered before the sink is bound"
+        );
+        let bind = client.bind.take().unwrap();
+        assert!(bind.send(PeerEventSink::new(7, tx)).is_ok());
+        assert!(matches!(
+            rx.recv().await,
+            Some((7, PeerEvent::Message(Message::Interested)))
+        ));
+        remote.tx.send(PeerCommand::Disconnect).await.unwrap();
+        loop {
+            match rx.recv().await {
+                Some((7, PeerEvent::Disconnected { .. })) => break,
+                Some(_) => {}
+                None => panic!("sink closed without a disconnect"),
+            }
+        }
+    }
+
     async fn prefer_encrypted_outcome(server_policy: EncryptionPolicy) -> bool {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let info_hash = Id20([0x31u8; 20]);
         let server = tokio::spawn(async move {
-            // A refused MSE attempt is followed by a fresh plaintext connection
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
                 if let Ok(accepted) = accept(
@@ -1623,6 +1903,7 @@ mod tests {
             advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await
         .unwrap();
@@ -1671,6 +1952,7 @@ mod tests {
             advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await;
         assert!(res.is_err() || accept_fut.await.unwrap().is_err());
@@ -1706,6 +1988,7 @@ mod tests {
             advertise_dht: false,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await
         .unwrap();
@@ -1749,12 +2032,12 @@ mod tests {
             advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         })
         .await
         .unwrap();
         let (b, mut rx_b) = accept_fut.await.unwrap();
 
-        // Both sides observe an encrypted handshake
         match rx_a.recv().await.unwrap() {
             PeerEvent::Handshook { encrypted, .. } => assert!(encrypted),
             e => panic!("unexpected event: {e:?}"),
@@ -1795,7 +2078,6 @@ mod tests {
         let peer_b = Id20([9u8; 20]);
         let tcp_seen = Arc::new(AtomicBool::new(false));
 
-        // The µTP leg carries MSE, so TCP stays unused
         let tcp_seen_task = tcp_seen.clone();
         let tcp_watch = tokio::spawn(async move {
             if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
@@ -1803,7 +2085,6 @@ mod tests {
                 tcp_seen_task.store(true, Ordering::SeqCst);
             }
         });
-        // Keep a handle: dropping the last `UtpSocket` closes its connections
         let accept_utp_sock = server_utp.clone();
         let accept_fut = tokio::spawn(async move {
             let stream = accept_utp_sock.accept().await.unwrap();
@@ -1830,6 +2111,7 @@ mod tests {
                 advertise_dht: true,
                 ext_handshake_builder: None,
                 proxy: None,
+                deferred: false,
             },
             Some(client_utp),
         )
@@ -1862,7 +2144,6 @@ mod tests {
             .unwrap();
         let server_addr = server_sock.local_addr();
 
-        // Encryption is required, so plaintext would be refused
         let server = tokio::spawn(async move {
             let stream = server_sock.accept().await.unwrap();
             let (handle, mut rx) = accept_utp(
@@ -1900,6 +2181,7 @@ mod tests {
                     advertise_dht: true,
                     ext_handshake_builder: None,
                     proxy: None,
+                    deferred: false,
                 },
             )
             .await
@@ -1976,7 +2258,6 @@ mod tests {
             .unwrap();
         let server_addr = server_sock.local_addr();
 
-        // Minimal peer: accept a µTP stream, exchange BT handshakes, then push one peer message so the client's reader task surfaces it
         let server = tokio::spawn(async move {
             let mut s = server_sock.accept().await.unwrap();
             let mut buf = [0u8; HANDSHAKE_LEN];
@@ -1990,7 +2271,6 @@ mod tests {
                 .await
                 .unwrap();
             s.flush().await.unwrap();
-            // Keep the connection alive until the client has read everything
             tokio::time::sleep(Duration::from_millis(300)).await;
         });
 
@@ -2009,6 +2289,7 @@ mod tests {
                     advertise_dht: true,
                     ext_handshake_builder: None,
                     proxy: None,
+                    deferred: false,
                 },
             )
             .await
@@ -2046,7 +2327,6 @@ mod tests {
         let client_id = Id20([1u8; 20]);
         let server_id = Id20([2u8; 20]);
 
-        // The peer listens on µTP only — no TCP listener exists on this UDP port number — so the client's TCP dial is refused and it must fall back to µTP to connect
         let server_sock = UtpSocket::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
@@ -2077,6 +2357,7 @@ mod tests {
             advertise_dht: true,
             ext_handshake_builder: None,
             proxy: None,
+            deferred: false,
         };
         let (_handle, mut rx) = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2108,7 +2389,6 @@ mod tests {
             .unwrap();
         let server_addr = server_sock.local_addr();
 
-        // Responder: accept the inbound µTP stream and run the plaintext BT handshake through the production `accept_utp_plaintext` path, then push one message so the initiator's reader surfaces it
         let server = tokio::spawn(async move {
             let s = server_sock.accept().await.unwrap();
             let known = vec![KnownInfoHash {
@@ -2155,6 +2435,7 @@ mod tests {
                     advertise_dht: true,
                     ext_handshake_builder: None,
                     proxy: None,
+                    deferred: false,
                 },
             )
             .await

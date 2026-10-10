@@ -1,4 +1,4 @@
-export interface DownloadStatsTaskInput {
+interface DownloadStatsTaskInput {
 	gid: string;
 	kind: string;
 	firstCompletedLength?: number;
@@ -32,7 +32,7 @@ export interface MonthlyProtocolTotal {
 	protocols: ProtocolTotal[];
 }
 
-export interface ProtocolSpeedPoint {
+interface ProtocolSpeedPoint {
 	protocol: string;
 	downloadSpeed: number;
 	uploadSpeed: number;

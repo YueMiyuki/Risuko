@@ -1,5 +1,3 @@
-//! HTTP / HTTPS tracker (BEP-3 + BEP-23 compact peer list)
-
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, OnceLock};
@@ -10,7 +8,6 @@ use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use super::super::bencode::{decode_all_external, DecodeLimits, Value};
 use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, TrackerError};
 
-/// RFC 3986 unreserved + `-_.~` are safe in a URL without percent-encoding
 const TRACKER_RESPONSE_LIMITS: DecodeLimits = DecodeLimits::new(2 * 1024 * 1024, 64, 262_144);
 
 const QUERY_SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
@@ -59,18 +56,6 @@ fn tracker_source_addr(mut source: SocketAddr) -> SocketAddr {
     source
 }
 
-pub async fn announce(url: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy(url, req, None).await
-}
-
-pub async fn announce_with_proxy(
-    url: &str,
-    req: &AnnounceRequest,
-    proxy: Option<&risuko_http::ProxyConnector>,
-) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy_and_source(url, req, proxy, None).await
-}
-
 pub async fn announce_with_proxy_and_source(
     url: &str,
     req: &AnnounceRequest,
@@ -86,7 +71,6 @@ pub async fn announce_with_proxy_and_source(
     fetch_announce(&client, url, req).await
 }
 
-/// Announce from one address family only (BEP 7); a proxy still routes redirects away from a bypassed tracker
 pub async fn announce_for_family(
     url: &str,
     req: &AnnounceRequest,
@@ -100,7 +84,6 @@ pub async fn announce_for_family(
     fetch_announce(&client, url, req).await
 }
 
-/// Whether the client tunnels `url` through the TCP proxy rather than connecting direct
 pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -> bool {
     proxy.proxy().is_some()
         && !url::Url::parse(url).is_ok_and(|url| {
@@ -110,7 +93,6 @@ pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -
         })
 }
 
-/// `source` pins direct connections only; proxy control connections pick their own
 fn proxy_client(
     proxy: &risuko_http::ProxyConnector,
     source: Option<SocketAddr>,
@@ -133,23 +115,32 @@ fn proxy_client(
         .map_err(|e| TrackerError::Http(e.to_string()))
 }
 
+const MAX_ANNOUNCE_BYTES: usize = 2 * 1024 * 1024;
+
 async fn fetch_announce(
     client: &risuko_http::Client,
     url: &str,
     req: &AnnounceRequest,
 ) -> Result<AnnounceResponse, TrackerError> {
     let query = build_query(req);
-    // Append to existing query string if the URL already has one
     let sep = if url.contains('?') { '&' } else { '?' };
     let full = format!("{}{}{}", url, sep, query);
-    let bytes = client
+    let resp = client
         .get(&full)
         .send()
         .await
-        .map_err(|e| TrackerError::Http(e.to_string()))?
-        .error_for_status()
-        .map_err(|e| TrackerError::Http(e.to_string()))?
-        .bytes()
+        .map_err(|e| TrackerError::Http(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        if let Ok(body) = resp.bytes_limited(MAX_ANNOUNCE_BYTES).await {
+            if let Err(rejected @ TrackerError::Rejected(_)) = parse_response(&body, req) {
+                return Err(rejected);
+            }
+        }
+        return Err(TrackerError::Http(format!("HTTP status {status}")));
+    }
+    let bytes = resp
+        .bytes_limited(MAX_ANNOUNCE_BYTES)
         .await
         .map_err(|e| TrackerError::Http(e.to_string()))?;
     parse_response(&bytes, req)
@@ -157,7 +148,6 @@ async fn fetch_announce(
 
 fn build_query(req: &AnnounceRequest) -> String {
     let pid = percent_encode(req.peer_id.as_bytes(), QUERY_SAFE);
-    // BEP 8: `sha_ih` replaces `info_hash` and the port is obscured
     let (hash_param, hash, port) = if req.obfuscate {
         (
             "sha_ih",
@@ -180,7 +170,6 @@ fn build_query(req: &AnnounceRequest) -> String {
     s
 }
 
-/// Compact peer field as plaintext, decrypting BEP 8 responses
 fn reveal_peers<'a>(
     raw: &'a [u8],
     stride: usize,
@@ -190,7 +179,6 @@ fn reveal_peers<'a>(
     if !req.obfuscate {
         return Some(std::borrow::Cow::Borrowed(raw));
     }
-    // Outer `None` is a window parameter outside `u32`, which drops the field instead of wrapping
     let window = |key: &[u8]| match response.get(key).and_then(Value::as_int) {
         Some(n) => u32::try_from(n).ok().map(Some),
         None => Some(None),
@@ -233,7 +221,6 @@ fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceRespons
 
     let mut peers = Vec::new();
     let mut seen = HashSet::new();
-    // Compact IPv4 (BEP-23): 6 bytes per peer
     if let Some(raw) = value
         .get(b"peers")
         .and_then(|v| v.as_bytes())
@@ -252,7 +239,6 @@ fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceRespons
         .and_then(|v| v.as_list())
         .filter(|_| !req.obfuscate)
     {
-        // Dictionary model (BEP-3 original): each entry is a dict with `ip` and `port` keys
         for entry in list {
             if entry.as_dict().is_some() {
                 let ip = entry.get(b"ip").and_then(|v| v.as_str());
@@ -271,7 +257,6 @@ fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceRespons
         }
     }
 
-    // Compact IPv6 (BEP-7): 18 bytes per peer
     if let Some(raw) = value
         .get(b"peers6")
         .and_then(|v| v.as_bytes())
@@ -337,10 +322,7 @@ mod tests {
 
     #[test]
     fn parses_compact_v4_response() {
-        let peers_bin: Vec<u8> = vec![
-            1, 2, 3, 4, 0x1a, 0xe1, // 1.2.3.4:6881
-            5, 6, 7, 8, 0x1a, 0xe2, // 5.6.7.8:6882
-        ];
+        let peers_bin: Vec<u8> = vec![1, 2, 3, 4, 0x1a, 0xe1, 5, 6, 7, 8, 0x1a, 0xe2];
         let body = encode_to_vec(&Value::Dict(vec![
             (b"interval".to_vec(), Value::Int(60)),
             (b"peers".to_vec(), Value::Bytes(peers_bin)),
@@ -354,10 +336,8 @@ mod tests {
     #[test]
     fn preserves_tracker_peer_order_while_deduplicating() {
         let peers_bin: Vec<u8> = vec![
-            5, 6, 7, 8, 0x1a, 0xe2, // 5.6.7.8:6882
-            1, 2, 3, 4, 0x1a, 0xe1, // 1.2.3.4:6881
-            5, 6, 7, 8, 0x1a, 0xe2, // duplicate
-            255, 255, 255, 255, 0x1a, 0xe3, // broadcast
+            5, 6, 7, 8, 0x1a, 0xe2, 1, 2, 3, 4, 0x1a, 0xe1, 5, 6, 7, 8, 0x1a, 0xe2, 255, 255, 255,
+            255, 0x1a, 0xe3,
         ];
         let body = encode_to_vec(&Value::Dict(vec![
             (b"interval".to_vec(), Value::Int(60)),
@@ -461,7 +441,6 @@ mod tests {
             let mut buf = vec![0u8; 4096];
             let n = socket.read(&mut buf).await.unwrap();
             let head = String::from_utf8_lossy(&buf[..n]).to_string();
-            // Tracker-side obfuscation of two peers, keyed with an IV
             let plain = [198u8, 51, 100, 2, 0x1a, 0xe1, 203, 0, 113, 5, 0x1a, 0xe2];
             let iv = b"rotating-iv".to_vec();
             let peers = deobfuscate_peers(&info_hash, Some(&iv), None, None, &plain, 6).unwrap();

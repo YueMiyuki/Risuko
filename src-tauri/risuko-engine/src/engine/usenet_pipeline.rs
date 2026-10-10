@@ -1,26 +1,23 @@
-//! Portable Usenet article assembly primitives
-
 use crate::engine::archive_safety::ArchiveLimits;
 use crate::engine::usenet::NzbSegment;
-use crate::traits::process_may_be_running;
+use crate::traits::{cleanup_stale_atomic_write_files, write_file_atomically};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 const RESUME_VERSION: u8 = 2;
-const HASH_BUFFER_BYTES: usize = 64 * 1024;
-const CHECKPOINT_SEGMENT_INTERVAL: usize = 8;
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const CHECKPOINT_BYTE_INTERVAL: u64 = 256 * 1024 * 1024;
 const CHECKPOINT_TIME_INTERVAL: Duration = Duration::from_secs(5);
 const FETCH_CONCURRENCY: usize = 4;
-const RESUME_TEMP_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_FETCH_WINDOW: usize = 128;
 const RESUME_TEMP_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,29 +158,15 @@ impl ResumeSidecar {
     }
 
     pub async fn save_atomic(&self, path: &Path) -> Result<(), String> {
-        let payload = serde_json::to_vec_pretty(self)
+        let payload = serde_json::to_vec(self)
             .map_err(|error| format!("serialize resume metadata: {error}"))?;
-        // Per-call unique suffix so concurrent writers never clobber each other's temp; temp removed on failure so no partial write is left behind
-        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let unique = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp = path.with_extension(format!(
-            "{}.{}.{}.tmp",
-            path.extension().and_then(|v| v.to_str()).unwrap_or("json"),
-            std::process::id(),
-            unique
-        ));
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| format!("create resume metadata directory: {error}"))?;
-        }
         let target = path.to_path_buf();
-        // Once started, spawn_blocking runs this small durable transaction to
-        // completion even if the caller is cancelled. TempPath removes the
-        // intermediate file on every error path
-        tokio::task::spawn_blocking(move || write_and_rename(&temp, &target, &payload))
-            .await
-            .map_err(|error| format!("resume metadata persistence task failed: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            write_file_atomically(&target, &payload)
+                .map_err(|error| format!("persist resume metadata: {error}"))
+        })
+        .await
+        .map_err(|error| format!("resume metadata persistence task failed: {error}"))?
     }
 }
 
@@ -191,94 +174,15 @@ async fn prune_stale_resume_temps(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let Some(current_file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    if !should_prune_resume_temps(path, parent, current_file_name) {
+    if !should_prune_resume_temps(parent) {
         return;
     }
-    let mut entries = match tokio::fs::read_dir(parent).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => {
-            tracing::warn!(path = %parent.display(), %error, "could not scan stale resume metadata temps");
-            return;
-        }
-    };
-
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(error) => {
-                tracing::warn!(path = %parent.display(), %error, "could not continue scanning stale resume metadata temps");
-                break;
-            }
-        };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(without_suffix) = name.strip_suffix(".tmp") else {
-            continue;
-        };
-        let Some((with_pid, sequence)) = without_suffix.rsplit_once('.') else {
-            continue;
-        };
-        if sequence.parse::<u64>().is_err() {
-            continue;
-        }
-        let Some((sidecar_name, pid)) = with_pid.rsplit_once('.') else {
-            continue;
-        };
-        let Some(pid) = pid.parse::<u32>().ok() else {
-            continue;
-        };
-        if !is_resume_temp_sidecar(path, current_file_name, sidecar_name)
-            || pid == std::process::id()
-        {
-            continue;
-        }
-        match entry.metadata().await {
-            Ok(metadata)
-                if metadata.is_file()
-                    && metadata
-                        .modified()
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age >= RESUME_TEMP_STALE_AGE) =>
-            {
-                if process_may_be_running(pid) {
-                    continue;
-                }
-                if let Err(error) = tokio::fs::remove_file(entry.path()).await {
-                    tracing::warn!(path = %entry.path().display(), %error, "could not remove stale resume metadata temp");
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(path = %entry.path().display(), %error, "could not inspect stale resume metadata temp");
-            }
-        }
-    }
+    let parent = parent.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || cleanup_stale_atomic_write_files(&parent)).await;
 }
 
-fn is_resume_temp_sidecar(path: &Path, current_file_name: &str, sidecar_name: &str) -> bool {
-    sidecar_name.ends_with(".resume.json")
-        || sidecar_name == current_file_name
-        || (path.extension().is_none()
-            && sidecar_name
-                .strip_suffix(".json")
-                .is_some_and(|stem| stem == current_file_name))
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-enum ResumeTempPruneScope {
-    ProductionDirectory(PathBuf),
-    CustomSidecar(PathBuf),
-}
-
-fn should_prune_resume_temps(path: &Path, parent: &Path, current_file_name: &str) -> bool {
-    static LAST_PRUNE: OnceLock<Mutex<HashMap<ResumeTempPruneScope, Instant>>> = OnceLock::new();
+fn should_prune_resume_temps(parent: &Path) -> bool {
+    static LAST_PRUNE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
 
     let now = Instant::now();
     let mut last_prune = LAST_PRUNE
@@ -286,32 +190,7 @@ fn should_prune_resume_temps(path: &Path, parent: &Path, current_file_name: &str
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     last_prune.retain(|_, last| now.saturating_duration_since(*last) < RESUME_TEMP_PRUNE_INTERVAL);
-    let production_scope = ResumeTempPruneScope::ProductionDirectory(parent.to_path_buf());
-    let requested_scope = if current_file_name.ends_with(".resume.json") {
-        production_scope.clone()
-    } else {
-        ResumeTempPruneScope::CustomSidecar(path.to_path_buf())
-    };
-    if last_prune.contains_key(&requested_scope) {
-        return false;
-    }
-    last_prune.insert(production_scope, now);
-    last_prune.insert(requested_scope, now);
-    true
-}
-
-fn write_and_rename(temp: &Path, path: &Path, payload: &[u8]) -> Result<(), String> {
-    let temp = tempfile::TempPath::try_from_path(temp.to_path_buf())
-        .map_err(|error| format!("prepare resume metadata temp: {error}"))?;
-    let mut file =
-        std::fs::File::create(&temp).map_err(|error| format!("create resume metadata: {error}"))?;
-    file.write_all(payload)
-        .map_err(|error| format!("write resume metadata: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("flush resume metadata: {error}"))?;
-    drop(file);
-    temp.persist(path)
-        .map_err(|error| format!("replace resume metadata: {}", error.error))
+    last_prune.insert(parent.to_path_buf(), now).is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +219,10 @@ pub trait ArticleSource: Send + Sync {
                 + 'a,
         >,
     >;
+
+    fn concurrency(&self) -> usize {
+        FETCH_CONCURRENCY
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +321,6 @@ pub fn decode_yenc_part(input: &[u8]) -> Result<DecodedYencPart, String> {
     let mut end_header = None;
     let mut in_payload = false;
     let mut output = Vec::new();
-    // A yEnc part can't exceed the whole file, so the `=ybegin size` header caps decoded output to stop a hostile article forcing us to buffer far more than the declared file before post-decode checks
     let mut decoded_cap = None;
 
     for line in input
@@ -561,24 +443,36 @@ pub fn decode_yenc_part(input: &[u8]) -> Result<DecodedYencPart, String> {
     })
 }
 
-pub fn decode_yenc(input: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(decode_yenc_part(input)?.data)
-}
-
 fn parse_yenc_header(line: &[u8], prefix: &str) -> Result<BTreeMap<String, String>, String> {
     let text = std::str::from_utf8(line).map_err(|_| "yEnc header is not ASCII".to_string())?;
     let remainder = text
         .strip_prefix(prefix)
         .ok_or_else(|| "invalid yEnc header".to_string())?;
     let mut fields = BTreeMap::new();
-    for token in remainder.split_ascii_whitespace() {
+    let name_at = remainder
+        .match_indices("name=")
+        .map(|(index, _)| index)
+        .find(|&index| index == 0 || remainder.as_bytes()[index - 1].is_ascii_whitespace());
+    let (keyed, name) = match name_at {
+        Some(index) => (&remainder[..index], Some(remainder[index + 5..].trim())),
+        None => (remainder, None),
+    };
+    for token in keyed.split_ascii_whitespace() {
         let Some((key, value)) = token.split_once('=') else {
             continue;
         };
-        if key.is_empty() || value.is_empty() {
+        if key.is_empty() {
             return Err("invalid yEnc header field".into());
         }
-        fields.insert(key.to_ascii_lowercase(), value.to_string());
+        if value.is_empty() {
+            continue;
+        }
+        fields
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| value.to_string());
+    }
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        fields.insert("name".into(), name.to_string());
     }
     Ok(fields)
 }
@@ -613,17 +507,56 @@ fn decode_yenc_line(line: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
+const fn build_crc32_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0xedb8_8320
             } else {
                 crc >> 1
             };
+            bit += 1;
         }
+        tables[0][index] = crc;
+        index += 1;
+    }
+    let mut index = 0;
+    while index < 256 {
+        let mut slice = 1;
+        while slice < 8 {
+            let previous = tables[slice - 1][index];
+            tables[slice][index] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            slice += 1;
+        }
+        index += 1;
+    }
+    tables
+}
+
+static CRC32_TABLES: [[u32; 256]; 8] = build_crc32_tables();
+
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+    let tables = &CRC32_TABLES;
+    let mut crc = 0xffff_ffffu32;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = tables[7][(low & 0xff) as usize]
+            ^ tables[6][((low >> 8) & 0xff) as usize]
+            ^ tables[5][((low >> 16) & 0xff) as usize]
+            ^ tables[4][(low >> 24) as usize]
+            ^ tables[3][(high & 0xff) as usize]
+            ^ tables[2][((high >> 8) & 0xff) as usize]
+            ^ tables[1][((high >> 16) & 0xff) as usize]
+            ^ tables[0][(high >> 24) as usize];
+    }
+    for byte in chunks.remainder() {
+        crc = (crc >> 8) ^ tables[0][((crc ^ *byte as u32) & 0xff) as usize];
     }
     !crc
 }
@@ -647,42 +580,51 @@ async fn validate_existing_receipts(
         return Err("assembled part is not a regular file".into());
     }
     limits.validate_file_size(metadata.len())?;
-    let mut file = tokio::fs::File::open(part_path)
-        .await
-        .map_err(|error| format!("open assembled part for validation: {error}"))?;
-    let mut valid = BTreeMap::new();
-    for (&number, receipt) in &sidecar.segment_receipts {
-        let Some(range) = receipt_range(receipt) else {
-            continue;
-        };
-        if range.end > metadata.len() {
-            continue;
+    let file_len = metadata.len();
+    let path = part_path.to_path_buf();
+    let receipts = sidecar.segment_receipts.clone();
+    let valid = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)
+            .map_err(|error| format!("open assembled part for validation: {error}"))?;
+        let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+        let mut valid = BTreeMap::new();
+        for (number, receipt) in receipts {
+            let Some(range) = receipt_range(&receipt) else {
+                continue;
+            };
+            if range.end > file_len {
+                continue;
+            }
+            if hash_file_range(&mut file, &mut buffer, receipt.offset, receipt.length)?
+                == receipt.sha256
+            {
+                valid.insert(number, receipt);
+            }
         }
-        if hash_file_range(&mut file, receipt.offset, receipt.length).await? == receipt.sha256 {
-            valid.insert(number, receipt.clone());
-        }
-    }
+        Ok::<_, String>(valid)
+    })
+    .await
+    .map_err(|error| format!("resume validation worker failed: {error}"))??;
     sidecar.completed_segments = valid.keys().copied().collect();
     sidecar.completed_bytes = completed_receipt_bytes(&valid)?;
     sidecar.segment_receipts = valid;
     Ok(())
 }
 
-async fn hash_file_range(
-    file: &mut tokio::fs::File,
+fn hash_file_range(
+    file: &mut std::fs::File,
+    buffer: &mut [u8],
     offset: u64,
     length: u64,
 ) -> Result<String, String> {
+    use std::io::{Read as _, Seek as _};
     file.seek(std::io::SeekFrom::Start(offset))
-        .await
         .map_err(|error| format!("seek assembled part for validation: {error}"))?;
     let mut hasher = Sha256::new();
     let mut remaining = length;
-    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
     while remaining > 0 {
         let wanted = remaining.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..wanted])
-            .await
             .map_err(|error| format!("read assembled part for validation: {error}"))?;
         hasher.update(&buffer[..wanted]);
         remaining -= wanted as u64;
@@ -692,6 +634,27 @@ async fn hash_file_range(
 
 fn ranges_overlap(left: YencRange, right: YencRange) -> bool {
     left.start < right.end && right.start < left.end
+}
+
+fn overlaps_occupied(
+    occupied: &BTreeMap<u64, (u64, u32)>,
+    invalid_receipts: &[u32],
+    range: YencRange,
+    number: u32,
+) -> bool {
+    if invalid_receipts.iter().any(|&invalid| invalid != number) {
+        return true;
+    }
+    let overlaps =
+        |(&start, &(end, _)): (&u64, &(u64, u32))| ranges_overlap(range, YencRange { start, end });
+    let before = occupied
+        .range(..=range.start)
+        .rev()
+        .find(|(_, (_, owner))| *owner != number);
+    let after = occupied
+        .range(range.start..)
+        .find(|(_, (_, owner))| *owner != number);
+    before.is_some_and(overlaps) || after.is_some_and(overlaps)
 }
 
 fn receipt_range(receipt: &ResumeSegment) -> Option<YencRange> {
@@ -802,7 +765,7 @@ fn validate_decoded_part(
     Ok(length)
 }
 
-/// Assemble all available articles and retain holes for unavailable segments
+#[cfg(test)]
 pub async fn assemble_file_with_report<S: ArticleSource>(
     output: &Path,
     segments: &[NzbSegment],
@@ -823,6 +786,7 @@ pub async fn assemble_file_with_report<S: ArticleSource>(
     .await
 }
 
+#[cfg(test)]
 pub async fn assemble_file_with_report_with_limits<S: ArticleSource>(
     output: &Path,
     segments: &[NzbSegment],
@@ -838,7 +802,6 @@ pub async fn assemble_file_with_report_with_limits<S: ArticleSource>(
     .await
 }
 
-/// Assemble articles while publishing progress relative to the whole task
 pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSource>(
     output: &Path,
     segments: &[NzbSegment],
@@ -953,7 +916,7 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
         resize_assembled_part(&mut file, size, limits).await?;
     }
     let mut resized_expected_size = sidecar.expected_size;
-    let mut segments_since_checkpoint = 0usize;
+    let mut bytes_since_checkpoint = 0u64;
     let mut last_checkpoint = Instant::now();
     let mut completed_receipt_bytes = sidecar.completed_bytes;
     let mut completed_article_bytes =
@@ -980,39 +943,46 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
         }};
     }
 
-    // Keep network fetches in flight while yielding decoded parts in manifest order; fixed batch size bounds completed payloads without trusting potentially inaccurate manifest byte counts
     let pending_segments = ordered
         .iter()
         .filter(|segment| !sidecar.completed_segments.contains(&segment.number))
         .collect::<Vec<_>>();
-    let mut batch_start = 0;
-    while batch_start < pending_segments.len() {
-        let batch_end = (batch_start + FETCH_CONCURRENCY).min(pending_segments.len());
-        let batch = &pending_segments[batch_start..batch_end];
-        let mut fetches = FuturesUnordered::new();
-        for (order, segment) in batch.iter().enumerate() {
-            let segment = (*segment).clone();
+    let window = source.concurrency().clamp(1, MAX_FETCH_WINDOW);
+    let mut queue = pending_segments.into_iter();
+    let mut fetches = FuturesUnordered::new();
+    let mut occupied = BTreeMap::<u64, (u64, u32)>::new();
+    let mut invalid_receipts = Vec::new();
+    for (&number, receipt) in &sidecar.segment_receipts {
+        match receipt_range(receipt) {
+            Some(range) => {
+                occupied.insert(range.start, (range.end, number));
+            }
+            None => invalid_receipts.push(number),
+        }
+    }
+    loop {
+        while fetches.len() < window {
+            let Some(segment) = queue.next() else {
+                break;
+            };
+            let segment = segment.clone();
             let message_id = segment.message_id.clone();
             fetches.push(async move {
                 let result = source.fetch(&message_id).await;
-                (order, segment, result)
+                (segment, result)
             });
         }
-        let mut fetched = Vec::with_capacity(batch.len());
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    return_after_checkpoint!("Download cancelled".into());
-                }
-                result = fetches.next() => match result {
-                    Some(result) => fetched.push(result),
-                    None => break,
-                },
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return_after_checkpoint!("Download cancelled".into());
             }
-        }
-        fetched.sort_by_key(|(order, _, _)| *order);
-        for (_, segment, fetch_result) in fetched {
+            next = fetches.next() => next,
+        };
+        let Some((segment, fetch_result)) = next else {
+            break;
+        };
+        {
             if cancel.is_cancelled() {
                 return_after_checkpoint!("Download cancelled".into());
             }
@@ -1072,13 +1042,7 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
                 length: receipt_length,
                 sha256: hex::encode(Sha256::digest(&decoded.data)),
             };
-            if sidecar.segment_receipts.iter().any(|(&number, receipt)| {
-                number != segment.number
-                    && match receipt_range(receipt) {
-                        Some(existing_range) => ranges_overlap(decoded.range, existing_range),
-                        None => true,
-                    }
-            }) {
+            if overlaps_occupied(&occupied, &invalid_receipts, decoded.range, segment.number) {
                 return_after_checkpoint!("yEnc part overlaps a completed segment".into());
             }
             if resized_expected_size != Some(expected_size) {
@@ -1096,6 +1060,7 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
             if let Err(error) = file.write_all(&decoded.data).await {
                 return_after_checkpoint!(format!("write assembled part: {error}"));
             }
+            occupied.insert(decoded.range.start, (decoded.range.end, segment.number));
             sidecar.completed_segments.insert(segment.number);
             sidecar
                 .segment_receipts
@@ -1110,17 +1075,17 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
                 None => return_after_checkpoint!("NZB article byte count overflowed".into()),
             };
             sidecar.completed_bytes = completed_receipt_bytes;
-            segments_since_checkpoint = segments_since_checkpoint.saturating_add(1);
-            if segments_since_checkpoint >= CHECKPOINT_SEGMENT_INTERVAL
+            bytes_since_checkpoint =
+                bytes_since_checkpoint.saturating_add(candidate_receipt.length);
+            if bytes_since_checkpoint >= CHECKPOINT_BYTE_INTERVAL
                 || last_checkpoint.elapsed() >= CHECKPOINT_TIME_INTERVAL
             {
                 checkpoint(&mut file, &sidecar, &sidecar_path).await?;
-                segments_since_checkpoint = 0;
+                bytes_since_checkpoint = 0;
                 last_checkpoint = Instant::now();
             }
             publish_assembly_progress(progress, progress_base, completed_article_bytes);
         }
-        batch_start = batch_end;
     }
     checkpoint(&mut file, &sidecar, &sidecar_path).await?;
     file.sync_all()
@@ -1184,25 +1149,6 @@ fn completed_article_bytes(
         })
 }
 
-/// Compatibility wrapper for callers that require every article to be present
-pub async fn assemble_file<S: ArticleSource>(
-    output: &Path,
-    segments: &[NzbSegment],
-    source: &S,
-    cancel: &CancellationToken,
-    progress: Option<&AtomicU64>,
-) -> Result<PathBuf, String> {
-    let report = assemble_file_with_report(output, segments, source, cancel, progress).await?;
-    if !report.complete {
-        return Err(format!(
-            "article unavailable for NZB segments {:?}",
-            report.unavailable_segments
-        ));
-    }
-    Ok(report.output)
-}
-
-/// Persist that a verified PAR2 repair promoted `report.output` successfully
 pub async fn mark_par2_repaired(report: &AssemblyReport) -> Result<(), String> {
     let metadata = tokio::fs::metadata(&report.output)
         .await
@@ -1221,9 +1167,24 @@ pub async fn mark_par2_repaired(report: &AssemblyReport) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn yenc_name_runs_to_end_of_line_and_empty_tokens_are_ignored() {
+        let header = parse_yenc_header(
+            b"=ybegin part=1 size=10 line= name=My Show part=2 size=3.mkv",
+            "=ybegin",
+        )
+        .unwrap();
+        assert_eq!(header.get("name").unwrap(), "My Show part=2 size=3.mkv");
+        assert_eq!(header.get("part").unwrap(), "1");
+        assert_eq!(header.get("size").unwrap(), "10");
+        assert!(!header.contains_key("line"));
+    }
+
     use super::*;
+    use crate::traits::process_may_be_running;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::SystemTime;
 
     #[derive(Default)]
     struct FakeSource {
@@ -1387,7 +1348,7 @@ mod tests {
     fn decodes_yenc_escapes() {
         let payload = b"a\n=\r\0z";
         let encoded = encode_yenc_part(payload, 1, payload.len() as u64);
-        assert_eq!(decode_yenc(&encoded).unwrap(), payload);
+        assert_eq!(decode_yenc_part(&encoded).unwrap().data, payload);
     }
 
     #[test]
@@ -1438,40 +1399,36 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_resume_replace_removes_its_temp_file() {
+    #[tokio::test]
+    async fn failed_resume_save_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("existing-directory");
         std::fs::create_dir(&target).unwrap();
-        let temp = dir
-            .path()
-            .join(format!("resume.json.{}.0.tmp", std::process::id()));
 
-        assert!(write_and_rename(&temp, &target, b"partial").is_err());
-        assert!(!temp.exists());
+        let state = ResumeSidecar::new("abc".into());
+        assert!(state.save_atomic(&target).await.is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("existing-directory")]);
     }
 
     #[test]
-    fn custom_resume_sidecars_have_independent_prune_scopes() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-
-        assert!(should_prune_resume_temps(&first, dir.path(), "first"));
-        assert!(should_prune_resume_temps(&second, dir.path(), "second"));
-        assert!(!should_prune_resume_temps(&first, dir.path(), "first"));
-        assert!(!should_prune_resume_temps(
-            &dir.path().join("file.resume.json"),
-            dir.path(),
-            "file.resume.json"
-        ));
+    fn resume_prune_is_throttled_per_directory() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        assert!(should_prune_resume_temps(first.path()));
+        assert!(should_prune_resume_temps(second.path()));
+        assert!(!should_prune_resume_temps(first.path()));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn loading_extensionless_resume_sidecar_prunes_only_dead_process_temps() {
+    async fn loading_a_resume_sidecar_prunes_only_dead_process_temps() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("resume");
+        let path = dir.path().join("resume.json");
         let mut dead_process = std::process::Command::new("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
@@ -1479,38 +1436,18 @@ mod tests {
         let dead_pid = dead_process.id();
         dead_process.wait().unwrap();
         assert!(!process_may_be_running(dead_pid));
-        let mut live_process = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        let live_pid = live_process.id();
-        assert!(process_may_be_running(live_pid));
-        let stale = path.with_extension(format!("json.{dead_pid}.7.tmp"));
-        let production_stale = dir
+        let stale = dir.path().join(format!(".risuko-atomic-{dead_pid}-a.tmp"));
+        let recent = dir.path().join(format!(".risuko-atomic-{dead_pid}-b.tmp"));
+        let active = dir
             .path()
-            .join(format!("finished.bin.resume.json.{dead_pid}.8.tmp"));
-        let recent = path.with_extension(format!("json.{dead_pid}.9.tmp"));
-        let active = path.with_extension(format!("json.{}.9.tmp", std::process::id()));
-        let live = path.with_extension(format!("json.{live_pid}.10.tmp"));
-        let other_path = dir.path().join("other-resume");
-        let other_stale = other_path.with_extension(format!("json.{dead_pid}.11.tmp"));
-        let unrelated = path.with_extension("json.backup.tmp");
-        tokio::fs::write(&stale, b"partial").await.unwrap();
-        tokio::fs::write(&production_stale, b"partial")
-            .await
-            .unwrap();
-        tokio::fs::write(&recent, b"in flight").await.unwrap();
-        tokio::fs::write(&active, b"active").await.unwrap();
-        tokio::fs::write(&live, b"live foreign process")
-            .await
-            .unwrap();
-        tokio::fs::write(&other_stale, b"other custom sidecar")
-            .await
-            .unwrap();
-        tokio::fs::write(&unrelated, b"keep").await.unwrap();
+            .join(format!(".risuko-atomic-{}-c.tmp", std::process::id()));
+        let unrelated = dir.path().join("resume.json.backup.tmp");
+        for file in [&stale, &recent, &active, &unrelated] {
+            tokio::fs::write(file, b"x").await.unwrap();
+        }
         let stale_time = std::fs::FileTimes::new()
-            .set_modified(SystemTime::now() - RESUME_TEMP_STALE_AGE - Duration::from_secs(1));
-        for candidate in [&stale, &production_stale, &active, &live, &other_stale] {
+            .set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60));
+        for candidate in [&stale, &active] {
             std::fs::File::open(candidate)
                 .unwrap()
                 .set_times(stale_time)
@@ -1518,38 +1455,11 @@ mod tests {
         }
 
         ResumeSidecar::load(&path, "manifest").await.unwrap();
-        let live_was_preserved = live.exists();
-        let _ = live_process.kill();
-        let _ = live_process.wait();
 
         assert!(!stale.exists());
-        assert!(!production_stale.exists());
         assert!(recent.exists());
         assert!(active.exists());
-        assert!(live_was_preserved);
-        assert!(other_stale.exists());
         assert!(unrelated.exists());
-
-        ResumeSidecar::load(&other_path, "manifest").await.unwrap();
-        assert!(!other_stale.exists());
-
-        let throttled = dir
-            .path()
-            .join(format!("later.bin.resume.json.{dead_pid}.12.tmp"));
-        tokio::fs::write(&throttled, b"old but discovered after the scan")
-            .await
-            .unwrap();
-        std::fs::File::open(&throttled)
-            .unwrap()
-            .set_times(stale_time)
-            .unwrap();
-        ResumeSidecar::load(&dir.path().join("another.bin.resume.json"), "manifest")
-            .await
-            .unwrap();
-        assert!(
-            throttled.exists(),
-            "the same directory should not be rescanned for every NZB file"
-        );
     }
 
     #[tokio::test]
@@ -1654,7 +1564,7 @@ mod tests {
         assert!(report.complete);
         assert_eq!(
             source.progress_before_second_fetch.load(Ordering::Relaxed),
-            7
+            24
         );
         assert_eq!(progress.load(Ordering::Relaxed), 43);
     }

@@ -7,14 +7,12 @@ use crate::engine::rss::types::RssRule;
 use crate::engine::rss::RssManager;
 use crate::state::AppState;
 
-/// Strip the explicit `out` filename hint when fanning extra inline media URLs out as separate http tasks — otherwise every queued image would land at the same path and clobber each other. The `dir` and other routing options stay
 fn strip_explicit_filename(opts: &Map<String, Value>) -> Map<String, Value> {
     let mut cloned = opts.clone();
     cloned.remove("out");
     cloned
 }
 
-/// Write an Article-kind RSS item's body as a self-contained HTML file under `dir`, mark it downloaded, then queue every inline media URL (the primary enclosure plus scraped `media_urls`) as separate http tasks alongside it. Returns the saved file path and the list of fanned-out media gids. Used by both the one-shot and tracked download paths so they stay in lockstep
 async fn write_article_and_fan_media(
     mgr: &Arc<RssManager>,
     manager: &Arc<crate::engine::manager::TaskManager>,
@@ -138,7 +136,6 @@ pub async fn get_rss_rules(state: State<'_, AppState>) -> Result<Value, String> 
     serde_json::to_value(rules).map_err(|e| e.to_string())
 }
 
-/// Resolve the destination directory from per-task options, falling back to the engine's global default
 async fn resolve_dir(
     opts: &Map<String, Value>,
     manager: &std::sync::Arc<crate::engine::manager::TaskManager>,
@@ -164,18 +161,6 @@ pub async fn delete_rss_items(
 }
 
 #[tauri::command]
-pub async fn mark_rss_downloaded(
-    state: State<'_, AppState>,
-    feed_id: String,
-    item_id: String,
-    download_path: Option<String>,
-) -> Result<(), String> {
-    let mgr = state.rss.clone();
-    mgr.mark_item_downloaded(&feed_id, &item_id, download_path)
-        .await
-}
-
-#[tauri::command]
 pub async fn clear_rss_download(
     state: State<'_, AppState>,
     feed_id: String,
@@ -195,7 +180,6 @@ pub async fn read_rss_download(
     let path = mgr.get_item_download_path(&feed_id, &item_id).await?;
     let p = std::path::Path::new(&path);
 
-    // Also check for .part file (download renames from this on completion)
     let actual = if p.exists() {
         p.to_path_buf()
     } else {
@@ -210,12 +194,26 @@ pub async fn read_rss_download(
         }
     };
 
-    tokio::fs::read_to_string(&actual)
+    read_text_capped(&actual).await
+}
+
+const MAX_RSS_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+
+async fn read_text_capped(path: &std::path::Path) -> Result<String, String> {
+    let len = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Failed to read file: {}", e))?
+        .len();
+    if len > MAX_RSS_TEXT_BYTES {
+        return Err(format!(
+            "File is too large to preview ({len} bytes, limit {MAX_RSS_TEXT_BYTES})"
+        ));
+    }
+    tokio::fs::read_to_string(path)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))
 }
 
-/// Start an RSS item download and monitor its status in a background task Returns immediately with the gid. Emits `rss:download-complete` or `rss:download-error` events when the download finishes
 #[tauri::command]
 pub async fn download_rss_item_tracked(
     handle: AppHandle,
@@ -240,7 +238,6 @@ pub async fn download_rss_item_tracked(
     let kind = crate::engine::rss::classify_item_kind(&item);
 
     if kind == crate::engine::rss::ItemKind::Article {
-        // Article: write the HTML synchronously, queue inline media, fire the completion event immediately. There is no engine gid for the html file itself, but the inline media tasks behave like normal http downloads
         let (path_str, extra_gids) =
             write_article_and_fan_media(&mgr, &manager, &item, &feed_id, &item_id, &dir, &opts)
                 .await?;
@@ -293,7 +290,6 @@ pub async fn download_rss_item_tracked(
         }
     }
 
-    // Spawn a background task to monitor download completion
     let monitor_gid = gid.clone();
     let monitor_feed_id = feed_id.clone();
     let monitor_item_id = item_id.clone();
@@ -301,27 +297,44 @@ pub async fn download_rss_item_tracked(
     let monitor_mgr = mgr.clone();
 
     tauri::async_runtime::spawn(async move {
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-        const MAX_POLLS: usize = 3600;
+        const MAX_CONSECUTIVE_MISSES: u32 = 30;
 
-        for _ in 0..MAX_POLLS {
-            tokio::time::sleep(POLL_INTERVAL).await;
+        let mut polls: u64 = 0;
+        let mut misses: u32 = 0;
+        loop {
+            tokio::time::sleep(rss_poll_delay(polls)).await;
+            polls += 1;
 
-            let engine = match crate::engine::get_manager().await {
-                Some(m) => m,
-                None => break,
+            let status_result = match crate::engine::get_manager().await {
+                Some(engine) => {
+                    engine
+                        .tell_status(&monitor_gid, &["status".to_string()])
+                        .await
+                }
+                None => Err("engine not running".to_string()),
             };
 
-            let status_result = engine
-                .tell_status(
-                    &monitor_gid,
-                    &["status".to_string(), "dir".to_string(), "files".to_string()],
-                )
-                .await;
-
             let status_val = match status_result {
-                Ok(val) => val,
-                Err(_) => break,
+                Ok(val) => {
+                    misses = 0;
+                    val
+                }
+                Err(_) => {
+                    misses += 1;
+                    if misses >= MAX_CONSECUTIVE_MISSES {
+                        let _ = handle.emit(
+                            "rss:download-error",
+                            serde_json::json!({
+                                "feedId": monitor_feed_id,
+                                "itemId": monitor_item_id,
+                                "gid": monitor_gid,
+                                "reason": "engine-unavailable",
+                            }),
+                        );
+                        return;
+                    }
+                    continue;
+                }
             };
             let status = status_val
                 .get("status")
@@ -330,17 +343,24 @@ pub async fn download_rss_item_tracked(
 
             match status {
                 "complete" => {
-                    // Prefer the pre-computed path from opts; when absent, derive it from the completed task's file list reported by the engine
-                    let resolved_path = monitor_download_path.clone().or_else(|| {
-                        status_val
-                            .get("files")
-                            .and_then(|f| f.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|f| f.get("path"))
-                            .and_then(|p| p.as_str())
-                            .filter(|p| !p.is_empty())
-                            .map(|p| p.to_string())
-                    });
+                    let mut resolved_path = monitor_download_path.clone();
+                    if resolved_path.is_none() {
+                        if let Some(engine) = crate::engine::get_manager().await {
+                            let files = engine
+                                .tell_status(&monitor_gid, &["files".to_string()])
+                                .await
+                                .ok();
+                            resolved_path = files
+                                .as_ref()
+                                .and_then(|v| v.get("files"))
+                                .and_then(|f| f.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|f| f.get("path"))
+                                .and_then(|p| p.as_str())
+                                .filter(|p| !p.is_empty())
+                                .map(|p| p.to_string());
+                        }
+                    }
                     let _ = monitor_mgr
                         .mark_item_downloaded(
                             &monitor_feed_id,
@@ -374,17 +394,6 @@ pub async fn download_rss_item_tracked(
                 _ => {}
             }
         }
-
-        // Timed out
-        let _ = handle.emit(
-            "rss:download-error",
-            serde_json::json!({
-                "feedId": monitor_feed_id,
-                "itemId": monitor_item_id,
-                "gid": monitor_gid,
-                "reason": "timeout",
-            }),
-        );
     });
 
     Ok(serde_json::json!({
@@ -395,20 +404,15 @@ pub async fn download_rss_item_tracked(
     }))
 }
 
+fn rss_poll_delay(polls: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((1 + polls / 30).min(5))
+}
+
 #[tauri::command]
 pub async fn update_rss_rule(state: State<'_, AppState>, rule: RssRule) -> Result<Value, String> {
     let mgr = state.rss.clone();
     let updated = mgr.update_rule(rule).await?;
     serde_json::to_value(updated).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn reorder_rss_rules(
-    state: State<'_, AppState>,
-    ordered_ids: Vec<String>,
-) -> Result<(), String> {
-    let mgr = state.rss.clone();
-    mgr.reorder_rules(ordered_ids).await
 }
 
 #[tauri::command]
@@ -420,12 +424,6 @@ pub async fn dry_run_rss_rule(
     let mgr = state.rss.clone();
     let results = mgr.dry_run_rule(rule, sample_size.unwrap_or(50)).await;
     serde_json::to_value(results).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn parse_rss_item_title(title: String) -> Result<Value, String> {
-    let parsed = crate::engine::rss::parser::parse_title(&title);
-    serde_json::to_value(parsed).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -445,4 +443,29 @@ pub async fn mark_rss_items_read(
 ) -> Result<(), String> {
     let mgr = state.rss.clone();
     mgr.mark_items_read(entries).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_text_capped_rejects_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, "hello").unwrap();
+        assert_eq!(read_text_capped(&small).await.unwrap(), "hello");
+
+        let big = dir.path().join("big.bin");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_RSS_TEXT_BYTES + 1).unwrap();
+        assert!(read_text_capped(&big).await.is_err());
+    }
+
+    #[test]
+    fn poll_delay_backs_off_and_caps() {
+        assert_eq!(rss_poll_delay(0).as_secs(), 1);
+        assert_eq!(rss_poll_delay(30).as_secs(), 2);
+        assert_eq!(rss_poll_delay(10_000).as_secs(), 5);
+    }
 }

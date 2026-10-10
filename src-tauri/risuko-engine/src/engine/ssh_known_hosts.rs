@@ -1,5 +1,3 @@
-//! Process-wide SSH/SFTP TOFU known-hosts store: records `host:port` -> SHA256 fingerprint on first connect, rejects any subsequent mismatch, backed by a JSON file under the user config dir and shared by the SFTP download path and upload sink
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -28,28 +26,10 @@ impl KnownHosts {
     }
 
     fn write_to_disk(path: &std::path::Path, map: &HashMap<String, String>) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
-        }
         let s =
             serde_json::to_string_pretty(map).map_err(|e| format!("serialize known_hosts: {e}"))?;
-        // Atomic replace: write to a sibling temp file, fsync, then rename over the target so a partial write can never truncate the existing pinned-host state
-        let tmp = path.with_extension("json.tmp");
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| format!("create {}: {e}", tmp.display()))?;
-            f.write_all(s.as_bytes())
-                .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-            f.sync_all()
-                .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            // best-effort cleanup of the temp file
-            let _ = std::fs::remove_file(&tmp);
-            format!("rename {} -> {}: {e}", tmp.display(), path.display())
-        })
+        // A partial write must never truncate existing pinned hosts
+        crate::traits::write_file_atomically(path, s.as_bytes())
     }
 }
 
@@ -61,7 +41,6 @@ pub fn fingerprint(key: &russh::keys::PublicKey) -> Result<String, russh::Error>
     Ok(format!("SHA256:{}", STANDARD_NO_PAD.encode(h.finalize())))
 }
 
-/// SSH client handler enforcing TOFU host-key verification: consults the shared known-hosts store — accept on match, refuse on mismatch, pin-and-persist on first sight; if persisting fails the connection is refused so a future mismatch can't go silently undetected
 pub struct TofuHandler {
     pub host_key: String,
 }

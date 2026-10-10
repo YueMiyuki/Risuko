@@ -20,10 +20,15 @@ pub struct AppState {
     pub vault: Arc<VaultManager>,
     pub log_dir: PathBuf,
     pub last_clipboard_self_write: Mutex<Option<String>>,
+    #[cfg(not(target_os = "android"))]
     pub last_clipboard_seen: Mutex<Option<String>>,
     pub pending_clip_uri: Mutex<Option<String>>,
     #[cfg(not(target_os = "android"))]
     pub tray_anchor: Mutex<Option<(f64, f64, f64, f64)>>,
+    #[cfg(not(target_os = "android"))]
+    pub flyout_gate: Mutex<crate::managers::panel_gate::PanelGate>,
+    #[cfg(not(target_os = "android"))]
+    pub clip_gate: Mutex<crate::managers::panel_gate::PanelGate>,
     pub _log_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -35,7 +40,7 @@ impl AppState {
         log_guard: tracing_appender::non_blocking::WorkerGuard,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let event_sink: Arc<dyn risuko_engine::EventSink> = Arc::new(risuko_engine::NoopEventSink);
-        let rss_manager = RssManager::new(storage.clone(), event_sink.clone());
+        let rss_manager = RssManager::new(storage.clone());
         if let Err(e) = rss_manager.load() {
             tracing::warn!("Failed to load RSS data: {}", e);
         }
@@ -54,19 +59,26 @@ impl AppState {
         if let Err(e) = upload_manager.load() {
             tracing::warn!("Failed to load upload sinks: {}", e);
         }
+        let vault = Arc::new(VaultManager::new());
+        vault.warm_up();
         Ok(Self {
             config: Mutex::new(config),
             is_quitting: AtomicBool::new(false),
             rss: Arc::new(rss_manager),
             stats: Arc::new(stats_manager),
             upload_sinks: Arc::new(upload_manager),
-            vault: Arc::new(VaultManager::new()),
+            vault,
             log_dir,
             last_clipboard_self_write: Mutex::new(None),
+            #[cfg(not(target_os = "android"))]
             last_clipboard_seen: Mutex::new(None),
             pending_clip_uri: Mutex::new(None),
             #[cfg(not(target_os = "android"))]
             tray_anchor: Mutex::new(None),
+            #[cfg(not(target_os = "android"))]
+            flyout_gate: Mutex::new(Default::default()),
+            #[cfg(not(target_os = "android"))]
+            clip_gate: Mutex::new(Default::default()),
             _log_guard: log_guard,
         })
     }

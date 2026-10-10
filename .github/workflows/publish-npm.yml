@@ -1,6 +1,9 @@
 name: Publish npm packages
 
 on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -12,7 +15,8 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
   id-token: write
 
 env:
@@ -21,8 +25,67 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  meta:
+    name: Resolve version
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dist_tag: ${{ steps.version.outputs.dist_tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - name: Require every app build of the release to have succeeded
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          jobs=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '.jobs[] | select(.name | test("^(Release \\(|Build updater latest.json)")) | "\(.conclusion)\t\(.name)"')
+          echo "$jobs"
+          if [[ -z "$jobs" ]] || grep -qv '^success' <<< "$jobs"; then
+            echo "::error::Release builds did not all succeed; nothing is published to npm"
+            exit 1
+          fi
+
+      - name: Download release metadata
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-meta
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Resolve version and npm dist-tag
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            raw=$(node -p "require('./release-meta.json').tag")
+            sha="$RUN_SHA"
+          else
+            raw="$INPUT_VERSION"
+            sha="$GITHUB_SHA"
+          fi
+          version="${raw#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$raw' is not a version of the form X.Y.Z or X.Y.Z-pre"
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then dist_tag=next; else dist_tag=latest; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   build-cli:
     name: CLI (${{ matrix.target }})
+    needs: meta
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -55,6 +118,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+
+      - name: Stamp release version
+        run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -87,11 +155,9 @@ jobs:
           name: cli-${{ matrix.npm_dir }}
           path: src-tauri/target/${{ matrix.target }}/release/${{ matrix.binary }}
 
-  # ───────────────────────────────────────────────────────
-  # Build risuko-napi native modules for all platforms
-  # ───────────────────────────────────────────────────────
   build-napi:
     name: NAPI (${{ matrix.target }})
+    needs: meta
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -124,6 +190,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+
+      - name: Stamp release version
+        run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -153,7 +224,6 @@ jobs:
       - name: Rename .node artifact
         shell: bash
         run: |
-          # cdylib output varies by platform
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             src="src-tauri/target/${{ matrix.target }}/release/risuko_napi.dll"
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
@@ -169,15 +239,14 @@ jobs:
           name: napi-${{ matrix.npm_dir }}
           path: ${{ matrix.node_file }}
 
-  # ───────────────────────────────────────────────────────
-  # Publish all npm packages
-  # ───────────────────────────────────────────────────────
   publish:
     name: Publish to npm
-    needs: [build-cli, build-napi]
+    needs: [meta, build-cli, build-napi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -201,7 +270,7 @@ jobs:
           path: artifacts/napi
 
       - name: Set version in all package.json files
-        run: node scripts/set-npm-version.mjs ${{ inputs.version }}
+        run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - name: Stage CLI platform packages
         shell: bash
@@ -211,14 +280,13 @@ jobs:
             platform=$(basename "$dir")
             echo "Staging CLI binary for $platform"
             artifact_dir="artifacts/cli/cli-${platform}"
-            if [ -d "$artifact_dir" ]; then
-              cp "$artifact_dir"/* "$dir"
-              # Ensure binary is executable
-              chmod +x "$dir"risuko 2>/dev/null || true
-              ls -la "$dir"
-            else
-              echo "::warning::No CLI artifact for $platform"
+            if [ ! -d "$artifact_dir" ]; then
+              echo "::error::No CLI artifact for $platform"
+              exit 1
             fi
+            cp "$artifact_dir"/* "$dir"
+            chmod +x "$dir"risuko 2>/dev/null || true
+            ls -la "$dir"
           done
 
       - name: Stage NAPI platform packages
@@ -229,61 +297,49 @@ jobs:
             platform=$(basename "$dir")
             echo "Staging NAPI module for $platform"
             artifact_dir="artifacts/napi/napi-${platform}"
-            if [ -d "$artifact_dir" ]; then
-              cp "$artifact_dir"/* "$dir"
-              ls -la "$dir"
-            else
-              echo "::warning::No NAPI artifact for $platform"
+            if [ ! -d "$artifact_dir" ]; then
+              echo "::error::No NAPI artifact for $platform"
+              exit 1
             fi
+            cp "$artifact_dir"/* "$dir"
+            ls -la "$dir"
           done
 
-      - name: Publish @risuko/cli-* platform packages
+      - name: Publish packages
         if: ${{ !inputs.dry_run }}
         shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          DIST_TAG: ${{ needs.meta.outputs.dist_tag }}
         run: |
           set -euo pipefail
-          for dir in packages/risuko-cli/npm/*/; do
-            echo "Publishing $(basename "$dir")..."
-            (cd "$dir" && npm publish --access public --provenance) || echo "::warning::Failed to publish $(basename "$dir")"
+          publish() {
+            local dir="$1" name
+            name=$(node -p "require('./$dir/package.json').name")
+            if [[ "$(npm view "$name@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
+              echo "$name@$VERSION is already published, skipping"
+              return
+            fi
+            echo "Publishing $name@$VERSION ($DIST_TAG)"
+            (cd "$dir" && npm publish --access public --provenance --tag "$DIST_TAG")
+          }
+          for dir in packages/risuko-cli/npm/*/ packages/risuko-js/npm/*/; do
+            publish "${dir%/}"
           done
-
-      - name: Publish risuko-cli main package
-        if: ${{ !inputs.dry_run }}
-        working-directory: packages/risuko-cli
-        run: npm publish --access public --provenance
-
-      - name: Publish @risuko/js-* platform packages
-        if: ${{ !inputs.dry_run }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for dir in packages/risuko-js/npm/*/; do
-            echo "Publishing $(basename "$dir")..."
-            (cd "$dir" && npm publish --access public --provenance) || echo "::warning::Failed to publish $(basename "$dir")"
-          done
-
-      - name: Publish risuko-js main package
-        if: ${{ !inputs.dry_run }}
-        working-directory: packages/risuko-js
-        run: npm publish --access public --provenance
-
-      - name: Publish @risuko/app launcher package
-        if: ${{ !inputs.dry_run }}
-        working-directory: packages/risuko-app
-        run: npm publish --access public --provenance
+          publish packages/risuko-cli
+          publish packages/risuko-js
+          publish packages/risuko-app
 
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          DIST_TAG: ${{ needs.meta.outputs.dist_tag }}
         run: |
-          echo "## Dry run — would publish these packages:" >> $GITHUB_STEP_SUMMARY
-          for dir in packages/risuko-cli/npm/*/; do
-            pkg=$(node -p "require('./$dir/package.json').name")
-            echo "- $pkg@${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          echo "## Dry run: would publish with dist-tag $DIST_TAG" >> "$GITHUB_STEP_SUMMARY"
+          for dir in packages/risuko-cli/npm/*/ packages/risuko-js/npm/*/ packages/risuko-cli packages/risuko-js packages/risuko-app; do
+            pkg=$(node -p "require('./${dir%/}/package.json').name")
+            echo "- $pkg@$VERSION" >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "- risuko-cli@${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          for dir in packages/risuko-js/npm/*/; do
-            pkg=$(node -p "require('./$dir/package.json').name")
-            echo "- $pkg@${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          done
-          echo "- risuko-js@${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- @risuko/app@${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY

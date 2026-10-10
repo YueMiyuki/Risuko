@@ -6,22 +6,26 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use risuko_bt::limiter::Throttle;
 use russh::client;
-use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::{error::Error as SftpError, RawSftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use super::ftp_download::{http_proxy_from_options, option_str};
+use super::ftp_download::{
+    host_port, http_proxy_from_options, option_str, output_filename, read_timeout_from_options,
+    retry_transient,
+};
 use super::FtpUri;
+use crate::engine::options::json_bool;
 use crate::engine::speed_limiter::{SpeedEma, SpeedLimiter};
 use crate::engine::ssh_known_hosts::TofuHandler;
 
 const PART_SUFFIX: &str = ".part";
 const BUF_SIZE: usize = 64 * 1024;
-const SFTP_READ_AHEAD: usize = 6;
+const SFTP_READ_AHEAD: usize = 64;
 
 struct SftpReadChunk {
     offset: u64,
@@ -55,15 +59,15 @@ impl OrderedChunkBuffer {
     }
 }
 
-fn next_sftp_read_len(file_size: u64, offset: u64) -> Option<usize> {
+fn next_sftp_read_len(file_size: u64, offset: u64, max_len: usize) -> Option<usize> {
     if file_size > 0 {
         if offset >= file_size {
             None
         } else {
-            Some(BUF_SIZE.min((file_size - offset) as usize))
+            Some(max_len.min((file_size - offset) as usize))
         }
     } else {
-        Some(BUF_SIZE)
+        Some(max_len)
     }
 }
 
@@ -104,7 +108,21 @@ async fn read_sftp_range(
     })
 }
 
-/// Run an SFTP download
+async fn next_read<S, T>(
+    reads: &mut FuturesUnordered<S>,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<T>, String>
+where
+    S: std::future::Future<Output = T>,
+{
+    match timeout {
+        Some(limit) => tokio::time::timeout(limit, reads.next())
+            .await
+            .map_err(|_| "SFTP read error: timed out".to_string()),
+        None => Ok(reads.next().await),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sftp_download(
     parsed: &FtpUri,
@@ -128,11 +146,7 @@ pub async fn run_sftp_download(
     let dir_path = Path::new(dir);
     fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
-    let filename = if out.is_empty() {
-        super::ftp_download::basename_from_ftp_path(&parsed.path)
-    } else {
-        out.to_string()
-    };
+    let filename = output_filename(&parsed.path, out);
 
     let part_name = if filename.ends_with(PART_SUFFIX) {
         filename.clone()
@@ -140,8 +154,8 @@ pub async fn run_sftp_download(
         format!("{filename}{PART_SUFFIX}")
     };
     let part_path = dir_path.join(&part_name);
+    let _part_claim = super::PartClaim::acquire(&part_path)?;
 
-    // Resolve credentials
     let user = parsed
         .user
         .clone()
@@ -158,10 +172,77 @@ pub async fn run_sftp_download(
     let private_key_source = option_str(options, "sftp-private-key");
     let key_passphrase = option_str(options, "sftp-private-key-passphrase");
 
-    // Connect via SSH
-    let config = Arc::new(client::Config::default());
+    let throttle = Throttle::new(global_limiter, task_limiter);
+    let job = SftpJob {
+        parsed,
+        options,
+        part_path: &part_path,
+        user: &user,
+        password: password.as_deref(),
+        private_key_source: private_key_source.as_deref(),
+        key_passphrase: key_passphrase.as_deref(),
+        total: &total,
+        completed: &completed,
+        speed: &speed,
+        connections: &connections,
+        cancel_token: &cancel_token,
+        throttle: &throttle,
+        read_timeout: read_timeout_from_options(options),
+    };
+    retry_transient(options, &cancel_token, || sftp_attempt(&job)).await?;
 
-    let addr = format!("{}:{}", parsed.host, parsed.port);
+    let auto_rename = options
+        .get("auto-file-renaming")
+        .and_then(json_bool)
+        .unwrap_or(true);
+    let final_path =
+        super::ftp_download::finalize_download(&part_path, &filename, dir_path, auto_rename)?;
+    tracing::info!("SFTP download complete: {}", final_path.display());
+    Ok(final_path)
+}
+
+struct SftpJob<'a> {
+    parsed: &'a FtpUri,
+    options: &'a Map<String, Value>,
+    part_path: &'a Path,
+    user: &'a str,
+    password: Option<&'a str>,
+    private_key_source: Option<&'a str>,
+    key_passphrase: Option<&'a str>,
+    total: &'a Arc<AtomicU64>,
+    completed: &'a Arc<AtomicU64>,
+    speed: &'a Arc<AtomicU64>,
+    connections: &'a Arc<AtomicU32>,
+    cancel_token: &'a CancellationToken,
+    throttle: &'a Throttle,
+    read_timeout: Option<std::time::Duration>,
+}
+
+async fn sftp_attempt(job: &SftpJob<'_>) -> Result<(), String> {
+    let parsed = job.parsed;
+    let options = job.options;
+    let part_path = job.part_path;
+    let total = job.total;
+    let completed = job.completed;
+    let speed = job.speed;
+    let connections = job.connections;
+    let cancel_token = job.cancel_token;
+    let throttle = job.throttle;
+    let read_timeout = job.read_timeout;
+    let user = job.user;
+    let password = job.password;
+    let private_key_source = job.private_key_source;
+    let key_passphrase = job.key_passphrase;
+
+    let config = Arc::new(client::Config {
+        window_size: 16 * 1024 * 1024,
+        maximum_packet_size: 256 * 1024,
+        nodelay: true,
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    });
+
+    let addr = host_port(&parsed.host, parsed.port);
     let http_proxy = http_proxy_from_options(options)?;
     let session_result = if let Some(proxy) = http_proxy {
         let stream = proxy
@@ -175,21 +256,23 @@ pub async fn run_sftp_download(
     .map_err(|e| format!("SSH connect failed: {e}"));
     let mut session = session_result?;
 
-    // Authenticate
-    let authenticated = try_authenticate(
-        &mut session,
-        &user,
-        password.as_deref(),
-        private_key_source.as_deref(),
-        key_passphrase.as_deref(),
-    )
-    .await?;
+    let key = match private_key_source.filter(|source| !source.is_empty()) {
+        Some(source) => match load_private_key(source, key_passphrase).await {
+            Ok(key) => Some(key),
+            Err(e) => {
+                tracing::warn!("Failed to load SSH key: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    let authenticated =
+        crate::engine::ssh_auth::authenticate(&mut session, user, key, password).await?;
 
     if !authenticated {
         return Err("SSH authentication failed: no valid credentials".to_string());
     }
 
-    // Open SFTP channel
     let channel = session
         .channel_open_session()
         .await
@@ -205,13 +288,19 @@ pub async fn run_sftp_download(
         .init()
         .await
         .map_err(|e| format!("SFTP session init failed: {e}"))?;
+    let mut max_read_len = BUF_SIZE;
     if version
         .extensions
         .get(russh_sftp::extensions::LIMITS)
         .is_some_and(|v| v == "1")
     {
         match sftp.limits().await {
-            Ok(limits) => sftp.set_limits(limits.into()),
+            Ok(limits) => {
+                if limits.max_read_len > 0 {
+                    max_read_len = max_read_len.min(limits.max_read_len as usize);
+                }
+                sftp.set_limits(limits.into());
+            }
             Err(e) => tracing::warn!("SFTP limits extension failed: {e}"),
         }
     }
@@ -219,7 +308,6 @@ pub async fn run_sftp_download(
 
     connections.store(1, Ordering::Relaxed);
 
-    // Stat remote file for size
     let remote_path = &parsed.path;
     let file_size = match sftp.stat(remote_path).await {
         Ok(attrs) => attrs.attrs.size.unwrap_or(0),
@@ -232,14 +320,13 @@ pub async fn run_sftp_download(
         total.store(file_size, Ordering::Relaxed);
     }
 
-    // Check existing partial download
     let existing_size = if part_path.exists() {
-        fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+        fs::metadata(part_path).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
 
-    let resume_offset = if existing_size > 0 && file_size > 0 && existing_size < file_size {
+    let resume_offset = if existing_size > 0 && file_size > 0 && existing_size <= file_size {
         existing_size
     } else {
         0
@@ -256,7 +343,6 @@ pub async fn run_sftp_download(
         .map_err(|e| format!("SFTP open failed: {e}"))?
         .handle;
 
-    // Open local file
     let mut local_file = if resume_offset > 0 {
         tokio::fs::OpenOptions::new()
             .write(true)
@@ -270,7 +356,6 @@ pub async fn run_sftp_download(
             .map_err(|e| format!("Failed to create part file: {e}"))?
     };
 
-    // Use positional reads with a small read-ahead window for high-latency SFTP links
     let mut bytes_downloaded = resume_offset;
     let mut last_speed_time = Instant::now();
     let mut interval_bytes: u64 = 0;
@@ -281,7 +366,7 @@ pub async fn run_sftp_download(
     let mut ordered = OrderedChunkBuffer::new(resume_offset);
 
     while reads.len() < SFTP_READ_AHEAD {
-        let Some(len) = next_sftp_read_len(file_size, next_read_offset) else {
+        let Some(len) = next_sftp_read_len(file_size, next_read_offset, max_read_len) else {
             break;
         };
         reads.push(read_sftp_range(
@@ -300,7 +385,7 @@ pub async fn run_sftp_download(
         }
 
         let chunk = match tokio::select! {
-            result = reads.next() => result,
+            result = next_read(&mut reads, read_timeout) => result?,
             _ = cancel_token.cancelled() => {
                 let _ = sftp.close(handle.clone()).await;
                 return Err("Download cancelled".to_string());
@@ -326,8 +411,7 @@ pub async fn run_sftp_download(
 
             while let Some(data) = ordered.pop_ready() {
                 let n = data.len();
-                global_limiter.acquire(n).await;
-                task_limiter.acquire(n).await;
+                throttle.acquire(n).await;
 
                 local_file
                     .write_all(&data)
@@ -338,7 +422,6 @@ pub async fn run_sftp_download(
                 completed.store(bytes_downloaded, Ordering::Relaxed);
                 interval_bytes += n as u64;
 
-                // Update speed EMA every 500 ms
                 let elapsed = last_speed_time.elapsed();
                 if elapsed.as_millis() >= 500 {
                     speed.store(
@@ -352,7 +435,7 @@ pub async fn run_sftp_download(
         }
 
         while !saw_eof && reads.len() < SFTP_READ_AHEAD {
-            let Some(len) = next_sftp_read_len(file_size, next_read_offset) else {
+            let Some(len) = next_sftp_read_len(file_size, next_read_offset, max_read_len) else {
                 break;
             };
             reads.push(read_sftp_range(
@@ -369,91 +452,35 @@ pub async fn run_sftp_download(
         .await
         .map_err(|e| format!("SFTP close failed: {e}"))?;
 
+    if file_size > 0 && bytes_downloaded != file_size {
+        let _ = local_file.flush().await;
+        return Err(format!(
+            "SFTP incomplete transfer: got {bytes_downloaded} of {file_size} bytes"
+        ));
+    }
+
     local_file
         .flush()
         .await
         .map_err(|e| format!("Failed to flush: {e}"))?;
     drop(local_file);
 
-    // Update final stats
     if file_size == 0 {
         total.store(bytes_downloaded, Ordering::Relaxed);
     }
     completed.store(bytes_downloaded, Ordering::Relaxed);
     speed.store(0, Ordering::Relaxed);
     connections.store(0, Ordering::Relaxed);
-
-    // Rename .part to final
-    let auto_rename = super::ftp_download::option_bool(options, "auto-file-renaming", true);
-    let final_path =
-        super::ftp_download::finalize_download(&part_path, &filename, dir_path, auto_rename)?;
-    tracing::info!("SFTP download complete: {}", final_path.display());
-    Ok(final_path)
+    Ok(())
 }
 
-/// Try to authenticate via SSH key first, then password
-async fn try_authenticate(
-    session: &mut client::Handle<TofuHandler>,
-    user: &str,
-    password: Option<&str>,
-    private_key_source: Option<&str>,
-    passphrase: Option<&str>,
-) -> Result<bool, String> {
-    // Try SSH key authentication
-    if let Some(key_source) = private_key_source {
-        if !key_source.is_empty() {
-            match load_private_key(key_source, passphrase).await {
-                Ok(key_pair) => {
-                    let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
-                    match session.authenticate_publickey(user, key_with_alg).await {
-                        Ok(auth) if auth.success() => {
-                            tracing::info!("SSH key authentication successful");
-                            return Ok(true);
-                        }
-                        Ok(_) => {
-                            tracing::warn!("SSH key authentication rejected by server");
-                        }
-                        Err(e) => {
-                            tracing::warn!("SSH key authentication error: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load SSH key: {e}");
-                }
-            }
-        }
-    }
-
-    // Fall back to password authentication
-    if let Some(pass) = password {
-        match session.authenticate_password(user, pass).await {
-            Ok(auth) if auth.success() => {
-                tracing::info!("SSH password authentication successful");
-                return Ok(true);
-            }
-            Ok(_) => {
-                tracing::warn!("SSH password authentication rejected");
-            }
-            Err(e) => {
-                tracing::warn!("SSH password authentication error: {e}");
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-/// Load an SSH private key from either a file path or inline PEM content
 async fn load_private_key(
     source: &str,
     passphrase: Option<&str>,
 ) -> Result<russh::keys::PrivateKey, String> {
     let pem_content = if source.contains("----BEGIN") {
-        // Inline PEM content
         source.to_string()
     } else {
-        // File path
         let path = if source.starts_with('~') {
             if let Some(home) = dirs::home_dir() {
                 home.join(&source[2..])
@@ -509,9 +536,11 @@ mod tests {
 
     #[test]
     fn next_sftp_read_len_caps_to_remaining_known_size() {
-        assert_eq!(next_sftp_read_len(100, 0), Some(100));
-        assert_eq!(next_sftp_read_len(100, 99), Some(1));
-        assert_eq!(next_sftp_read_len(100, 100), None);
-        assert_eq!(next_sftp_read_len(0, u64::MAX), Some(BUF_SIZE));
+        assert_eq!(next_sftp_read_len(100, 0, BUF_SIZE), Some(100));
+        assert_eq!(next_sftp_read_len(100, 99, BUF_SIZE), Some(1));
+        assert_eq!(next_sftp_read_len(100, 100, BUF_SIZE), None);
+        assert_eq!(next_sftp_read_len(0, u64::MAX, BUF_SIZE), Some(BUF_SIZE));
+        assert_eq!(next_sftp_read_len(1 << 20, 0, 32 * 1024), Some(32 * 1024));
+        assert_eq!(next_sftp_read_len(0, 0, 32 * 1024), Some(32 * 1024));
     }
 }

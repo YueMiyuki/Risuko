@@ -28,11 +28,10 @@ percent-encoding = "2"
 futures-util = "0.3"
 tower-service = "0.3"
 thiserror = "2"
-tokio-socks = "0.5"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zlib"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 cookie_store = "0.22"
 cookie = "0.18"
 base64 = "0.22"

@@ -1,4 +1,3 @@
-//! Magnet URI → info-dict resolution
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,8 +12,7 @@ use tokio::task::JoinSet;
 use super::core::hash::sha256;
 use super::core::merkle::MerkleProofTable;
 use super::core::{
-    generate_peer_id, parse_info_v2_from_bytes, Id20, Id32, Magnet, TorrentInfoHashes,
-    ValidatedTorrentMetaV2Info,
+    parse_info_v2_from_bytes, Id20, Id32, Magnet, TorrentInfoHashes, ValidatedTorrentMetaV2Info,
 };
 use super::dht::Dht;
 use super::peer::{connect_with_utp_fallback, PeerCommand, PeerEvent, SpawnPeer};
@@ -27,18 +25,18 @@ use super::wire::{Message, MessageEncoder};
 
 const META_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: usize = 32 * 1024 * 1024;
-/// Padded piece-layer hashes fetched per magnet (64 MiB), mirroring libtorrent's 2^21 piece cap
 const MAX_PIECE_LAYER_HASHES: u64 = 1 << 21;
 const OUR_UT_METADATA_ID: u8 = 3;
 const OUR_UT_PEX_ID: u8 = 4;
 const TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
+const STOPPED_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_PEERS: usize = 128;
+const PEER_METADATA_WINDOW: usize = 4;
 pub const ERR_PIECE_LAYERS_UNAVAILABLE: &str = "piece layers unavailable";
 
-/// Resolution result
 pub struct Resolved {
     pub info_hash: Id20,
     pub info_hash_v2: Option<Id32>,
@@ -50,62 +48,6 @@ pub struct Resolved {
 }
 
 const DEFAULT_LISTEN_PORT: u16 = 6881;
-
-/// Resolve a magnet URI to its raw info dict
-pub async fn resolve(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-) -> Result<Resolved, String> {
-    resolve_with_port(
-        magnet_uri,
-        extra_trackers,
-        DEFAULT_LISTEN_PORT,
-        budget,
-        encryption,
-    )
-    .await
-}
-
-/// Resolve a magnet while advertising the caller's real peer-listen port
-pub async fn resolve_with_port(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    listen_port: u16,
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-) -> Result<Resolved, String> {
-    resolve_with_port_and_utp(
-        magnet_uri,
-        extra_trackers,
-        listen_port,
-        budget,
-        encryption,
-        None,
-    )
-    .await
-}
-
-pub async fn resolve_with_port_and_utp(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    listen_port: u16,
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-    utp: Option<Arc<crate::utp::UtpSocket>>,
-) -> Result<Resolved, String> {
-    resolve_with_port_and_utp_and_proxy(
-        magnet_uri,
-        extra_trackers,
-        listen_port,
-        budget,
-        encryption,
-        utp,
-        None,
-    )
-    .await
-}
 
 pub async fn resolve_with_port_and_utp_and_proxy(
     magnet_uri: &str,
@@ -136,54 +78,14 @@ pub async fn resolve_with_peers(
     budget: Duration,
     encryption: crate::peer::EncryptionPolicy,
 ) -> Result<Resolved, String> {
-    resolve_with_peers_and_port(
+    resolve_with_peers_and_port_and_utp_and_proxy(
         magnet_uri,
         extra_trackers,
         extra_peers,
         DEFAULT_LISTEN_PORT,
         budget,
         encryption,
-    )
-    .await
-}
-
-pub async fn resolve_with_peers_and_port(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    extra_peers: &[SocketAddr],
-    listen_port: u16,
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-) -> Result<Resolved, String> {
-    resolve_with_peers_and_port_and_utp(
-        magnet_uri,
-        extra_trackers,
-        extra_peers,
-        listen_port,
-        budget,
-        encryption,
         None,
-    )
-    .await
-}
-
-pub async fn resolve_with_peers_and_port_and_utp(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    extra_peers: &[SocketAddr],
-    listen_port: u16,
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-    utp: Option<Arc<crate::utp::UtpSocket>>,
-) -> Result<Resolved, String> {
-    resolve_with_peers_and_port_and_utp_and_proxy(
-        magnet_uri,
-        extra_trackers,
-        extra_peers,
-        listen_port,
-        budget,
-        encryption,
-        utp,
         None,
     )
     .await
@@ -200,23 +102,44 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     utp: Option<Arc<crate::utp::UtpSocket>>,
     proxy: Option<risuko_http::ProxyConnector>,
 ) -> Result<Resolved, String> {
+    resolve_with_conn_budget(
+        magnet_uri,
+        extra_trackers,
+        extra_peers,
+        listen_port,
+        budget,
+        encryption,
+        utp,
+        proxy,
+        None,
+    )
+    .await
+}
+
+const BUDGET_POLL: Duration = Duration::from_millis(250);
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_with_conn_budget(
+    magnet_uri: &str,
+    extra_trackers: &[String],
+    extra_peers: &[SocketAddr],
+    listen_port: u16,
+    budget: Duration,
+    encryption: crate::peer::EncryptionPolicy,
+    utp: Option<Arc<crate::utp::UtpSocket>>,
+    proxy: Option<risuko_http::ProxyConnector>,
+    conn_budget: Option<Arc<crate::conn_budget::ConnBudget>>,
+) -> Result<Resolved, String> {
     let magnet = Magnet::parse(magnet_uri).map_err(|e| e.to_string())?;
     let info_hash = magnet.info_hash();
     let want_v1 = magnet.info_hash_v1();
     let want_v2 = magnet.info_hash_v2();
     let advertise_v2 = want_v1.is_none() && want_v2.is_some();
 
-    let mut trackers: Vec<String> = Vec::new();
-    for t in magnet.trackers.iter().chain(extra_trackers.iter()) {
-        for part in expand_tracker_entries(t) {
-            if !trackers.iter().any(|x| x == &part) {
-                trackers.push(part);
-            }
-        }
-    }
+    let trackers =
+        super::torrent::split_tracker_lists(magnet.trackers.iter().chain(extra_trackers.iter()));
 
-    let our_peer_id = generate_peer_id();
-    // Announce as a leecher (`left != 0`); `left: 0` marks us as a seeder and trackers then return other leechers, useless for metadata fetch and the peer list we hand off; size is unknown until the info dict arrives, so use a large sentinel (common BT client practice)
+    let our_peer_id = crate::core::peer_id::session_peer_id_or_new(listen_port);
     let req = metadata_announce_request(info_hash, our_peer_id, listen_port);
 
     let deadline = Instant::now() + budget;
@@ -232,7 +155,6 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<(SocketAddr, PeerSource)>();
     let tracker_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // Fire off all tracker announces in parallel; each feeds peer_tx with its own bounded timeout, so a slow tracker never gates the others
     let mut tracker_set: JoinSet<()> = JoinSet::new();
     for url in trackers.clone() {
         let req = req.clone();
@@ -263,7 +185,6 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
         });
     }
 
-    // Fire up DHT in parallel
     let dht_handle: Option<tokio::task::JoinHandle<()>> = match Dht::current_shared().await {
         Some(dht) => {
             let tx = peer_tx.clone();
@@ -282,11 +203,9 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
             None
         }
     };
-    // Caller-supplied peers go in first so the driver can begin contacting them immediately, without waiting for any tracker / DHT round-trip
     for p in extra_peers {
         let _ = peer_tx.send((*p, PeerSource::Manual));
     }
-    // BEP-9 `x.pe` peers, resolved off the hot path
     if !magnet.peers.is_empty() {
         let tx = peer_tx.clone();
         let magnet_peers = magnet.clone();
@@ -302,18 +221,14 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
     }
     drop(peer_tx);
 
-    // First successful (info, piece_layers, winner_addr) triple wins via this oneshot
     type ResolvedPayload = (Vec<u8>, BTreeMap<Id32, Vec<u8>>, SocketAddr);
     let (result_tx, result_rx) = oneshot::channel::<ResolvedPayload>();
     let result_tx: Arc<Mutex<Option<oneshot::Sender<ResolvedPayload>>>> =
         Arc::new(Mutex::new(Some(result_tx)));
 
-    // Tracks whether *any* peer delivered the info dict but failed to furnish all required piece layers; exhausting the deadline with info-yes / layers-no lets us surface a typed error rather than a generic "no metadata" failure
     let layers_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Bound fan-out so we don't open thousands of sockets
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PEERS));
-    // Shared so we can hand discovered peers to the download after resolve; a fan-in task owns `peer_rx` and records every addr before dialing
     let discovered: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let (dial_tx, mut dial_rx) = mpsc::unbounded_channel::<SocketAddr>();
     let fan_discovered = discovered.clone();
@@ -328,25 +243,24 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
         }
     });
 
-    // Driver: consume peer addresses and spawn bounded fetch tasks
+    let share = Arc::new(MetadataShare::default());
     let driver = {
         let result_tx = result_tx.clone();
         let sem = sem.clone();
         let layers_failed = layers_failed.clone();
         let utp = utp.clone();
         let proxy = proxy.clone();
+        let conn_budget = conn_budget.clone();
         async move {
             let mut joinset: JoinSet<()> = JoinSet::new();
 
             loop {
-                // If a winner already published, stop spawning
                 if result_tx.lock().is_none() {
                     break;
                 }
                 tokio::select! {
                     maybe = dial_rx.recv() => {
                         let Some(addr) = maybe else {
-                            // Trackers drained; wait for in-flight to finish
                             while joinset.join_next().await.is_some() {
                                 if result_tx.lock().is_none() { break; }
                             }
@@ -361,8 +275,22 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                         let layers_failed = layers_failed.clone();
                         let utp = utp.clone();
                         let peer_proxy = proxy.clone();
+                        let share = share.clone();
+                        let conn_budget = conn_budget.clone();
                         joinset.spawn(async move {
                             let _permit = permit;
+                            let _slot = match &conn_budget {
+                                Some(b) => {
+                                    let Some(slot) = b
+                                        .acquire_waiting(BUDGET_POLL, || result_tx.lock().is_none())
+                                        .await
+                                    else {
+                                        return;
+                                    };
+                                    Some(slot)
+                                }
+                                None => None,
+                            };
                             let fetched = tokio::time::timeout(
                                 PEER_TOTAL_TIMEOUT,
                                 try_fetch_from_peer(
@@ -377,12 +305,12 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                                     advertise_v2,
                                     utp,
                                     peer_proxy,
+                                    share,
                                 ),
                             )
                             .await
                             .ok()
                             .flatten();
-                            // Info dict already matched the magnet's hashes
                             let Some((bytes, layers, layers_complete)) = fetched else { return };
                             if !layers_complete {
                                 if can_use_v1_metadata_without_piece_layers(want_v1, &bytes) {
@@ -391,7 +319,6 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                                     }
                                     return;
                                 }
-                                // Hash-validated info dict but the peer could not serve every required piece layer; let another peer try
                                 layers_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::debug!("peer {addr}: piece layers incomplete; will try other peers");
                                 return;
@@ -402,14 +329,12 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
                         });
                     }
                     Some(_done) = joinset.join_next(), if !joinset.is_empty() => {
-                        // Reap completed tasks; slot is implicitly freed by permit drop
                     }
                 }
             }
         }
     };
 
-    // Race the driver against the overall deadline and the oneshot winner
     let overall = deadline.saturating_duration_since(Instant::now());
     let winner = tokio::select! {
         biased;
@@ -420,17 +345,16 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
 
     tracker_set.abort_all();
     while tracker_set.join_next().await.is_some() {}
+    send_stopped(&trackers, &req, proxy.clone());
     if let Some(h) = dht_handle {
         h.abort();
     }
-    // Brief wait so fan-in can record peers already in-flight before senders drop
     let _ = tokio::time::timeout(Duration::from_millis(200), fan_in).await;
 
     let peers: Vec<SocketAddr> = discovered.lock().iter().copied().collect();
 
     match winner {
         Some((info_bytes, piece_layers, winner_addr)) => {
-            // Prefer the peer that already served metadata — they are a proven live contact for the subsequent download
             let mut peers = peers;
             if let Some(pos) = peers.iter().position(|a| *a == winner_addr) {
                 peers.swap(0, pos);
@@ -453,7 +377,6 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
             })
         }
         None => {
-            // Distinguish "no peer ever delivered the info dict" (generic metadata failure) from "every peer that delivered the info dict refused to serve piece layers" (pure-v2 specific — surface a typed error code so the UI can suggest importing a .torrent instead)
             if layers_failed.load(std::sync::atomic::Ordering::Relaxed) {
                 Err(format!(
                     "{ERR_PIECE_LAYERS_UNAVAILABLE}: no peer served the BEP 52 piece-layer hashes for this magnet"
@@ -463,6 +386,40 @@ pub async fn resolve_with_peers_and_port_and_utp_and_proxy(
             }
         }
     }
+}
+
+fn send_stopped(
+    trackers: &[String],
+    started: &AnnounceRequest,
+    proxy: Option<risuko_http::ProxyConnector>,
+) {
+    if trackers.is_empty() {
+        return;
+    }
+    let mut stopped = started.clone();
+    stopped.event = AnnounceEvent::Stopped;
+    stopped.num_want = 0;
+    let trackers = trackers.to_vec();
+    tokio::spawn(async move {
+        let mut set: JoinSet<()> = JoinSet::new();
+        for url in trackers {
+            let stopped = stopped.clone();
+            let proxy = proxy.clone();
+            set.spawn(async move {
+                if let Err(e) = super::tracker::announce_with_proxy(
+                    &url,
+                    &stopped,
+                    STOPPED_TIMEOUT,
+                    proxy.as_ref(),
+                )
+                .await
+                {
+                    tracing::debug!("tracker {url} stopped announce failed: {e}");
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    });
 }
 
 fn metadata_announce_request(info_hash: Id20, peer_id: Id20, listen_port: u16) -> AnnounceRequest {
@@ -480,14 +437,6 @@ fn metadata_announce_request(info_hash: Id20, peer_id: Id20, listen_port: u16) -
     }
 }
 
-fn expand_tracker_entries(raw: &str) -> Vec<String> {
-    raw.split([',', '\n', '\r'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 pub fn is_dialable_peer_addr(addr: SocketAddr) -> bool {
     if addr.port() == 0 {
         return false;
@@ -497,7 +446,7 @@ pub fn is_dialable_peer_addr(addr: SocketAddr) -> bool {
             if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_link_local() {
                 return false;
             }
-            // Cloudflare anycast shows up via PEX/DHT as "peers" that always time out and burn dial slots (162.158/15, 172.64/13, …)
+            // Cloudflare anycast peers always time out and burn dial slots
             !is_cloudflare_v4(ip)
         }
         std::net::IpAddr::V6(ip) => {
@@ -510,16 +459,16 @@ fn is_cloudflare_v4(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     matches!(
         (o[0], o[1]),
-        (162, 158 | 159) // 162.158.0.0/15
-            | (172, 64..=71) // 172.64.0.0/13
-            | (104, 16..=31) // 104.16.0.0/12 (covers /13 published ranges)
-            | (173, 245) // 173.245.48.0/20 — coarse; rare false positives OK
-            | (108, 162) // 108.162.192.0/18
-            | (141, 101) // 141.101.64.0/18
-            | (188, 114) // 188.114.96.0/20
-            | (190, 93) // 190.93.240.0/20
-            | (197, 234) // 197.234.240.0/22
-            | (198, 41) // 198.41.128.0/17
+        (162, 158 | 159)
+            | (172, 64..=71)
+            | (104, 16..=31)
+            | (173, 245)
+            | (108, 162)
+            | (141, 101)
+            | (188, 114)
+            | (190, 93)
+            | (197, 234)
+            | (198, 41)
     ) || matches!(
         (o[0], o[1], o[2]),
         (103, 21, 244..=247) | (103, 22, 200..=203) | (103, 31, 4..=7) | (131, 0, 72..=75)
@@ -546,17 +495,154 @@ fn can_use_v1_metadata_without_piece_layers(want_v1: Option<Id20>, info_bytes: &
     })
 }
 
-/// Whether a fetched info dict hashes to the magnet's declared v1 / v2 info-hashes
 fn info_matches_magnet(info_bytes: &[u8], want: TorrentInfoHashes) -> bool {
-    // Pure-v2 magnet: peer cannot deliver a v1 dict by definition, so only the v2 check gates
     let sha1_ok = want.v1.is_none_or(|v1| {
         Id20::from_slice(Sha1::digest(info_bytes).as_slice()).is_ok_and(|h| h == v1)
     });
-    // BEP 52: pure-v2 / hybrid magnets must also pass SHA-256 cross-validation against urn:btmh (hybrid info dicts hash identically under both algorithms)
     sha1_ok && want.v2.is_none_or(|v2| sha256(info_bytes) == v2)
 }
 
-/// Outcome of a single-peer fetch attempt: raw info dict bytes, any validated piece layers, and whether the layers cover every file that requires them; `(_, _, false)` means the metadata is v2 but at least one file's layer was rejected/missing, so the caller should try another peer rather than committing this partial result; `None` also covers an info dict that does not match `want`
+struct Assembly {
+    size: usize,
+    state: Mutex<AssemblyState>,
+}
+
+struct AssemblyState {
+    pieces: Vec<Option<Vec<u8>>>,
+    claimed: Vec<u8>,
+}
+
+impl Assembly {
+    fn new(size: usize) -> Self {
+        let n = size.div_ceil(META_PIECE_SIZE);
+        Self {
+            size,
+            state: Mutex::new(AssemblyState {
+                pieces: vec![None; n],
+                claimed: vec![0; n],
+            }),
+        }
+    }
+
+    fn num_pieces(&self) -> usize {
+        self.size.div_ceil(META_PIECE_SIZE)
+    }
+
+    fn piece_len(&self, idx: usize) -> usize {
+        if idx + 1 == self.num_pieces() {
+            self.size - idx * META_PIECE_SIZE
+        } else {
+            META_PIECE_SIZE
+        }
+    }
+
+    fn missing_all_in(&self, set: &HashSet<usize>) -> bool {
+        let st = self.state.lock();
+        st.pieces
+            .iter()
+            .enumerate()
+            .all(|(i, p)| p.is_some() || set.contains(&i))
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.lock().pieces.iter().all(Option::is_some)
+    }
+
+    fn claim(&self, n: usize, skip: &HashSet<usize>) -> Vec<usize> {
+        let mut st = self.state.lock();
+        let mut out = Vec::new();
+        for want_unclaimed in [true, false] {
+            for idx in 0..st.pieces.len() {
+                if out.len() >= n {
+                    break;
+                }
+                if st.pieces[idx].is_none()
+                    && !skip.contains(&idx)
+                    && !out.contains(&idx)
+                    && (st.claimed[idx] == 0) == want_unclaimed
+                {
+                    out.push(idx);
+                }
+            }
+        }
+        for &idx in &out {
+            st.claimed[idx] = st.claimed[idx].saturating_add(1);
+        }
+        out
+    }
+
+    fn unclaim(&self, idx: usize) {
+        let mut st = self.state.lock();
+        if let Some(c) = st.claimed.get_mut(idx) {
+            *c = c.saturating_sub(1);
+        }
+    }
+
+    fn store(&self, idx: usize, block: &[u8]) {
+        let mut st = self.state.lock();
+        if let Some(slot) = st.pieces.get_mut(idx) {
+            if slot.is_none() {
+                *slot = Some(block.to_vec());
+            }
+        }
+    }
+
+    fn assemble(&self) -> Option<Vec<u8>> {
+        let st = self.state.lock();
+        let mut out = Vec::with_capacity(self.size);
+        for p in &st.pieces {
+            out.extend_from_slice(p.as_ref()?);
+        }
+        Some(out)
+    }
+
+    fn reset(&self) {
+        let mut st = self.state.lock();
+        st.pieces.iter_mut().for_each(|p| *p = None);
+    }
+}
+
+struct Claims {
+    assembly: Arc<Assembly>,
+    mine: HashSet<usize>,
+}
+
+impl Claims {
+    fn release(&mut self, idx: usize) {
+        if self.mine.remove(&idx) {
+            self.assembly.unclaim(idx);
+        }
+    }
+}
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        for idx in self.mine.drain() {
+            self.assembly.unclaim(idx);
+        }
+    }
+}
+
+#[derive(Default)]
+struct MetadataShare {
+    current: Mutex<Option<Arc<Assembly>>>,
+}
+
+impl MetadataShare {
+    fn attach(&self, size: usize) -> Arc<Assembly> {
+        let mut cur = self.current.lock();
+        match cur.as_ref() {
+            Some(a) if a.size == size => a.clone(),
+            Some(_) => Arc::new(Assembly::new(size)),
+            None => {
+                let a = Arc::new(Assembly::new(size));
+                *cur = Some(a.clone());
+                a
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_fetch_from_peer(
     addr: SocketAddr,
@@ -567,8 +653,8 @@ async fn try_fetch_from_peer(
     advertise_v2: bool,
     utp: Option<Arc<crate::utp::UtpSocket>>,
     proxy: Option<risuko_http::ProxyConnector>,
+    share: Arc<MetadataShare>,
 ) -> Option<(Vec<u8>, BTreeMap<Id32, Vec<u8>>, bool)> {
-    // Build a per-peer extended-handshake builder; the connection layer invokes it once with the peer's IP so `yourip` matches that peer (some swarms, notably CN BT clients, only engage with remotes that populate this), and metadata size is unknown until the peer replies so we leave it `None` here
     let ext_handshake_builder: crate::peer::ExtHandshakeBuilder =
         std::sync::Arc::new(|peer_ip: std::net::IpAddr| {
             let hs = ExtHandshake::new_outgoing(OUR_UT_METADATA_ID, OUR_UT_PEX_ID, None)
@@ -590,14 +676,14 @@ async fn try_fetch_from_peer(
             advertise_dht: true,
             ext_handshake_builder: Some(ext_handshake_builder),
             proxy,
+            deferred: false,
         },
         utp,
     )
     .await
     .ok()?;
 
-    // Run the protocol inside a helper so every exit path disconnects the peer actor below; otherwise timed-out or rejected probes leak the socket and reader task
-    let result = try_fetch_from_peer_inner(&handle, rx, want).await;
+    let result = try_fetch_from_peer_inner(&handle, rx, want, &share).await;
     let _ = handle.tx.send(PeerCommand::Disconnect).await;
     result
 }
@@ -606,8 +692,8 @@ async fn try_fetch_from_peer_inner(
     handle: &super::peer::PeerHandle,
     mut rx: tokio::sync::mpsc::Receiver<PeerEvent>,
     want: TorrentInfoHashes,
+    share: &MetadataShare,
 ) -> Option<(Vec<u8>, BTreeMap<Id32, Vec<u8>>, bool)> {
-    // Collect Handshook and the peer's extended handshake from a single receive loop; the extended handshake message can arrive before the BT handshake event under some orderings, and draining two sequential loops would drop whichever arrives first in the other arm
     let mut peer_supports_ext: Option<bool> = None;
     let mut peer_supports_v2 = false;
     let peer_ext = loop {
@@ -622,7 +708,6 @@ async fn try_fetch_from_peer_inner(
             PeerEvent::Message(Message::Extended { ext_id: 0, payload }) => {
                 let h = ExtHandshake::decode(&payload)?;
                 if peer_supports_ext.is_none() {
-                    // Extended handshake must be preceded by Handshook with the extension bit set; keep looping until Handshook confirms support, but stash the decoded dict
                     match wait_for_handshook(&mut rx).await {
                         Some((true, v2)) => {
                             peer_supports_v2 = v2;
@@ -643,64 +728,68 @@ async fn try_fetch_from_peer_inner(
     if total_size == 0 || total_size > MAX_METADATA_SIZE {
         return None;
     }
-    let num_pieces = total_size.div_ceil(META_PIECE_SIZE);
-    let mut pieces: Vec<Option<Vec<u8>>> = vec![None; num_pieces];
+    let assembly = share.attach(total_size);
+    let mut claims = Claims {
+        assembly: assembly.clone(),
+        mine: HashSet::new(),
+    };
+    let mut rejected: HashSet<usize> = HashSet::new();
 
-    for i in 0..num_pieces {
-        let payload = ut_metadata_request(i as i64);
-        handle
-            .tx
-            .send(PeerCommand::Send(Message::Extended {
-                ext_id: their_ut_metadata_id,
-                payload,
-            }))
-            .await
-            .ok()?;
-    }
-
-    let mut remaining = num_pieces;
-    while remaining > 0 {
-        match rx.recv().await? {
+    while !assembly.is_complete() {
+        let room = PEER_METADATA_WINDOW.saturating_sub(claims.mine.len());
+        if room > 0 {
+            let skip: HashSet<usize> = claims.mine.union(&rejected).copied().collect();
+            for idx in assembly.claim(room, &skip) {
+                claims.mine.insert(idx);
+                handle
+                    .tx
+                    .send(PeerCommand::Send(Message::Extended {
+                        ext_id: their_ut_metadata_id,
+                        payload: ut_metadata_request(idx as i64),
+                    }))
+                    .await
+                    .ok()?;
+            }
+        }
+        if claims.mine.is_empty() && assembly.missing_all_in(&rejected) {
+            return None;
+        }
+        let event = match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(event) => event?,
+            Err(_) => continue,
+        };
+        match event {
             PeerEvent::Message(Message::Extended { ext_id, payload })
                 if ext_id == OUR_UT_METADATA_ID =>
             {
                 let msg = parse_ut_metadata(payload)?;
+                let idx = msg.piece as usize;
                 if msg.msg_type == ut_metadata_type::DATA {
-                    let idx = msg.piece as usize;
-                    if idx < num_pieces && pieces[idx].is_none() {
-                        let expected = if idx + 1 == num_pieces {
-                            total_size - idx * META_PIECE_SIZE
-                        } else {
-                            META_PIECE_SIZE
-                        };
-                        if msg.block.len() == expected {
-                            pieces[idx] = Some(msg.block.to_vec());
-                            remaining -= 1;
-                        }
+                    if claims.mine.contains(&idx) && msg.block.len() == assembly.piece_len(idx) {
+                        assembly.store(idx, &msg.block);
+                        claims.release(idx);
                     }
-                } else if msg.msg_type == ut_metadata_type::REJECT {
-                    return None;
+                } else if msg.msg_type == ut_metadata_type::REJECT && claims.mine.contains(&idx) {
+                    claims.release(idx);
+                    rejected.insert(idx);
                 }
             }
             PeerEvent::Disconnected { .. } => return None,
             _ => continue,
         }
     }
+    drop(claims);
 
-    let mut info_bytes = Vec::with_capacity(total_size);
-    for p in pieces {
-        info_bytes.extend_from_slice(&p?);
-    }
+    let info_bytes = assembly.assemble()?;
     if info_bytes.len() != total_size {
         return None;
     }
-    // Verify before trusting any field; v2 file lengths size the piece-layer fetch below
     if !info_matches_magnet(&info_bytes, want) {
         tracing::debug!("peer {}: info hash mismatch", handle.addr);
+        assembly.reset();
         return None;
     }
 
-    // If the info dict is v2, attempt to fetch each file's piece layer on the same connection via BEP 52 HASH_REQUEST; a peer that has the info but cannot serve layers (HashReject / no v2 support) yields `(_, _, false)` so the driver tries another peer
     let v2 = match parse_info_v2_from_bytes(&info_bytes) {
         Ok(v) => v,
         Err(_) => return None,
@@ -725,7 +814,6 @@ async fn try_fetch_from_peer_inner(
     Some((info_bytes, layers.unwrap_or_default(), complete))
 }
 
-/// Fetch and verify every file's piece layer via BEP 52 hash requests; `None` on connection errors, missing entries for rejected files
 async fn fetch_piece_layers(
     handle: &super::peer::PeerHandle,
     rx: &mut tokio::sync::mpsc::Receiver<PeerEvent>,
@@ -734,19 +822,14 @@ async fn fetch_piece_layers(
     use super::core::merkle::{pad_hash, piece_layer_requests, BLOCK_SIZE};
 
     let piece_length = v2.piece_length;
-    // base_layer for piece-aligned requests = log2(piece_length / 16 KiB)
     let base_layer = (piece_length / BLOCK_SIZE).trailing_zeros();
 
-    /// One file's layer being reassembled from chunk responses
     struct LayerFetch {
         file_len: u64,
-        /// Outstanding `(index, length)` chunks
         pending: Vec<(u32, u32)>,
-        /// Padded layer, pre-filled with the pad hash for skipped padding chunks
         layer: Vec<u8>,
     }
 
-    // One fetch per distinct `pieces_root` that has a layer (file > piece_length)
     let pad = pad_hash(piece_length / BLOCK_SIZE);
     let mut wanted: BTreeMap<Id32, LayerFetch> = BTreeMap::new();
     let mut total_hashes = 0u64;
@@ -754,7 +837,6 @@ async fn fetch_piece_layers(
         if f.length <= piece_length as u64 || wanted.contains_key(&f.pieces_root) {
             continue;
         }
-        // Bound before allocating; a hash-matched dict can still declare absurd file lengths
         let piece_count = f.length.div_ceil(piece_length as u64);
         let padded = piece_count
             .max(2)
@@ -778,7 +860,6 @@ async fn fetch_piece_layers(
         return Some(BTreeMap::new());
     }
 
-    // Send all requests up front so the peer can pipeline its responses
     for (root, fetch) in &wanted {
         for &(index, length) in &fetch.pending {
             let req = Message::HashRequest {
@@ -847,7 +928,6 @@ async fn fetch_piece_layers(
                         out.insert(root, canonical);
                     }
                     Err(e) => {
-                        // A bad chunk spoils the layer; try another peer
                         tracing::debug!("piece-layer verify failed for {root:?}: {e}");
                         return Some(out);
                     }
@@ -856,7 +936,6 @@ async fn fetch_piece_layers(
             PeerEvent::Message(Message::HashReject { pieces_root, .. }) => {
                 let root = Id32(pieces_root);
                 if wanted.contains_key(&root) && !out.contains_key(&root) {
-                    // Single rejection is terminal for this peer — the caller will fall back to another seeder
                     tracing::debug!("peer rejected piece-layer request for {root:?}");
                     return Some(out);
                 }
@@ -888,22 +967,18 @@ async fn wait_for_handshook(
     }
 }
 
-/// Build a minimal `.torrent` blob from a raw info dict, optional trackers, and (for BEP 52 v2 metadata) any piece layers fetched out-of-band via `HASH_REQUEST`; the result is suitable for feeding back into [`crate::parse_torrent`]
 pub fn synth_torrent_bytes(
     info_bytes: &[u8],
     trackers: &[String],
     piece_layers: &BTreeMap<Id32, Vec<u8>>,
 ) -> Vec<u8> {
-    // Top-level dict keys must appear in lexicographic order: announce, announce-list, info, piece layers
     let mut out = Vec::with_capacity(info_bytes.len() + 64);
     out.push(b'd');
     if !trackers.is_empty() {
-        // announce: use first as primary
         let primary = trackers[0].as_bytes();
         out.extend_from_slice(b"8:announce");
         out.extend_from_slice(format!("{}:", primary.len()).as_bytes());
         out.extend_from_slice(primary);
-        // announce-list: list of tiers, each a list of URLs
         out.extend_from_slice(b"13:announce-listl");
         for t in trackers {
             out.push(b'l');
@@ -917,7 +992,6 @@ pub fn synth_torrent_bytes(
     out.extend_from_slice(b"4:info");
     out.extend_from_slice(info_bytes);
     if !piece_layers.is_empty() {
-        // BEP 52 `piece layers` dict, keys are 32-byte SHA-256 roots; BTreeMap iteration order matches the bencode lexicographic requirement on dict keys
         out.extend_from_slice(b"12:piece layersd");
         for (root, layer) in piece_layers {
             out.extend_from_slice(b"32:");
@@ -933,6 +1007,35 @@ pub fn synth_torrent_bytes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assembly_shares_pieces_and_regrants_claimed_tail() {
+        let size = META_PIECE_SIZE * 2 + 10;
+        let a = Assembly::new(size);
+        let none = HashSet::new();
+        assert_eq!(a.claim(2, &none), vec![0, 1]);
+        assert_eq!(a.claim(2, &none), vec![2, 0]);
+        a.store(0, &vec![1u8; META_PIECE_SIZE]);
+        a.store(1, &vec![2u8; META_PIECE_SIZE]);
+        assert!(!a.is_complete());
+        assert_eq!(a.piece_len(2), 10);
+        a.store(2, &[3u8; 10]);
+        assert!(a.is_complete());
+        assert_eq!(a.assemble().unwrap().len(), size);
+        a.reset();
+        assert!(!a.is_complete());
+        let skip: HashSet<usize> = [0, 1].into();
+        assert!(a.missing_all_in(&[0, 1, 2].into()));
+        assert!(!a.missing_all_in(&skip));
+    }
+
+    #[test]
+    fn share_gives_mismatched_size_a_private_assembly() {
+        let share = MetadataShare::default();
+        let a = share.attach(100);
+        assert!(Arc::ptr_eq(&a, &share.attach(100)));
+        assert!(!Arc::ptr_eq(&a, &share.attach(200)));
+    }
+
     use super::*;
 
     #[test]
@@ -969,19 +1072,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expand_tracker_entries_splits_newlines_and_commas() {
-        let parts = expand_tracker_entries(
-            "udp://a:1/announce\n\nudp://b:2/announce,http://c:3/announce\r\n",
-        );
-        assert_eq!(
-            parts,
-            vec![
-                "udp://a:1/announce".to_string(),
-                "udp://b:2/announce".to_string(),
-                "http://c:3/announce".to_string(),
-            ]
-        );
+    #[tokio::test]
+    async fn metadata_attempt_sends_stopped_to_trackers_it_announced_to() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/announce", listener.local_addr().unwrap());
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let events_tx = events_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let event = head
+                        .split("event=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(['&', ' ']).next())
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = events_tx.send(event);
+                    let body = b"d8:intervali600e5:peers0:e";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        let magnet = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+        let resolved = resolve_with_peers(
+            &magnet,
+            &[url],
+            &[],
+            Duration::from_secs(2),
+            crate::peer::EncryptionPolicy::PlaintextOnly,
+        )
+        .await;
+        assert!(resolved.is_err(), "no peers, so nothing resolves");
+
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(seen.contains(&"started".to_string()) && seen.contains(&"stopped".to_string()))
+            {
+                match events_rx.recv().await {
+                    Some(event) => seen.push(event),
+                    None => break,
+                }
+            }
+        })
+        .await
+        .unwrap_or_default();
+        assert!(seen.contains(&"started".to_string()), "{seen:?}");
+        assert!(seen.contains(&"stopped".to_string()), "{seen:?}");
+    }
+
+    fn spawn_resolve(
+        peer: SocketAddr,
+        budget: Arc<crate::conn_budget::ConnBudget>,
+    ) -> tokio::task::JoinHandle<Result<Resolved, String>> {
+        let magnet = format!("magnet:?xt=urn:btih:{}", "cd".repeat(20));
+        tokio::spawn(async move {
+            resolve_with_conn_budget(
+                &magnet,
+                &[],
+                &[peer],
+                6881,
+                Duration::from_secs(20),
+                crate::peer::EncryptionPolicy::PlaintextOnly,
+                None,
+                None,
+                Some(budget),
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_waits_for_budget_instead_of_failing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let budget = crate::conn_budget::ConnBudget::new(10);
+        let held: Vec<_> = (0..10).map(|_| budget.try_acquire().unwrap()).collect();
+        assert!(budget.try_acquire().is_none());
+        let task = spawn_resolve(peer, budget.clone());
+
+        let early = tokio::time::timeout(Duration::from_millis(800), listener.accept()).await;
+        assert!(early.is_err(), "dialled without a budget slot");
+        assert!(!task.is_finished(), "the magnet must keep waiting");
+
+        drop(held);
+        let (_sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("dials once a slot frees")
+            .unwrap();
+        assert_eq!(budget.used(), 1, "the connection holds exactly one slot");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_uses_the_reserve_when_torrents_fill_the_rest() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let budget = crate::conn_budget::ConnBudget::new(40);
+        let mut lease = crate::conn_budget::BudgetLease::new(budget.clone());
+        while lease.try_reserve() {}
+        assert!(budget.is_full());
+        let task = spawn_resolve(peer, budget.clone());
+        let (_sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("reserve lets the dial through")
+            .unwrap();
+        task.abort();
     }
 
     #[test]
@@ -1037,7 +1247,6 @@ mod tests {
         let meta = crate::parse_torrent(&torrent_bytes).unwrap();
         assert_eq!(meta.meta_version.as_str(), "hybrid");
         assert!(meta.piece_layers.is_empty());
-        // Wire-bit advertisement still applies because the metadata carries v2 hashes, so peers that gate engagement on the V2 reserved bit see us as v2-aware; serving piece layers / announcing v2 info-hashes remains gated on `supports_v2_wire` (false here), so the runtime falls back to the v1 download path
         assert!(meta.info_v2.is_some());
         assert!(!crate::core::supports_v2_wire(&meta));
     }
@@ -1065,7 +1274,10 @@ mod tests {
         let handle = super::super::peer::PeerHandle {
             addr: "127.0.0.1:6881".parse().unwrap(),
             tx,
+            piece_tx: mpsc::channel(1).0,
             io_abort: tokio::spawn(async {}).abort_handle(),
+            gate: Default::default(),
+            bind: None,
         };
         let (_event_tx, mut rx) = mpsc::channel(1);
         let piece_length = 16 * 1024;
@@ -1078,6 +1290,7 @@ mod tests {
                 length: (MAX_PIECE_LAYER_HASHES + 1) * piece_length as u64,
                 pieces_root: Id32([1u8; 32]),
             }],
+            empty_files: Vec::new(),
         };
 
         let layers = fetch_piece_layers(&handle, &mut rx, &v2).await;

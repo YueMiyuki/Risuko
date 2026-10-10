@@ -287,10 +287,12 @@ import { computed, ref, watch } from "vue";
 import api from "@/api";
 import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
 import { flushDownloadStatsMinute } from "@/store/task";
+import { downsampleSeries } from "@/utils/downsample";
 
 defineOptions({ name: "StatsPage" });
 
 const TOP_PROTOCOL_COUNT = 5;
+const MAX_SPEED_POINTS = 1000;
 const CHART_WIDTH = 760;
 const CHART_HEIGHT = 300;
 const CHART_PAD_X = 108;
@@ -403,6 +405,15 @@ const monthlyRows = computed(() => stats.value?.monthly || []);
 const protocolTotals = computed(() => stats.value?.protocolTotals || []);
 const monthCount = computed(() => monthlyRows.value.length);
 const speedPointCount = computed(() => stats.value?.speed.length || 0);
+const speedPoints = computed(() =>
+	downsampleSeries(stats.value?.speed || [], MAX_SPEED_POINTS, (point) =>
+		point.protocols.reduce(
+			(sum, item) =>
+				sum + Number(item.downloadSpeed) + Number(item.uploadSpeed),
+			0,
+		),
+	),
+);
 const extraProtocolCount = computed(() =>
 	Math.max(0, protocolTotals.value.length - TOP_PROTOCOL_COUNT),
 );
@@ -508,8 +519,15 @@ const tableRows = computed(() =>
 );
 
 const speedMax = computed(() => {
-	const values = speedLines.value.flatMap((line) => line.values);
-	return Math.max(1, ...values);
+	let max = 1;
+	for (const line of speedLines.value) {
+		for (const value of line.values) {
+			if (value > max) {
+				max = value;
+			}
+		}
+	}
+	return max;
 });
 
 const speedTicks = computed(() => {
@@ -536,7 +554,7 @@ const formatTimeTick = (minute: number) => {
 };
 
 const speedXTicks = computed(() => {
-	const points = stats.value?.speed || [];
+	const points = speedPoints.value;
 	if (!points.length) {
 		return [];
 	}
@@ -588,7 +606,7 @@ const makePath = (values: number[], max: number) => {
 };
 
 const speedLines = computed<SpeedLine[]>(() => {
-	const points = stats.value?.speed || [];
+	const points = speedPoints.value;
 	if (!points.length) {
 		return [];
 	}
@@ -608,7 +626,14 @@ const speedLines = computed<SpeedLine[]>(() => {
 			path: "",
 		})),
 	);
-	const max = Math.max(1, ...raw.flatMap((line) => line.values));
+	let max = 1;
+	for (const line of raw) {
+		for (const value of line.values) {
+			if (value > max) {
+				max = value;
+			}
+		}
+	}
 	return raw
 		.filter((line) => line.values.some((value) => value > 0))
 		.map((line) => ({ ...line, path: makePath(line.values, max) }));
@@ -664,7 +689,7 @@ function clearSpeedHover() {
 }
 
 function onSpeedChartMove(event: MouseEvent) {
-	const points = stats.value?.speed || [];
+	const points = speedPoints.value;
 	const lines = speedLines.value;
 	if (!points.length || !lines.length) {
 		clearSpeedHover();

@@ -28,11 +28,8 @@ pub struct ImportedCookies {
     pub user_agent: String,
     pub cookie_header: String,
     pub count: usize,
-    /// True when imported cookies include a `cf_clearance` token; renderer warns before retrying since a CF-blocked site rejects the next request without it
     pub has_cf_clearance: bool,
-    /// Names of imported cookies (values omitted); helps diagnose "import succeeded but request still blocked" cases
     pub cookie_names: Vec<String>,
-    /// Full cookie list with values, surfaced to the dialog so the user can confirm what's being sent; local-IPC only
     pub cookies: Vec<ImportedCookieView>,
 }
 
@@ -83,7 +80,7 @@ pub async fn import_browser_cookies(
     let host_cookies = match cookies_for_url(&browser, &url).await {
         Ok(hc) => hc,
         Err(e) => {
-            // Windows Chrome v20 (app-bound) profiles decrypt only as admin; surface a stable code so the renderer can ask the user to approve elevation and retry via the elevated command
+            // Windows Chrome v20 app-bound cookies decrypt only as admin
             if e.contains(risuko_cookies::ELEVATION_REQUIRED) {
                 tracing::info!(
                     "import_browser_cookies: app-bound cookies require elevation (browser={browser})"
@@ -96,7 +93,6 @@ pub async fn import_browser_cookies(
     build_imported_cookies(host_cookies, &browser, persist, user_agent).await
 }
 
-/// Run cookie extraction through a UAC-elevated helper process, then import the result; Windows-only (app-bound / Chrome v20), called after the user agrees to the elevation prompt `import_browser_cookies` requested via `ELEVATION_REQUIRED`, relaunching this binary as `extract-cookies` to decrypt keys as admin and write cookies back as JSON
 #[tauri::command]
 pub async fn import_browser_cookies_elevated(
     browser: String,
@@ -119,7 +115,6 @@ pub async fn import_browser_cookies_elevated(
     }
 }
 
-/// Shared tail of both import paths: turn extracted `HostCookies` into the renderer-facing `ImportedCookies`, optionally persisting them in the engine cookie store
 async fn build_imported_cookies(
     host_cookies: HostCookies,
     browser: &str,
@@ -181,7 +176,6 @@ async fn build_imported_cookies(
         cookie_names.len()
     );
 
-    // Caller-supplied UA wins (e.g. Cloudflare dialog passes the textarea's edited value); falls back to the browser's built-in default so empty hand-offs still get a sensible default
     let effective_user_agent = user_agent
         .as_ref()
         .map(|s| s.trim().to_string())
@@ -267,7 +261,6 @@ pub struct CapturedUserAgent {
     pub user_agent: String,
 }
 
-/// Open `http://127.0.0.1:<random>/` in the user's default browser, read the User-Agent header from the first GET, and return it; cf_clearance validates against the UA in effect when the challenge was solved, so reusing the cookie requires the matching UA. The internal listener replies with a small HTML page that auto-closes then shuts down, timing out after 60s if nothing connects
 #[tauri::command]
 pub async fn capture_user_agent() -> Result<CapturedUserAgent, String> {
     tracing::info!("capture_user_agent: starting one-shot listener");
@@ -280,13 +273,10 @@ pub async fn capture_user_agent() -> Result<CapturedUserAgent, String> {
         .port();
     let url = format!("http://127.0.0.1:{port}/risuko-ua-capture");
 
-    // Open in the user's default browser; best effort, the user can also paste the URL into a different browser if they prefer
     if let Err(e) = open::that(&url) {
         tracing::warn!("capture_user_agent: open::that({url}) failed: {e}");
-        // Keep the listener alive in case the user pastes the URL manually
     }
 
-    // Loop accept(): browsers may prefetch favicons or do CORS preflight before the real GET arrives; take the first request to /risuko-ua-capture that parses cleanly
     let captured = timeout(Duration::from_secs(60), async {
         loop {
             let (mut stream, peer) = match listener.accept().await {
@@ -300,7 +290,6 @@ pub async fn capture_user_agent() -> Result<CapturedUserAgent, String> {
 
             let mut buf = vec![0u8; 4096];
             let mut total = 0usize;
-            // Read until we see end-of-headers (double CRLF). Cap at 4 KiB
             let parsed: Option<(String, String)> = loop {
                 match timeout(Duration::from_secs(5), stream.read(&mut buf[total..])).await {
                     Ok(Ok(0)) => break None,
@@ -317,7 +306,6 @@ pub async fn capture_user_agent() -> Result<CapturedUserAgent, String> {
                 }
             };
 
-            // Always send a tiny HTML body so the browser tab doesn't hang
             let body = "<!doctype html><meta charset=utf-8><title>Risuko</title>\
                  <style>body{font:14px/1.5 system-ui;padding:2rem;color:#333}\
                  h1{font-size:18px}</style>\
@@ -357,7 +345,6 @@ fn parse_request(buf: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(buf).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;
-    // GET /path HTTP/1.1
     let mut parts = request_line.split_whitespace();
     let _method = parts.next()?;
     let path = parts.next()?.to_string();
@@ -376,19 +363,20 @@ fn parse_request(buf: &[u8]) -> Option<(String, String)> {
     Some((path, user_agent))
 }
 
-/// Windows UAC elevation: relaunch this binary elevated as `extract-cookies` to decrypt app-bound (Chrome v20) cookies, then read the JSON it writes back
 #[cfg(target_os = "windows")]
 mod elevate {
     use risuko_cookies::HostCookies;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    const HELPER_TIMEOUT_MS: u32 = 120_000;
 
     fn to_wide(s: &str) -> Vec<u16> {
         OsStr::new(s)
@@ -397,7 +385,6 @@ mod elevate {
             .collect()
     }
 
-    /// Relaunch this binary elevated, wait for it, and parse the cookies it wrote; the OS shows the UAC consent dialog and if the user declines, `ShellExecuteExW` fails and we return a friendly error rather than hang
     pub async fn extract_cookies_elevated(browser: &str, url: &str) -> Result<HostCookies, String> {
         let browser = browser.to_string();
         let url = url.to_string();
@@ -409,7 +396,6 @@ mod elevate {
     fn run_elevated(browser: &str, url: &str) -> Result<HostCookies, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
 
-        // Temp file the elevated child writes the cookies JSON to; we create (and auto-remove) it, the elevated process only needs to write it
         let out_path = tempfile::Builder::new()
             .prefix("risuko-cookies-")
             .suffix(".json")
@@ -417,7 +403,6 @@ mod elevate {
             .map_err(|e| format!("create temp file failed: {e}"))?
             .into_temp_path();
 
-        // Quote values and strip embedded quotes so a value can't break out of its argument (browser comes from a fixed allowlist; url is user data)
         let params = format!(
             "extract-cookies --browser \"{}\" --url \"{}\" --out \"{}\"",
             browser.replace('"', ""),
@@ -439,7 +424,6 @@ mod elevate {
 
         let ok = unsafe { ShellExecuteExW(&mut info) };
         if ok == 0 {
-            // Most commonly ERROR_CANCELLED (1223): the user dismissed UAC
             return Err(
                 "administrator approval was declined or the elevated helper failed to start"
                     .to_string(),
@@ -449,9 +433,16 @@ mod elevate {
             return Err("elevated helper did not return a process handle".to_string());
         }
 
-        unsafe {
-            WaitForSingleObject(info.hProcess, INFINITE);
+        let timed_out = unsafe {
+            let timed_out = WaitForSingleObject(info.hProcess, HELPER_TIMEOUT_MS) == WAIT_TIMEOUT;
+            if timed_out {
+                TerminateProcess(info.hProcess, 1);
+            }
             CloseHandle(info.hProcess);
+            timed_out
+        };
+        if timed_out {
+            return Err("the elevated helper timed out".to_string());
         }
 
         let bytes =

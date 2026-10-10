@@ -72,14 +72,60 @@ impl Response {
         Ok(collected.to_bytes())
     }
 
-    pub(crate) async fn drain(mut self) -> Result<()> {
-        if let Some(body) = self.body.take() {
-            let mut stream = body.into_data_stream();
-            while let Some(chunk) = stream.next().await {
-                chunk?;
+    pub async fn bytes_limited(mut self, max: usize) -> Result<Bytes> {
+        let too_big = || Error::Body(format!("body exceeds {max} bytes"));
+        if self.content_length().is_some_and(|n| n > max as u64) {
+            return Err(too_big());
+        }
+        let body = self
+            .body
+            .take()
+            .ok_or_else(|| Error::Body("body already consumed".into()))?;
+        let mut stream = body.into_data_stream();
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if out.len() + chunk.len() > max {
+                return Err(too_big());
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out.into())
+    }
+
+    pub async fn snippet(mut self, max: usize) -> String {
+        let Some(body) = self.body.take() else {
+            return String::new();
+        };
+        let mut stream = body.into_data_stream();
+        let mut out = Vec::new();
+        while let Some(Ok(chunk)) = stream.next().await {
+            let room = max - out.len();
+            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if out.len() >= max {
+                break;
             }
         }
-        Ok(())
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    pub async fn text_limited(self, max: usize) -> Result<String> {
+        let bytes = self.bytes_limited(max).await?;
+        String::from_utf8(bytes.into()).map_err(|e| Error::Decode(e.to_string()))
+    }
+
+    pub(crate) async fn drain_bounded(mut self) {
+        const LIMIT: usize = 64 * 1024;
+        if let Some(body) = self.body.take() {
+            let mut stream = body.into_data_stream();
+            let mut seen = 0usize;
+            while let Some(Ok(chunk)) = stream.next().await {
+                seen += chunk.len();
+                if seen >= LIMIT {
+                    break;
+                }
+            }
+        }
     }
 
     pub async fn text(self) -> Result<String> {

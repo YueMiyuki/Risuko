@@ -1,11 +1,26 @@
-//! Small cross-cutting helpers shared across engine protocol modules
-
 use std::time::{SystemTime, UNIX_EPOCH};
+pub(crate) const ERROR_SNIPPET_BYTES: usize = 512;
+
+pub(crate) const RESPONSE_BODY_LIMIT: usize = 64 * 1024;
+
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+pub(crate) fn atomic_saturating_sub(counter: &std::sync::atomic::AtomicU64, amount: u64) {
+    use std::sync::atomic::Ordering;
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(actual) = counter.compare_exchange_weak(
+        current,
+        current.saturating_sub(amount),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = actual;
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -15,7 +30,6 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// If `dir/name` already exists, return `dir/stem.1.ext`, `dir/stem.2.ext`, etc
 pub(crate) fn dedup_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
@@ -23,8 +37,8 @@ pub(crate) fn dedup_path(dir: &std::path::Path, name: &str) -> std::path::PathBu
     }
 
     let (stem, ext) = match name.rfind('.') {
-        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]), // "file.txt" -> ("file", ".txt")
-        _ => (name, ""),                                      // "noext" -> ("noext", "")
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
     };
 
     for n in 1u32.. {
@@ -38,7 +52,6 @@ pub(crate) fn dedup_path(dir: &std::path::Path, name: &str) -> std::path::PathBu
             return path;
         }
     }
-    // Unreachable in practice
     candidate
 }
 
@@ -46,7 +59,11 @@ pub(crate) fn safe_filename(name: &str, fallback: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '|' | '?' | '*' | '\0')
+            if c.is_control()
+                || matches!(
+                    c,
+                    '/' | '\\' | ':' | '<' | '>' | '|' | '?' | '*' | '"' | '\0'
+                )
             {
                 '_'
             } else {
@@ -64,10 +81,13 @@ pub(crate) fn safe_filename(name: &str, fallback: &str) -> String {
     trimmed.to_string()
 }
 
-fn is_windows_device_name(name: &str) -> bool {
-    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+pub fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
     let upper = stem.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
         return true;
     }
     if upper.len() == 4 {
@@ -98,5 +118,8 @@ mod tests {
         assert_eq!(safe_filename("NUL.txt", "fallback"), "fallback");
         assert_eq!(safe_filename("com9", "fallback"), "fallback");
         assert_eq!(safe_filename("foo  ", "fallback"), "foo");
+        assert_eq!(safe_filename("con.tar.gz", "fallback"), "fallback");
+        assert_eq!(safe_filename("lpt1 .txt", "fallback"), "fallback");
+        assert_eq!(safe_filename("console.log", "fallback"), "console.log");
     }
 }

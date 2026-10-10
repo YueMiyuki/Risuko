@@ -1,17 +1,4 @@
 #!/usr/bin/env node
-
-/**
- * Bootstrap npm package records locally by publishing placeholder artifacts
- *
- * This is useful for first-time scoped package creation, so npm package pages
- * exist and Trusted Publishing can be configured in the npm web UI
- *
- * Usage:
- *   node scripts/bootstrap-npm-local.mjs
- *   node scripts/bootstrap-npm-local.mjs 0.0.0-bootstrap.0
- *   node scripts/bootstrap-npm-local.mjs 0.0.0-bootstrap.1 --tag bootstrap --dry-run
- */
-
 import {
   existsSync,
   mkdtempSync,
@@ -120,7 +107,6 @@ function createPlaceholderFile(pkgName, filePath) {
     return;
   }
 
-  // For executable-style files without extension, create a simple script
   writeFileSync(filePath, "#!/usr/bin/env sh\necho \"hello world (bootstrap placeholder)\"\n");
 }
 
@@ -210,5 +196,4 @@ if (dryRun) {
   console.log("\nBootstrap publish completed.");
 }
 
-// Keep the temp directory for troubleshooting unless explicitly cleaned by user
 console.log(`Temp workspace kept at: ${tempRoot}`);

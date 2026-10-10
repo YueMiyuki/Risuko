@@ -1,10 +1,7 @@
-//! Peer id generation (BEP 20): Azureus-style `-RS<version>-` plus 12 random bytes
-
 use rand::Rng;
 
 use super::hash::Id20;
 
-/// `-RS`, three version characters from `CARGO_PKG_VERSION`, `0-`
 pub const PEER_ID_PREFIX: [u8; 8] = [
     b'-',
     b'R',
@@ -16,7 +13,6 @@ pub const PEER_ID_PREFIX: [u8; 8] = [
     b'-',
 ];
 
-/// Client name + version advertised in the BEP 10 `v` key
 pub const CLIENT_VERSION: &str = concat!("Risuko ", env!("CARGO_PKG_VERSION"));
 
 const fn parse_version_part(part: &str) -> u32 {
@@ -31,7 +27,6 @@ const fn parse_version_part(part: &str) -> u32 {
     value
 }
 
-/// Version digit: 0-9, then A-Z and a-z (libtorrent's encoding), saturating at `z`
 const fn version_char(value: u32) -> u8 {
     match value {
         0..=9 => b'0' + value as u8,
@@ -41,12 +36,26 @@ const fn version_char(value: u32) -> u8 {
     }
 }
 
-/// Generate a fresh peer id for this client instance
 pub fn generate_peer_id() -> Id20 {
     let mut raw = [0u8; 20];
     raw[..PEER_ID_PREFIX.len()].copy_from_slice(&PEER_ID_PREFIX);
     rand::rng().fill_bytes(&mut raw[PEER_ID_PREFIX.len()..]);
     Id20(raw)
+}
+
+static SESSION_PEER_ID: parking_lot::Mutex<Option<(u16, Id20)>> = parking_lot::Mutex::new(None);
+
+pub(crate) fn set_session_peer_id(listen_port: u16, id: Id20) {
+    *SESSION_PEER_ID.lock() = Some((listen_port, id));
+}
+
+static FALLBACK_PEER_ID: std::sync::OnceLock<Id20> = std::sync::OnceLock::new();
+
+pub(crate) fn session_peer_id_or_new(listen_port: u16) -> Id20 {
+    match *SESSION_PEER_ID.lock() {
+        Some((port, id)) if port == listen_port => id,
+        _ => *FALLBACK_PEER_ID.get_or_init(generate_peer_id),
+    }
 }
 
 #[cfg(test)]
@@ -63,7 +72,6 @@ mod tests {
     fn randomness_differs() {
         let a = generate_peer_id();
         let b = generate_peer_id();
-        // Prefix bytes match, suffix should (almost certainly) differ
         assert_ne!(a, b);
     }
 
@@ -86,5 +94,14 @@ mod tests {
         assert_eq!(version_char(10), b'A');
         assert_eq!(version_char(36), b'a');
         assert_eq!(version_char(99), b'z');
+    }
+
+    #[test]
+    fn session_peer_id_is_reused_once_recorded() {
+        let id = generate_peer_id();
+        set_session_peer_id(54321, id);
+        assert_eq!(session_peer_id_or_new(54321), id);
+        assert_ne!(session_peer_id_or_new(54322), id);
+        assert_eq!(session_peer_id_or_new(54322), session_peer_id_or_new(54323));
     }
 }

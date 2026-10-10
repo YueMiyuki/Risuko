@@ -64,6 +64,7 @@ export const useAppStore = defineStore("app", {
 			numActive: 0,
 			numWaiting: 0,
 			numStopped: 0,
+			numPaused: 0,
 		},
 		addTaskVisible: false,
 		missedScheduledVisible: false,
@@ -301,11 +302,13 @@ export const useAppStore = defineStore("app", {
 				);
 			}
 		},
-		async fetchProgress() {
+		async fetchProgress(prefetched?: DownloadTask[]) {
 			try {
-				const tasks = await api.fetchActiveTaskList({
-					keys: ["totalLength", "completedLength"],
-				});
+				const tasks =
+					prefetched ??
+					(await api.fetchActiveTaskList({
+						keys: ["totalLength", "completedLength"],
+					}));
 
 				if (tasks.length === 0) {
 					this.progress = -1;

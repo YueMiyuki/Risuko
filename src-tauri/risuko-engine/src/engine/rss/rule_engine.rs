@@ -1,5 +1,3 @@
-//! Rule evaluation: pure functions over `RssRule`, `RssItem`, `ParsedMeta`
-
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -15,7 +13,6 @@ use super::types::{
 const QUALITY_BASE_SCORE: i32 = 1000;
 const QUALITY_STEP: i32 = 100;
 
-/// Evaluate a rule against an item; pure, returns whether it matches and a score for best-match/upgrade decisions Rule-set semantics (see `RssManager::best_matching_rule`): rules are pre-sorted by `priority` descending; `RuleMode::AnyMatch` short-circuits on the first match (preempting later rules regardless of mode) unless a higher-priority `RuleMode::BestMatch` already has a strictly better score, in which case the running best wins; `RuleMode::BestMatch` keeps scanning and wins by score across the full active set. UI/help mirror this: AnyMatch is "first hit wins (within its priority tier)", BestMatch is "highest-score hit wins overall"
 pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> RuleEvaluation {
     if !rule.is_active {
         return reject("rule disabled");
@@ -24,20 +21,17 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         return reject("feed not in scope");
     }
 
-    // title_must — every pattern must match the item title
     for p in &rule.title_must {
         if !pattern_matches(p, &item.title) {
             return reject(format!("missing required pattern '{}'", p.value));
         }
     }
-    // title_must_not — no pattern may match
     for p in &rule.title_must_not {
         if pattern_matches(p, &item.title) {
             return reject(format!("excluded by pattern '{}'", p.value));
         }
     }
 
-    // Size filters (silently skip when unknown)
     if let Some(len) = item.enclosure_length {
         if let Some(min) = rule.min_size_bytes {
             if len < min {
@@ -51,7 +45,6 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         }
     }
 
-    // Seeder filter (silently skip when unknown, like size filters; many feeds omit seeder counts and rejecting them would drop valid items)
     if let Some(min) = rule.min_seeders {
         if let Some(s) = parsed.seeders {
             if s < min {
@@ -60,13 +53,10 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         }
     }
 
-    // Series filter
     if let Some(ref want) = rule.series_filter {
         let want_norm = normalize_series(want);
-        // Empty normalized filters would match every item, so treat them as no constraint
         if !want_norm.is_empty() {
             let have_norm = parsed.series.as_deref().map(normalize_series);
-            // One-directional: parsed series must contain the filter (a bidirectional check would let "attack on titan" match a parsed series of merely "titan")
             match have_norm {
                 Some(have) if have.contains(&want_norm) => {}
                 _ => return reject("series filter mismatch"),
@@ -74,7 +64,6 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         }
     }
 
-    // Season filter
     if let Some(ref allowed) = rule.seasons {
         if let Some(s) = parsed.season {
             if !allowed.contains(&s) {
@@ -85,7 +74,6 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         }
     }
 
-    // Episode selector
     if let Some(ref sel) = rule.episodes {
         let ep = parsed.episode.or(parsed.absolute_episode);
         if !episode_in_selector(sel, ep) {
@@ -93,7 +81,6 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
         }
     }
 
-    // Quality required/forbidden
     let tags_lower: Vec<String> = parsed
         .quality_tags
         .iter()
@@ -123,13 +110,11 @@ pub fn evaluate_rule(rule: &RssRule, item: &RssItem, parsed: &ParsedMeta) -> Rul
     }
 }
 
-/// Score by index in preference list (earlier = higher); items with no matching preferred quality score 0
 pub fn quality_score(preferences: &[String], tags: &[String]) -> i32 {
     if preferences.is_empty() {
         return QUALITY_BASE_SCORE;
     }
     let tags_lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
-    // Score strictly decreases with preference index, so the first matching preference is the best one
     preferences
         .iter()
         .position(|p| tags_lower.contains(&p.to_lowercase()))
@@ -140,7 +125,6 @@ pub fn quality_score(preferences: &[String], tags: &[String]) -> i32 {
 fn pattern_matches(p: &Pattern, text: &str) -> bool {
     match p.kind {
         PatternKind::Contains => {
-            // Treat common release separators (`.`, `_`) as spaces so a human pattern like "show name" matches "Show.Name.S01E02"
             fn normalize(s: &str, case_sensitive: bool) -> String {
                 let mut out = String::with_capacity(s.len());
                 let mut prev_space = false;
@@ -182,10 +166,8 @@ fn pattern_matches(p: &Pattern, text: &str) -> bool {
     }
 }
 
-/// Cap distinct user patterns retained per cache On overflow, clear the cache instead of precise eviction; active rules reuse few patterns
 const PATTERN_CACHE_CAP: usize = 1024;
 
-/// Compile-once regex cache for rules Caches invalid patterns too, keyed by fully-resolved source including `(?i)`
 fn cached_regex(pattern_src: &str) -> Option<Regex> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -201,7 +183,6 @@ fn cached_regex(pattern_src: &str) -> Option<Regex> {
     compiled
 }
 
-/// Compile-once glob cache for rules, keyed by value and case sensitivity
 fn cached_glob(value: &str, case_sensitive: bool) -> Option<GlobMatcher> {
     static CACHE: OnceLock<Mutex<HashMap<(String, bool), Option<GlobMatcher>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -241,13 +222,11 @@ fn reject(reason: impl Into<String>) -> RuleEvaluation {
     }
 }
 
-/// Check whether the schedule allows a download at `ts_secs` (unix seconds). For overnight windows (e.g. `start_hour=22`, `end_hour=06`), `sched.days` gates the *start* day of the window: a 22–06 schedule for Monday matches Mon 22:00–23:59 *and* Tue 00:00–05:59. Without this adjustment, the early morning hours of a valid window would be rejected because the local weekday has already rolled over
 pub fn schedule_allows(sched: &Schedule, ts_secs: u64) -> bool {
     let local = ts_secs as i64 + sched.tz_offset_min as i64 * 60;
     let day_secs = local.rem_euclid(86_400);
     let hour = (day_secs / 3600) as u8;
     let mut day_index = local.div_euclid(86_400);
-    // Overnight window: hours after midnight belong to the *previous* day's schedule entry, so step back a day before resolving the weekday
     if sched.start_hour > sched.end_hour && hour < sched.end_hour {
         day_index -= 1;
     }
@@ -257,19 +236,17 @@ pub fn schedule_allows(sched: &Schedule, ts_secs: u64) -> bool {
         return false;
     }
     if sched.start_hour == sched.end_hour {
-        return true; // 24h window
+        return true;
     }
     if sched.start_hour < sched.end_hour {
         hour >= sched.start_hour && hour < sched.end_hour
     } else {
-        // wraps midnight
         hour >= sched.start_hour || hour < sched.end_hour
     }
 }
 
-/// Unix epoch day 0 (1970-01-01) was a Thursday
 fn unix_weekday(days_since_epoch: i64) -> Weekday {
-    let idx = (days_since_epoch.rem_euclid(7) + 3).rem_euclid(7); // shift so Mon=0
+    let idx = (days_since_epoch.rem_euclid(7) + 3).rem_euclid(7);
     match idx {
         0 => Weekday::Mon,
         1 => Weekday::Tue,
@@ -281,7 +258,6 @@ fn unix_weekday(days_since_epoch: i64) -> Weekday {
     }
 }
 
-/// Compute the dedupe key for an item, given parsed metadata. Returns None when not enough info is present (no series + no episode number)
 pub fn episode_key_for(parsed: &ParsedMeta) -> Option<EpisodeKey> {
     let series = parsed.series.as_ref().map(|s| normalize_series(s))?;
     if series.is_empty() {
@@ -304,7 +280,6 @@ pub fn episode_key_for(parsed: &ParsedMeta) -> Option<EpisodeKey> {
     })
 }
 
-/// Decision for whether to download an item given an episode-history record
 #[derive(Debug, PartialEq, Eq)]
 pub enum DedupeDecision {
     Download,
@@ -506,9 +481,7 @@ mod tests {
             end_hour: 17,
             tz_offset_min: 0,
         };
-        // 1970-01-01 12:00 UTC
         assert!(schedule_allows(&sched, 12 * 3600));
-        // 1970-01-01 18:00 UTC
         assert!(!schedule_allows(&sched, 18 * 3600));
     }
 

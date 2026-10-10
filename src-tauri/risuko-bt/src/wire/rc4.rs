@@ -1,4 +1,3 @@
-//! RC4 stream cipher for MSE/PE
 pub struct Rc4 {
     s: [u8; 256],
     i: u8,

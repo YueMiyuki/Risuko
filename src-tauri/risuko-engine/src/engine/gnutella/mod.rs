@@ -1,5 +1,3 @@
-//! Gnutella 0.6 — Phase 3
-
 pub mod download;
 pub mod peer;
 pub mod types;

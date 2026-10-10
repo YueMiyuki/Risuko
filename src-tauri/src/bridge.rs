@@ -6,7 +6,6 @@ use tauri_plugin_store::StoreExt;
 
 use risuko_engine::traits::{ConfigDirProvider, EventSink, StorageBackend};
 
-/// Tauri-backed config directory provider
 pub struct TauriConfigDir {
     config_dir: PathBuf,
 }
@@ -27,7 +26,6 @@ impl ConfigDirProvider for TauriConfigDir {
     }
 }
 
-/// Tauri-backed event sink — forwards to webview via `AppHandle::emit()`
 pub struct TauriEventSink {
     handle: AppHandle,
 }
@@ -48,7 +46,6 @@ impl EventSink for TauriEventSink {
     }
 }
 
-/// Tauri-backed storage using `tauri_plugin_store`
 pub struct TauriStorage {
     handle: AppHandle,
 }

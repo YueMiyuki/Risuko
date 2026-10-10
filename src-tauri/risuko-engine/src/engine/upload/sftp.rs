@@ -1,17 +1,15 @@
-//! SFTP upload sink. Reuses the russh + russh-sftp stack already used by the SFTP downloader
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use russh::client;
-use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sink::{SftpConfig, UploadControl, UploadFile, UploadSink};
+use crate::engine::ssh_auth::authenticate;
 use crate::engine::ssh_known_hosts::TofuHandler;
 
 const COPY_BUF: usize = 256 * 1024;
@@ -35,7 +33,6 @@ impl SftpSink {
         Ok(Self { cfg })
     }
 
-    /// Returns both so callers keep the russh `Handle` alive for the session lifetime; dropping it issues an SSH `Disconnect` that kills the `SftpSession` channel and fails the next request
     async fn connect(&self) -> Result<(client::Handle<TofuHandler>, SftpSession), String> {
         let config = Arc::new(client::Config::default());
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
@@ -44,38 +41,19 @@ impl SftpSink {
             .await
             .map_err(|e| format!("SSH connect failed: {e}"))?;
 
-        let mut authed = false;
-
-        // Try private key first if provided
-        if !self.cfg.private_key.is_empty() {
+        let key = if self.cfg.private_key.is_empty() {
+            None
+        } else {
             match russh::keys::decode_secret_key(&self.cfg.private_key, None) {
-                Ok(key) => {
-                    let alg = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                    match session
-                        .authenticate_publickey(&self.cfg.username, alg)
-                        .await
-                    {
-                        Ok(a) if a.success() => authed = true,
-                        Ok(_) => tracing::warn!("SFTP key auth rejected"),
-                        Err(e) => tracing::warn!("SFTP key auth error: {e}"),
-                    }
+                Ok(key) => Some(key),
+                Err(e) => {
+                    tracing::warn!("SFTP key decode error: {e}");
+                    None
                 }
-                Err(e) => tracing::warn!("SFTP key decode error: {e}"),
             }
-        }
-
-        if !authed && !self.cfg.password.is_empty() {
-            match session
-                .authenticate_password(&self.cfg.username, &self.cfg.password)
-                .await
-            {
-                Ok(a) if a.success() => authed = true,
-                Ok(_) => return Err("SFTP password auth rejected".into()),
-                Err(e) => return Err(format!("SFTP password auth: {e}")),
-            }
-        }
-
-        if !authed {
+        };
+        let password = (!self.cfg.password.is_empty()).then_some(self.cfg.password.as_str());
+        if !authenticate(&mut session, &self.cfg.username, key, password).await? {
             return Err("SFTP authentication failed".into());
         }
 
@@ -94,7 +72,6 @@ impl SftpSink {
         Ok((session, sftp))
     }
 
-    /// Walk the parent path one segment at a time creating missing dirs; SFTP `mkdir` errors when the parent doesn't exist
     async fn ensure_parent_dirs(&self, sftp: &SftpSession, full_path: &str) -> Result<(), String> {
         let parent = match full_path.rsplit_once('/') {
             Some((p, _)) if !p.is_empty() => p.to_string(),
@@ -111,17 +88,14 @@ impl SftpSink {
                 accum.push('/');
             }
             accum.push_str(seg);
-            // Best-effort: ignore "already exists" errors
             match sftp.try_exists(&accum).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     if let Err(e) = sftp.create_dir(&accum).await {
-                        // Tolerate races where another upload created it
                         tracing::debug!("SFTP mkdir {accum} ignored: {e}");
                     }
                 }
                 Err(_) => {
-                    // Couldn't stat — try mkdir and ignore failure
                     let _ = sftp.create_dir(&accum).await;
                 }
             }
@@ -130,7 +104,6 @@ impl SftpSink {
     }
 
     fn full_remote_path(&self, remote_relative: &str) -> String {
-        // A configured base of "/" is an absolute root mount and must be preserved; naive trim_end_matches('/') would collapse it to "" and produce a non-absolute path
         let rel = remote_relative.trim_start_matches('/');
         if self.cfg.base_path == "/" {
             return format!("/{rel}");
@@ -161,7 +134,6 @@ impl UploadSink for SftpSink {
             .await
             .inspect_err(|e| tracing::debug!("SFTP ensure_parent_dirs({remote}) failed: {e}"))?;
 
-        // Stage writes to a sibling `.part` file so an existing good upload at the final path is never truncated or unlinked on failure; only the successful end-state (full body flushed + closed) renames the temp into the final name
         let remote_tmp = format!("{remote}.part");
         let mut remote_file = sftp
             .open_with_flags(
@@ -170,7 +142,6 @@ impl UploadSink for SftpSink {
             )
             .await
             .map_err(|e| {
-                // Don't echo `remote_tmp` (user-controlled, may leak host layout) into the returned error or info logs; the full path is still emitted at debug level for operators with log access
                 tracing::debug!("SFTP open {remote_tmp}: {e}");
                 tracing::error!("SFTP open failed: {e}");
                 format!("SFTP open failed: {e}")
@@ -184,7 +155,6 @@ impl UploadSink for SftpSink {
         let mut buf = vec![0u8; COPY_BUF];
         let mut sent: u64 = 0;
 
-        // Best-effort cleanup of the partial temp: close the handle (releasing the server lock) and unlink the temp so a retry doesn't see a torn file; errors are logged but never override the original failure and the final `remote` name is never touched
         async fn discard_partial(
             mut remote_file: russh_sftp::client::fs::File,
             sftp: &SftpSession,
@@ -221,14 +191,13 @@ impl UploadSink for SftpSink {
         }
 
         if let Err(e) = remote_file.shutdown().await {
-            // Close failed after a complete write; drop the temp so a half-flushed file isn't left behind, final `remote` is untouched
             if let Err(re) = sftp.remove_file(&remote_tmp).await {
                 tracing::debug!("SFTP cleanup after close failure ignored: {re}");
             }
             return Err(format!("SFTP close: {e}"));
         }
 
-        // Rename the staged temp over the final path; SFTPv3 `rename` may fail if the destination exists on some servers, so on failure unlink the existing remote and retry once to allow overwrites
+        // Some servers' SFTPv3 `rename` fails if the destination exists
         if let Err(e) = sftp.rename(&remote_tmp, &remote).await {
             tracing::debug!(
                 "SFTP rename {remote_tmp} -> {remote} failed ({e}); retrying after unlink"
@@ -241,7 +210,6 @@ impl UploadSink for SftpSink {
         }
 
         ctl.report(file.size, file.size);
-        // Always insert exactly one '/' between port and the remote path so the URL is well-formed whether `remote` is absolute or relative
         let remote_for_url = remote.trim_start_matches('/');
         Ok(format!(
             "sftp://{}@{}:{}/{}",
@@ -250,10 +218,8 @@ impl UploadSink for SftpSink {
     }
 
     async fn test(&self) -> Result<(), String> {
-        // Connect with a short overall timeout so a hung step fails fast in the UI
         tokio::time::timeout(Duration::from_secs(20), async {
             let (_ssh, sftp) = self.connect().await?;
-            // Stat the base dir or `/` to confirm we can talk SFTP
             let probe = if self.cfg.base_path.trim().is_empty() {
                 "/".to_string()
             } else {

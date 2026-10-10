@@ -1,5 +1,3 @@
-//! NZB parsing and non-secret Usenet task metadata
-
 use quick_xml::de::from_str;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -292,8 +290,93 @@ fn subject_filename(subject: &str) -> Option<String> {
     (!safe.is_empty()).then_some(safe)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRole {
+    Data,
+    Par2Index,
+    Par2Volume { blocks: Option<u32> },
+}
+
+pub fn file_role(name: &str) -> FileRole {
+    let lower = name.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".par2") else {
+        return FileRole::Data;
+    };
+    let Some(at) = stem.rfind(".vol") else {
+        return FileRole::Par2Index;
+    };
+    let range = &stem[at + 4..];
+    if !range.starts_with(|c: char| c.is_ascii_digit()) {
+        return FileRole::Par2Index;
+    }
+    let blocks = range
+        .split_once(['+', '-'])
+        .filter(|(first, count)| {
+            !first.is_empty()
+                && !count.is_empty()
+                && first.bytes().all(|b| b.is_ascii_digit())
+                && count.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|(_, count)| count.parse().ok());
+    FileRole::Par2Volume { blocks }
+}
+
+pub fn deferred_par2_volumes<S: AsRef<str>>(names: &[S]) -> Vec<usize> {
+    let roles: Vec<FileRole> = names.iter().map(|name| file_role(name.as_ref())).collect();
+    let mut deferred: Vec<usize> = roles
+        .iter()
+        .enumerate()
+        .filter(|(_, role)| matches!(role, FileRole::Par2Volume { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    if !roles.contains(&FileRole::Par2Index) {
+        let smallest = (0..deferred.len()).min_by_key(|position| {
+            let index = deferred[*position];
+            let blocks = match roles[index] {
+                FileRole::Par2Volume { blocks } => blocks.unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            };
+            (blocks, index)
+        });
+        if let Some(position) = smallest {
+            deferred.remove(position);
+        }
+    }
+    deferred
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferral_keeps_one_volume_when_the_set_has_no_index() {
+        let with_index = ["a.mkv", "a.par2", "a.vol0+1.par2", "a.vol1+2.par2"];
+        assert_eq!(deferred_par2_volumes(&with_index), [2, 3]);
+        let without_index = ["a.mkv", "a.vol1+2.par2", "a.vol0+1.par2"];
+        assert_eq!(deferred_par2_volumes(&without_index), [1]);
+        assert!(deferred_par2_volumes(&["a.mkv"]).is_empty());
+    }
+
+    #[test]
+    fn file_roles_separate_par2_index_and_recovery_volumes() {
+        assert_eq!(file_role("movie.mkv"), FileRole::Data);
+        assert_eq!(file_role("movie.par2"), FileRole::Par2Index);
+        assert_eq!(file_role("MOVIE.PAR2"), FileRole::Par2Index);
+        assert_eq!(
+            file_role("movie.vol003+004.par2"),
+            FileRole::Par2Volume { blocks: Some(4) }
+        );
+        assert_eq!(
+            file_role("movie.mkv.vol00+01.PAR2"),
+            FileRole::Par2Volume { blocks: Some(1) }
+        );
+        assert_eq!(
+            file_role("movie.vol1.par2"),
+            FileRole::Par2Volume { blocks: None }
+        );
+        assert_eq!(file_role("movie.volume.par2"), FileRole::Par2Index);
+        assert_eq!(file_role("movie.par2.txt"), FileRole::Data);
+    }
+
     use super::*;
 
     const SAMPLE: &[u8] = br#"<?xml version="1.0"?>

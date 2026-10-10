@@ -1,7 +1,4 @@
-//! OS-keychain-backed credential vault
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use keyring_core::{Entry, Error};
 use serde_json::Value;
@@ -53,34 +50,36 @@ fn build_default_store() -> Result<std::sync::Arc<keyring_core::CredentialStore>
 }
 
 pub struct VaultManager {
-    enabled: AtomicBool,
+    enabled: OnceLock<bool>,
 }
 
 impl VaultManager {
     pub fn new() -> Self {
-        ensure_default_store();
-        let mgr = Self {
-            enabled: AtomicBool::new(false),
-        };
-        mgr.probe();
-        mgr
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
-    }
-
-    /// Build a manager with a forced `enabled` flag, skipping the OS probe
-    #[cfg(test)]
-    pub(crate) fn for_test(enabled: bool) -> Self {
         Self {
-            enabled: AtomicBool::new(enabled),
+            enabled: OnceLock::new(),
         }
     }
 
-    /// Non-destructive reachability check: confirm the keyring backend opens
-    /// and lookups succeed
-    fn probe(&self) {
+    pub fn warm_up(self: &std::sync::Arc<Self>) {
+        let vault = self.clone();
+        std::thread::spawn(move || {
+            vault.enabled();
+        });
+    }
+
+    pub fn enabled(&self) -> bool {
+        *self.enabled.get_or_init(Self::probe)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(enabled: bool) -> Self {
+        Self {
+            enabled: OnceLock::from(enabled),
+        }
+    }
+
+    fn probe() -> bool {
+        ensure_default_store();
         let ok = match Entry::new(SERVICE, PROBE_ACCOUNT) {
             Ok(entry) => match entry.get_password() {
                 Ok(_) | Err(Error::NoEntry) => true,
@@ -88,40 +87,34 @@ impl VaultManager {
             },
             Err(_) => false,
         };
-        self.enabled.store(ok, Ordering::Relaxed);
         if ok {
             tracing::info!("Credential vault: OS keychain available");
         } else {
             tracing::warn!("Credential vault: OS keychain unavailable, falling back to plaintext");
         }
+        ok
     }
 
-    /// Store the secret JSON object for the given credential id
     pub fn put(&self, id: &str, secrets: &Value) -> Result<(), String> {
         self.put_at(SERVICE, id, secrets)
     }
 
-    /// Retrieve the secret JSON object for the given credential id
     pub fn get(&self, id: &str) -> Result<Option<Value>, String> {
         self.get_at(SERVICE, id)
     }
 
-    /// Best-effort delete; missing entries are not an error
     pub fn remove(&self, id: &str) -> Result<(), String> {
         self.remove_at(SERVICE, id)
     }
 
-    /// Store secrets for an upload sink (separate keychain namespace)
     pub fn put_sink(&self, id: &str, secrets: &Value) -> Result<(), String> {
         self.put_at(SINK_SERVICE, id, secrets)
     }
 
-    /// Retrieve secrets for an upload sink
     pub fn get_sink(&self, id: &str) -> Result<Option<Value>, String> {
         self.get_at(SINK_SERVICE, id)
     }
 
-    /// Best-effort delete of an upload sink's secrets
     pub fn remove_sink(&self, id: &str) -> Result<(), String> {
         self.remove_at(SINK_SERVICE, id)
     }
@@ -184,7 +177,6 @@ mod tests {
     #[test]
     fn disabled_remove_is_ok() {
         let m = VaultManager::for_test(false);
-        // Should silently succeed so callers can blindly remove on cleanup
         m.remove("any-id").unwrap();
     }
 
@@ -199,7 +191,6 @@ mod tests {
         }
         let m = VaultManager::new();
         if !m.enabled() {
-            // No usable backend on this host; treat as a skip
             return;
         }
 
@@ -217,7 +208,6 @@ mod tests {
         m.remove(&id).expect("remove");
         assert_eq!(m.get(&id).expect("get after remove"), None);
 
-        // Removing a missing entry must remain a no-op
         m.remove(&id).expect("idempotent remove");
     }
 }

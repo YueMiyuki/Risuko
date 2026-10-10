@@ -505,7 +505,66 @@
                 <NumberInput
                   v-model="form.btMaxOutstandingPerPeer"
                   :min="0"
-                  :max="256"
+                  :max="500"
+                  :step="1"
+                />
+              </div>
+            </div>
+
+            <div class="settings-row" style="margin-top: 8px">
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.bt-max-connections') }}
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.bt-max-connections-tips') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <NumberInput
+                  v-model="form.btMaxConnections"
+                  :min="20"
+                  :max="5000"
+                  :step="10"
+                />
+              </div>
+            </div>
+
+            <div class="settings-row" style="margin-top: 8px">
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.bt-ban-corrupt-peers') }}
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.bt-ban-corrupt-peers-tips') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <ui-checkbox
+                  :model-value="!!form.btBanCorruptPeers"
+                  @change="(val) => setAdvancedBoolean('btBanCorruptPeers', val)"
+                />
+              </div>
+            </div>
+
+            <div
+              v-if="form.btBanCorruptPeers"
+              class="settings-row"
+              style="margin-top: 8px"
+            >
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.bt-ban-corrupt-strikes') }}
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.bt-ban-corrupt-strikes-tips') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <NumberInput
+                  v-model="form.btBanCorruptStrikes"
+                  :min="1"
+                  :max="100"
                   :step="1"
                 />
               </div>
@@ -1021,7 +1080,7 @@
                   <Input
                     :type="hideRpcSecret ? 'password' : 'text'"
                     placeholder="RPC Secret"
-                    :maxlength="64"
+                    :maxlength="256"
                     :disabled="form.externalEngineEnabled"
                     v-model="form.rpcSecret"
                   />
@@ -1284,6 +1343,49 @@
                 <ui-checkbox
                   :model-value="!!form.protocols.g2"
                   @change="(val) => onProtocolsChange('g2', val)"
+                />
+              </div>
+            </div>
+            <div
+              class="settings-row"
+              data-preference-search-target="preferences.gift-integration preferences.gift-enabled preferences.gift-host preferences.gift-port"
+            >
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.gift-enabled') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <ui-checkbox
+                  :model-value="!!form.giftEnabled"
+                  :title="$t('preferences.gift-enabled')"
+                  :aria-label="$t('preferences.gift-enabled')"
+                  @change="(val) => setAdvancedBoolean('giftEnabled', val)"
+                />
+              </div>
+            </div>
+            <div v-if="form.giftEnabled" class="settings-select-group" style="margin-top: 12px">
+              <div class="settings-select-item">
+                <label class="settings-select-item-label">
+                  {{ $t('preferences.gift-host') }}
+                </label>
+                <Input
+                  v-model="form.giftHost"
+                  autocomplete="off"
+                  placeholder="127.0.0.1"
+                  @blur="onGiftHostBlur"
+                />
+              </div>
+              <div class="settings-select-item">
+                <label class="settings-select-item-label">
+                  {{ $t('preferences.gift-port') }}
+                </label>
+                <Input
+                  v-model="form.giftPort"
+                  inputmode="numeric"
+                  maxlength="5"
+                  placeholder="1213"
+                  @blur="onGiftPortBlur"
                 />
               </div>
             </div>
@@ -1679,6 +1781,9 @@ const initForm = (config) => {
 		btTracker,
 		btMaxPeersPerTorrent,
 		btMaxOutstandingPerPeer,
+		btMaxConnections,
+		btBanCorruptPeers,
+		btBanCorruptStrikes,
 		btEnableUpnp,
 		btUpnpLease,
 		btEnableLsd,
@@ -1706,6 +1811,9 @@ const initForm = (config) => {
 		dohProvider,
 		ed2kPort,
 		ed2kServer,
+		giftEnabled,
+		giftHost,
+		giftPort,
 		lastSyncTrackerTime,
 		listenPort,
 		logDirOverride,
@@ -1740,6 +1848,9 @@ const initForm = (config) => {
 		btTracker: convertCommaToLine(btTracker),
 		btMaxPeersPerTorrent: btMaxPeersPerTorrent ?? 100,
 		btMaxOutstandingPerPeer: btMaxOutstandingPerPeer ?? 0,
+		btMaxConnections: btMaxConnections ?? 400,
+		btBanCorruptPeers: parseBooleanConfig(btBanCorruptPeers, true),
+		btBanCorruptStrikes: btBanCorruptStrikes ?? 3,
 		btEnableUpnp: parseBooleanConfig(btEnableUpnp, true),
 		btUpnpLease: btUpnpLease ?? 300,
 		btEnableLsd: parseBooleanConfig(btEnableLsd, true),
@@ -1763,6 +1874,9 @@ const initForm = (config) => {
 		dohBootstrap: dohBootstrap || "",
 		dohFallback: parseBooleanConfig(dohFallback, true),
 		dohProvider: resolveDohProvider(dohProvider, dohUrl),
+		giftEnabled: parseBooleanConfig(giftEnabled, false),
+		giftHost: `${giftHost ?? ""}`.trim() || "127.0.0.1",
+		giftPort: normalizePortValue(giftPort, 1213),
 		ed2kPort: (ed2kPort ?? config.ed2KPort) || 4662,
 		ed2kServer: convertCommaToLine(
 			(ed2kServer ?? config.ed2KServer) || DEFAULT_ED2K_SERVERS,
@@ -1873,13 +1987,17 @@ const ADVANCED_BOOLEAN_KEYS = [
 	"externalEngineEnabled",
 	"completionScriptEnabled",
 	"ed2kEnableKad",
+	"giftEnabled",
 	"pbhEnable",
 ];
 
 const ADVANCED_NUMERIC_KEYS = [
 	"ed2kKadPort",
+	"giftPort",
 	"btMaxPeersPerTorrent",
 	"btMaxOutstandingPerPeer",
+	"btMaxConnections",
+	"btBanCorruptStrikes",
 	"btUpnpLease",
 	"connectTimeout",
 	"nzbBodyTimeout",
@@ -1954,6 +2072,10 @@ const normalizeAdvancedConfig = (data, rpcDefaultPort) => {
 					data[key] = 4672;
 					continue;
 				}
+				if (key === "giftPort") {
+					data[key] = 1213;
+					continue;
+				}
 				if (key === "pbhListenPort") {
 					data[key] = ENGINE_PBH_RPC_PORT;
 					continue;
@@ -1963,10 +2085,14 @@ const normalizeAdvancedConfig = (data, rpcDefaultPort) => {
 			}
 			const n = Number(raw);
 			let ok: boolean;
-			if (key === "ed2kKadPort") {
+			if (key === "ed2kKadPort" || key === "giftPort") {
 				ok = Number.isInteger(n) && n >= 1 && n <= 65535;
 			} else if (key === "pbhListenPort") {
 				ok = Number.isInteger(n) && n >= 1 && n <= 65535;
+			} else if (key === "btMaxConnections") {
+				ok = Number.isInteger(n) && n >= 20 && n <= 5000;
+			} else if (key === "btBanCorruptStrikes") {
+				ok = Number.isInteger(n) && n >= 1 && n <= 100;
 			} else if (key === "btUpnpLease") {
 				ok = Number.isFinite(n) && n >= 60 && n <= 86400;
 			} else if (key === "connectTimeout") {
@@ -1984,6 +2110,8 @@ const normalizeAdvancedConfig = (data, rpcDefaultPort) => {
 				data[key] = n;
 			} else if (key === "ed2kKadPort") {
 				data[key] = 4672;
+			} else if (key === "giftPort") {
+				data[key] = 1213;
 			} else if (key === "pbhListenPort") {
 				data[key] = ENGINE_PBH_RPC_PORT;
 			} else {
@@ -1998,6 +2126,10 @@ const normalizeAdvancedConfig = (data, rpcDefaultPort) => {
 
 	if (data.ed2kServer !== undefined) {
 		data.ed2kServer = convertLineToComma(data.ed2kServer);
+	}
+
+	if ("giftHost" in data) {
+		data.giftHost = `${data.giftHost ?? ""}`.trim() || "127.0.0.1";
 	}
 
 	if (data.rpcListenPort === "") {
@@ -2190,6 +2322,12 @@ export default {
 				this.form.externalEnginePort,
 				this.rpcDefaultPort,
 			);
+		},
+		onGiftHostBlur() {
+			this.form.giftHost = `${this.form.giftHost ?? ""}`.trim() || "127.0.0.1";
+		},
+		onGiftPortBlur() {
+			this.form.giftPort = normalizePortValue(this.form.giftPort, 1213);
 		},
 		onEd2kKadPortBlur() {
 			this.form.ed2kKadPort = normalizePortValue(this.form.ed2kKadPort, 4672);

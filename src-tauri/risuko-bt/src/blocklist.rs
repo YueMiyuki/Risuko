@@ -1,6 +1,4 @@
-//! BitTorrent IP/CIDR blocklist
-
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,34 +15,31 @@ enum Prefix {
     V6 { network: u128, mask: u128 },
 }
 
-impl Prefix {
-    fn contains(self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (Prefix::V4 { network, mask }, IpAddr::V4(addr)) => u32::from(addr) & mask == network,
-            (Prefix::V4 { network, mask }, IpAddr::V6(addr)) => match addr.to_ipv4_mapped() {
-                Some(v4) => u32::from(v4) & mask == network,
-                None => false,
-            },
-            (Prefix::V6 { network, mask }, IpAddr::V6(addr)) => u128::from(addr) & mask == network,
-            (Prefix::V6 { .. }, IpAddr::V4(_)) => false,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct BlockList {
     exact: HashSet<IpAddr>,
     prefixes: Vec<Prefix>,
+    v4_ranges: Vec<(u32, u32)>,
+    v6_ranges: Vec<(u128, u128)>,
+    banned: HashSet<IpAddr>,
+    ban_order: VecDeque<IpAddr>,
+    ban_revision: u32,
     revision: u32,
 }
 
+const MAX_BANNED: usize = 4096;
+
 impl BlockList {
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.prefixes.is_empty()
+        self.exact.is_empty() && self.prefixes.is_empty() && self.banned.is_empty()
     }
 
     pub fn revision(&self) -> u32 {
         self.revision
+    }
+
+    pub fn ban_revision(&self) -> u32 {
+        self.ban_revision
     }
 
     pub fn rule_count(&self) -> u32 {
@@ -56,25 +51,46 @@ impl BlockList {
             return false;
         }
         let canonical = canonicalize_ip(ip);
-        if self.exact.contains(&canonical) {
+        if self.exact.contains(&canonical) || self.banned.contains(&canonical) {
             return true;
         }
-        self.prefixes.iter().any(|prefix| prefix.contains(ip))
-    }
-
-    /// Full-replace semantics: parse `entries` (plain IPs or CIDR strings) and bump `revision`
-    pub fn replace(&mut self, entries: &[String]) -> BlocklistApplyResult {
-        self.exact.clear();
-        self.prefixes.clear();
-        for entry in entries {
-            match parse_entry(entry) {
-                Some(ParsedEntry::Exact(ip)) => {
-                    self.exact.insert(canonicalize_ip(ip));
+        match ip {
+            IpAddr::V4(addr) => range_contains(&self.v4_ranges, u32::from(addr)),
+            IpAddr::V6(addr) => {
+                if let Some(v4) = addr.to_ipv4_mapped() {
+                    if range_contains(&self.v4_ranges, u32::from(v4)) {
+                        return true;
+                    }
                 }
-                Some(ParsedEntry::Prefix(prefix)) => self.prefixes.push(prefix),
-                None => {}
+                range_contains(&self.v6_ranges, u128::from(addr))
             }
         }
+    }
+
+    pub fn ban(&mut self, ip: IpAddr) -> bool {
+        let ip = canonicalize_ip(ip);
+        if !self.banned.insert(ip) {
+            return false;
+        }
+        self.ban_order.push_back(ip);
+        if self.banned.len() > MAX_BANNED {
+            if let Some(oldest) = self.ban_order.pop_front() {
+                self.banned.remove(&oldest);
+            }
+        }
+        self.ban_revision = self.ban_revision.wrapping_add(1);
+        true
+    }
+
+    pub fn replace(&mut self, entries: &[String]) -> BlocklistApplyResult {
+        self.replace_prepared(PreparedRules::parse(entries))
+    }
+
+    pub fn replace_prepared(&mut self, rules: PreparedRules) -> BlocklistApplyResult {
+        self.exact = rules.exact;
+        self.prefixes = rules.prefixes;
+        self.v4_ranges = rules.v4_ranges;
+        self.v6_ranges = rules.v6_ranges;
         self.revision = self.revision.wrapping_add(1);
         BlocklistApplyResult {
             revision: self.revision,
@@ -83,6 +99,57 @@ impl BlockList {
             removed_peers: 0,
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct PreparedRules {
+    exact: HashSet<IpAddr>,
+    prefixes: Vec<Prefix>,
+    v4_ranges: Vec<(u32, u32)>,
+    v6_ranges: Vec<(u128, u128)>,
+}
+
+impl PreparedRules {
+    pub fn parse(entries: &[String]) -> Self {
+        let mut rules = PreparedRules::default();
+        for entry in entries {
+            match parse_entry(entry) {
+                Some(ParsedEntry::Exact(ip)) => {
+                    rules.exact.insert(canonicalize_ip(ip));
+                }
+                Some(ParsedEntry::Prefix(prefix)) => rules.prefixes.push(prefix),
+                None => {}
+            }
+        }
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for prefix in &rules.prefixes {
+            match *prefix {
+                Prefix::V4 { network, mask } => v4.push((network, network | !mask)),
+                Prefix::V6 { network, mask } => v6.push((network, network | !mask)),
+            }
+        }
+        rules.v4_ranges = merge_ranges(v4);
+        rules.v6_ranges = merge_ranges(v6);
+        rules
+    }
+}
+
+fn merge_ranges<T: Copy + Ord>(mut ranges: Vec<(T, T)>) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+fn range_contains<T: Copy + Ord>(ranges: &[(T, T)], value: T) -> bool {
+    let idx = ranges.partition_point(|&(start, _)| start <= value);
+    idx > 0 && value <= ranges[idx - 1].1
 }
 
 enum ParsedEntry {
@@ -184,6 +251,36 @@ mod tests {
     }
 
     #[test]
+    fn bans_survive_rule_replacement_and_match_mapped_addresses() {
+        let mut list = BlockList::default();
+        assert!(list.ban("192.0.2.7".parse().unwrap()));
+        assert!(!list.ban("::ffff:192.0.2.7".parse().unwrap()));
+        list.replace(&["198.51.100.0/24".to_string()]);
+        assert!(list.contains("192.0.2.7".parse().unwrap()));
+        assert!(list.contains("::ffff:192.0.2.7".parse().unwrap()));
+        assert_eq!(list.rule_count(), 1);
+    }
+
+    #[test]
+    fn ban_evicts_the_oldest_at_the_cap_and_bumps_the_ban_revision() {
+        let mut list = BlockList::default();
+        let ip = |n: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+        for n in 0..MAX_BANNED as u32 {
+            assert!(list.ban(ip(n)));
+        }
+        let before = list.ban_revision();
+        assert!(!list.ban(ip(5)));
+        assert_eq!(list.ban_revision(), before);
+        assert!(list.ban(ip(MAX_BANNED as u32)));
+        assert_eq!(list.ban_revision(), before.wrapping_add(1));
+        assert!(!list.contains(ip(0)));
+        assert!(list.contains(ip(1)));
+        assert!(list.contains(ip(MAX_BANNED as u32)));
+        assert_eq!(list.banned.len(), MAX_BANNED);
+        assert_eq!(list.ban_order.len(), MAX_BANNED);
+    }
+
+    #[test]
     fn replace_is_full_swap_and_bumps_revision() {
         let mut list = BlockList::default();
         list.replace(&["1.1.1.1".into()]);
@@ -192,6 +289,26 @@ mod tests {
         assert!(list.contains("8.8.8.8".parse().unwrap()));
         assert_eq!(list.revision(), 2);
         assert_eq!(list.rule_count(), 1);
+    }
+
+    #[test]
+    fn overlapping_and_nested_prefixes_match_via_merged_ranges() {
+        let mut list = BlockList::default();
+        list.replace(&[
+            "10.0.0.0/8".into(),
+            "10.5.0.0/16".into(),
+            "192.168.1.0/24".into(),
+            "192.168.1.128/25".into(),
+            "2001:db8::/32".into(),
+            "2001:db8:1::/48".into(),
+        ]);
+        assert!(list.contains("10.255.255.255".parse().unwrap()));
+        assert!(list.contains("192.168.1.200".parse().unwrap()));
+        assert!(!list.contains("192.168.2.1".parse().unwrap()));
+        assert!(!list.contains("9.255.255.255".parse().unwrap()));
+        assert!(list.contains("2001:db8:1::5".parse().unwrap()));
+        assert!(!list.contains("2001:db7::1".parse().unwrap()));
+        assert_eq!(list.rule_count(), 6);
     }
 
     #[test]

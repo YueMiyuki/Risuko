@@ -161,12 +161,6 @@ export default class Api {
 		return invoke("change_global_option_engine", { options: args });
 	}
 
-	getGlobalOption() {
-		return invoke<Record<string, string>>("get_global_option_engine").then(
-			(data) => changeKeysToCamelCase(data),
-		);
-	}
-
 	saveUsenetCredentials(
 		profileId: string,
 		username?: string,
@@ -195,7 +189,7 @@ export default class Api {
 	}
 
 	updateActiveTaskOption(options: Record<string, unknown>) {
-		return this.fetchTaskList({ type: "active" })
+		return this.fetchTaskList({ type: "active", keys: ["gid"] })
 			.then((data) => {
 				if (isEmpty(data)) {
 					return;
@@ -618,10 +612,6 @@ export default class Api {
 		return invoke("merge_download_stats", { data });
 	}
 
-	clearDownloadStats() {
-		return invoke("clear_download_stats");
-	}
-
 	multicall(
 		method: string,
 		params: { gids?: string[]; options?: Record<string, unknown> } = {},
@@ -647,10 +637,6 @@ export default class Api {
 
 	batchPauseTask(params: { gids?: string[] } = {}) {
 		return this.multicall("risuko.pause", params);
-	}
-
-	batchForcePauseTask(params: { gids?: string[] } = {}) {
-		return this.multicall("risuko.forcePause", params);
 	}
 
 	addRssFeed(url: string) {

@@ -80,6 +80,10 @@ export default {
 		this.inlineMql.addEventListener("change", this.onInlineMqlChange);
 	},
 	beforeUnmount() {
+		if (this.closedTimer) {
+			clearTimeout(this.closedTimer);
+			this.closedTimer = null;
+		}
 		this.inlineMql?.removeEventListener("change", this.onInlineMqlChange);
 	},
 	watch: {

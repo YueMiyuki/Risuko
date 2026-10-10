@@ -1,10 +1,7 @@
-//! Durable Kad identity and contact cache
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +39,6 @@ pub fn state_path(config_dir: &Path) -> PathBuf {
     config_dir.join(STATE_FILENAME)
 }
 
-/// Load the persisted identity and bounded contact cache; missing/corrupt/unsupported/invalid state is treated as recoverable (new identity generated, invalid contacts discarded), and only filesystem permission failures are returned as errors
 pub fn load(config_dir: &Path, local_hint: Option<NodeId>) -> io::Result<LoadedKadState> {
     let path = state_path(config_dir);
     let recovered = || LoadedKadState {
@@ -74,7 +70,6 @@ pub fn load(config_dir: &Path, local_hint: Option<NodeId>) -> io::Result<LoadedK
         Err(error) => return Err(error),
     };
 
-    // Limit the read as well as checking metadata: a file can grow between metadata() and read()
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let read_result = file
         .take(MAX_STATE_FILE_BYTES.saturating_add(1))
@@ -95,7 +90,6 @@ pub fn load(config_dir: &Path, local_hint: Option<NodeId>) -> io::Result<LoadedK
         return Ok(recovered());
     }
 
-    // Contacts are validated by RoutingTable::insert (which also applies local-ID and K-bucket constraints); keep only the first bounded set so an oversized cache can't cause startup work amplification
     let mut routing = RoutingTable::new(state.node_id);
     for contact in state.contacts.into_iter().take(MAX_PERSISTED_CONTACTS) {
         let _ = routing.insert(contact);
@@ -132,7 +126,6 @@ pub fn serialize(node_id: NodeId, contacts: &[Contact]) -> Result<Vec<u8>, serde
     serde_json::to_vec_pretty(&state)
 }
 
-/// Atomically persist state via a sibling temp file and rename (atomic on supported filesystems when source and destination share a directory)
 pub fn save(config_dir: &Path, node_id: NodeId, contacts: &[Contact]) -> io::Result<()> {
     fs::create_dir_all(config_dir)?;
     let path = state_path(config_dir);
@@ -178,7 +171,6 @@ pub fn save(config_dir: &Path, node_id: NodeId, contacts: &[Contact]) -> io::Res
             }
             return Err(error);
         }
-        // Best effort directory sync; some platforms disallow opening a directory, and the durable file was already atomically replaced
         if let Ok(directory) = File::open(config_dir) {
             let _ = directory.sync_all();
         }
@@ -188,13 +180,6 @@ pub fn save(config_dir: &Path, node_id: NodeId, contacts: &[Contact]) -> io::Res
         let _ = fs::remove_file(&temp_path);
     }
     result
-}
-
-pub fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

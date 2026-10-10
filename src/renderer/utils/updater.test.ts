@@ -418,6 +418,29 @@ test("continues the update flow when persisting the check time fails", async () 
 	);
 });
 
+test("relaunches through the native command so the engine stops first", async () => {
+	useDesktop(state);
+	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };
+	state.invokeResult = (command) =>
+		command === "is_signed_updater_available" ? true : null;
+	const update = {
+		version: "9.9.9",
+		download: async () => undefined,
+		install: async () => undefined,
+		close: async () => undefined,
+	};
+	state.checkResult = update;
+	state.confirmQueue = [
+		{ confirmed: true, checkboxChecked: false },
+		{ confirmed: true, checkboxChecked: false },
+		{ confirmed: true, checkboxChecked: false },
+	];
+
+	await updater.checkForUpdates("manual");
+	assert.ok(state.invokeCalls.some(([command]) => command === "relaunch_app"));
+	assert.equal(state.relaunchCalls, 0);
+});
+
 test("coalesces concurrent automatic and manual checks before the signing gate resolves", async () => {
 	useDesktop(state);
 	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };

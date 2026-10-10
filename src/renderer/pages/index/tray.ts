@@ -2,6 +2,7 @@ import { APP_THEME } from "@shared/constants";
 import { getLanguage } from "@shared/locales";
 import type { AppConfig } from "@shared/types/config";
 import logger from "@shared/utils/logger";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createApp } from "vue";
 import Flyout from "@/components/Flyout/Flyout.vue";
@@ -113,6 +114,8 @@ async function init(config: AppConfig) {
 				});
 		}
 	});
+
+	await invoke("panel_ready");
 }
 
 usePreferenceStore()
@@ -122,4 +125,5 @@ usePreferenceStore()
 	})
 	.catch((err: unknown) => {
 		logger.warn("[Risuko] flyout init failed:", err);
+		invoke("panel_ready").catch(() => {});
 	});

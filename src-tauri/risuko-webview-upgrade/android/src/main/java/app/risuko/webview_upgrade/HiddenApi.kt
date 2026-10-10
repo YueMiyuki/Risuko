@@ -32,7 +32,6 @@ internal object HiddenApi {
             ) as Method
 
             val vmRuntime = getRuntime.invoke(null)
-            // "L" is the JNI signature prefix for every class -> exempt all
             setExemptions.invoke(vmRuntime, arrayOf("L"))
             Log.i(LOG_TAG, "Hidden API restrictions exempted")
         } catch (t: Throwable) {

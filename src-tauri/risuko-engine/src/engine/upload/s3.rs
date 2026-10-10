@@ -1,5 +1,3 @@
-//! S3 (and S3-compatible) upload sink for AWS S3, MinIO, Backblaze B2, Cloudflare R2, Wasabi, Garage, etc; uses SigV4 single-PUT with `UNSIGNED-PAYLOAD` to stream the body without a SHA-256 pre-pass, while files over [`SINGLE_PUT_MAX`] use a 3-step multipart upload (Initiate / UploadPart × N / Complete) raising the per-object cap to 5 TiB
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,32 +9,32 @@ use hmac::{Hmac, Mac};
 use risuko_http::{Client, ClientBuilder, Url};
 use sha2::{Digest, Sha256};
 
-use super::sink::{S3Config, UploadControl, UploadFile, UploadSink};
+use super::sink::{
+    run_with_stall, Heartbeat, S3Config, UploadControl, UploadFile, UploadSink,
+    UPLOAD_STALL_TIMEOUT,
+};
+use crate::engine::util::{ERROR_SNIPPET_BYTES, RESPONSE_BODY_LIMIT};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const UNSIGNED: &str = "UNSIGNED-PAYLOAD";
 
-/// S3 single-PUT object size limit (per AWS API contract). Files above this threshold are uploaded via the multipart pipeline
-const SINGLE_PUT_MAX: u64 = 5 * 1024 * 1024 * 1024;
+const MULTIPART_THRESHOLD: u64 = 128 * 1024 * 1024;
 
-/// Default per-part size for multipart uploads. 64 MiB keeps the part count under the 10 000-part limit for files up to ~640 GiB; larger files get a scaled-up part size in [`choose_part_size`]
+const PART_ATTEMPTS: u32 = 3;
+
 const DEFAULT_PART_SIZE: u64 = 64 * 1024 * 1024;
 
-/// AWS-imposed minimum part size (except for the trailing part)
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
-/// AWS-imposed maximum number of parts per multipart upload
 const MAX_PARTS: u64 = 10_000;
 
-/// Number of multipart parts uploaded concurrently Small fixed fan-out improves high-latency uploads without flooding the client pool
 const MULTIPART_CONCURRENCY: usize = 4;
 
 pub struct S3Sink {
     cfg: S3Config,
     client: Client,
     base_url: Url,
-    /// Resolved host header used in canonical request — always `host[:port]` of the endpoint, never the bucket-prefixed form
     host_header: String,
 }
 
@@ -72,7 +70,6 @@ impl S3Sink {
         };
 
         let client = ClientBuilder::new()
-            .timeout(Duration::from_secs(30 * 60))
             .connect_timeout(Duration::from_secs(30))
             .user_agent("risuko/upload")
             .build()
@@ -86,7 +83,6 @@ impl S3Sink {
         })
     }
 
-    /// Build the object key from the prefix + remote-relative path Both segments are joined with `/` and any leading `/` is stripped
     fn object_key(&self, remote_relative: &str) -> String {
         let pre = self.cfg.prefix.trim_matches('/');
         let rel = remote_relative.trim_start_matches('/');
@@ -97,7 +93,6 @@ impl S3Sink {
         }
     }
 
-    /// Build the absolute URL for an object. Path-style: `{endpoint}/{bucket}/{key}`. Virtual-host style: `{scheme}://{bucket}.{host}/{key}`
     fn object_url(&self, key: &str) -> Result<Url, String> {
         let encoded = uri_encode(key, false);
         if self.cfg.force_path_style {
@@ -120,7 +115,6 @@ impl S3Sink {
                 Some(p) => format!(":{p}"),
                 None => String::new(),
             };
-            // Preserve any subpath baked into the configured endpoint (e.g. an S3-compatible service mounted behind a reverse-proxy prefix). Naively dropping it would point requests at the wrong path on the upstream
             let base_path = self.base_url.path().trim_end_matches('/');
             let s = format!(
                 "{scheme}://{}.{host}{port_part}{base_path}/{encoded}",
@@ -130,7 +124,6 @@ impl S3Sink {
         }
     }
 
-    /// Canonical host header for the request. For virtual-host style this becomes `{bucket}.{host[:port]}` so the signature matches what the server sees in its `Host` header
     fn canonical_host(&self) -> String {
         if self.cfg.force_path_style {
             self.host_header.clone()
@@ -139,12 +132,10 @@ impl S3Sink {
         }
     }
 
-    /// Compute SigV4 signature for a PUT with unsigned payload Returns the full `Authorization` header value
     fn sign_put(&self, url: &Url, amz_date: &str, datestamp: &str) -> String {
         self.sign_request("PUT", url, "", UNSIGNED, amz_date, datestamp)
     }
 
-    /// Generic SigV4 v4 signer. `canonical_query` must already be sorted and URI-encoded per AWS rules. `payload_hash` is either `UNSIGNED-PAYLOAD` or the lowercase hex SHA256 of the body
     fn sign_request(
         &self,
         method: &str,
@@ -184,7 +175,6 @@ impl S3Sink {
         )
     }
 
-    /// Multipart upload for files > [`SINGLE_PUT_MAX`] Pipeline: `POST ?uploads=` (Initiate) -> N x `PUT ?partNumber&uploadId` (UploadPart) -> `POST ?uploadId` (Complete). On any failure or cancel we best-effort `DELETE ?uploadId` to release the staged parts — without that the bucket would silently accumulate orphan multipart state that the user pays for Parts are uploaded with bounded concurrency ([`MULTIPART_CONCURRENCY`]); progress uses a shared atomic so out-of-order parts still report a monotonic total
     async fn upload_multipart(
         &self,
         file: &UploadFile,
@@ -194,7 +184,6 @@ impl S3Sink {
         let url = self.object_url(&key)?;
         let part_size = choose_part_size(file.size);
 
-        // -- Initiate --
         let upload_id = self.initiate_multipart(&url, ctl).await?;
 
         let result = self
@@ -202,7 +191,6 @@ impl S3Sink {
             .await;
 
         if result.is_err() {
-            // Best-effort abort; log errors without replacing the original failure
             if let Err(e) = self.abort_multipart(&url, &upload_id).await {
                 tracing::warn!("S3 abort multipart {upload_id}: {e}");
             }
@@ -221,7 +209,6 @@ impl S3Sink {
     ) -> Result<String, String> {
         let total = file.size;
 
-        // Build descriptors first so the part-count cap is checked before any request
         let mut descriptors: Vec<(u32, u64, u64)> = Vec::new();
         let mut offset: u64 = 0;
         let mut part_number: u32 = 1;
@@ -237,7 +224,6 @@ impl S3Sink {
             part_number += 1;
         }
 
-        // Track cumulative bytes across out-of-order parts with one shared atomic
         let uploaded = Arc::new(AtomicU64::new(0));
 
         let mut parts: Vec<(u32, String)> =
@@ -257,10 +243,8 @@ impl S3Sink {
             .try_collect()
             .await?;
 
-        // CompleteMultipartUpload requires ascending part numbers
         parts.sort_by_key(|(pn, _)| *pn);
 
-        // -- Complete --
         self.complete_multipart(url, upload_id, &parts).await?;
         ctl.report(total, total);
         Ok(url.to_string())
@@ -278,20 +262,22 @@ impl S3Sink {
             .header("x-amz-content-sha256", UNSIGNED)
             .header("x-amz-date", now.0)
             .header("authorization", auth)
-            .header("content-length", "0");
+            .header("content-length", "0")
+            .timeout(Duration::from_secs(30));
 
         let resp = tokio::select! {
             _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
             r = req.send() => r.map_err(|e| format!("S3 initiate multipart: {e}"))?,
         };
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("S3 initiate multipart read body: {e}"))?;
         if !status.is_success() {
+            let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
             return Err(format!("S3 initiate multipart returned {status}: {body}"));
         }
+        let body = resp
+            .text_limited(RESPONSE_BODY_LIMIT)
+            .await
+            .map_err(|e| format!("S3 initiate multipart read body: {e}"))?;
         parse_upload_id(&body)
             .ok_or_else(|| format!("S3 initiate multipart: missing UploadId in response: {body}"))
     }
@@ -309,6 +295,56 @@ impl S3Sink {
         uploaded: &Arc<AtomicU64>,
         total: u64,
     ) -> Result<String, String> {
+        let mut attempt = 1;
+        loop {
+            let part_last = Arc::new(AtomicU64::new(0));
+            let res = self
+                .upload_part_once(
+                    file,
+                    ctl,
+                    url,
+                    upload_id,
+                    part_number,
+                    offset,
+                    len,
+                    uploaded,
+                    total,
+                    &part_last,
+                )
+                .await;
+            let (err, retryable) = match res {
+                Ok(etag) => return Ok(etag),
+                Err(e) => e,
+            };
+            let sent = part_last.load(Ordering::Relaxed);
+            crate::engine::util::atomic_saturating_sub(uploaded, sent);
+            if !retryable || attempt >= PART_ATTEMPTS || ctl.cancel.is_cancelled() {
+                return Err(err);
+            }
+            tracing::warn!("S3 UploadPart {part_number} attempt {attempt} failed: {err}");
+            let backoff = Duration::from_secs(1 << (attempt - 1));
+            tokio::select! {
+                _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            attempt += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_part_once(
+        &self,
+        file: &UploadFile,
+        ctl: &UploadControl,
+        url: &Url,
+        upload_id: &str,
+        part_number: u32,
+        offset: u64,
+        len: u64,
+        uploaded: &Arc<AtomicU64>,
+        total: u64,
+        part_last: &Arc<AtomicU64>,
+    ) -> Result<String, (String, bool)> {
         let query = format!(
             "partNumber={part_number}&uploadId={}",
             uri_encode(upload_id, true)
@@ -319,15 +355,17 @@ impl S3Sink {
         let now = chrono_now_utc();
         let auth = self.sign_request("PUT", &part_url, &query, UNSIGNED, &now.0, &now.1);
 
-        // Fold each part's `sent` delta into the shared counter for monotonic UI progress
         let progress = ctl.clone();
         let uploaded = uploaded.clone();
-        let part_last = Arc::new(AtomicU64::new(0));
+        let part_last = part_last.clone();
+        let hb = Heartbeat::new();
+        let hb_cb = hb.clone();
         let body = risuko_http::file_stream_body_range_with_progress(
             file.local_path.clone(),
             offset,
             len,
             move |sent| {
+                hb_cb.touch();
                 let prev = part_last.swap(sent, Ordering::Relaxed);
                 let delta = sent.saturating_sub(prev);
                 let cum = uploaded.fetch_add(delta, Ordering::Relaxed) + delta;
@@ -346,9 +384,14 @@ impl S3Sink {
             .header("authorization", auth)
             .header("content-length", len.to_string());
 
+        let send_fut = async {
+            req.send()
+                .await
+                .map_err(|e| format!("S3 UploadPart {part_number}: {e}"))
+        };
         let resp = tokio::select! {
-            _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
-            r = req.send() => r.map_err(|e| format!("S3 UploadPart {part_number}: {e}"))?,
+            _ = ctl.cancel.cancelled() => return Err(("cancelled".into(), false)),
+            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r.map_err(|e| (e, true))?,
         };
         let status = resp.status();
         let etag = resp
@@ -357,12 +400,18 @@ impl S3Sink {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "S3 UploadPart {part_number} returned {status}: {body}"
+            let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
+            return Err((
+                format!("S3 UploadPart {part_number} returned {status}: {body}"),
+                is_retryable_status(status.as_u16()),
             ));
         }
-        etag.ok_or_else(|| format!("S3 UploadPart {part_number}: missing ETag header"))
+        etag.ok_or_else(|| {
+            (
+                format!("S3 UploadPart {part_number}: missing ETag header"),
+                false,
+            )
+        })
     }
 
     async fn complete_multipart(
@@ -389,20 +438,23 @@ impl S3Sink {
             .header("x-amz-content-sha256", payload_hash)
             .header("x-amz-date", now.0)
             .header("authorization", auth)
-            .header("content-type", "application/xml");
+            .header("content-type", "application/xml")
+            .timeout(Duration::from_secs(300));
 
         let resp = req
             .send()
             .await
             .map_err(|e| format!("S3 CompleteMultipart: {e}"))?;
         let status = resp.status();
-        let resp_body = resp.text().await.unwrap_or_default();
+        let resp_body = resp
+            .text_limited(RESPONSE_BODY_LIMIT)
+            .await
+            .unwrap_or_default();
         if !status.is_success() {
             return Err(format!(
                 "S3 CompleteMultipart returned {status}: {resp_body}"
             ));
         }
-        // S3 returns 200 even on some errors with `<Error>` body; detect that
         if resp_body.contains("<Error>") {
             return Err(format!("S3 CompleteMultipart error body: {resp_body}"));
         }
@@ -421,14 +473,15 @@ impl S3Sink {
             .header("host", self.canonical_host())
             .header("x-amz-content-sha256", UNSIGNED)
             .header("x-amz-date", now.0)
-            .header("authorization", auth);
+            .header("authorization", auth)
+            .timeout(Duration::from_secs(30));
         let resp = req
             .send()
             .await
             .map_err(|e| format!("S3 AbortMultipart: {e}"))?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 404 {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
             return Err(format!("S3 AbortMultipart returned {status}: {body}"));
         }
         Ok(())
@@ -442,8 +495,7 @@ impl UploadSink for S3Sink {
             return Err("cancelled".into());
         }
 
-        // Single PUT tops out at 5 GiB per the S3 API contract — anything larger uses the multipart path which itself caps at ~48.8 TiB (10,000 parts × 5 GiB max per part)
-        if file.size > SINGLE_PUT_MAX {
+        if file.size > MULTIPART_THRESHOLD {
             return self.upload_multipart(file, ctl).await;
         }
 
@@ -455,13 +507,17 @@ impl UploadSink for S3Sink {
         let datestamp = now.1;
 
         let auth = self.sign_put(&url, &amz_date, &datestamp);
-        // Wrap the file stream so each yielded chunk reports progress back through `ctl` and observes cancellation mid-stream
         let total = file.size;
         let progress = ctl.clone();
+        let hb = Heartbeat::new();
+        let hb_cb = hb.clone();
         let body = risuko_http::file_stream_body_with_progress(
             file.local_path.clone(),
             total,
-            move |sent| progress.report(sent.min(total), total),
+            move |sent| {
+                hb_cb.touch();
+                progress.report(sent.min(total), total)
+            },
             Some(ctl.cancel.clone()),
         );
 
@@ -475,25 +531,23 @@ impl UploadSink for S3Sink {
             .header("authorization", auth)
             .header("content-length", file.size.to_string());
 
-        let send_fut = req.send();
+        let send_fut = async { req.send().await.map_err(|e| format!("PUT failed: {e}")) };
         let resp = tokio::select! {
             _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
-            r = send_fut => r.map_err(|e| format!("PUT failed: {e}"))?,
+            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r?,
         };
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
             return Err(format!("S3 PUT {url} returned {status}: {body}"));
         }
 
-        // Final pin so the UI sees 100% even if the last chunk's report was raced by the response arriving
         ctl.report(file.size, file.size);
         Ok(url.to_string())
     }
 
     async fn test(&self) -> Result<(), String> {
-        // HEAD on the bucket root (path-style: /bucket; vhost: /) 200/403 means reachable; 404 means missing
         let url = if self.cfg.force_path_style {
             let mut u = self.base_url.clone();
             let path = format!(
@@ -524,16 +578,13 @@ impl UploadSink for S3Sink {
             .map_err(|e| format!("HEAD bucket: {e}"))?;
 
         let status = resp.status();
-        // 200 = bucket reachable + ListBucket permission. 403 = bucket exists and our credentials are recognised but lack ListBucket; AWS HeadBucket returns *no body* for 403, so we cannot inspect an error code here — treat 403 as a successful reachability check so upload-only keys (the common case for app-managed buckets) pass. Authentication failures surface as 400 ("InvalidAccessKeyId", "SignatureDoesNotMatch") rather than 403, so accepting 403 here does not mask credential errors
         if status.is_success() || status.as_u16() == 403 {
             return Ok(());
         }
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
         Err(format!("S3 HEAD bucket returned {status}: {body}"))
     }
 }
-
-// -- crypto helpers --
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
@@ -548,7 +599,6 @@ fn derive_signing_key(secret: &str, datestamp: &str, region: &str, service: &str
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// AWS-flavoured URI encoding. `encode_slash=false` keeps `/` as-is (path segments). Per SigV4 spec
 fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -569,7 +619,6 @@ fn canonical_uri(path: &str) -> String {
     if path.is_empty() {
         "/".to_string()
     } else {
-        // Re-encode while preserving `/`
         let decoded = percent_encoding::percent_decode_str(path)
             .decode_utf8_lossy()
             .into_owned();
@@ -577,7 +626,6 @@ fn canonical_uri(path: &str) -> String {
     }
 }
 
-/// Returns (`yyyymmddThhmmssZ`, `yyyymmdd`) for the current UTC time
 fn chrono_now_utc() -> (String, String) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -589,7 +637,6 @@ fn chrono_now_utc() -> (String, String) {
     (amz, day)
 }
 
-/// Convert UNIX epoch seconds (UTC) to (year, month, day, hour, min, sec) Algorithm from Howard Hinnant's `civil_from_days`
 fn epoch_to_ymdhms(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
     let days = (secs / 86400) as i64;
     let rem = secs % 86400;
@@ -610,9 +657,10 @@ fn epoch_to_ymdhms(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
     (y, mo, d, h, mi, s)
 }
 
-// -- multipart helpers --
+fn is_retryable_status(code: u16) -> bool {
+    code >= 500 || code == 408 || code == 429
+}
 
-/// Pick a part size that keeps the part count under [`MAX_PARTS`] Defaults to [`DEFAULT_PART_SIZE`]; doubles until the limit is satisfied Always >= [`MIN_PART_SIZE`]
 fn choose_part_size(file_size: u64) -> u64 {
     let mut size = DEFAULT_PART_SIZE;
     while file_size.div_ceil(size) > MAX_PARTS {
@@ -621,19 +669,16 @@ fn choose_part_size(file_size: u64) -> u64 {
     size.max(MIN_PART_SIZE)
 }
 
-/// Extract the `<UploadId>` element value from an `InitiateMultipartUpload` response. AWS and all S3-compatible servers wrap it in plain XML so a substring match is safe and avoids pulling in a full XML parser
 fn parse_upload_id(xml: &str) -> Option<String> {
     let start = xml.find("<UploadId>")? + "<UploadId>".len();
     let end = xml[start..].find("</UploadId>")?;
     Some(xml[start..start + end].to_string())
 }
 
-/// Build the `<CompleteMultipartUpload>` request body. Parts must be in ascending part-number order
 fn build_complete_xml(parts: &[(u32, String)]) -> String {
     let mut s = String::with_capacity(64 + parts.len() * 96);
     s.push_str("<CompleteMultipartUpload>");
     for (n, etag) in parts {
-        // ETag in the response already includes surrounding quotes; the S3 spec requires those quotes to be present here too
         s.push_str("<Part><PartNumber>");
         s.push_str(&n.to_string());
         s.push_str("</PartNumber><ETag>");
@@ -659,8 +704,6 @@ mod tests {
             force_path_style: path_style,
         }
     }
-
-    // -- constructor validation --
 
     #[test]
     fn rejects_empty_endpoint() {
@@ -688,8 +731,6 @@ mod tests {
         assert!(S3Sink::new(c).is_err());
     }
 
-    // -- object_key --
-
     #[test]
     fn object_key_no_prefix() {
         let s = S3Sink::new(cfg("https://s3.amazonaws.com", "b", "", false)).unwrap();
@@ -710,8 +751,6 @@ mod tests {
         let s = S3Sink::new(cfg("https://s3.amazonaws.com", "b", "/uploads/", false)).unwrap();
         assert_eq!(s.object_key("file.bin"), "uploads/file.bin");
     }
-
-    // -- object_url --
 
     #[test]
     fn object_url_path_style() {
@@ -748,8 +787,6 @@ mod tests {
         assert!(u.as_str().ends_with("/b/hello%20world.bin"), "got {u}");
     }
 
-    // -- canonical_host --
-
     #[test]
     fn canonical_host_path_style_strips_bucket() {
         let s = S3Sink::new(cfg("https://s3.amazonaws.com", "mybucket", "", true)).unwrap();
@@ -768,11 +805,8 @@ mod tests {
         assert_eq!(s.canonical_host(), "minio.local:9000");
     }
 
-    // -- pure helpers --
-
     #[test]
     fn epoch_basic() {
-        // 2024-01-02T03:04:05Z = 1704164645
         let t = epoch_to_ymdhms(1_704_164_645);
         assert_eq!(t, (2024, 1, 2, 3, 4, 5));
     }
@@ -784,13 +818,11 @@ mod tests {
 
     #[test]
     fn epoch_leap_year_feb_29() {
-        // 2024-02-29T00:00:00Z = 1709164800
         assert_eq!(epoch_to_ymdhms(1_709_164_800), (2024, 2, 29, 0, 0, 0));
     }
 
     #[test]
     fn epoch_y2k_boundary() {
-        // 2000-03-01T00:00:00Z = 951868800 (after century leap year)
         assert_eq!(epoch_to_ymdhms(951_868_800), (2000, 3, 1, 0, 0, 0));
     }
 
@@ -803,13 +835,11 @@ mod tests {
 
     #[test]
     fn uri_encode_preserves_unreserved() {
-        // RFC 3986 unreserved set: ALPHA / DIGIT / "-" / "." / "_" / "~"
         assert_eq!(uri_encode("Az09-._~", false), "Az09-._~");
     }
 
     #[test]
     fn uri_encode_uppercases_hex() {
-        // SigV4 mandates uppercase hex in percent-encoded triplets
         assert_eq!(uri_encode("\n", false), "%0A");
         assert_eq!(uri_encode("\x7f", false), "%7F");
     }
@@ -821,16 +851,12 @@ mod tests {
 
     #[test]
     fn canonical_uri_re_encodes() {
-        // Already-encoded input should round-trip through decode + re-encode and produce the same canonical form
         assert_eq!(canonical_uri("/a/b%20c"), "/a/b%20c");
         assert_eq!(canonical_uri("/a/b c"), "/a/b%20c");
     }
 
-    // -- crypto --
-
     #[test]
     fn signing_key_matches_aws_example() {
-        // From AWS docs: signing-key derivation example
         let key = derive_signing_key(
             "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
             "20120215",
@@ -843,15 +869,12 @@ mod tests {
 
     #[test]
     fn hmac_sha256_known_vector() {
-        // RFC 4231 test case 1
         let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
         assert_eq!(
             hex::encode(&mac),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
-
-    // -- sign_put --
 
     #[test]
     fn sign_put_is_deterministic_for_fixed_inputs() {
@@ -885,8 +908,6 @@ mod tests {
         assert!(auth.contains("/us-east-1/s3/"));
     }
 
-    // -- multipart helpers --
-
     #[test]
     fn choose_part_size_default_for_small_files() {
         assert_eq!(choose_part_size(100 * 1024 * 1024), DEFAULT_PART_SIZE);
@@ -895,7 +916,6 @@ mod tests {
 
     #[test]
     fn choose_part_size_scales_for_huge_files() {
-        // 64 MiB * 10_000 = 640 GiB. Anything above that needs > 64 MiB parts
         let two_tb = 2 * 1024 * 1024 * 1024 * 1024_u64;
         let size = choose_part_size(two_tb);
         assert!(size > DEFAULT_PART_SIZE);
@@ -906,6 +926,22 @@ mod tests {
     fn choose_part_size_respects_min() {
         assert_eq!(choose_part_size(0), MIN_PART_SIZE.max(DEFAULT_PART_SIZE));
     }
+
+    #[test]
+    fn retryable_statuses() {
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(408));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(400));
+    }
+
+    const _: () = assert!(
+        MULTIPART_THRESHOLD < SINGLE_PUT_HARD_LIMIT && MULTIPART_THRESHOLD >= MIN_PART_SIZE
+    );
+
+    const SINGLE_PUT_HARD_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
     #[test]
     fn parse_upload_id_extracts_value() {

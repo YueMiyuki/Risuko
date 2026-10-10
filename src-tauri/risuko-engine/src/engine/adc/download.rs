@@ -1,5 +1,3 @@
-//! ADC / DC download orchestration: resolves the hub from the URI, handshakes, searches for the TTH, downloads from the first accepting peer. Limitations: active-mode only (passive-only hubs needing `$RevConnectToMe` won't complete); hub-only URIs without a TTH return `NoSource` since there's no search UI
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -8,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 use super::types::{is_adc_uri, parse_adc_hub_uri, parse_dchub_file_uri, AdcError};
 use crate::engine::options::EngineOptions;
 
-/// Run a single ADC / NMDC download to completion: parse the URI, open the hub, locate a peer holding the requested TTH and copy the file to `dir`; returns the output path on success or a failure string (`"cancelled"` when aborted)
 pub async fn run_adc_download(
     uri: &str,
     dir: &str,
@@ -19,7 +16,7 @@ pub async fn run_adc_download(
     connections: Arc<AtomicU32>,
     cancel_token: CancellationToken,
 ) -> Result<PathBuf, String> {
-    let _ = (speed, connections); // surfaced via the periodic update task
+    let _ = (speed, connections);
 
     if !is_adc_uri(uri) {
         return Err(format!("not an ADC/DC URI: {uri}"));
@@ -43,7 +40,6 @@ pub async fn run_adc_download(
         return Err("cancelled".into());
     }
 
-    // Passive-only mode: no listening socket, so peer negotiation (`$ConnectToMe` / ADC `CTM`) cannot complete; bail before hub I/O so the task fails fast instead of hanging
     let _ = (&tth, &completed, dir);
     Err(AdcError::NoSource.to_string())
 }

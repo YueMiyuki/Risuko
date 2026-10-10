@@ -1,5 +1,3 @@
-//! Pattern-based download dir + tag assignment at task creation; precedence: custom `task_routing_rules` (first enabled match) > legacy `file_category_dirs` fallback > default global `dir`
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,7 +15,6 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Result of resolving a routing decision for a task
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingDecision {
@@ -25,33 +22,26 @@ pub struct RoutingDecision {
     pub dir: String,
 }
 
-/// Resolve routing for a file name: custom rules first, then legacy category-based dir
 pub fn resolve_routing(
     rules: &[TaskRoutingRule],
     filename: &str,
     default_dir: &str,
     file_category_dirs: &std::collections::HashMap<String, String>,
 ) -> RoutingDecision {
-    // 1. Custom routing rules
     for rule in rules {
         if !rule.enabled {
             continue;
         }
-        if glob_matches(&rule.pattern, filename) {
-            // Only return if dir is non-empty after trimming
-            if !rule.dir.trim().is_empty() {
-                return RoutingDecision {
-                    tag: Some(rule.label.clone()),
-                    dir: rule.dir.trim().to_string(),
-                };
-            }
+        if glob_matches(&rule.pattern, filename) && !rule.dir.trim().is_empty() {
+            return RoutingDecision {
+                tag: Some(rule.label.clone()),
+                dir: rule.dir.trim().to_string(),
+            };
         }
     }
 
-    // 2. Legacy category-based fallback
     if let Some(category) = super::upload::resolve_category(filename) {
         if let Some(cat_dir) = file_category_dirs.get(&category) {
-            // Only return if dir is non-empty after trimming
             if !cat_dir.trim().is_empty() {
                 return RoutingDecision {
                     tag: Some(category),
@@ -61,14 +51,12 @@ pub fn resolve_routing(
         }
     }
 
-    // 3. Default
     RoutingDecision {
         tag: None,
         dir: default_dir.to_string(),
     }
 }
 
-/// Final name for HTTP/FTP/SFTP downloads, which treat a trailing `.part` as their temp suffix
 pub(crate) fn strip_part_suffix(filename: &str) -> &str {
     filename
         .strip_suffix(".part")
@@ -76,7 +64,6 @@ pub(crate) fn strip_part_suffix(filename: &str) -> &str {
         .unwrap_or(filename)
 }
 
-/// Case-insensitive glob match using the `glob` crate
 fn glob_matches(pattern: &str, text: &str) -> bool {
     let pattern = pattern.trim();
     if pattern.is_empty() {
@@ -90,7 +77,6 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    // glob::Pattern only supports exact match; we compare against the file name
     pat.matches(&normalized_text)
 }
 
@@ -164,7 +150,6 @@ mod tests {
         let dec = resolve_routing(&[], strip_part_suffix("song.mp3.part"), "/Downloads", &cats);
         assert_eq!(dec.dir, "/Music");
         assert_eq!(strip_part_suffix(".part"), ".part");
-        // A real `*.part` name is routed as-is
         let rules = vec![rule("r2", "Parts", "*.part", "/Parts", true)];
         let dec = resolve_routing(&rules, "movie.mkv.part", "/Downloads", &cats);
         assert_eq!(dec.dir, "/Parts");
@@ -183,7 +168,6 @@ mod tests {
     fn custom_rule_wins_over_category() {
         let rules = vec![rule("r1", "ISO", "*.iso", "/ISO", true)];
         let mut cats = HashMap::new();
-        // iso is in the "compressed" category table
         cats.insert("compressed".into(), "/Compressed".into());
         let dec = resolve_routing(&rules, "image.iso", "/Downloads", &cats);
         assert_eq!(dec.tag, Some("ISO".into()));

@@ -154,7 +154,7 @@ export const TRACKER_SOURCE_OPTIONS = [
 	},
 ];
 
-export const PROXY_SCOPES = {
+const PROXY_SCOPES = {
 	DOWNLOAD: "download",
 	UPDATE_APP: "update-app",
 	UPDATE_TRACKERS: "update-trackers",

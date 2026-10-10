@@ -2,8 +2,11 @@ pub mod parser;
 pub mod rule_engine;
 pub mod types;
 
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -12,15 +15,17 @@ use self::rule_engine::{
     dedupe_decision, episode_key_for, evaluate_rule, schedule_allows, DedupeDecision,
 };
 use self::types::*;
-use crate::traits::{EventSink, StorageBackend};
+use crate::traits::StorageBackend;
 
 const RSS_STORE_KEY: &str = "rss";
 const DEFAULT_UPDATE_INTERVAL_SECS: u64 = 1800;
-/// Floor for a feed's poll interval; guards the poller against a 0 interval (configured via `update_feed_settings`) degrading into a busy-spin
 const MIN_UPDATE_INTERVAL_SECS: u64 = 60;
 const MAX_ITEMS_PER_FEED: usize = 500;
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 const MAX_EPISODE_HISTORY: usize = 10_000;
+const MAX_FEED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BACKOFF_SECS: u64 = 6 * 3600;
+const FETCH_CONCURRENCY: usize = 6;
 
 use crate::engine::util::now_secs;
 
@@ -29,35 +34,104 @@ fn item_id(guid_or_link: &str) -> String {
     hex::encode(Sha256::digest(guid_or_link.as_bytes()))
 }
 
+struct PendingDownload {
+    feed_id: String,
+    item_id: String,
+    title: String,
+    rule_id: String,
+    rule_name: String,
+    key: Option<EpisodeKey>,
+    score: i32,
+    queued_at: u64,
+    prev_episode: Option<EpisodeRecord>,
+}
+
 pub struct RssManager {
     store: Arc<Mutex<RssStore>>,
     storage: Arc<dyn StorageBackend>,
-    event_sink: Arc<dyn EventSink>,
+    save_gate: Arc<Mutex<()>>,
+    pending: Arc<Mutex<HashMap<String, PendingDownload>>>,
+    monitor_active: Arc<AtomicBool>,
+}
+
+struct FetchFailure {
+    message: String,
+    transient: bool,
+}
+
+enum Fetched {
+    NotModified,
+    Parsed {
+        feed: Box<feed_rs::model::Feed>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
+async fn persist(
+    store: &Mutex<RssStore>,
+    storage: &Arc<dyn StorageBackend>,
+    gate: &Mutex<()>,
+) -> Result<(), String> {
+    let _gate = gate.lock().await;
+    let wrapper = {
+        let s = store.lock().await;
+        let data =
+            serde_json::to_value(&*s).map_err(|e| format!("Serialize RSS data failed: {e}"))?;
+        serde_json::json!({ "data": data })
+    };
+    let storage = Arc::clone(storage);
+    tokio::task::spawn_blocking(move || storage.save(RSS_STORE_KEY, &wrapper))
+        .await
+        .map_err(|e| format!("RSS save task failed: {e}"))?
+}
+
+fn feed_retry_delay(interval: u64, error_count: u32) -> u64 {
+    if error_count == 0 {
+        return interval;
+    }
+    let shift = error_count.min(16);
+    interval
+        .saturating_mul(1u64 << shift)
+        .min(MAX_BACKOFF_SECS)
+        .max(interval)
+}
+
+fn feed_is_due(feed: &RssFeed, now: u64) -> bool {
+    let last = feed
+        .last_attempt_at
+        .into_iter()
+        .chain(feed.last_fetched_at)
+        .max()
+        .unwrap_or(0);
+    now >= last.saturating_add(feed_retry_delay(
+        feed.update_interval_secs,
+        feed.error_count,
+    ))
 }
 
 impl RssManager {
-    pub fn new(storage: Arc<dyn StorageBackend>, event_sink: Arc<dyn EventSink>) -> Self {
+    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             store: Arc::new(Mutex::new(RssStore::default())),
             storage,
-            event_sink,
+            save_gate: Arc::new(Mutex::new(())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            monitor_active: Arc::new(AtomicBool::new(false)),
         }
     }
-
-    // Persistence
 
     pub fn load(&self) -> Result<(), String> {
         if let Some(val) = self.storage.load(RSS_STORE_KEY)? {
             if let Some(data_val) = val.get("data").cloned() {
                 let data: RssStore = serde_json::from_value(data_val)
                     .map_err(|e| format!("Failed to parse RSS data: {e}"))?;
-                // Called during single-threaded startup before the Arc is shared, so the lock is uncontended. Avoid blocking_lock(), which panics if this ever runs inside a Tokio runtime worker thread (mirrors DownloadStatsManager::load)
+                // blocking_lock() would panic inside a Tokio worker
                 let mut s = self
                     .store
                     .try_lock()
                     .map_err(|_| "RSS store busy during load".to_string())?;
                 *s = data;
-                // Lazy-derive parsed metadata for items missing it
                 for items in s.items.values_mut() {
                     for item in items.iter_mut() {
                         if item.parsed_meta.is_none() {
@@ -65,7 +139,6 @@ impl RssManager {
                         }
                     }
                 }
-                // Stable sort rules by priority desc
                 s.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
             }
         }
@@ -73,19 +146,15 @@ impl RssManager {
     }
 
     pub async fn save(&self) -> Result<(), String> {
-        let data = {
-            let s = self.store.lock().await;
-            serde_json::to_value(&*s).map_err(|e| format!("Serialize RSS data failed: {e}"))?
-        };
-        let wrapper = serde_json::json!({ "data": data });
-        self.storage.save(RSS_STORE_KEY, &wrapper)?;
-        Ok(())
+        persist(&self.store, &self.storage, &self.save_gate).await
     }
 
-    // Feed CRUD
-
     pub async fn add_feed(&self, url: &str) -> Result<RssFeed, String> {
-        let parsed = fetch_and_parse(url).await?;
+        let parsed = match fetch_feed(url, None, None).await {
+            Ok(Fetched::Parsed { feed, .. }) => feed,
+            Ok(Fetched::NotModified) => return Err("Feed returned no content".to_string()),
+            Err(e) => return Err(e.message),
+        };
 
         let title = parsed
             .title
@@ -109,13 +178,15 @@ impl RssManager {
             created_at: now_secs(),
             is_active: true,
             error_count: 0,
+            last_attempt_at: Some(now_secs()),
+            etag: None,
+            last_modified: None,
         };
 
         let items = extract_items(&feed.id, &parsed.entries);
 
         {
             let mut s = self.store.lock().await;
-            // Prevent duplicate URL
             if s.feeds.iter().any(|f| f.url == url) {
                 return Err("Feed already subscribed".to_string());
             }
@@ -133,7 +204,6 @@ impl RssManager {
         let mut s = self.store.lock().await;
         s.feeds.retain(|f| f.id != feed_id);
         s.items.remove(feed_id);
-        // Strip the removed feed id from every rule, then drop any rule that started with a non-empty feed list and became empty (an empty list means "all feeds" — rules that were already global must be preserved)
         s.rules.retain_mut(|r| {
             let was_scoped = !r.feed_ids.is_empty();
             r.feed_ids.retain(|f| f != feed_id);
@@ -144,58 +214,90 @@ impl RssManager {
     }
 
     pub async fn update_feed(&self, feed_id: &str) -> Result<Vec<RssItem>, String> {
-        let url = {
+        let (url, etag, last_modified) = {
             let s = self.store.lock().await;
-            s.feeds
+            let f = s
+                .feeds
                 .iter()
                 .find(|f| f.id == feed_id)
-                .map(|f| f.url.clone())
-                .ok_or_else(|| "Feed not found".to_string())?
+                .ok_or_else(|| "Feed not found".to_string())?;
+            (f.url.clone(), f.etag.clone(), f.last_modified.clone())
         };
 
-        let result = fetch_and_parse(&url).await;
+        let result = fetch_feed(&url, etag, last_modified).await;
+        let outcome = self.apply_fetch(feed_id, result).await;
+        self.save().await?;
+        outcome
+    }
 
+    async fn apply_fetch(
+        &self,
+        feed_id: &str,
+        result: Result<Fetched, FetchFailure>,
+    ) -> Result<Vec<RssItem>, String> {
         let mut s = self.store.lock().await;
+        let now = now_secs();
         let feed = s
             .feeds
             .iter_mut()
             .find(|f| f.id == feed_id)
             .ok_or_else(|| "Feed not found".to_string())?;
+        feed.last_attempt_at = Some(now);
 
         match result {
-            Ok(parsed) => {
-                feed.last_fetched_at = Some(now_secs());
+            Ok(Fetched::NotModified) => {
+                feed.last_fetched_at = Some(now);
                 feed.error_count = 0;
+                Ok(Vec::new())
+            }
+            Ok(Fetched::Parsed {
+                feed: parsed,
+                etag,
+                last_modified,
+            }) => {
+                feed.last_fetched_at = Some(now);
+                feed.error_count = 0;
+                feed.etag = etag;
+                feed.last_modified = last_modified;
                 if let Some(title) = parsed.title {
                     feed.title = title.content;
                 }
 
-                let new_items = extract_items(feed_id, &parsed.entries);
                 let existing = s.items.entry(feed_id.to_string()).or_default();
+                let known: HashMap<String, usize> = existing
+                    .iter()
+                    .enumerate()
+                    .map(|(i, it)| (it.id.clone(), i))
+                    .collect();
                 let mut fresh: Vec<RssItem> = Vec::new();
-                for item in new_items {
-                    if let Some(old) = existing.iter_mut().find(|i| i.id == item.id) {
-                        if old.content.is_empty() && !item.content.is_empty() {
-                            old.content = item.content;
+                let mut seen_new: HashSet<String> = HashSet::new();
+                for entry in parsed.entries.iter().take(MAX_ITEMS_PER_FEED) {
+                    let id = entry_item_id(entry);
+                    if let Some(&idx) = known.get(&id) {
+                        let old = &mut existing[idx];
+                        if old.content.is_empty() {
+                            if let Some(body) = entry.content.as_ref().and_then(|c| c.body.clone())
+                            {
+                                old.content = body;
+                            }
                         }
-                    } else {
-                        fresh.push(item);
+                    } else if seen_new.insert(id) {
+                        fresh.push(extract_item(feed_id, entry));
                     }
                 }
 
-                // Prepend new items
-                let mut merged = fresh.clone();
-                merged.append(existing);
-                merged.truncate(MAX_ITEMS_PER_FEED);
-                *existing = merged;
-
-                drop(s);
-                self.save().await?;
+                if !fresh.is_empty() {
+                    let mut merged = Vec::with_capacity(fresh.len() + existing.len());
+                    merged.extend(fresh.iter().cloned());
+                    merged.append(existing);
+                    merged.truncate(MAX_ITEMS_PER_FEED);
+                    *existing = merged;
+                }
                 Ok(fresh)
             }
             Err(e) => {
-                feed.error_count += 1;
-                if feed.error_count >= MAX_CONSECUTIVE_ERRORS {
+                feed.error_count = feed.error_count.saturating_add(1);
+                if !e.transient && feed.error_count >= MAX_CONSECUTIVE_ERRORS {
                     tracing::warn!(
                         "Feed '{}' disabled after {} consecutive errors",
                         feed.title,
@@ -203,9 +305,7 @@ impl RssManager {
                     );
                     feed.is_active = false;
                 }
-                drop(s);
-                self.save().await?;
-                Err(e)
+                Err(e.message)
             }
         }
     }
@@ -214,33 +314,39 @@ impl RssManager {
         self.update_feeds(false).await
     }
 
-    /// Update active feeds; with `only_due`, skip feeds whose own interval has not elapsed yet The background poller uses this so slow feeds do not refetch at the global wake cadence
     async fn update_feeds(&self, only_due: bool) -> Vec<(String, Vec<RssItem>)> {
         let now = now_secs();
-        let feeds: Vec<(String, bool, u64, Option<u64>)> = {
+        let due: Vec<(String, String, Option<String>, Option<String>)> = {
             let s = self.store.lock().await;
             s.feeds
                 .iter()
+                .filter(|f| f.is_active && (!only_due || feed_is_due(f, now)))
                 .map(|f| {
                     (
                         f.id.clone(),
-                        f.is_active,
-                        f.update_interval_secs,
-                        f.last_fetched_at,
+                        f.url.clone(),
+                        f.etag.clone(),
+                        f.last_modified.clone(),
                     )
                 })
                 .collect()
         };
+        if due.is_empty() {
+            return Vec::new();
+        }
+
+        let fetched: Vec<(String, Result<Fetched, FetchFailure>)> = futures_util::stream::iter(due)
+            .map(|(id, url, etag, last_modified)| async move {
+                let result = fetch_feed(&url, etag, last_modified).await;
+                (id, result)
+            })
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
         let mut all_new = Vec::new();
-        for (feed_id, is_active, interval, last_fetched_at) in feeds {
-            if !is_active {
-                continue;
-            }
-            if only_due && now < last_fetched_at.unwrap_or(0).saturating_add(interval) {
-                continue;
-            }
-            match self.update_feed(&feed_id).await {
+        for (feed_id, result) in fetched {
+            match self.apply_fetch(&feed_id, result).await {
                 Ok(new_items) if !new_items.is_empty() => {
                     all_new.push((feed_id, new_items));
                 }
@@ -250,6 +356,9 @@ impl RssManager {
                 }
             }
         }
+        if let Err(e) = self.save().await {
+            tracing::warn!("Failed to save RSS store: {}", e);
+        }
         all_new
     }
 
@@ -258,27 +367,48 @@ impl RssManager {
     }
 
     pub async fn get_items(&self, feed_id: &str) -> Vec<RssItem> {
+        let candidates: Vec<(String, String)> = {
+            let s = self.store.lock().await;
+            let Some(items) = s.items.get(feed_id) else {
+                return Vec::new();
+            };
+            items
+                .iter()
+                .filter(|i| i.is_downloaded)
+                .filter_map(|i| Some((i.id.clone(), i.download_path.clone()?)))
+                .collect()
+        };
+
+        let stale: HashSet<String> = if candidates.is_empty() {
+            HashSet::new()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .filter(|(_, path)| {
+                        let path = std::path::Path::new(path);
+                        !path.exists() && path.parent().is_some_and(|parent| parent.exists())
+                    })
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .await
+            .unwrap_or_default()
+        };
+
         let mut changed = false;
         let items = {
             let mut s = self.store.lock().await;
             let Some(items) = s.items.get_mut(feed_id) else {
                 return Vec::new();
             };
-            for item in items.iter_mut() {
-                if !item.is_downloaded {
-                    continue;
-                }
-                let Some(path) = item.download_path.as_deref() else {
-                    continue;
-                };
-                let path = std::path::Path::new(path);
-                if path.exists() {
-                    continue;
-                }
-                if path.parent().is_some_and(|parent| parent.exists()) {
-                    item.is_downloaded = false;
-                    item.download_path = None;
-                    changed = true;
+            if !stale.is_empty() {
+                for item in items.iter_mut() {
+                    if item.is_downloaded && stale.contains(&item.id) {
+                        item.is_downloaded = false;
+                        item.download_path = None;
+                        changed = true;
+                    }
                 }
             }
             items.clone()
@@ -289,7 +419,6 @@ impl RssManager {
         items
     }
 
-    /// Fetch a single item by feed/item id
     pub async fn get_item(&self, feed_id: &str, item_id: &str) -> Result<RssItem, String> {
         let s = self.store.lock().await;
         let items = s
@@ -316,7 +445,6 @@ impl RssManager {
             .find(|f| f.id == feed_id)
             .ok_or_else(|| "Feed not found".to_string())?;
         if let Some(interval) = interval {
-            // Clamp to a floor so a 0 (or tiny) interval can't make the poller busy-spin or refetch a feed on every wake
             feed.update_interval_secs = interval.max(MIN_UPDATE_INTERVAL_SECS);
         }
         if let Some(active) = is_active {
@@ -328,8 +456,6 @@ impl RssManager {
         drop(s);
         self.save().await
     }
-
-    // Item operations
 
     pub async fn mark_item_downloaded(
         &self,
@@ -354,7 +480,6 @@ impl RssManager {
             .await
     }
 
-    /// Mark multiple items read in a single save. `entries` is a list of `(feed_id, item_id)` pairs
     pub async fn mark_items_read(&self, entries: Vec<(String, String)>) -> Result<(), String> {
         let mut s = self.store.lock().await;
         for (feed_id, item_id) in &entries {
@@ -401,7 +526,6 @@ impl RssManager {
             if let Some(items) = s.items.get_mut(feed_id) {
                 let id_set: std::collections::HashSet<&str> =
                     item_ids.iter().map(|s| s.as_str()).collect();
-                // Collect download paths before removing
                 for item in items.iter() {
                     if id_set.contains(item.id.as_str()) {
                         if let Some(ref path) = item.download_path {
@@ -414,7 +538,6 @@ impl RssManager {
         }
         drop(s);
 
-        // Delete downloaded files (best-effort)
         for path in &paths_to_delete {
             let p = std::path::Path::new(path);
             if p.exists() {
@@ -439,7 +562,6 @@ impl RssManager {
             .ok_or_else(|| "No downloadable URL found for this item".to_string())
     }
 
-    /// Return every downloadable URL for an item, primary enclosure first followed by every inline media URL we scraped from the body. The link fallback is included only when there is no enclosure and no media so we don't accidentally queue an HTML page alongside real payloads
     pub async fn get_item_download_urls(
         &self,
         feed_id: &str,
@@ -474,8 +596,6 @@ impl RssManager {
             .ok_or_else(|| "No download path recorded".to_string())
     }
 
-    // Rules
-
     pub async fn add_rule(&self, rule: RssRule) -> Result<RssRule, String> {
         validate_rule(&rule)?;
         let rule = RssRule {
@@ -499,7 +619,6 @@ impl RssManager {
             .iter()
             .position(|r| r.id == rule.id)
             .ok_or_else(|| "Rule not found".to_string())?;
-        // Preserve server-maintained stats
         let preserved_stats = s.rules[idx].stats.clone();
         let updated = RssRule {
             stats: preserved_stats,
@@ -521,7 +640,6 @@ impl RssManager {
 
     pub async fn reorder_rules(&self, ordered_ids: Vec<String>) -> Result<(), String> {
         let mut s = self.store.lock().await;
-        // Assign descending priority based on the supplied order
         let n = ordered_ids.len() as i32;
         for (idx, id) in ordered_ids.iter().enumerate() {
             if let Some(rule) = s.rules.iter_mut().find(|r| &r.id == id) {
@@ -537,7 +655,6 @@ impl RssManager {
         self.store.lock().await.rules.clone()
     }
 
-    /// Best matching active+auto rule for the given item (and parsed meta) Honors per-rule mode (any-match wins by priority, best-match wins by score across all matching rules)\
     pub async fn best_matching_rule(
         &self,
         item: &RssItem,
@@ -555,7 +672,6 @@ impl RssManager {
             }
             match rule.mode {
                 RuleMode::AnyMatch => {
-                    // Rules are pre-sorted by priority desc. "AnyMatch" wins immediately *unless* a higher-priority BestMatch rule already produced a strictly better score, in which case we keep that one to avoid lower-priority preemption
                     if let Some((_, bs)) = &best {
                         if eval.score < *bs {
                             continue;
@@ -573,7 +689,6 @@ impl RssManager {
         best
     }
 
-    /// Dry-run a rule against the most recent items (across all feeds)
     pub async fn dry_run_rule(&self, rule: RssRule, sample_size: usize) -> Vec<DryRunMatch> {
         let items: Vec<RssItem> = {
             let s = self.store.lock().await;
@@ -602,35 +717,26 @@ impl RssManager {
             .collect()
     }
 
-    // Polling
-
     pub fn start_polling(rss: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            // Initial delay before first poll
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
             loop {
-                // The global minimum is only the wake cadence; each feed keeps its own interval
                 let new_items_per_feed = rss.update_feeds(true).await;
 
-                // Auto-download matching items via the v2 rule engine
+                let mut dirty = false;
                 for (feed_id, new_items) in &new_items_per_feed {
                     for item in new_items {
                         if item.is_downloaded {
                             continue;
                         }
-                        rss.evaluate_and_download(feed_id, item).await;
+                        dirty |= rss.evaluate_and_download(feed_id, item).await;
                     }
                 }
-
-                // Notify frontend of new items
-                if !new_items_per_feed.is_empty() {
-                    let total_new: usize = new_items_per_feed
-                        .iter()
-                        .map(|(_, items)| items.len())
-                        .sum();
-                    rss.event_sink
-                        .emit("rss-new-items", serde_json::json!(total_new));
+                if dirty {
+                    if let Err(e) = rss.save().await {
+                        tracing::warn!("Failed to save RSS store: {}", e);
+                    }
                 }
 
                 let min_interval = {
@@ -642,23 +748,20 @@ impl RssManager {
                         .min()
                         .unwrap_or(DEFAULT_UPDATE_INTERVAL_SECS)
                 };
-                // Floor the wake cadence: a feed configured with interval 0 would otherwise turn this into a tight sleep(0) spin loop
                 let min_interval = min_interval.max(MIN_UPDATE_INTERVAL_SECS);
 
-                // Sleep *after* the fetch so the first poll fires promptly once the startup delay elapses, rather than a full interval later
                 tokio::time::sleep(tokio::time::Duration::from_secs(min_interval)).await;
             }
         })
     }
 
-    /// Evaluate rules against an item and trigger an auto-download if any match (respecting schedule, cooldown, dedupe and upgrade)
-    async fn evaluate_and_download(&self, feed_id: &str, item: &RssItem) {
+    async fn evaluate_and_download(&self, feed_id: &str, item: &RssItem) -> bool {
         let parsed = item
             .parsed_meta
             .clone()
             .unwrap_or_else(|| parser::parse_title(&item.title));
         let Some((rule, score)) = self.best_matching_rule(item, &parsed).await else {
-            return;
+            return false;
         };
 
         let now = now_secs();
@@ -669,7 +772,7 @@ impl RssManager {
                     rule.name,
                     item.title
                 );
-                return;
+                return false;
             }
         }
 
@@ -693,7 +796,7 @@ impl RssManager {
                     item.title,
                     reason
                 );
-                return;
+                return false;
             }
             DedupeDecision::Download | DedupeDecision::Upgrade => {}
         }
@@ -705,10 +808,9 @@ impl RssManager {
 
         let Some(manager) = super::get_manager().await else {
             tracing::warn!("RSS auto-download: engine not available");
-            return;
+            return false;
         };
 
-        // Branch by item kind: articles get an HTML body written to disk and their inline media fanned out, mirroring the manual download path in the rss_cmds layer. Treating an article like an enclosure would only queue the page URL and lose the body content
         let kind = classify_item_kind(item);
         let download_path: Option<String> = if kind == ItemKind::Article {
             let dir = match opts.get("dir").and_then(|v| v.as_str()) {
@@ -726,15 +828,14 @@ impl RssManager {
             let dir_path = std::path::Path::new(&dir);
             if let Err(e) = tokio::fs::create_dir_all(dir_path).await {
                 tracing::warn!("Auto-download: failed to create dir {}: {}", dir, e);
-                return;
+                return false;
             }
             let file_path = dir_path.join(&filename);
             let path_str = file_path.to_string_lossy().to_string();
             if let Err(e) = tokio::fs::write(&file_path, html.as_bytes()).await {
                 tracing::warn!("Auto-download: failed to write article html: {}", e);
-                return;
+                return false;
             }
-            // Fan out inline media + the (thumbnail) enclosure as siblings
             let mut media_opts = opts.clone();
             media_opts.remove("out");
             let mut queued: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -760,17 +861,16 @@ impl RssManager {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!("RSS auto-download: no URL for '{}': {}", item.title, e);
-                    return;
+                    return false;
                 }
             };
             let gid = match manager.add_http_task(vec![url.clone()], opts.clone()).await {
                 Ok(g) => g,
                 Err(e) => {
                     tracing::warn!("Auto-download failed for '{}': {}", item.title, e);
-                    return;
+                    return false;
                 }
             };
-            // Fan inline media (images / extra enclosures) out as separate tasks so feeds whose primary enclosure is a thumbnail still capture the full payload set
             let mut media_opts = opts.clone();
             media_opts.remove("out");
             for extra in &item.media_urls {
@@ -785,100 +885,32 @@ impl RssManager {
                 }
             }
 
-            // Spawn a monitor task: wait for the primary download to complete, then record the actual on-disk path and update episode history. This mirrors the pattern in download_rss_item_tracked so that get_item_download_path and open-file affordances work correctly
-            let mon_store = Arc::clone(&self.store);
-            let mon_storage = Arc::clone(&self.storage);
-            let mon_feed_id = feed_id.to_string();
-            let mon_item_id = item.id.clone();
-            let mon_item_title = item.title.clone();
-            let mon_rule_id = rule.id.clone();
-            let mon_rule_name = rule.name.clone();
-            let mon_now = now;
-            let mon_score = score;
-            let mon_key = key.clone();
-            tokio::spawn(async move {
-                const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
-                const MAX_POLLS: usize = 3600;
-
-                for _ in 0..MAX_POLLS {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-
-                    let engine = match super::get_manager().await {
-                        Some(m) => m,
-                        None => break,
-                    };
-
-                    let status_result = engine
-                        .tell_status(
-                            &gid,
-                            &["status".to_string(), "dir".to_string(), "files".to_string()],
-                        )
-                        .await;
-
-                    let status_val = match status_result {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let status = status_val
-                        .get("status")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-
-                    match status {
-                        "complete" => {
-                            // Derive final path from the first file entry
-                            let download_path = status_val
-                                .get("files")
-                                .and_then(|f| f.as_array())
-                                .and_then(|a| a.first())
-                                .and_then(|f| f.get("path"))
-                                .and_then(|p| p.as_str())
-                                .filter(|p| !p.is_empty())
-                                .map(|p| p.to_string());
-
-                            let mut s = mon_store.lock().await;
-                            record_download(
-                                &mut s,
-                                &mon_feed_id,
-                                &mon_item_id,
-                                &mon_rule_id,
-                                mon_key.as_ref(),
-                                mon_score,
-                                mon_now,
-                                download_path,
-                            );
-                            let wrapper = serde_json::json!({ "data": *s });
-                            drop(s);
-                            let _ = mon_storage.save(RSS_STORE_KEY, &wrapper);
-                            tracing::info!(
-                                "Auto-downloaded '{}' via rule '{}'",
-                                mon_item_title,
-                                mon_rule_name
-                            );
-                            return;
-                        }
-                        "error" | "removed" => {
-                            tracing::warn!(
-                                "RSS auto-download task {} for '{}' ended with status '{}'",
-                                gid,
-                                mon_item_title,
-                                status
-                            );
-                            return;
-                        }
-                        _ => {}
-                    }
+            let prev_episode = {
+                let mut s = self.store.lock().await;
+                let prev = key
+                    .as_ref()
+                    .and_then(|k| s.episode_history.get(&k.to_storage_key()).cloned());
+                if let Some(k) = key.as_ref() {
+                    record_episode(&mut s, k, feed_id, &item.id, &rule.id, score, now, None);
                 }
-
-                tracing::warn!(
-                    "RSS auto-download monitor for '{}' (gid={}) timed out",
-                    mon_item_title,
-                    gid
-                );
-            });
-
-            // Episode history and rule stats are handled by the monitor above. Return without the synchronous mark_item_downloaded call
-            return;
+                prev
+            };
+            self.track_download(
+                gid,
+                PendingDownload {
+                    feed_id: feed_id.to_string(),
+                    item_id: item.id.clone(),
+                    title: item.title.clone(),
+                    rule_id: rule.id.clone(),
+                    rule_name: rule.name.clone(),
+                    key: key.clone(),
+                    score,
+                    queued_at: now,
+                    prev_episode,
+                },
+            )
+            .await;
+            return true;
         };
 
         let mut s = self.store.lock().await;
@@ -893,8 +925,103 @@ impl RssManager {
             download_path,
         );
         drop(s);
-        let _ = self.save().await;
         tracing::info!("Auto-downloaded '{}' via rule '{}'", item.title, rule.name);
+        true
+    }
+
+    async fn track_download(&self, gid: String, pending: PendingDownload) {
+        let mut map = self.pending.lock().await;
+        map.insert(gid, pending);
+        if !self.monitor_active.swap(true, Ordering::SeqCst) {
+            tokio::spawn(run_download_monitor(
+                Arc::clone(&self.store),
+                Arc::clone(&self.storage),
+                Arc::clone(&self.save_gate),
+                Arc::clone(&self.pending),
+                Arc::clone(&self.monitor_active),
+            ));
+        }
+    }
+}
+
+async fn run_download_monitor(
+    store: Arc<Mutex<RssStore>>,
+    storage: Arc<dyn StorageBackend>,
+    gate: Arc<Mutex<()>>,
+    pending: Arc<Mutex<HashMap<String, PendingDownload>>>,
+    active: Arc<AtomicBool>,
+) {
+    let fields = ["status".to_string(), "dir".to_string(), "files".to_string()];
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        let gids: Vec<String> = {
+            let map = pending.lock().await;
+            if map.is_empty() {
+                active.store(false, Ordering::SeqCst);
+                return;
+            }
+            map.keys().cloned().collect()
+        };
+
+        let engine = super::get_manager().await;
+        let mut changed = false;
+        for gid in gids {
+            let status_val = match &engine {
+                Some(engine) => engine.tell_status(&gid, &fields).await.ok(),
+                None => None,
+            };
+            let status = status_val
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("removed");
+            if !matches!(status, "complete" | "error" | "removed") {
+                continue;
+            }
+            let Some(p) = pending.lock().await.remove(&gid) else {
+                continue;
+            };
+            if status == "complete" {
+                let download_path = status_val
+                    .as_ref()
+                    .and_then(|v| v.get("files"))
+                    .and_then(|f| f.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|f| f.get("path"))
+                    .and_then(|p| p.as_str())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_string());
+                let mut s = store.lock().await;
+                record_download(
+                    &mut s,
+                    &p.feed_id,
+                    &p.item_id,
+                    &p.rule_id,
+                    p.key.as_ref(),
+                    p.score,
+                    p.queued_at,
+                    download_path,
+                );
+                drop(s);
+                tracing::info!("Auto-downloaded '{}' via rule '{}'", p.title, p.rule_name);
+            } else {
+                tracing::warn!(
+                    "RSS auto-download task {} for '{}' ended with status '{}'",
+                    gid,
+                    p.title,
+                    status
+                );
+                let mut s = store.lock().await;
+                rollback_episode(&mut s, &p);
+            }
+            changed = true;
+        }
+        if changed {
+            if let Err(e) = persist(&store, &storage, &gate).await {
+                tracing::warn!("Failed to save RSS store: {}", e);
+            }
+        }
     }
 }
 
@@ -918,9 +1045,6 @@ fn validate_rule(rule: &RssRule) -> Result<(), String> {
     Ok(())
 }
 
-// Helpers
-
-/// Post-download bookkeeping shared by both auto-download paths: flag the item, bump rule stats and record episode history (with a soft cap)
 #[allow(clippy::too_many_arguments)]
 fn record_download(
     s: &mut RssStore,
@@ -946,34 +1070,68 @@ fn record_download(
         rule_mut.stats.download_count = rule_mut.stats.download_count.saturating_add(1);
     }
     if let Some(k) = key {
-        s.episode_history.insert(
-            k.to_storage_key(),
-            EpisodeRecord {
-                item_id: item_id.to_string(),
-                feed_id: feed_id.to_string(),
-                score,
-                downloaded_at: now,
-                file_path: path,
-                rule_id: Some(rule_id.to_string()),
-            },
-        );
-        // Soft cap: prune oldest entries when we exceed the limit
-        if s.episode_history.len() > MAX_EPISODE_HISTORY {
-            let mut entries: Vec<(String, u64)> = s
-                .episode_history
-                .iter()
-                .map(|(k, v)| (k.clone(), v.downloaded_at))
-                .collect();
-            entries.sort_by_key(|(_, ts)| *ts);
-            let excess = s.episode_history.len() - MAX_EPISODE_HISTORY;
-            for (k, _) in entries.into_iter().take(excess) {
-                s.episode_history.remove(&k);
-            }
+        record_episode(s, k, feed_id, item_id, rule_id, score, now, path);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_episode(
+    s: &mut RssStore,
+    key: &EpisodeKey,
+    feed_id: &str,
+    item_id: &str,
+    rule_id: &str,
+    score: i32,
+    now: u64,
+    path: Option<String>,
+) {
+    s.episode_history.insert(
+        key.to_storage_key(),
+        EpisodeRecord {
+            item_id: item_id.to_string(),
+            feed_id: feed_id.to_string(),
+            score,
+            downloaded_at: now,
+            file_path: path,
+            rule_id: Some(rule_id.to_string()),
+        },
+    );
+    if s.episode_history.len() > MAX_EPISODE_HISTORY {
+        let mut entries: Vec<(String, u64)> = s
+            .episode_history
+            .iter()
+            .map(|(k, v)| (k.clone(), v.downloaded_at))
+            .collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        let excess = s.episode_history.len() - MAX_EPISODE_HISTORY;
+        for (k, _) in entries.into_iter().take(excess) {
+            s.episode_history.remove(&k);
         }
     }
 }
 
-/// Shared HTTP client for RSS feed fetches. Building a fresh `Client` on every call would rebuild TLS state and drop keep-alive between polls, so cache one for the lifetime of the process. Returns an error rather than panicking if the underlying TLS/connector setup fails so a transient init failure becomes a recoverable RSS fetch error
+fn rollback_episode(s: &mut RssStore, p: &PendingDownload) {
+    let Some(k) = p.key.as_ref() else {
+        return;
+    };
+    let storage_key = k.to_storage_key();
+    let ours = s
+        .episode_history
+        .get(&storage_key)
+        .is_some_and(|r| r.item_id == p.item_id && r.file_path.is_none());
+    if !ours {
+        return;
+    }
+    match p.prev_episode.clone() {
+        Some(prev) => {
+            s.episode_history.insert(storage_key, prev);
+        }
+        None => {
+            s.episode_history.remove(&storage_key);
+        }
+    }
+}
+
 fn http_client() -> Result<&'static risuko_http::Client, String> {
     static CLIENT: std::sync::OnceLock<risuko_http::Client> = std::sync::OnceLock::new();
     if let Some(c) = CLIENT.get() {
@@ -982,39 +1140,107 @@ fn http_client() -> Result<&'static risuko_http::Client, String> {
     let client = risuko_http::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Risuko/1.0")
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
         .build()
         .map_err(|e| format!("Failed to build rss http client: {e}"))?;
-    // If another thread won the race, our `client` is dropped and we return the one already stored
     let _ = CLIENT.set(client);
-    Ok(CLIENT.get().expect("client just initialized"))
+    CLIENT
+        .get()
+        .ok_or_else(|| "rss http client unavailable".to_string())
 }
 
-async fn fetch_feed_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = http_client()?
-        .get(url)
+fn header_string(
+    resp: &risuko_http::Response,
+    name: risuko_http::header::HeaderName,
+) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string())
+}
+
+async fn fetch_feed(
+    url: &str,
+    etag: Option<String>,
+    last_modified: Option<String>,
+) -> Result<Fetched, FetchFailure> {
+    let transient = |message: String| FetchFailure {
+        message,
+        transient: true,
+    };
+    let client = http_client().map_err(transient)?;
+    let mut req = client.get(url);
+    if let Some(etag) = etag.as_deref() {
+        req = req.header(risuko_http::header::IF_NONE_MATCH, etag);
+    }
+    if let Some(lm) = last_modified.as_deref() {
+        req = req.header(risuko_http::header::IF_MODIFIED_SINCE, lm);
+    }
+    let resp = req
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch feed: {e}"))?;
+        .map_err(|e| transient(format!("Failed to fetch feed: {e}")))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("Feed returned HTTP {}", resp.status()));
+    let status = resp.status();
+    if status == risuko_http::StatusCode::NOT_MODIFIED {
+        return Ok(Fetched::NotModified);
     }
+    if !status.is_success() {
+        return Err(FetchFailure {
+            message: format!("Feed returned HTTP {status}"),
+            transient: status.is_server_error()
+                || status == risuko_http::StatusCode::TOO_MANY_REQUESTS
+                || status == risuko_http::StatusCode::REQUEST_TIMEOUT,
+        });
+    }
+    let new_etag = header_string(&resp, risuko_http::header::ETAG);
+    let new_last_modified = header_string(&resp, risuko_http::header::LAST_MODIFIED);
+    let body = resp.bytes_limited(MAX_FEED_BYTES).await.map_err(|e| {
+        let too_large = e.to_string().contains("exceeds");
+        FetchFailure {
+            message: if too_large {
+                "Feed body too large".to_string()
+            } else {
+                format!("Failed to read feed body: {e}")
+            },
+            transient: !too_large,
+        }
+    })?;
 
-    resp.bytes()
+    let feed = tokio::task::spawn_blocking(move || feed_rs::parser::parse(&body[..]))
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("Failed to read feed body: {e}"))
+        .map_err(|e| transient(format!("Feed parse task failed: {e}")))?
+        .map_err(|e| FetchFailure {
+            message: format!("Failed to parse feed: {e}"),
+            transient: false,
+        })?;
+    Ok(Fetched::Parsed {
+        feed: Box::new(feed),
+        etag: new_etag,
+        last_modified: new_last_modified,
+    })
 }
 
-async fn fetch_and_parse(url: &str) -> Result<feed_rs::model::Feed, String> {
-    let body = fetch_feed_bytes(url).await?;
-    feed_rs::parser::parse(&body[..]).map_err(|e| format!("Failed to parse feed: {e}"))
+fn entry_item_id(entry: &feed_rs::model::Entry) -> String {
+    if entry.id.is_empty() {
+        item_id(entry.links.first().map(|l| l.href.as_str()).unwrap_or(""))
+    } else {
+        item_id(&entry.id)
+    }
 }
 
 fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssItem> {
     entries
         .iter()
-        .map(|entry| {
+        .map(|entry| extract_item(feed_id, entry))
+        .collect()
+}
+
+fn extract_item(feed_id: &str, entry: &feed_rs::model::Entry) -> RssItem {
+    {
+        {
             let guid = entry.id.clone();
             let link = entry
                 .links
@@ -1038,7 +1264,6 @@ fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssIte
                 .or_else(|| entry.content.as_ref().and_then(|c| c.body.clone()))
                 .unwrap_or_default();
 
-            // Keep the full body separately: many feeds ship a short <description> plus a full <content:encoded>, and collapsing to just the summary loses the article
             let content = entry
                 .content
                 .as_ref()
@@ -1050,10 +1275,8 @@ fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssIte
                 .or(entry.updated)
                 .map(|dt| dt.timestamp() as u64);
 
-            // Extract enclosure: prefer real media payloads over thumbnail images
             let (enc_url, enc_type, enc_len) = extract_enclosure(entry);
 
-            // Scrape inline media references (img/video/audio/source) from the entry body, plus any extra enclosure-style links beyond the primary one we picked above. Many "content" feeds (blogs, news, podcasts with cover art) advertise a thumbnail JPG as the enclosure while the real article images live in the HTML body
             let media_urls = extract_media_urls(entry, enc_url.as_deref());
 
             let parsed_meta = if title.is_empty() {
@@ -1080,8 +1303,8 @@ fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssIte
                 matched_rule_id: None,
                 media_urls,
             }
-        })
-        .collect()
+        }
+    }
 }
 
 fn extract_enclosure(
@@ -1089,7 +1312,6 @@ fn extract_enclosure(
 ) -> (Option<String>, Option<String>, Option<u64>) {
     let mut candidates: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
 
-    // media:content candidates. Thumbnails aren't filtered here; they're deprioritized later by `media_score` so real payloads win
     for media in &entry.media {
         for content in &media.content {
             if let Some(ref url) = content.url {
@@ -1102,14 +1324,12 @@ fn extract_enclosure(
         }
     }
 
-    // links with rel="enclosure"
     for link in &entry.links {
         if link.rel.as_deref() == Some("enclosure") {
             candidates.push((link.href.clone(), link.media_type.clone(), link.length));
         }
     }
 
-    // Pick the highest-scoring candidate (first wins on ties). Score deprioritizes images so a cover-art / thumbnail JPG never wins over an actual torrent / video / audio payload
     match candidates
         .into_iter()
         .min_by_key(|(url, mime, _)| std::cmp::Reverse(media_score(url, mime.as_deref())))
@@ -1119,7 +1339,6 @@ fn extract_enclosure(
     }
 }
 
-/// Score a candidate enclosure so we prefer real media over thumbnails. Higher is better. Magnet links and torrents win, then video/audio, then generic binaries; HTML and images sink to the bottom
 fn media_score(url: &str, mime: Option<&str>) -> i32 {
     let lower_url = url.to_ascii_lowercase();
     if lower_url.starts_with("magnet:") {
@@ -1147,7 +1366,6 @@ fn media_score(url: &str, mime: Option<&str>) -> i32 {
     if mime_lower.starts_with("image/") {
         return 100;
     }
-    // Unknown mime, guess from extension
     if has_media_ext(&lower_url, MEDIA_EXTS) {
         return 600;
     }
@@ -1166,13 +1384,11 @@ const IMAGE_EXTS: &[&str] = &[
 ];
 
 fn has_media_ext(url: &str, exts: &[&str]) -> bool {
-    // Strip query / fragment before extension check
     let path = url.split('?').next().unwrap_or(url);
     let path = path.split('#').next().unwrap_or(path);
     exts.iter().any(|e| path.ends_with(e))
 }
 
-/// Pull every inline media URL out of an entry. This combines: * extra enclosure-style links beyond the primary picked enclosure * `<img>`, `<video>`, `<audio>`, `<source>` elements in the HTML body of `entry.content` and `entry.summary` * `<a href="…">` to known media file extensions Output is deduplicated and excludes the primary enclosure URL
 fn extract_media_urls(entry: &feed_rs::model::Entry, primary: Option<&str>) -> Vec<String> {
     use std::collections::BTreeSet;
 
@@ -1186,7 +1402,6 @@ fn extract_media_urls(entry: &feed_rs::model::Entry, primary: Option<&str>) -> V
         if Some(trimmed) == primary {
             return;
         }
-        // Only push absolute http(s) / magnet URLs — relative paths can't be resolved without a base href and would break the downloader
         let lower = trimmed.to_ascii_lowercase();
         if !(lower.starts_with("http://")
             || lower.starts_with("https://")
@@ -1199,7 +1414,6 @@ fn extract_media_urls(entry: &feed_rs::model::Entry, primary: Option<&str>) -> V
         }
     };
 
-    // Extra enclosure links (besides the one extract_enclosure already picked)
     for link in &entry.links {
         if link.rel.as_deref() == Some("enclosure") {
             push(link.href.clone(), &mut out, &mut seen);
@@ -1213,7 +1427,6 @@ fn extract_media_urls(entry: &feed_rs::model::Entry, primary: Option<&str>) -> V
         }
     }
 
-    // HTML scrape from summary + content bodies
     let mut bodies: Vec<&str> = Vec::new();
     if let Some(ref s) = entry.summary {
         bodies.push(&s.content);
@@ -1232,7 +1445,6 @@ fn extract_media_urls(entry: &feed_rs::model::Entry, primary: Option<&str>) -> V
     out
 }
 
-/// Best-effort regex scrape of media URLs from an HTML fragment. We avoid pulling in a full HTML parser for this — RSS bodies are typically small and a couple of cached regexes give us img/video/audio/source/a-href in one pass
 fn scrape_media_from_html(html: &str) -> Vec<String> {
     use std::sync::OnceLock;
     static SRC_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -1259,7 +1471,6 @@ fn scrape_media_from_html(html: &str) -> Vec<String> {
             urls.push(decode_html_entities(m.as_str()));
         }
     }
-    // srcset is comma-separated, take the URL part only
     for cap in srcset_re.captures_iter(html) {
         if let Some(m) = cap.get(1) {
             for entry in m.as_str().split(',') {
@@ -1269,7 +1480,6 @@ fn scrape_media_from_html(html: &str) -> Vec<String> {
             }
         }
     }
-    // <a href> only when it points to a known media file
     for cap in href_re.captures_iter(html) {
         if let Some(m) = cap.get(1) {
             let href = decode_html_entities(m.as_str());
@@ -1284,7 +1494,6 @@ fn scrape_media_from_html(html: &str) -> Vec<String> {
 }
 
 fn decode_html_entities(s: &str) -> String {
-    // First handle named entities via simple replacement
     let s = s
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
@@ -1293,7 +1502,6 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">");
 
-    // Then scan for numeric character references: &#NNN; (decimal) and &#xHHH; (hex)
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1320,31 +1528,25 @@ fn decode_html_entities(s: &str) -> String {
                 };
                 if let Some(ch) = parsed.and_then(char::from_u32) {
                     out.push(ch);
-                    // skip `&#` + optional `x` + digits + `;`
                     i += 2 + digits_start + digits.len() + 1;
                     continue;
                 }
             }
         }
-        // Copy the byte as-is (safe: push char at byte boundary)
         out.push(s[i..].chars().next().unwrap());
         i += s[i..].chars().next().unwrap().len_utf8();
     }
     out
 }
 
-/// What kind of payload an RSS item primarily represents
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ItemKind {
-    /// Real binary payload (torrent / video / audio / archive). Download the enclosure as-is
     Media,
     Article,
 }
 
-/// Score boundary at which a candidate enclosure is considered a real media payload rather than a thumbnail / page reference. Mirrors `media_score` values for application/video/audio/octet-stream
 const MEDIA_PAYLOAD_THRESHOLD: i32 = 400;
 
-/// Classify an item as media or article based on its enclosure metadata
 pub fn classify_item_kind(item: &RssItem) -> ItemKind {
     match item.enclosure_url.as_deref() {
         Some(url) => {
@@ -1359,7 +1561,6 @@ pub fn classify_item_kind(item: &RssItem) -> ItemKind {
     }
 }
 
-/// Build a self-contained HTML document for an article item using its stored description / content body. Inline media references stay as absolute URLs so the page renders even before sibling downloads finish; downloaded copies live next to this file for offline backup
 pub fn build_article_html(item: &RssItem) -> String {
     let title = if item.title.is_empty() {
         "Untitled".to_string()
@@ -1376,7 +1577,6 @@ pub fn build_article_html(item: &RssItem) -> String {
     } else {
         sanitize_article_html(body_src)
     };
-    // Only emit a <base> when the source link is an http(s) URL we can fully escape. Non-http schemes (javascript:, data:, file:) would let the feed smuggle script execution into the rendered page
     let base_tag = if is_safe_http_url(&item.link) {
         format!(r#"<base href="{}" />"#, html_escape(&item.link))
     } else {
@@ -1390,7 +1590,6 @@ pub fn build_article_html(item: &RssItem) -> String {
     } else {
         String::new()
     };
-    // Strict CSP: no scripts (inline or external), no plugins, no framing. Images / media / styles still load over http(s) so the article renders
     let csp = "default-src 'none'; \
                img-src http: https: data:; \
                media-src http: https:; \
@@ -1431,7 +1630,6 @@ pub fn build_article_html(item: &RssItem) -> String {
     )
 }
 
-/// Sanitize an item title into a filesystem-safe filename stem, then append a short id suffix for uniqueness and an `.html` extension
 pub fn article_filename(item: &RssItem) -> String {
     const MAX_STEM: usize = 80;
     let raw = if item.title.is_empty() {
@@ -1439,18 +1637,7 @@ pub fn article_filename(item: &RssItem) -> String {
     } else {
         item.title.clone()
     };
-    let mut stem: String = raw
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    stem = stem.trim().trim_matches('.').to_string();
-    if stem.is_empty() {
-        stem = "article".to_string();
-    }
+    let mut stem = crate::engine::util::safe_filename(raw.trim(), "article");
     if stem.chars().count() > MAX_STEM {
         stem = stem.chars().take(MAX_STEM).collect();
     }
@@ -1470,7 +1657,6 @@ fn is_safe_http_url(s: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-/// Strip script-bearing tags and inline event-handler / `javascript:` URL attributes from feed-supplied HTML before embedding it in a generated article page. This is best-effort defence-in-depth; the strict CSP emitted in `build_article_html` is the primary control against script execution
 fn sanitize_article_html(html: &str) -> String {
     use std::sync::OnceLock;
     static BLOCK_RES: OnceLock<Vec<regex::Regex>> = OnceLock::new();
@@ -1478,7 +1664,6 @@ fn sanitize_article_html(html: &str) -> String {
     static ON_ATTR_RE: OnceLock<regex::Regex> = OnceLock::new();
     static JS_HREF_RE: OnceLock<regex::Regex> = OnceLock::new();
 
-    // Drop script/style/iframe/object/embed/frame elements entirely (incl. body). The `regex` crate has no backreferences, so emit one regex per tag instead of a single `</\1>` pattern
     let block_res = BLOCK_RES.get_or_init(|| {
         const TAGS: &[&str] = &[
             "script", "style", "iframe", "object", "embed", "frame", "frameset", "noscript",
@@ -1491,19 +1676,16 @@ fn sanitize_article_html(html: &str) -> String {
             })
             .collect()
     });
-    // Drop self-closing variants of the same dangerous tags + meta/link
     let self_close_re = SELF_CLOSE_RE.get_or_init(|| {
         regex::Regex::new(
             r"(?is)<(?:script|style|iframe|object|embed|frame|frameset|noscript|template|meta|link)\b[^>]*/?>",
         )
         .expect("self-close regex")
     });
-    // Strip on*="..." / on*='...' / on*=value event handlers
     let on_attr_re = ON_ATTR_RE.get_or_init(|| {
         regex::Regex::new(r#"(?i)\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#)
             .expect("on-attr regex")
     });
-    // Neutralise javascript:/vbscript:/data: URLs in href/src/xlink:href attributes. Emit two patterns to avoid a backreference between quotes. Known limitation: this runs on raw HTML, so an entity-encoded scheme (e.g. href="&#106;avascript:...") is decoded by the browser at render time and slips past this literal check. The strict CSP emitted in `build_article_html` (script-src 'none', default-src 'none') is the primary control and blocks execution regardless; this regex is only defence-in-depth against unencoded schemes
     let js_href_re = JS_HREF_RE.get_or_init(|| {
         regex::Regex::new(
             r#"(?i)\b(?:href|src|xlink:href)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:javascript|vbscript|data):[^\s>]*)"#,
@@ -1524,7 +1706,7 @@ fn sanitize_article_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{FileStorage, NoopEventSink};
+    use crate::traits::FileStorage;
     use tempfile::TempDir;
 
     struct RssTestCtx {
@@ -1535,8 +1717,7 @@ mod tests {
     fn test_manager() -> RssTestCtx {
         let dir = TempDir::new().unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(FileStorage::new(dir.path().to_path_buf()));
-        let event_sink: Arc<dyn EventSink> = Arc::new(NoopEventSink);
-        let mgr = RssManager::new(storage, event_sink);
+        let mgr = RssManager::new(storage);
         RssTestCtx { _dir: dir, mgr }
     }
 
@@ -1552,7 +1733,16 @@ mod tests {
             created_at: 1,
             is_active: true,
             error_count: 0,
+            last_attempt_at: None,
+            etag: None,
+            last_modified: None,
         }
+    }
+
+    #[test]
+    fn article_filename_strips_reserved_characters() {
+        let item = sample_item("f", "abcdef123456", "a\"b/c:d ");
+        assert_eq!(article_filename(&item), "a_b_c_d__abcdef12.html");
     }
 
     fn sample_item(feed_id: &str, item_id: &str, title: &str) -> RssItem {
@@ -1576,8 +1766,6 @@ mod tests {
         }
     }
 
-    // -- Pure helpers --
-
     #[test]
     fn item_id_is_deterministic() {
         let a = item_id("hello");
@@ -1585,7 +1773,7 @@ mod tests {
         let c = item_id("world");
         assert_eq!(a, b);
         assert_ne!(a, c);
-        assert_eq!(a.len(), 64); // SHA-256 hex
+        assert_eq!(a.len(), 64);
     }
 
     #[test]
@@ -1602,7 +1790,6 @@ mod tests {
             media_score("magnet:?xt=urn:btih:abc", None)
                 > media_score("https://x/a.mp4", Some("video/mp4"))
         );
-        // Unknown mime falls back to extension hints
         assert!(media_score("https://x/a.mkv", None) > media_score("https://x/a.png", None));
     }
 
@@ -1629,8 +1816,6 @@ mod tests {
         let urls = scrape_media_from_html(html);
         assert_eq!(urls, vec!["https://cdn/x.jpg?a=1&b=2".to_string()]);
     }
-
-    // -- RssManager CRUD --
 
     #[test]
     fn get_feeds_returns_populated() {
@@ -1832,7 +2017,6 @@ mod tests {
             item.media_urls = vec![
                 "https://cdn/img1.jpg".into(),
                 "https://cdn/video.mp4".into(),
-                // Duplicate of primary should be filtered
                 "https://enc/cover.jpg".into(),
             ];
             item.link = "https://link.example.com/article".into();
@@ -2082,8 +2266,7 @@ mod tests {
     fn load_and_save_round_trip() {
         let dir = TempDir::new().unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(FileStorage::new(dir.path().to_path_buf()));
-        let event_sink: Arc<dyn EventSink> = Arc::new(NoopEventSink);
-        let mgr = RssManager::new(storage.clone(), event_sink.clone());
+        let mgr = RssManager::new(storage.clone());
         let rt = tokio::runtime::Runtime::new().unwrap();
         {
             let mut s = mgr.store.blocking_lock();
@@ -2093,11 +2276,160 @@ mod tests {
         }
         rt.block_on(mgr.save()).unwrap();
 
-        let mgr2 = RssManager::new(storage, event_sink);
+        let mgr2 = RssManager::new(storage);
         mgr2.load().unwrap();
         let feeds = rt.block_on(mgr2.get_feeds());
         assert_eq!(feeds.len(), 1);
         let items = rt.block_on(mgr2.get_items("f1"));
         assert_eq!(items.len(), 1);
+    }
+
+    fn rss_xml(count: usize) -> Vec<u8> {
+        let mut xml =
+            String::from("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title>");
+        for n in 0..count {
+            xml.push_str(&format!(
+                "<item><title>Item {n}</title><guid>g{n}</guid><link>https://e.com/{n}</link></item>"
+            ));
+        }
+        xml.push_str("</channel></rss>");
+        xml.into_bytes()
+    }
+
+    fn parsed(count: usize) -> Result<Fetched, FetchFailure> {
+        let feed = feed_rs::parser::parse(&rss_xml(count)[..]).unwrap();
+        Ok(Fetched::Parsed {
+            feed: Box::new(feed),
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn apply_fetch_caps_window_and_does_not_refire_old_entries() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        mgr.store
+            .lock()
+            .await
+            .feeds
+            .push(sample_feed("f1", "https://a.com"));
+        let fresh = mgr
+            .apply_fetch("f1", parsed(MAX_ITEMS_PER_FEED + 100))
+            .await
+            .unwrap();
+        assert_eq!(fresh.len(), MAX_ITEMS_PER_FEED);
+        let again = mgr
+            .apply_fetch("f1", parsed(MAX_ITEMS_PER_FEED + 100))
+            .await
+            .unwrap();
+        assert!(again.is_empty());
+        let s = mgr.store.lock().await;
+        assert_eq!(s.items["f1"].len(), MAX_ITEMS_PER_FEED);
+        assert_eq!(s.feeds[0].etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[tokio::test]
+    async fn apply_fetch_not_modified_resets_errors() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        {
+            let mut s = mgr.store.lock().await;
+            let mut f = sample_feed("f1", "https://a.com");
+            f.error_count = 3;
+            s.feeds.push(f);
+        }
+        let fresh = mgr
+            .apply_fetch("f1", Ok(Fetched::NotModified))
+            .await
+            .unwrap();
+        assert!(fresh.is_empty());
+        let s = mgr.store.lock().await;
+        assert_eq!(s.feeds[0].error_count, 0);
+        assert!(s.feeds[0].last_attempt_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn transient_errors_never_disable_feed() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        mgr.store
+            .lock()
+            .await
+            .feeds
+            .push(sample_feed("f1", "https://a.com"));
+        for _ in 0..(MAX_CONSECUTIVE_ERRORS + 2) {
+            let r = mgr
+                .apply_fetch(
+                    "f1",
+                    Err(FetchFailure {
+                        message: "down".into(),
+                        transient: true,
+                    }),
+                )
+                .await;
+            assert!(r.is_err());
+        }
+        assert!(mgr.store.lock().await.feeds[0].is_active);
+        for _ in 0..MAX_CONSECUTIVE_ERRORS {
+            let _ = mgr
+                .apply_fetch(
+                    "f1",
+                    Err(FetchFailure {
+                        message: "gone".into(),
+                        transient: false,
+                    }),
+                )
+                .await;
+        }
+        assert!(!mgr.store.lock().await.feeds[0].is_active);
+    }
+
+    #[test]
+    fn failing_feeds_back_off_from_their_own_interval() {
+        assert_eq!(feed_retry_delay(300, 0), 300);
+        assert_eq!(feed_retry_delay(300, 1), 600);
+        assert_eq!(feed_retry_delay(300, 3), 2400);
+        assert_eq!(feed_retry_delay(300, 30), MAX_BACKOFF_SECS);
+        let mut f = sample_feed("f1", "https://a.com");
+        f.update_interval_secs = 60;
+        f.error_count = 2;
+        f.last_attempt_at = Some(1000);
+        assert!(!feed_is_due(&f, 1000 + 239));
+        assert!(feed_is_due(&f, 1000 + 240));
+    }
+
+    #[test]
+    fn rollback_restores_previous_episode_record() {
+        let key = EpisodeKey {
+            series: "show".into(),
+            season: Some(1),
+            episode: 2,
+            absolute: false,
+        };
+        let mut s = RssStore::default();
+        let prev = EpisodeRecord {
+            item_id: "old".into(),
+            feed_id: "f1".into(),
+            score: 1,
+            downloaded_at: 5,
+            file_path: Some("/x".into()),
+            rule_id: None,
+        };
+        s.episode_history.insert(key.to_storage_key(), prev.clone());
+        record_episode(&mut s, &key, "f1", "new", "r1", 9, 10, None);
+        let p = PendingDownload {
+            feed_id: "f1".into(),
+            item_id: "new".into(),
+            title: "t".into(),
+            rule_id: "r1".into(),
+            rule_name: "n".into(),
+            key: Some(key.clone()),
+            score: 9,
+            queued_at: 10,
+            prev_episode: Some(prev),
+        };
+        rollback_episode(&mut s, &p);
+        assert_eq!(s.episode_history[&key.to_storage_key()].item_id, "old");
     }
 }

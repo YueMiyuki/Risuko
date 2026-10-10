@@ -402,6 +402,18 @@ export const checkTaskIsSeeder = (task) => {
 	return !!bittorrent && seeder === "true";
 };
 
+export const getDisplayTaskStatus = (task) => {
+	return checkTaskIsSeeder(task) ? TASK_STATUS.SEEDING : task.status;
+};
+
+export const getDisplayDownloadSpeed = (task) => {
+	return checkTaskIsSeeder(task) ? 0 : Number(task?.downloadSpeed || 0);
+};
+
+export const formatProgressPercent = (totalLength, completedLength) => {
+	return `${calcProgress(totalLength, completedLength, 1)}`.replace(/\.0$/, "");
+};
+
 export const getTaskUri = (task, withTracker = false) => {
 	const { files } = task;
 	let result = "";

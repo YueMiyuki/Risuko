@@ -1,5 +1,3 @@
-// Path helpers for finding browser cookie databases across platforms
-
 use std::path::{Path, PathBuf};
 
 pub fn expand(path: &str) -> eyre::Result<PathBuf> {
@@ -68,7 +66,6 @@ pub fn find_first_existing(patterns: &[&str]) -> Option<PathBuf> {
 }
 
 pub fn find_local_state(cookie_db: &Path) -> Option<PathBuf> {
-    // "Local State" sits next to the profile directory or one level above it
     let parent = cookie_db.parent()?;
 
     for rel in ["../../Local State", "../Local State", "Local State"] {
@@ -79,4 +76,52 @@ pub fn find_local_state(cookie_db: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+pub struct DbSnapshot {
+    dir: tempfile::TempDir,
+    name: std::ffi::OsString,
+}
+
+impl DbSnapshot {
+    pub fn db_path(&self) -> PathBuf {
+        self.dir.path().join(&self.name)
+    }
+}
+
+pub fn copy_db_snapshot(src: &Path) -> eyre::Result<DbSnapshot> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| eyre::eyre!("invalid db path"))?
+        .to_owned();
+    let dir = tempfile::tempdir()?;
+    std::fs::copy(src, dir.path().join(&name))?;
+
+    let mut wal = name.clone();
+    wal.push("-wal");
+    let wal_src = src.with_file_name(&wal);
+    if wal_src.exists() {
+        let _ = std::fs::copy(&wal_src, dir.path().join(&wal));
+    }
+    Ok(DbSnapshot { dir, name })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_db_snapshot;
+
+    #[test]
+    fn snapshot_includes_wal_sidecar() {
+        let src = tempfile::tempdir().unwrap();
+        let db = src.path().join("cookies.sqlite");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(src.path().join("cookies.sqlite-wal"), b"wal").unwrap();
+        let snap = copy_db_snapshot(&db).unwrap();
+        let copy = snap.db_path();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(copy.with_file_name("cookies.sqlite-wal")).unwrap(),
+            b"wal"
+        );
+    }
 }

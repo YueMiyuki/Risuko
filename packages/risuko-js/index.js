@@ -36,7 +36,6 @@ function loadNativeBinding() {
 		if (err.code !== "MODULE_NOT_FOUND") {
 			throw err;
 		}
-		// Fallback: try loading from local path (development)
 		const localPath = join(__dirname, `risuko.${platform}-${arch}.node`);
 		if (existsSync(localPath)) {
 			return require(localPath);

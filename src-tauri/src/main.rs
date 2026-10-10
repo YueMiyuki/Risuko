@@ -7,10 +7,14 @@ use clap::Parser;
 use risuko_lib::cli;
 
 fn main() {
-    let parsed = cli::Cli::parse();
+    let args: Vec<String> = std::env::args().collect();
+    let command = if cli::is_cli_invocation(&args) {
+        cli::Cli::parse().command
+    } else {
+        None
+    };
 
-    if let Some(command) = parsed.command {
-        // CLI mode: run the command and exit
+    if let Some(command) = command {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -29,6 +33,5 @@ fn main() {
         std::process::exit(code);
     }
 
-    // GUI mode: launch Tauri app
     risuko_lib::run();
 }

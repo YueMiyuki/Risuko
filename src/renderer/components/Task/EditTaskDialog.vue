@@ -264,8 +264,6 @@ function normalizeLimit(raw: unknown): string {
 	return s;
 }
 
-// Splits the header option into the two fields this dialog edits plus the
-// remaining custom headers, which are carried over untouched on save
 function splitHeaderLines(header: unknown): {
 	cookie: string;
 	authorization: string;
@@ -421,8 +419,6 @@ export default {
 				this.form.authorization.trim() !== this.snapshot.authorization.trim()
 			);
 		},
-		// The engine can only append trackers, so anything already announced is
-		// ignored and removals are not offered
 		newTrackers(): string[] {
 			if (!this.isBT) {
 				return [];
@@ -671,7 +667,6 @@ export default {
 				this.form.authorization.trim() !== this.snapshot.authorization.trim() ||
 				this.form.userAgent.trim() !== this.snapshot.userAgent.trim();
 			if (headerChanged) {
-				// Custom headers this dialog does not expose must survive the rewrite
 				const header: string[] = [...this.otherHeaders];
 				if (this.form.userAgent.trim()) {
 					header.push(`User-Agent: ${this.form.userAgent.trim()}`);

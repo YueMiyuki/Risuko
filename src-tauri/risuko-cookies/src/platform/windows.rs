@@ -1,5 +1,3 @@
-// Windows Chromium cookie decryption
-
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use eyre::{bail, Result};
@@ -43,12 +41,10 @@ fn decrypt_v20(data: &[u8], _master_key: &[u8]) -> Result<Vec<u8>> {
         bail!("v20 data too short");
     }
 
-    // Chrome 130+ app-bound encryption needs an elevated token to access the key
     bail!("{}", ELEVATION_REQUIRED);
 }
 
 fn decrypt_dpapi(data: &[u8]) -> Result<Vec<u8>> {
-    // Use the Windows DPAPI to decrypt the master key — this runs under the current user's context
     unsafe {
         let mut blob_in = CRYPT_INTEGER_BLOB {
             cbData: data.len() as u32,
@@ -84,7 +80,6 @@ fn decrypt_dpapi(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn extract_master_key(local_state_path: &std::path::Path) -> Result<Vec<u8>> {
-    // Read the "Local State" JSON, extract the base64-encoded encrypted key, strip the DPAPI prefix
     let content = std::fs::read_to_string(local_state_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
