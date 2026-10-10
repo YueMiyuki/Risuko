@@ -6856,7 +6856,7 @@ dependencies = [
 
 [[package]]
 name = "risuko"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",
@@ -6910,7 +6910,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-bt"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6940,7 +6940,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-cli"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -6955,7 +6955,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-cookies"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -6981,7 +6981,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-engine"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "aes 0.9.3",
  "async-trait",
@@ -7037,7 +7037,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-http"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -7070,7 +7070,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-napi"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -7083,7 +7083,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-share"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "iroh",
@@ -7098,7 +7098,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-webview-upgrade"
-version = "0.7.1"
+version = "1.0.0"
 dependencies = [
  "tauri",
  "tauri-plugin",

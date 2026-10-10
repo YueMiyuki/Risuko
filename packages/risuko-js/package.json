@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/risuko-js",
-	"version": "0.7.1",
+	"version": "1.0.0",
 	"description": "Risuko download engine — Node.js native bindings for multi-protocol downloads (HTTP, BitTorrent, ED2K, M3U8, FTP/SFTP)",
 	"main": "index.js",
 	"types": "index.d.ts",
@@ -34,12 +34,12 @@
 		}
 	},
 	"optionalDependencies": {
-		"@risuko/js-darwin-arm64": "0.7.1",
-		"@risuko/js-darwin-x64": "0.7.1",
-		"@risuko/js-linux-x64-gnu": "0.7.1",
-		"@risuko/js-linux-arm64-gnu": "0.7.1",
-		"@risuko/js-win32-x64-msvc": "0.7.1",
-		"@risuko/js-win32-arm64-msvc": "0.7.1"
+		"@risuko/js-darwin-arm64": "1.0.0",
+		"@risuko/js-darwin-x64": "1.0.0",
+		"@risuko/js-linux-x64-gnu": "1.0.0",
+		"@risuko/js-linux-arm64-gnu": "1.0.0",
+		"@risuko/js-win32-x64-msvc": "1.0.0",
+		"@risuko/js-win32-arm64-msvc": "1.0.0"
 	},
 	"engines": {
 		"node": ">= 22"

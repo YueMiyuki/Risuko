@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/cli-darwin-arm64",
-	"version": "0.7.1",
+	"version": "1.0.0",
 	"description": "Risuko CLI binary for macOS ARM64",
 	"repository": {
 		"type": "git",

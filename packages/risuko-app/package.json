@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/app",
-	"version": "0.7.1",
+	"version": "1.0.0",
 	"description": "Risuko download manager — launches the desktop app, downloading it from GitHub Releases on first run",
 	"license": "MIT",
 	"repository": {

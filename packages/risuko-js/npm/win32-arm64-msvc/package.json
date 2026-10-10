@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/js-win32-arm64-msvc",
-	"version": "0.7.1",
+	"version": "1.0.0",
 	"description": "Risuko JS native module for Windows ARM64",
 	"repository": {
 		"type": "git",
