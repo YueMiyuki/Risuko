@@ -266,6 +266,7 @@ impl Drop for Session {
         let _ = self.upnp_handle.lock().take();
         let _ = self.lsd.lock().take();
         let _ = self.dht.lock().take();
+        super::core::peer_id::clear_session_peer_id(self.listen_port, self.peer_id);
     }
 }
 

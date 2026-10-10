@@ -317,7 +317,7 @@ pub fn run() {
             let _ = window.set_decorations(false);
         }
 
-        let opened_at_login = std::env::args().any(|arg| arg == "--opened-at-login=1");
+        let opened_at_login = std::env::args_os().any(|arg| arg == "--opened-at-login=1");
         if opened_at_login {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();

@@ -476,32 +476,37 @@ impl MerkleProofTable {
 
 use std::sync::Arc;
 
-use super::metainfo::TorrentMeta;
+use super::metainfo::{TorrentMeta, TorrentMetaInfoV2};
+
+fn build_v2_table(
+    meta: &TorrentMeta,
+    piece_length: u32,
+    file: &TorrentMetaInfoV2,
+) -> Result<MerkleProofTable, MerkleError> {
+    let layer = meta
+        .piece_layers
+        .get(&file.pieces_root)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    MerkleProofTable::from_layer_bytes(file.pieces_root, file.length, piece_length, layer)
+}
 
 pub fn build_v2_tables(meta: &TorrentMeta) -> Option<Result<Vec<MerkleProofTable>, MerkleError>> {
     let v2 = meta.info_v2.as_ref()?;
     Some(
         v2.files
             .iter()
-            .map(|file| {
-                let layer = meta
-                    .piece_layers
-                    .get(&file.pieces_root)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                MerkleProofTable::from_layer_bytes(
-                    file.pieces_root,
-                    file.length,
-                    v2.piece_length,
-                    layer,
-                )
-            })
+            .map(|file| build_v2_table(meta, v2.piece_length, file))
             .collect(),
     )
 }
 
 pub fn supports_v2_wire(meta: &TorrentMeta) -> bool {
-    matches!(build_v2_tables(meta), Some(Ok(_)))
+    meta.info_v2.as_ref().is_some_and(|v2| {
+        v2.files
+            .iter()
+            .all(|file| build_v2_table(meta, v2.piece_length, file).is_ok())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +952,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MerkleError::RootMismatch));
+    }
+
+    fn v2_meta_with_layer(layer_tamper: bool) -> TorrentMeta {
+        use crate::bencode::{encode_to_vec, Value};
+        let piece_len: u32 = 16 * 1024;
+        let (_, small) = synth_file(8 * 1024, piece_len);
+        let (_, big) = synth_file(2 * piece_len as u64, piece_len);
+        let mut layer: Vec<u8> = big.piece_root_hashes.iter().flat_map(|h| h.0).collect();
+        if layer_tamper {
+            layer[0] ^= 1;
+        }
+        let leaf = |len: u64, root: Id32| {
+            Value::Dict(vec![(
+                Vec::new(),
+                Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(len as i64)),
+                    (b"pieces root".to_vec(), Value::Bytes(root.0.to_vec())),
+                ]),
+            )])
+        };
+        let info = Value::Dict(vec![
+            (
+                b"file tree".to_vec(),
+                Value::Dict(vec![
+                    (b"a".to_vec(), leaf(small.file_length, small.file_root)),
+                    (b"b".to_vec(), leaf(big.file_length, big.file_root)),
+                ]),
+            ),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(piece_len as i64)),
+        ]);
+        let top = Value::Dict(vec![
+            (b"info".to_vec(), info),
+            (
+                b"piece layers".to_vec(),
+                Value::Dict(vec![(big.file_root.0.to_vec(), Value::Bytes(layer))]),
+            ),
+        ]);
+        super::super::metainfo::parse_torrent(&encode_to_vec(&top)).unwrap()
+    }
+
+    #[test]
+    fn v2_wire_support_requires_every_file_table_to_build() {
+        assert!(supports_v2_wire(&v2_meta_with_layer(false)));
+        assert!(!supports_v2_wire(&v2_meta_with_layer(true)));
+        assert_eq!(
+            build_v2_tables(&v2_meta_with_layer(false))
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

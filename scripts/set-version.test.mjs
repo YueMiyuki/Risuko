@@ -58,6 +58,29 @@ test("normalizeVersion strips a leading v and rejects junk", () => {
 	assert.throws(() => normalizeVersion(undefined));
 });
 
+test("normalizeVersion follows strict SemVer", () => {
+	assert.equal(normalizeVersion("1.2.3-0.3.7"), "1.2.3-0.3.7");
+	assert.equal(normalizeVersion("1.2.3-x.7.z.92"), "1.2.3-x.7.z.92");
+	assert.equal(normalizeVersion("1.2.3-rc.1+build.5"), "1.2.3-rc.1+build.5");
+	assert.equal(normalizeVersion("1.2.3+20130313144700"), "1.2.3+20130313144700");
+	assert.equal(normalizeVersion("1.2.3-01a"), "1.2.3-01a");
+	for (const bad of [
+		"01.2.3",
+		"1.02.3",
+		"1.2.03",
+		"1.2.3-01",
+		"1.2.3-foo..bar",
+		"1.2.3-",
+		"1.2.3-foo.",
+		"1.2.3-foo.01",
+		"1.2.3+",
+		"1.2.3+a..b",
+		"1.2.3-rc_1",
+	]) {
+		assert.throws(() => normalizeVersion(bad), bad);
+	}
+});
+
 test("setVersion rewrites every manifest and only workspace lock entries", () => {
 	const root = fixture();
 	try {

@@ -1,27 +1,45 @@
-export function downsampleSeries<T>(
+export interface TimeBucket<T> {
+	time: number;
+	items: T[];
+}
+
+export function bucketByTime<T>(
 	items: readonly T[],
 	max: number,
-	score: (item: T) => number,
-): T[] {
+	step: number,
+	time: (item: T) => number,
+): TimeBucket<T>[] {
+	if (items.length === 0) {
+		return [];
+	}
 	const limit = Math.max(2, Math.floor(max));
-	if (items.length <= limit) {
-		return items as T[];
-	}
-	const out: T[] = [];
-	const size = items.length / limit;
-	for (let bucket = 0; bucket < limit; bucket++) {
-		const start = Math.floor(bucket * size);
-		const end = Math.min(items.length, Math.floor((bucket + 1) * size));
-		let best = items[start];
-		let bestScore = score(best);
-		for (let i = start + 1; i < end; i++) {
-			const value = score(items[i]);
-			if (value > bestScore) {
-				best = items[i];
-				bestScore = value;
-			}
+	const start = time(items[0]);
+	const span = time(items[items.length - 1]) - start;
+	const width = Math.max(step, span / limit);
+	const dense = items.length > limit;
+	const slotOf = (at: number) =>
+		span > 0
+			? Math.min(limit - 1, Math.floor(((at - start) / span) * limit))
+			: 0;
+	const buckets: TimeBucket<T>[] = [];
+	let slot = -1;
+	for (const item of items) {
+		const at = time(item);
+		const next = dense ? slotOf(at) : slot + 1;
+		if (next !== slot) {
+			buckets.push({ time: at, items: [] });
+			slot = next;
 		}
-		out.push(best);
+		buckets[buckets.length - 1].items.push(item);
 	}
-	return out;
+	const filled: TimeBucket<T>[] = [];
+	for (const bucket of buckets) {
+		const previous = filled[filled.length - 1];
+		if (previous && bucket.time - previous.time > width * 2) {
+			filled.push({ time: previous.time + width, items: [] });
+			filled.push({ time: bucket.time - width, items: [] });
+		}
+		filled.push(bucket);
+	}
+	return filled;
 }

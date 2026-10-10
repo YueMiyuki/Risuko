@@ -27,6 +27,7 @@ static HANDLE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[derive(Clone)]
 struct HandleSlot {
     file: Arc<std::fs::File>,
+    path: PathBuf,
     writable: bool,
     used: u64,
 }
@@ -50,6 +51,7 @@ pub struct FilesystemStorage {
     parts_dir: Option<PathBuf>,
     shadowed: Mutex<Vec<bool>>,
     shadow_handles: HandleCache,
+    unsynced: Mutex<HashSet<PathBuf>>,
     io_gate: tokio::sync::RwLock<()>,
     dirty: std::sync::atomic::AtomicBool,
     read_cache: super::read_cache::ReadCache,
@@ -66,6 +68,7 @@ impl FilesystemStorage {
             parts_dir: None,
             shadowed: Mutex::new(vec![false; files]),
             shadow_handles: Mutex::new(vec![None; files]),
+            unsynced: Mutex::new(HashSet::new()),
             io_gate: tokio::sync::RwLock::new(()),
             dirty: std::sync::atomic::AtomicBool::new(false),
             read_cache: super::read_cache::ReadCache::default(),
@@ -159,6 +162,7 @@ impl FilesystemStorage {
         })
         .await
         .map_err(|e| io::Error::other(e.to_string()))??;
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         self.shadowed.lock()[idx] = false;
         self.shadow_handles.lock()[idx] = None;
         let parts_dir = self.parts_dir.clone();
@@ -256,14 +260,21 @@ impl FilesystemStorage {
     ) -> Result<Arc<std::fs::File>, StorageError> {
         if self.is_shadowed(idx) {
             if let Some(path) = self.shadow_path(idx) {
-                return open_cached(&self.shadow_handles, idx, &path, write).await;
+                return open_cached(&self.shadow_handles, &self.unsynced, idx, &path, write).await;
             }
         }
         self.handle(idx, write).await
     }
 
     async fn handle(&self, idx: usize, write: bool) -> Result<Arc<std::fs::File>, StorageError> {
-        open_cached(&self.handles, idx, &self.layout.files()[idx].path, write).await
+        open_cached(
+            &self.handles,
+            &self.unsynced,
+            idx,
+            &self.layout.files()[idx].path,
+            write,
+        )
+        .await
     }
 
     pub async fn close_handles(&self) -> Result<(), StorageError> {
@@ -278,16 +289,34 @@ impl FilesystemStorage {
                     .collect::<Vec<_>>()
             })
             .collect();
-        if snapshot.is_empty() || !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let evicted = self.take_unsynced();
+        if (snapshot.is_empty() && evicted.is_empty())
+            || !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             return Ok(());
         }
-        self.sync_all(snapshot).await
+        self.sync_all(snapshot, evicted).await
     }
 
-    async fn sync_all(&self, handles: Vec<Arc<std::fs::File>>) -> Result<(), StorageError> {
+    fn take_unsynced(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.unsynced.lock())
+            .into_iter()
+            .collect()
+    }
+
+    async fn sync_all(
+        &self,
+        handles: Vec<Arc<std::fs::File>>,
+        evicted: Vec<PathBuf>,
+    ) -> Result<(), StorageError> {
         let joins: Vec<_> = handles
             .into_iter()
             .map(|handle| task::spawn_blocking(move || handle.sync_data()))
+            .chain(
+                evicted
+                    .into_iter()
+                    .map(|path| task::spawn_blocking(move || sync_path(&path))),
+            )
             .collect();
         let mut first_error: Option<io::Error> = None;
         for join in joins {
@@ -432,15 +461,17 @@ impl FilesystemStorage {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let evicted = self.take_unsynced();
         if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
-        self.sync_all(snapshot).await
+        self.sync_all(snapshot, evicted).await
     }
 }
 
 async fn open_cached(
     cache: &HandleCache,
+    unsynced: &Mutex<HashSet<PathBuf>>,
     idx: usize,
     path: &Path,
     write: bool,
@@ -452,6 +483,7 @@ async fn open_cached(
         }
     }
     let path = path.to_path_buf();
+    let slot_path = path.clone();
     let file = task::spawn_blocking(move || -> io::Result<std::fs::File> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
@@ -480,21 +512,30 @@ async fn open_cached(
     if let Some(slot) = guard.get_mut(idx) {
         *slot = Some(HandleSlot {
             file: arc.clone(),
+            path: slot_path,
             writable: write,
             used: next_tick(),
         });
     }
-    evict_lru(&mut guard, idx);
+    unsynced.lock().extend(evict_lru(&mut guard, idx));
     Ok(arc)
 }
 
-fn evict_lru(slots: &mut [Option<HandleSlot>], keep: usize) {
+fn sync_path(path: &Path) -> io::Result<()> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file.sync_data(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn evict_lru(slots: &mut [Option<HandleSlot>], keep: usize) -> Vec<PathBuf> {
     if slots.len() <= MAX_OPEN_HANDLES {
-        return;
+        return Vec::new();
     }
     let open = slots.iter().flatten().count();
     if open <= MAX_OPEN_HANDLES {
-        return;
+        return Vec::new();
     }
     let mut by_age: Vec<(u64, usize)> = slots
         .iter()
@@ -503,9 +544,13 @@ fn evict_lru(slots: &mut [Option<HandleSlot>], keep: usize) {
         .filter_map(|(i, s)| s.as_ref().map(|s| (s.used, i)))
         .collect();
     by_age.sort_unstable();
-    for (_, i) in by_age.into_iter().take(open - MAX_OPEN_HANDLES) {
-        slots[i] = None;
-    }
+    by_age
+        .into_iter()
+        .take(open - MAX_OPEN_HANDLES)
+        .filter_map(|(_, i)| slots[i].take())
+        .filter(|slot| slot.writable)
+        .map(|slot| slot.path)
+        .collect()
 }
 
 #[cfg(windows)]
@@ -702,7 +747,9 @@ mod tests {
         );
 
         assert_eq!(storage.set_selection(None).await, vec![0]);
+        assert!(!storage.dirty.load(std::sync::atomic::Ordering::Relaxed));
         storage.promote_file(0).await.unwrap();
+        assert!(storage.dirty.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(
             tokio::fs::read(root.join("a.bin")).await.unwrap(),
             piece0[..10]
@@ -818,16 +865,56 @@ mod tests {
             .map(|i| {
                 Some(HandleSlot {
                     file: file.clone(),
-                    writable: false,
+                    path: PathBuf::from(i.to_string()),
+                    writable: i % 2 == 0,
                     used: i as u64,
                 })
             })
             .collect();
-        evict_lru(&mut slots, 0);
+        let mut evicted = evict_lru(&mut slots, 0);
+        evicted.sort();
         assert_eq!(slots.iter().flatten().count(), MAX_OPEN_HANDLES);
         assert!(slots[0].is_some(), "kept index survives");
         assert!(slots[1].is_none() && slots[5].is_none());
         assert!(slots[6].is_some());
+        assert_eq!(evicted, [PathBuf::from("2"), PathBuf::from("4")]);
+    }
+
+    #[tokio::test]
+    async fn evicted_writable_handles_are_still_synced_on_close() {
+        let files = MAX_OPEN_HANDLES + 6;
+        let entries: Vec<_> = (0..files)
+            .map(|i| {
+                Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(1)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![Value::Bytes(format!("f{i}").into_bytes())]),
+                    ),
+                ])
+            })
+            .collect();
+        let info = Value::Dict(vec![
+            (b"files".to_vec(), Value::List(entries)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16 * 1024)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 20])),
+        ]);
+        let meta =
+            parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(&meta.info, &tmp.path().join("root"));
+        for i in 0..files {
+            storage.write_at(i as u64, &[7]).await.unwrap();
+        }
+        assert_eq!(
+            storage.handles.lock().iter().flatten().count(),
+            MAX_OPEN_HANDLES
+        );
+        assert_eq!(storage.unsynced.lock().len(), files - MAX_OPEN_HANDLES);
+        storage.close_handles().await.unwrap();
+        assert!(storage.unsynced.lock().is_empty());
+        assert!(!storage.dirty.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]

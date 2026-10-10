@@ -208,15 +208,14 @@ async fn announce_loop(
     let mut ifaces = LanIfaces::default();
     let mut full = true;
     loop {
-        if full {
-            ifaces.refresh(v4.as_deref(), v6.as_deref());
+        ifaces.refresh(v4.as_deref(), v6.as_deref());
+        let hashes: Vec<Id20> = if full {
             inner.pending.lock().clear();
-            let hashes: Vec<Id20> = inner.info_hashes.lock().iter().copied().collect();
-            do_announce(v4.as_deref(), v6.as_deref(), &inner, &ifaces, &hashes).await;
+            inner.info_hashes.lock().iter().copied().collect()
         } else {
-            let hashes: Vec<Id20> = std::mem::take(&mut *inner.pending.lock());
-            do_announce(v4.as_deref(), v6.as_deref(), &inner, &ifaces, &hashes).await;
-        }
+            std::mem::take(&mut *inner.pending.lock())
+        };
+        do_announce(v4.as_deref(), v6.as_deref(), &inner, &ifaces, &hashes).await;
         let last = Instant::now();
         tokio::select! {
             _ = tick.tick() => full = true,

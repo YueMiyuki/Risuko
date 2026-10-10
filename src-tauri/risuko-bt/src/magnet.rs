@@ -34,7 +34,7 @@ const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_PEERS: usize = 128;
-const PEER_METADATA_WINDOW: usize = 4;
+const PEER_METADATA_WINDOW: usize = 16;
 pub const ERR_PIECE_LAYERS_UNAVAILABLE: &str = "piece layers unavailable";
 
 pub struct Resolved {
@@ -602,6 +602,22 @@ impl Assembly {
     }
 }
 
+enum Assembled {
+    Incomplete,
+    Mismatch,
+    Verified(Vec<u8>),
+}
+
+fn assemble_checked(assembly: &Assembly, want: TorrentInfoHashes) -> Assembled {
+    match assembly.assemble() {
+        None => Assembled::Incomplete,
+        Some(bytes) if bytes.len() == assembly.size && info_matches_magnet(&bytes, want) => {
+            Assembled::Verified(bytes)
+        }
+        Some(_) => Assembled::Mismatch,
+    }
+}
+
 struct Claims {
     assembly: Arc<Assembly>,
     mine: HashSet<usize>,
@@ -728,67 +744,80 @@ async fn try_fetch_from_peer_inner(
     if total_size == 0 || total_size > MAX_METADATA_SIZE {
         return None;
     }
-    let assembly = share.attach(total_size);
-    let mut claims = Claims {
-        assembly: assembly.clone(),
-        mine: HashSet::new(),
-    };
+    let mut assembly = share.attach(total_size);
+    let mut private = false;
     let mut rejected: HashSet<usize> = HashSet::new();
 
-    while !assembly.is_complete() {
-        let room = PEER_METADATA_WINDOW.saturating_sub(claims.mine.len());
-        if room > 0 {
-            let skip: HashSet<usize> = claims.mine.union(&rejected).copied().collect();
-            for idx in assembly.claim(room, &skip) {
-                claims.mine.insert(idx);
-                handle
-                    .tx
-                    .send(PeerCommand::Send(Message::Extended {
-                        ext_id: their_ut_metadata_id,
-                        payload: ut_metadata_request(idx as i64),
-                    }))
-                    .await
-                    .ok()?;
-            }
-        }
-        if claims.mine.is_empty() && assembly.missing_all_in(&rejected) {
-            return None;
-        }
-        let event = match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-            Ok(event) => event?,
-            Err(_) => continue,
+    let info_bytes = loop {
+        let mut claims = Claims {
+            assembly: assembly.clone(),
+            mine: HashSet::new(),
         };
-        match event {
-            PeerEvent::Message(Message::Extended { ext_id, payload })
-                if ext_id == OUR_UT_METADATA_ID =>
-            {
-                let msg = parse_ut_metadata(payload)?;
-                let idx = msg.piece as usize;
-                if msg.msg_type == ut_metadata_type::DATA {
-                    if claims.mine.contains(&idx) && msg.block.len() == assembly.piece_len(idx) {
-                        assembly.store(idx, &msg.block);
-                        claims.release(idx);
-                    }
-                } else if msg.msg_type == ut_metadata_type::REJECT && claims.mine.contains(&idx) {
-                    claims.release(idx);
-                    rejected.insert(idx);
+        while !assembly.is_complete() {
+            let room = PEER_METADATA_WINDOW.saturating_sub(claims.mine.len());
+            if room > 0 {
+                let skip: HashSet<usize> = claims.mine.union(&rejected).copied().collect();
+                for idx in assembly.claim(room, &skip) {
+                    claims.mine.insert(idx);
+                    handle
+                        .tx
+                        .send(PeerCommand::Send(Message::Extended {
+                            ext_id: their_ut_metadata_id,
+                            payload: ut_metadata_request(idx as i64),
+                        }))
+                        .await
+                        .ok()?;
                 }
             }
-            PeerEvent::Disconnected { .. } => return None,
-            _ => continue,
+            if claims.mine.is_empty() && assembly.missing_all_in(&rejected) {
+                return None;
+            }
+            let event = match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                Ok(event) => event?,
+                Err(_) => continue,
+            };
+            match event {
+                PeerEvent::Message(Message::Extended { ext_id, payload })
+                    if ext_id == OUR_UT_METADATA_ID =>
+                {
+                    let msg = parse_ut_metadata(payload)?;
+                    let idx = msg.piece as usize;
+                    if msg.msg_type == ut_metadata_type::DATA {
+                        if claims.mine.contains(&idx) && msg.block.len() == assembly.piece_len(idx)
+                        {
+                            assembly.store(idx, &msg.block);
+                            claims.release(idx);
+                        }
+                    } else if msg.msg_type == ut_metadata_type::REJECT && claims.mine.contains(&idx)
+                    {
+                        claims.release(idx);
+                        rejected.insert(idx);
+                    }
+                }
+                PeerEvent::Disconnected { .. } => return None,
+                _ => continue,
+            }
         }
-    }
-    drop(claims);
+        drop(claims);
 
-    let info_bytes = assembly.assemble()?;
-    if info_bytes.len() != total_size {
-        return None;
-    }
-    if !info_matches_magnet(&info_bytes, want) {
-        tracing::debug!("peer {}: info hash mismatch", handle.addr);
-        assembly.reset();
-        return None;
-    }
+        match assemble_checked(&assembly, want) {
+            Assembled::Verified(bytes) => break bytes,
+            Assembled::Incomplete => {}
+            Assembled::Mismatch if !private => {
+                tracing::debug!(
+                    "peer {}: info hash mismatch; refetching without shared blocks",
+                    handle.addr
+                );
+                assembly.reset();
+                assembly = Arc::new(Assembly::new(total_size));
+                private = true;
+            }
+            Assembled::Mismatch => {
+                tracing::debug!("peer {}: info hash mismatch", handle.addr);
+                return None;
+            }
+        }
+    };
 
     let v2 = match parse_info_v2_from_bytes(&info_bytes) {
         Ok(v) => v,
@@ -1026,6 +1055,127 @@ mod tests {
         let skip: HashSet<usize> = [0, 1].into();
         assert!(a.missing_all_in(&[0, 1, 2].into()));
         assert!(!a.missing_all_in(&skip));
+    }
+
+    fn filler_info() -> Vec<u8> {
+        let filler = vec![b'x'; META_PIECE_SIZE + 100];
+        let mut info = format!("d1:a{}:", filler.len()).into_bytes();
+        info.extend_from_slice(&filler);
+        info.push(b'e');
+        info
+    }
+
+    fn hashes_of(info: &[u8]) -> TorrentInfoHashes {
+        TorrentInfoHashes {
+            v1: Some(Id20::from_slice(Sha1::digest(info).as_slice()).unwrap()),
+            v2: None,
+        }
+    }
+
+    fn metadata_peer(
+        info: Vec<u8>,
+        garbage_piece: Option<usize>,
+    ) -> (super::super::peer::PeerHandle, mpsc::Receiver<PeerEvent>) {
+        use super::super::wire::extended::ut_metadata_data;
+        let (tx, mut cmd_rx) = mpsc::channel::<PeerCommand>(64);
+        let (event_tx, rx) = mpsc::channel(64);
+        let handle = super::super::peer::PeerHandle {
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            tx,
+            piece_tx: mpsc::channel(1).0,
+            io_abort: tokio::spawn(async {}).abort_handle(),
+            gate: Default::default(),
+            bind: None,
+        };
+        tokio::spawn(async move {
+            let mut reserved = [0u8; 8];
+            reserved[handshake_reserved::EXT_PROTOCOL.0] |= handshake_reserved::EXT_PROTOCOL.1;
+            let _ = event_tx
+                .send(PeerEvent::Handshook {
+                    peer_id: Id20([7u8; 20]),
+                    reserved,
+                    info_hash: Id20([8u8; 20]),
+                    encrypted: false,
+                    utp: false,
+                })
+                .await;
+            let hs = ExtHandshake::new_outgoing(2, 3, Some(info.len() as u64));
+            let _ = event_tx
+                .send(PeerEvent::Message(Message::Extended {
+                    ext_id: EXT_HANDSHAKE_ID,
+                    payload: hs.encode(),
+                }))
+                .await;
+            while let Some(cmd) = cmd_rx.recv().await {
+                let PeerCommand::Send(Message::Extended { ext_id: 2, payload }) = cmd else {
+                    continue;
+                };
+                let Some(msg) = parse_ut_metadata(payload) else {
+                    continue;
+                };
+                let idx = msg.piece as usize;
+                let start = idx * META_PIECE_SIZE;
+                let mut block = info[start..(start + META_PIECE_SIZE).min(info.len())].to_vec();
+                if garbage_piece == Some(idx) {
+                    block.fill(0xAA);
+                }
+                let reply = Message::Extended {
+                    ext_id: OUR_UT_METADATA_ID,
+                    payload: ut_metadata_data(idx as i64, info.len() as i64, &block),
+                };
+                if event_tx.send(PeerEvent::Message(reply)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (handle, rx)
+    }
+
+    #[test]
+    fn poisoned_assembly_is_a_mismatch_until_refilled() {
+        let info = filler_info();
+        let want = hashes_of(&info);
+        let a = Assembly::new(info.len());
+        assert!(matches!(assemble_checked(&a, want), Assembled::Incomplete));
+        a.store(0, &vec![0xAA; META_PIECE_SIZE]);
+        a.store(1, &info[META_PIECE_SIZE..]);
+        assert!(matches!(assemble_checked(&a, want), Assembled::Mismatch));
+        a.reset();
+        a.store(0, &info[..META_PIECE_SIZE]);
+        a.store(1, &info[META_PIECE_SIZE..]);
+        assert!(matches!(assemble_checked(&a, want), Assembled::Verified(b) if b == info));
+    }
+
+    #[tokio::test]
+    async fn honest_peer_recovers_from_a_poisoned_shared_block() {
+        let info = filler_info();
+        let want = hashes_of(&info);
+        let share = MetadataShare::default();
+        share
+            .attach(info.len())
+            .store(0, &vec![0xAA; META_PIECE_SIZE]);
+
+        let (handle, rx) = metadata_peer(info.clone(), None);
+        let got = try_fetch_from_peer_inner(&handle, rx, want, &share).await;
+        assert_eq!(
+            got.map(|(bytes, _, complete)| (bytes, complete)),
+            Some((info, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_serving_a_bad_block_is_dropped() {
+        let info = filler_info();
+        let want = hashes_of(&info);
+        let share = MetadataShare::default();
+
+        let (handle, rx) = metadata_peer(info, Some(0));
+        let got = tokio::time::timeout(
+            Duration::from_secs(10),
+            try_fetch_from_peer_inner(&handle, rx, want, &share),
+        )
+        .await;
+        assert!(matches!(got, Ok(None)));
     }
 
     #[test]

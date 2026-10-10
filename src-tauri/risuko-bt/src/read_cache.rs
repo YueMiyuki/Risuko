@@ -298,14 +298,8 @@ impl ReadCache {
                 let result = load().await;
                 let data = match result {
                     Ok(v) if v.len() == len => Bytes::from(v),
-                    Ok(_) => {
-                        self.invalidate_all();
-                        return Err(StorageError::Io(io::Error::other("short extent read")));
-                    }
-                    Err(e) => {
-                        self.invalidate_all();
-                        return Err(e);
-                    }
+                    Ok(_) => return Err(StorageError::Io(io::Error::other("short extent read"))),
+                    Err(e) => return Err(e),
                 };
                 {
                     let mut locked = self.inner.lock();
@@ -317,7 +311,7 @@ impl ReadCache {
                                 let _ = tx.send(data.clone());
                             }
                         }
-                        if inner.generation == generation && len <= self.capacity {
+                        if inner.generation == generation && len > 0 && len <= self.capacity {
                             if let Some(old) = inner.entries.remove(&start) {
                                 inner.lru.remove(&old.used);
                                 inner.bytes -= old.data.len();
@@ -625,6 +619,61 @@ mod tests {
             .await;
         assert!(err.is_err());
         assert_eq!(cache.bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_leaves_unrelated_loads_alone() {
+        let cache = Arc::new(ReadCache::default());
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let gate_rx = Arc::new(tokio::sync::Mutex::new(Some(gate_rx)));
+        let mut tasks = Vec::new();
+        for blk in 0..2usize {
+            let c = cache.clone();
+            let g = gate_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                c.get(0, 1024, (blk * 16) as u64, 16, move || async move {
+                    let rx = g.lock().await.take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                    Ok(data(1024, 0))
+                })
+                .await
+            }));
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let err = cache
+            .get(1 << 20, 1024, 1 << 20, 16, || async {
+                Err(StorageError::Io(io::Error::other("boom")))
+            })
+            .await;
+        assert!(err.is_err());
+        let _ = gate_tx.send(());
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        assert_eq!(cache.bytes(), 1024);
+        assert_eq!(cache.loads(), 2);
+        cache
+            .get(0, 1024, 0, 16, || async { Ok(data(1024, 0)) })
+            .await
+            .unwrap();
+        assert_eq!(cache.loads(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_extents_are_not_cached() {
+        let cache = ReadCache::default();
+        for start in 0..8u64 {
+            cache
+                .get(start, 0, start, 0, || async { Ok(Vec::new()) })
+                .await
+                .unwrap();
+        }
+        let inner = cache.inner.lock();
+        assert!(inner.entries.is_empty() && inner.lru.is_empty());
     }
 
     #[tokio::test]

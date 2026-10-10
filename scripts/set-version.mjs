@@ -2,7 +2,8 @@ import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFil
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+const SEMVER =
+	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export function normalizeVersion(raw) {
 	const version = String(raw ?? "")
@@ -63,7 +64,8 @@ function replaceOnce(path, pattern, replacement, changes) {
 }
 
 function tableBody(text, header) {
-	const match = new RegExp(`^\\[${header.replace(/\./g, "\\.")}\\][ \\t]*$`, "m").exec(text);
+	const escaped = header.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+	const match = new RegExp(`^\\[${escaped}\\][ \\t]*$`, "m").exec(text);
 	if (!match) {
 		return null;
 	}

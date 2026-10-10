@@ -108,7 +108,7 @@ impl Magnet {
         let mut info_hash_v2: Option<Id32> = None;
         let mut trackers = Vec::new();
         let mut display_name: Option<String> = None;
-        let mut select_only: Option<Vec<usize>> = None;
+        let mut select_only: Vec<usize> = Vec::new();
         let mut peers: Vec<MagnetPeer> = Vec::new();
 
         for (k, v) in url.query_pairs() {
@@ -146,7 +146,6 @@ impl Magnet {
                 }
                 "so" => {
                     const MAX_SO_TOTAL: usize = 100_000;
-                    let mut indices = Vec::new();
                     for part in v.split(',') {
                         let part = part.trim();
                         if part.is_empty() {
@@ -166,28 +165,25 @@ impl Magnet {
                                         "so range too large: {part}"
                                     )));
                                 }
-                                if indices.len().saturating_add(b - a + 1) > MAX_SO_TOTAL {
+                                if select_only.len().saturating_add(b - a + 1) > MAX_SO_TOTAL {
                                     return Err(MagnetError::Parse(
                                         "so selection too large".into(),
                                     ));
                                 }
-                                indices.extend(a..=b);
+                                select_only.extend(a..=b);
                             }
                             None => {
                                 let i: usize = part
                                     .parse()
                                     .map_err(|_| MagnetError::Parse(format!("bad so {part}")))?;
-                                if indices.len() >= MAX_SO_TOTAL {
+                                if select_only.len() >= MAX_SO_TOTAL {
                                     return Err(MagnetError::Parse(
                                         "so selection too large".into(),
                                     ));
                                 }
-                                indices.push(i);
+                                select_only.push(i);
                             }
                         }
-                    }
-                    if !indices.is_empty() {
-                        select_only = Some(indices);
                     }
                 }
                 _ => {}
@@ -206,7 +202,7 @@ impl Magnet {
             info_hash_v2,
             trackers,
             display_name,
-            select_only,
+            select_only: (!select_only.is_empty()).then_some(select_only),
             peers,
         })
     }
@@ -341,5 +337,24 @@ mod tests {
         let many = ["0-99998"; 3].join(",");
         assert!(Magnet::parse(&format!("{base}&so={many}")).is_err());
         assert!(Magnet::parse(&format!("{base}&so=0-99998")).is_ok());
+    }
+
+    #[test]
+    fn so_total_is_capped_across_repeated_fields() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        assert!(Magnet::parse(&format!("{base}&so=0-99998&so=0-99998")).is_err());
+        let spam = "&so=0-99998".repeat(50);
+        assert!(Magnet::parse(&format!("{base}{spam}")).is_err());
+    }
+
+    #[test]
+    fn repeated_so_fields_are_merged() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let m = Magnet::parse(&format!("{base}&so=0,2&so=&so=5-6")).unwrap();
+        assert_eq!(m.select_only.as_deref(), Some(&[0usize, 2, 5, 6][..]));
+        assert!(Magnet::parse(&format!("{base}&so="))
+            .unwrap()
+            .select_only
+            .is_none());
     }
 }

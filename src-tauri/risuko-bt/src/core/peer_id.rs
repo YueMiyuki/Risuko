@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rand::Rng;
 
 use super::hash::Id20;
@@ -43,19 +45,25 @@ pub fn generate_peer_id() -> Id20 {
     Id20(raw)
 }
 
-static SESSION_PEER_ID: parking_lot::Mutex<Option<(u16, Id20)>> = parking_lot::Mutex::new(None);
+static SESSION_PEER_IDS: parking_lot::Mutex<BTreeMap<u16, Id20>> =
+    parking_lot::Mutex::new(BTreeMap::new());
 
 pub(crate) fn set_session_peer_id(listen_port: u16, id: Id20) {
-    *SESSION_PEER_ID.lock() = Some((listen_port, id));
+    SESSION_PEER_IDS.lock().insert(listen_port, id);
+}
+
+pub(crate) fn clear_session_peer_id(listen_port: u16, id: Id20) {
+    let mut ids = SESSION_PEER_IDS.lock();
+    if ids.get(&listen_port) == Some(&id) {
+        ids.remove(&listen_port);
+    }
 }
 
 static FALLBACK_PEER_ID: std::sync::OnceLock<Id20> = std::sync::OnceLock::new();
 
 pub(crate) fn session_peer_id_or_new(listen_port: u16) -> Id20 {
-    match *SESSION_PEER_ID.lock() {
-        Some((port, id)) if port == listen_port => id,
-        _ => *FALLBACK_PEER_ID.get_or_init(generate_peer_id),
-    }
+    let recorded = SESSION_PEER_IDS.lock().get(&listen_port).copied();
+    recorded.unwrap_or_else(|| *FALLBACK_PEER_ID.get_or_init(generate_peer_id))
 }
 
 #[cfg(test)]
@@ -103,5 +111,20 @@ mod tests {
         assert_eq!(session_peer_id_or_new(54321), id);
         assert_ne!(session_peer_id_or_new(54322), id);
         assert_eq!(session_peer_id_or_new(54322), session_peer_id_or_new(54323));
+    }
+
+    #[test]
+    fn concurrent_sessions_keep_their_own_peer_ids() {
+        let first = generate_peer_id();
+        let second = generate_peer_id();
+        set_session_peer_id(54331, first);
+        set_session_peer_id(54332, second);
+        assert_eq!(session_peer_id_or_new(54331), first);
+        assert_eq!(session_peer_id_or_new(54332), second);
+        clear_session_peer_id(54331, second);
+        assert_eq!(session_peer_id_or_new(54331), first);
+        clear_session_peer_id(54331, first);
+        assert_ne!(session_peer_id_or_new(54331), first);
+        assert_eq!(session_peer_id_or_new(54332), second);
     }
 }

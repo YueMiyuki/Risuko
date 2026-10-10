@@ -327,6 +327,7 @@ export default {
 				if (found || attempt >= SEARCH_TARGET_RETRY_LIMIT) {
 					return;
 				}
+				window.clearTimeout(this.searchRetryTimer);
 				this.searchRetryTimer = window.setTimeout(
 					() =>
 						this.scheduleSearchTarget(settingKey, fallbackTarget, attempt + 1),

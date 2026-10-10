@@ -329,6 +329,28 @@ fn target_is_v6(target: &DhtTarget) -> bool {
     matches!(target, DhtTarget::Addr(addr) if addr.is_ipv6())
 }
 
+type AnnounceTargets = BTreeMap<(Id20, bool), (DhtTarget, Vec<u8>)>;
+
+fn record_announce_target(
+    targets: &mut AnnounceTargets,
+    distance: Id20,
+    from: DhtTarget,
+    token: Vec<u8>,
+) {
+    let v6 = target_is_v6(&from);
+    targets.insert((distance, v6), (from, token));
+    let same_family: Vec<(Id20, bool)> = targets
+        .keys()
+        .filter(|(_, family)| *family == v6)
+        .copied()
+        .collect();
+    if same_family.len() > K * 2 {
+        if let Some(farthest) = same_family.last() {
+            targets.remove(farthest);
+        }
+    }
+}
+
 fn dht_targets_match(expected: &DhtTarget, actual: &DhtTarget) -> bool {
     match (expected, actual) {
         (DhtTarget::Addr(expected), DhtTarget::Addr(actual)) => expected == actual,
@@ -1038,7 +1060,7 @@ impl Dht {
         let mut shortlist: BTreeMap<Id20, DhtTarget> = BTreeMap::new();
         let mut queried: HashSet<DhtTarget> = HashSet::new();
         let mut peers_seen: HashSet<SocketAddr> = HashSet::new();
-        let mut announce_targets: BTreeMap<Id20, (DhtTarget, Vec<u8>)> = BTreeMap::new();
+        let mut announce_targets: AnnounceTargets = BTreeMap::new();
 
         let mut seed_seen = HashSet::new();
         targets.retain(|target| seed_seen.insert(target.clone()));
@@ -1102,18 +1124,12 @@ impl Dht {
                 }
                 if responder_public {
                     if let Some(tok) = token {
-                        let v6 = target_is_v6(&from);
-                        announce_targets.insert(node_id.distance(&info_hash), (from, tok));
-                        let same_family: Vec<Id20> = announce_targets
-                            .iter()
-                            .filter(|(_, (t, _))| target_is_v6(t) == v6)
-                            .map(|(d, _)| *d)
-                            .collect();
-                        if same_family.len() > K * 2 {
-                            if let Some(farthest) = same_family.last() {
-                                announce_targets.remove(farthest);
-                            }
-                        }
+                        record_announce_target(
+                            &mut announce_targets,
+                            node_id.distance(&info_hash),
+                            from,
+                            tok,
+                        );
                     }
                 }
 
@@ -1388,7 +1404,9 @@ impl Dht {
 
     fn closest_routing(&self, target: &Id20, n: usize) -> Vec<SocketAddr> {
         let mut nodes = self.routing.lock().closest_nodes(target, n);
-        nodes.extend(self.routing6.lock().closest_nodes(target, n));
+        if self.ipv6_usable() {
+            nodes.extend(self.routing6.lock().closest_nodes(target, n));
+        }
         nodes.sort_by_key(|(id, _)| id.distance(target));
         nodes.truncate(n);
         nodes.into_iter().map(|(_, addr)| addr).collect()
@@ -1415,7 +1433,8 @@ impl Dht {
     pub fn refresh_routing(&self, limit: usize) -> Vec<(Id20, SocketAddr)> {
         let now = Instant::now();
         let mut routes = self.routing.lock().refresh_stale(now, limit);
-        routes.extend(self.routing6.lock().refresh_stale(now, limit));
+        let remaining = limit.saturating_sub(routes.len());
+        routes.extend(self.routing6.lock().refresh_stale(now, remaining));
         routes
     }
 
@@ -2378,11 +2397,10 @@ async fn reader_loop(
             }
         };
         let Ok(msg) = decode_all_external(&buf[..n], KRPC_DECODE_LIMITS) else {
-            if is_query_packet(&buf[..n]) && limiter.allow(from.ip(), Instant::now()) {
-                if let Some(tid) = recover_transaction_id(&buf[..n]) {
-                    let reply = krpc_error(&tid, 203, b"invalid bencode");
-                    let _ = sock.send_to(&reply, from).await;
-                }
+            if let Some(reply) =
+                malformed_query_reply(&buf[..n], from.ip(), &mut limiter, Instant::now())
+            {
+                let _ = sock.send_to(&reply, from).await;
             }
             continue;
         };
@@ -2429,6 +2447,20 @@ async fn reader_loop(
 
 fn is_query_packet(packet: &[u8]) -> bool {
     packet.windows(6).any(|w| w == b"1:y1:q")
+}
+
+fn malformed_query_reply(
+    packet: &[u8],
+    ip: IpAddr,
+    limiter: &mut InboundLimiter,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    if !is_query_packet(packet) || !limiter.allow(ip, now) {
+        return None;
+    }
+    let tid = recover_transaction_id(packet)?;
+    let reply = krpc_error(&tid, 203, b"invalid bencode");
+    limiter.take_reply_budget(reply.len(), now).then_some(reply)
 }
 
 struct InboundLimiter {
@@ -3366,6 +3398,106 @@ mod tests {
         assert!(limiter.allow("192.0.2.10".parse().unwrap(), t0));
         assert!(limiter.take_reply_budget(1024, t0));
         assert!(!limiter.take_reply_budget(64 * 1024, t0));
+    }
+
+    #[test]
+    fn malformed_query_replies_share_the_global_reply_budget() {
+        let t0 = Instant::now();
+        let packet = b"d1:t2:ab1:y1:qXe";
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+
+        let mut limiter = InboundLimiter::new(t0);
+        assert!(malformed_query_reply(packet, ip, &mut limiter, t0).is_some());
+        assert!(malformed_query_reply(b"d1:t2:ab1:y1:rXe", ip, &mut limiter, t0).is_none());
+
+        let mut limiter = InboundLimiter::new(t0);
+        assert!(limiter.take_reply_budget(REPLY_BYTES_PER_SEC as usize, t0));
+        let other: IpAddr = "192.0.2.10".parse().unwrap();
+        assert!(malformed_query_reply(packet, other, &mut limiter, t0).is_none());
+        assert!(
+            malformed_query_reply(packet, other, &mut limiter, t0 + Duration::from_secs(1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn announce_targets_keep_one_entry_per_family_for_a_shared_distance() {
+        let distance = Id20::from_slice(&[5u8; 20]).unwrap();
+        let v4 = DhtTarget::Addr("198.51.100.1:6881".parse().unwrap());
+        let v6 = DhtTarget::Addr("[2001:db8::1]:6881".parse().unwrap());
+        let mut targets = AnnounceTargets::new();
+        record_announce_target(&mut targets, distance, v4.clone(), vec![4]);
+        record_announce_target(&mut targets, distance, v6.clone(), vec![6]);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[&(distance, false)], (v4, vec![4]));
+        assert_eq!(targets[&(distance, true)], (v6, vec![6]));
+    }
+
+    #[test]
+    fn announce_targets_prune_each_family_independently() {
+        let mut targets = AnnounceTargets::new();
+        for i in 0..(K * 2 + 4) as u8 {
+            let mut id = [0u8; 20];
+            id[19] = i + 1;
+            let distance = Id20::from_slice(&id).unwrap();
+            let v4 = DhtTarget::Addr(SocketAddr::from(([198, 51, 100, i + 1], 6881)));
+            record_announce_target(&mut targets, distance, v4, vec![i]);
+        }
+        let far = Id20::from_slice(&[0xffu8; 20]).unwrap();
+        let v6 = DhtTarget::Addr("[2001:db8::1]:6881".parse().unwrap());
+        record_announce_target(&mut targets, far, v6, vec![9]);
+
+        let v4_count = targets.keys().filter(|(_, v6)| !*v6).count();
+        let v6_count = targets.keys().filter(|(_, v6)| *v6).count();
+        assert_eq!(v4_count, K * 2);
+        assert_eq!(v6_count, 1);
+    }
+
+    #[tokio::test]
+    async fn seed_selection_skips_ipv6_contacts_during_backoff() {
+        let dht = Dht::spawn().await.expect("bind DHT sockets");
+        let near = Id20::from_slice(&[1u8; 20]).unwrap();
+        let v4: SocketAddr = "198.51.100.7:6881".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::7]:6881".parse().unwrap();
+        dht.add_routing(near, v4);
+        dht.add_routing(Id20::from_slice(&[2u8; 20]).unwrap(), v6);
+        *dht.v6_unreachable_since.lock() = Some(Instant::now());
+
+        let seeds = dht.closest_routing(&near, K * 2);
+        assert_eq!(seeds, vec![v4]);
+        dht.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_routing_respects_the_limit_across_both_tables() {
+        let dht = Dht::spawn().await.expect("bind DHT sockets");
+        for i in 1..=3u8 {
+            let mut id = [0u8; 20];
+            id[0] = 0x80;
+            id[19] = i;
+            dht.add_routing(
+                Id20::from_slice(&id).unwrap(),
+                SocketAddr::from(([198, 51, 100, i], 6881)),
+            );
+            id[0] = 0x40;
+            dht.add_routing(
+                Id20::from_slice(&id).unwrap(),
+                format!("[2001:db8::{i}]:6881").parse().unwrap(),
+            );
+        }
+        for table in [&dht.routing, &dht.routing6] {
+            for bucket in &mut table.lock().buckets {
+                for node in &mut bucket.nodes {
+                    node.last_seen = Instant::now() - ROUTING_STALE;
+                }
+            }
+        }
+
+        let refreshed = dht.refresh_routing(4);
+        assert_eq!(refreshed.len(), 4);
+        assert_eq!(refreshed.iter().filter(|(_, a)| a.is_ipv6()).count(), 1);
+        assert_eq!(dht.refresh_routing(4).len(), 2);
+        dht.shutdown().await;
     }
 
     #[test]

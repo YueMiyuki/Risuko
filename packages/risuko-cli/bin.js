@@ -69,7 +69,11 @@ function main() {
 			child.kill(sig);
 		});
 	}
-	process.on("SIGINT", () => {});
+	process.on("SIGINT", () => {
+		if (platform !== "win32") {
+			child.kill("SIGINT");
+		}
+	});
 
 	child.on("error", (error) => {
 		console.error(error.message);

@@ -107,10 +107,6 @@ const namedCategories: SyncCategory[] = [
 		keys: ["media-format", "youtube-format", "m3u8-output-format"],
 	},
 	{
-		id: "rss",
-		keys: [],
-	},
-	{
 		id: "stats",
 		keys: [],
 	},

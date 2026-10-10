@@ -113,7 +113,7 @@ pub fn toggle_app_menu(handle: AppHandle, hidden: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn is_opened_at_login() -> bool {
-    std::env::args().any(|arg| arg == "--opened-at-login=1")
+    std::env::args_os().any(|arg| arg == "--opened-at-login=1")
 }
 
 #[tauri::command]

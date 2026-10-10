@@ -140,6 +140,11 @@ const translations = {
 test("routes settings to the preference tab that owns them", () => {
 	assert.equal(getRouteForKey("preferences.enable-proxy"), "advanced");
 	assert.equal(getRouteForKey("preferences.bt-create-subfolder"), "advanced");
+	assert.equal(getRouteForKey("preferences.bt-ban-corrupt-peers"), "advanced");
+	assert.equal(
+		getRouteForKey("preferences.bt-ban-corrupt-strikes"),
+		"advanced",
+	);
 	assert.equal(getRouteForKey("preferences.theme-dark"), "appearance");
 	assert.equal(getRouteForKey("preferences.usenet-max-entries"), "usenet");
 	assert.equal(getRouteForKey("cloudSinks.s3Bucket"), "cloud-sinks");

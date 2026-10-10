@@ -74,7 +74,7 @@ pub(crate) fn url_decode(s: &str) -> String {
 }
 
 pub(crate) fn split_uri(rest: &str) -> Option<(String, u16, &str, &str)> {
-    let (authority, path_query) = match rest.find('/') {
+    let (authority, path_query) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };
@@ -136,5 +136,21 @@ mod tests {
         assert_eq!((h.as_str(), p), ("2001:db8::1", 6346));
         assert!(split_uri(":80/a").is_none());
         assert!(split_uri("h:bad/a").is_none());
+    }
+    #[test]
+    fn query_directly_after_authority_is_not_host() {
+        let (h, p, path, q) = split_uri("host:7000?urn=urn:sha1:ABC&xl=5").unwrap();
+        assert_eq!(
+            (h.as_str(), p, path, q),
+            ("host", 7000, "", "urn=urn:sha1:ABC&xl=5")
+        );
+        let (h, p, _, q) = split_uri("[::1]?dn=a").unwrap();
+        assert_eq!((h.as_str(), p, q), ("::1", 6346, "dn=a"));
+        assert!(split_uri("host:bad?x=1").is_none());
+        let l =
+            parse_gnutella_uri("gnutella://peer:6346?urn=urn:sha1:ABC&dn=a+b.bin&xl=10").unwrap();
+        assert_eq!((l.host.as_str(), l.port), ("peer", 6346));
+        assert_eq!(l.urn.as_deref(), Some("urn:sha1:ABC"));
+        assert_eq!((l.file_name.as_str(), l.file_size), ("a b.bin", 10));
     }
 }

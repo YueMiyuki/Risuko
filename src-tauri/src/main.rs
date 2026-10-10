@@ -7,7 +7,9 @@ use clap::Parser;
 use risuko_lib::cli;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let command = if cli::is_cli_invocation(&args) {
         cli::Cli::parse().command
     } else {

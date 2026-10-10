@@ -1,23 +1,66 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { downsampleSeries } from "./downsample.ts";
+import { bucketByTime } from "./downsample.ts";
 
-test("short series pass through untouched", () => {
-	const items = [1, 2, 3];
-	assert.equal(
-		downsampleSeries(items, 10, (v) => v),
+const minute = (value: number) => value * 60;
+
+test("short series keep one bucket per item", () => {
+	const items = [0, 1, 2].map(minute);
+	const buckets = bucketByTime(items, 10, 60, (value) => value);
+	assert.deepEqual(
+		buckets.map((bucket) => bucket.time),
 		items,
+	);
+	assert.deepEqual(
+		buckets.map((bucket) => bucket.items),
+		items.map((value) => [value]),
 	);
 });
 
-test("long series are bounded, ordered and keep peaks", () => {
-	const items = Array.from({ length: 5000 }, (_, i) => (i === 1234 ? 1e9 : i));
-	const out = downsampleSeries(items, 1000, (v) => v);
-	assert.equal(out.length, 1000);
-	assert.ok(out.includes(1e9));
-	const positions = out.map((v) => items.indexOf(v));
+test("long series are bounded, ordered and keep every item", () => {
+	const items = Array.from({ length: 5000 }, (_, i) => minute(i));
+	const buckets = bucketByTime(items, 1000, 60, (value) => value);
+	assert.equal(buckets.length, 1000);
 	assert.deepEqual(
-		positions,
-		[...positions].sort((a, b) => a - b),
+		buckets.flatMap((bucket) => bucket.items),
+		items,
+	);
+	const times = buckets.map((bucket) => bucket.time);
+	assert.deepEqual(
+		times,
+		[...times].sort((a, b) => a - b),
+	);
+});
+
+test("buckets follow time rather than item position", () => {
+	const dense = Array.from({ length: 2000 }, (_, i) => minute(i));
+	const sparse = [...dense, minute(100000)];
+	const buckets = bucketByTime(sparse, 1000, 60, (value) => value);
+	const filled = buckets.filter((bucket) => bucket.items.length > 0);
+	assert.equal(filled.length, 21);
+	assert.equal(filled[0].items.length, 100);
+	assert.deepEqual(filled[20].items, [minute(100000)]);
+});
+
+test("idle gaps are bracketed by empty buckets", () => {
+	const items = [0, 1, 500, 501].map(minute);
+	const buckets = bucketByTime(items, 1000, 60, (value) => value);
+	assert.deepEqual(
+		buckets.map((bucket) => [bucket.time, bucket.items.length]),
+		[
+			[minute(0), 1],
+			[minute(1), 1],
+			[minute(2), 0],
+			[minute(499), 0],
+			[minute(500), 1],
+			[minute(501), 1],
+		],
+	);
+});
+
+test("empty input yields no buckets", () => {
+	assert.deepEqual(
+		bucketByTime([], 10, 60, (value: number) => value),
+		[],
 	);
 });

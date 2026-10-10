@@ -735,6 +735,13 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
     }
 }
 
+fn v2_aligned_piece_count(files: &[TorrentMetaInfoV2], piece_length: u32) -> Option<u64> {
+    files
+        .iter()
+        .map(|f| f.length.div_ceil(piece_length as u64))
+        .try_fold(0u64, u64::checked_add)
+}
+
 pub(crate) fn v2_alignment_padding(offset: u64, file_length: u64, piece_length: u32) -> u64 {
     if file_length == 0 || piece_length == 0 {
         return 0;
@@ -797,6 +804,9 @@ fn validate_info_v2(value: &Value) -> Result<ValidatedTorrentMetaV2Info, MetaErr
         return Err(MetaError::ZeroLength);
     }
     check_piece_count(total, piece_length)?;
+    if v2_aligned_piece_count(&files, piece_length).is_none_or(|n| n > MAX_PIECES) {
+        return Err(MetaError::BadInfoV2("too many pieces"));
+    }
 
     let private = value
         .get(b"private")
@@ -1293,6 +1303,30 @@ mod tests {
         verifier.verify(0, &piece0).unwrap();
         verifier.verify(1, &b).unwrap();
         assert!(verifier.verify(1, &piece0[..b.len()]).is_err());
+    }
+
+    #[test]
+    fn v2_piece_count_includes_alignment_padding() {
+        let files: Vec<TorrentMetaInfoV2> = (0..1000)
+            .map(|i| TorrentMetaInfoV2 {
+                path: vec![i.to_string()],
+                length: 1,
+                pieces_root: Id32([1u8; 32]),
+            })
+            .collect();
+        let v2 = ValidatedTorrentMetaV2Info {
+            name: "tiny".into(),
+            piece_length: 16 * 1024,
+            private: false,
+            files,
+            empty_files: Vec::new(),
+        };
+        assert_eq!(v2.total_length().div_ceil(v2.piece_length as u64), 1);
+        assert_eq!(
+            v2_aligned_piece_count(&v2.files, v2.piece_length),
+            Some(1000)
+        );
+        assert_eq!(synthesize_v1_facade_from_v2(&v2).piece_count(), 1000);
     }
 
     #[test]

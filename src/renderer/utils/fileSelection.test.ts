@@ -7,6 +7,7 @@ test("selection state comes from counts", () => {
 	assert.equal(selectionState(5, new Set()), "none");
 	assert.equal(selectionState(5, new Set([1, 3])), "partial");
 	assert.equal(selectionState(3, new Set([1, 2, 3])), "all");
+	assert.equal(selectionState(3, new Set([1, 2, 3, 4])), "partial");
 });
 
 test("index list is numerically sorted", () => {

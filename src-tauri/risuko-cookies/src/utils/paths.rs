@@ -89,26 +89,49 @@ impl DbSnapshot {
     }
 }
 
+const SNAPSHOT_ATTEMPTS: usize = 3;
+
+type Fingerprint = Option<(u64, std::time::SystemTime)>;
+
+fn fingerprint(path: &Path) -> Fingerprint {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 pub fn copy_db_snapshot(src: &Path) -> eyre::Result<DbSnapshot> {
     let name = src
         .file_name()
         .ok_or_else(|| eyre::eyre!("invalid db path"))?
         .to_owned();
-    let dir = tempfile::tempdir()?;
-    std::fs::copy(src, dir.path().join(&name))?;
-
     let mut wal = name.clone();
     wal.push("-wal");
     let wal_src = src.with_file_name(&wal);
-    if wal_src.exists() {
-        let _ = std::fs::copy(&wal_src, dir.path().join(&wal));
+    let dir = tempfile::tempdir()?;
+    let db_dst = dir.path().join(&name);
+    let wal_dst = dir.path().join(&wal);
+
+    let mut stable = false;
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = (fingerprint(src), fingerprint(&wal_src));
+        std::fs::copy(src, &db_dst)?;
+        let _ = std::fs::remove_file(&wal_dst);
+        if wal_src.exists() {
+            let _ = std::fs::copy(&wal_src, &wal_dst);
+        }
+        stable = before == (fingerprint(src), fingerprint(&wal_src));
+        if stable {
+            break;
+        }
+    }
+    if !stable {
+        tracing::debug!(target: "risuko_cookies", "db changed while copying {}", src.display());
     }
     Ok(DbSnapshot { dir, name })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::copy_db_snapshot;
+    use super::{copy_db_snapshot, fingerprint};
 
     #[test]
     fn snapshot_includes_wal_sidecar() {
@@ -123,5 +146,25 @@ mod tests {
             std::fs::read(copy.with_file_name("cookies.sqlite-wal")).unwrap(),
             b"wal"
         );
+    }
+
+    #[test]
+    fn snapshot_without_wal_has_no_sidecar() {
+        let src = tempfile::tempdir().unwrap();
+        let db = src.path().join("cookies.sqlite");
+        std::fs::write(&db, b"db").unwrap();
+        let snap = copy_db_snapshot(&db).unwrap();
+        assert!(!snap.db_path().with_file_name("cookies.sqlite-wal").exists());
+    }
+
+    #[test]
+    fn fingerprint_tracks_size_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        assert!(fingerprint(&file).is_none());
+        std::fs::write(&file, b"a").unwrap();
+        let first = fingerprint(&file);
+        std::fs::write(&file, b"ab").unwrap();
+        assert_ne!(first, fingerprint(&file));
     }
 }

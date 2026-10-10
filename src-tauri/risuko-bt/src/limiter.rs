@@ -7,11 +7,12 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 const BURST_WINDOW_US: u64 = 2_000_000;
+const EPOCH_SHIFT: u32 = 48;
+const TIME_MASK: u64 = (1 << EPOCH_SHIFT) - 1;
 
 pub struct RateLimiter {
     limit_bps: AtomicU64,
-    next_avail_us: AtomicU64,
-    epoch: AtomicU64,
+    state: AtomicU64,
     retuned: Notify,
     start: Instant,
 }
@@ -35,8 +36,7 @@ impl RateLimiter {
         let start = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
         Self {
             limit_bps: AtomicU64::new(limit_bps),
-            next_avail_us: AtomicU64::new(0),
-            epoch: AtomicU64::new(0),
+            state: AtomicU64::new(0),
             retuned: Notify::new(),
             start,
         }
@@ -48,10 +48,17 @@ impl RateLimiter {
 
     pub fn set_limit(&self, bps: u64) {
         if self.limit_bps.swap(bps, Ordering::AcqRel) != bps {
-            self.next_avail_us.store(0, Ordering::Release);
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+            let _ = self
+                .state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                    Some(((s >> EPOCH_SHIFT) + 1) << EPOCH_SHIFT)
+                });
             self.retuned.notify_waiters();
         }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> EPOCH_SHIFT
     }
 
     pub fn limit_bps(&self) -> u64 {
@@ -69,36 +76,48 @@ impl RateLimiter {
             .as_micros() as u64
     }
 
-    fn reserve(&self, bytes: u64, limit: u64) -> u64 {
+    fn reserve(&self, bytes: u64, limit: u64, epoch: u64) -> Option<u64> {
         let cost_us = (bytes as u128 * 1_000_000).div_ceil(limit as u128) as u64;
         loop {
             let now_us = self.now_us();
-            let cur = self.next_avail_us.load(Ordering::Acquire);
-            let base = cur.max(now_us.saturating_sub(BURST_WINDOW_US));
-            let new_va = base.saturating_add(cost_us);
+            let cur = self.state.load(Ordering::Acquire);
+            if cur >> EPOCH_SHIFT != epoch {
+                return None;
+            }
+            let base = (cur & TIME_MASK).max(now_us.saturating_sub(BURST_WINDOW_US));
+            let new_va = base.saturating_add(cost_us).min(TIME_MASK);
             if self
-                .next_avail_us
-                .compare_exchange_weak(cur, new_va, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange_weak(
+                    cur,
+                    (epoch << EPOCH_SHIFT) | new_va,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
-                return new_va.saturating_sub(now_us);
+                return Some(new_va.saturating_sub(now_us));
             }
         }
     }
 
     fn charge(&self, bytes: u64) -> Charge {
-        let epoch = self.epoch.load(Ordering::Acquire);
-        let limit = self.limit_bps.load(Ordering::Acquire);
-        if limit == 0 {
-            return Charge {
-                epoch,
-                deadline: None,
-            };
-        }
-        let wait_us = self.reserve(bytes, limit);
-        Charge {
-            epoch,
-            deadline: (wait_us > 0).then(|| Instant::now() + Duration::from_micros(wait_us)),
+        loop {
+            let epoch = self.epoch();
+            let limit = self.limit_bps.load(Ordering::Acquire);
+            if limit == 0 {
+                return Charge {
+                    epoch,
+                    deadline: None,
+                };
+            }
+            if let Some(wait_us) = self.reserve(bytes, limit, epoch) {
+                return Charge {
+                    epoch,
+                    deadline: (wait_us > 0)
+                        .then(|| Instant::now() + Duration::from_micros(wait_us)),
+                };
+            }
         }
     }
 
@@ -107,12 +126,14 @@ impl RateLimiter {
             return;
         }
         'reserve: loop {
-            let epoch = self.epoch.load(Ordering::Acquire);
+            let epoch = self.epoch();
             let limit = self.limit_bps.load(Ordering::Acquire);
             if limit == 0 {
                 return;
             }
-            let wait_us = self.reserve(bytes as u64, limit);
+            let Some(wait_us) = self.reserve(bytes as u64, limit, epoch) else {
+                continue 'reserve;
+            };
             if wait_us == 0 {
                 return;
             }
@@ -121,7 +142,7 @@ impl RateLimiter {
                 let notified = self.retuned.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.epoch.load(Ordering::Acquire) != epoch {
+                if self.epoch() != epoch {
                     continue 'reserve;
                 }
                 tokio::select! {
@@ -174,11 +195,11 @@ impl Throttle {
             tokio::pin!(gn, tn);
             gn.as_mut().enable();
             tn.as_mut().enable();
-            if self.global.epoch.load(Ordering::Acquire) != g.epoch {
+            if self.global.epoch() != g.epoch {
                 g = self.global.charge(bytes as u64);
                 continue;
             }
-            if self.task.epoch.load(Ordering::Acquire) != t.epoch {
+            if self.task.epoch() != t.epoch {
                 t = self.task.charge(bytes as u64);
                 continue;
             }
@@ -302,6 +323,17 @@ mod tests {
         let before = Instant::now();
         l.acquire(10 * KIB).await;
         assert!(before.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_epoch_reservation_leaves_no_debt() {
+        let l = RateLimiter::new(KIB as u64);
+        let epoch = l.epoch();
+        l.set_limit(1000 * KIB as u64);
+        assert_eq!(l.reserve(600 * KIB as u64, KIB as u64, epoch), None);
+        let before = Instant::now();
+        l.acquire(100 * KIB).await;
+        assert!(before.elapsed() < Duration::from_millis(50));
     }
 
     #[tokio::test(start_paused = true)]

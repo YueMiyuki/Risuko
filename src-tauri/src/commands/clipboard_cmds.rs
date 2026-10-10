@@ -48,7 +48,7 @@ fn path_has_allowed_ext(uri: &str, exts: &[String]) -> bool {
 }
 
 #[cfg(not(target_os = "android"))]
-const MAX_CLIPBOARD_CHARS: usize = 8 * 1024;
+const MAX_CLIPBOARD_BYTES: usize = 8 * 1024;
 
 #[cfg(not(target_os = "android"))]
 fn config_value<'a>(
@@ -102,7 +102,7 @@ pub fn on_clipboard_update(app: &AppHandle) {
         return;
     };
     let text = text.trim();
-    if text.is_empty() || text.len() > MAX_CLIPBOARD_CHARS {
+    if text.is_empty() || text.len() > MAX_CLIPBOARD_BYTES {
         return;
     }
     let text = text.to_string();
