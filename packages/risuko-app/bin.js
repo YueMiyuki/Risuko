@@ -5,8 +5,16 @@ const https = require("node:https");
 const crypto = require("node:crypto");
 const { execFileSync, spawn } = require("node:child_process");
 
-const PKG_VERSION = require("./package.json").version;
 const REPO = "YueMiyuki/risuko";
+const MIRROR = "https://dl.risuko.app";
+const LATEST_SOURCES = [
+	`${MIRROR}/manifest.json`,
+	`https://github.com/${REPO}/releases/latest/download/latest.json`,
+];
+const LOOKUP_TIMEOUT_MS = 5_000;
+const UPDATER_PUBKEY =
+	"RWTd4Yzh9GXgnM46g1U78JdfLJDLxX+n8kRPAkn/Vdhm6KLi7JHknZSn";
+const LAST_UNSIGNED_RELEASE = [1, 0, 0, ""];
 
 class DownloadHttpError extends Error {
 	constructor(statusCode, url) {
@@ -21,7 +29,7 @@ class DownloadHttpError extends Error {
 }
 
 const rawArgs = process.argv.slice(2);
-let version = PKG_VERSION;
+let version = null;
 let noCache = false;
 let allowLegacyNoChecksum = false;
 const appArgs = [];
@@ -38,7 +46,7 @@ for (let i = 0; i < rawArgs.length; i++) {
 		console.log(`Usage: risuko-app [launcher-options] [-- app-args...]
 
 Launcher options:
-  --version <x.y.z>   Use a specific release version (default: ${PKG_VERSION})
+  --version <x.y.z>   Use a specific release version (default: latest)
   --no-cache          Re-download even if the binary is already cached
   --allow-legacy-no-checksum
                       Allow unsigned installs when SHA-256 sidecar is missing
@@ -80,40 +88,112 @@ const PLATFORM_INFO = {
 	},
 };
 
-function getPlatformEntry() {
+function getPlatformEntry(forVersion) {
 	const info = PLATFORM_INFO[platform];
-	if (!info) {
-		throw new Error(`Unsupported platform: ${platform}`);
-	}
-	const asset = `Risuko_${version}_${platform}_${arch}.${info.ext}`;
+	const asset = `Risuko_${forVersion}_${platform}_${arch}.${info.ext}`;
 	const binary =
 		platform === "linux" || platform === "win32" ? asset : info.binary;
 	return { asset, extract: info.extract, binary };
 }
 
-function getCacheDir() {
-	let base;
+function getCacheBase() {
 	if (platform === "darwin") {
-		base = path.join(
+		return path.join(
 			process.env.HOME || "~",
 			"Library",
 			"Application Support",
 			"risuko-launcher",
 		);
-	} else if (platform === "win32") {
-		base = path.join(
+	}
+	if (platform === "win32") {
+		return path.join(
 			process.env.APPDATA ||
 				path.join(process.env.USERPROFILE || "~", "AppData", "Roaming"),
 			"risuko-launcher",
 		);
-	} else {
-		base = path.join(
-			process.env.XDG_DATA_HOME ||
-				path.join(process.env.HOME || "~", ".local", "share"),
-			"risuko-launcher",
-		);
 	}
-	return path.join(base, version);
+	return path.join(
+		process.env.XDG_DATA_HOME ||
+			path.join(process.env.HOME || "~", ".local", "share"),
+		"risuko-launcher",
+	);
+}
+
+function parseVersion(value) {
+	const m = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/.exec(value);
+	return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ?? ""] : null;
+}
+
+function compareVersions(a, b) {
+	for (let i = 0; i < 3; i++) {
+		if (a[i] !== b[i]) {
+			return a[i] - b[i];
+		}
+	}
+	if (a[3] === b[3]) {
+		return 0;
+	}
+	if (!a[3] || !b[3]) {
+		return a[3] ? -1 : 1;
+	}
+	return a[3] < b[3] ? -1 : 1;
+}
+
+function newestCachedVersion() {
+	const base = getCacheBase();
+	let names;
+	try {
+		names = fs.readdirSync(base);
+	} catch {
+		return null;
+	}
+	const cached = names.filter(
+		(name) =>
+			parseVersion(name) &&
+			fs.existsSync(path.join(base, name, getPlatformEntry(name).binary)),
+	);
+	cached.sort((a, b) => compareVersions(parseVersion(b), parseVersion(a)));
+	return cached[0] ?? null;
+}
+
+async function fetchLatestVersion() {
+	for (const url of LATEST_SOURCES) {
+		try {
+			const res = await fetch(url, {
+				headers: { "User-Agent": "risuko-app-launcher" },
+				signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
+			});
+			if (!res.ok) {
+				continue;
+			}
+			const manifest = await res.json();
+			const latest = String(manifest?.version ?? "").replace(/^v/, "");
+			if (parseVersion(latest)) {
+				return latest;
+			}
+		} catch {}
+	}
+	return null;
+}
+
+async function resolveVersion() {
+	if (version) {
+		return version;
+	}
+	const latest = await fetchLatestVersion();
+	if (latest) {
+		return latest;
+	}
+	const cached = newestCachedVersion();
+	if (cached) {
+		console.warn(
+			`Could not check for the latest release; launching cached v${cached}`,
+		);
+		return cached;
+	}
+	throw new Error(
+		"Could not look up the latest release. Check your connection or pass --version <x.y.z>.",
+	);
 }
 
 const MAX_REDIRECTS = 5;
@@ -216,14 +296,92 @@ async function downloadText(url) {
 	return res.text();
 }
 
-function sha256File(filePath) {
-	const hash = crypto.createHash("sha256");
+async function downloadOptionalText(url) {
+	try {
+		return await downloadText(url);
+	} catch (err) {
+		if (err instanceof DownloadHttpError && err.statusCode === 404) {
+			return null;
+		}
+		throw err;
+	}
+}
+
+function hashFile(filePath) {
+	const sha256 = crypto.createHash("sha256");
+	const blake2b = crypto.createHash("blake2b512");
 	const input = fs.createReadStream(filePath);
 	return new Promise((resolve, reject) => {
-		input.on("data", (chunk) => hash.update(chunk));
+		input.on("data", (chunk) => {
+			sha256.update(chunk);
+			blake2b.update(chunk);
+		});
 		input.on("error", reject);
-		input.on("end", () => resolve(hash.digest("hex")));
+		input.on("end", () =>
+			resolve({ sha256: sha256.digest("hex"), blake2b: blake2b.digest() }),
+		);
 	});
+}
+
+function verifySignature(blake2b, signatureText, assetName) {
+	const publicKey = Buffer.from(UPDATER_PUBKEY, "base64");
+	const lines = Buffer.from(signatureText.trim(), "base64")
+		.toString("utf8")
+		.split(/\r?\n/);
+	const signature = Buffer.from(lines[1] ?? "", "base64");
+	const trustedLine = lines[2] ?? "";
+	const globalSignature = Buffer.from(lines[3] ?? "", "base64");
+	if (
+		publicKey.length !== 42 ||
+		signature.length !== 74 ||
+		globalSignature.length !== 64 ||
+		!trustedLine.startsWith("trusted comment: ")
+	) {
+		throw new Error(`Malformed signature for ${assetName}`);
+	}
+	if (signature.subarray(0, 2).toString() !== "ED") {
+		throw new Error(`Unsupported signature algorithm for ${assetName}`);
+	}
+	if (!signature.subarray(2, 10).equals(publicKey.subarray(2, 10))) {
+		throw new Error(`${assetName} is signed with an unknown key`);
+	}
+	const key = crypto.createPublicKey({
+		key: {
+			kty: "OKP",
+			crv: "Ed25519",
+			x: publicKey.subarray(10).toString("base64url"),
+		},
+		format: "jwk",
+	});
+	const trusted = trustedLine.slice("trusted comment: ".length);
+	const raw = signature.subarray(10);
+	if (
+		!crypto.verify(null, blake2b, key, raw) ||
+		!crypto.verify(
+			null,
+			Buffer.concat([raw, Buffer.from(trusted)]),
+			key,
+			globalSignature,
+		)
+	) {
+		throw new Error(`Signature verification failed for ${assetName}`);
+	}
+	const meta = Object.fromEntries(
+		trusted.split("\t").map((field) => {
+			const i = field.indexOf(":");
+			return [field.slice(0, i), field.slice(i + 1)];
+		}),
+	);
+	if (meta.version ? meta.version !== version : meta.file !== assetName) {
+		throw new Error(
+			`Signature for ${assetName} belongs to a different release (${trusted})`,
+		);
+	}
+}
+
+function isUnsignedRelease(releaseVersion) {
+	const parsed = parseVersion(releaseVersion);
+	return parsed !== null && compareVersions(parsed, LAST_UNSIGNED_RELEASE) <= 0;
 }
 
 function parseExpectedSha256(text, assetName) {
@@ -257,28 +415,44 @@ function isLegacyChecksumRelease(releaseVersion) {
 	return m[4].startsWith("-");
 }
 
-async function verifySha256(assetPath, checksumUrl, assetName) {
-	let checksumText;
-	try {
-		checksumText = await downloadText(checksumUrl);
-	} catch (err) {
-		if (err instanceof DownloadHttpError && err.statusCode === 404) {
-			if (isLegacyChecksumRelease(version) && allowLegacyNoChecksum) {
-				return false;
-			}
-			throw new Error(
-				`SHA-256 sidecar not found for ${assetName}: ${checksumUrl}`,
-			);
+async function verifySha256(actual, checksumUrl, assetName) {
+	const checksumText = await downloadOptionalText(checksumUrl);
+	if (checksumText === null) {
+		if (isLegacyChecksumRelease(version) && allowLegacyNoChecksum) {
+			return "unverified";
 		}
-		throw err;
+		throw new Error(
+			`SHA-256 sidecar not found for ${assetName}: ${checksumUrl}`,
+		);
 	}
 	const expected = parseExpectedSha256(checksumText, assetName);
-	const actual = await sha256File(assetPath);
 	if (actual !== expected) {
 		throw new Error(
 			`SHA-256 mismatch for ${assetName}: expected ${expected}, got ${actual}`,
 		);
 	}
+	return "checksum";
+}
+
+async function verifyDownload(assetPath, assetUrl, assetName) {
+	const hashes = await hashFile(assetPath);
+	const signatureText = await downloadOptionalText(`${assetUrl}.sig`);
+	if (signatureText !== null) {
+		verifySignature(hashes.blake2b, signatureText, assetName);
+		return "signature";
+	}
+	if (!isUnsignedRelease(version)) {
+		throw new Error(`Signature not found for ${assetName}: ${assetUrl}.sig`);
+	}
+	return verifySha256(
+		hashes.sha256,
+		`${githubAssetUrl(assetName)}.sha256`,
+		assetName,
+	);
+}
+
+function githubAssetUrl(assetName) {
+	return `https://github.com/${REPO}/releases/download/v${version}/${assetName}`;
 }
 
 function fmtBytes(n) {
@@ -325,41 +499,52 @@ function extract(entry, assetPath, cacheDir) {
 }
 
 async function main() {
-	const entry = getPlatformEntry();
-	const cacheDir = getCacheDir();
+	if (!PLATFORM_INFO[platform]) {
+		throw new Error(`Unsupported platform: ${platform}`);
+	}
+	version = await resolveVersion();
+	const entry = getPlatformEntry(version);
+	const cacheDir = path.join(getCacheBase(), version);
 	const binaryPath = path.join(cacheDir, entry.binary);
 
 	const isCached = fs.existsSync(binaryPath);
 
 	if (!isCached || noCache) {
-		const assetUrl = `https://github.com/${REPO}/releases/download/v${version}/${entry.asset}`;
-		const checksumUrl = `${assetUrl}.sha256`;
+		const sources = [
+			`${MIRROR}/v${version}/${entry.asset}`,
+			githubAssetUrl(entry.asset),
+		];
 		const assetPath = path.join(cacheDir, entry.asset);
 		const tmpPath = `${assetPath}.download`;
 
 		fs.mkdirSync(cacheDir, { recursive: true });
 
 		console.log(`Downloading Risuko v${version} for ${platform}/${arch}…`);
-		console.log(`  From: ${assetUrl}`);
 
-		try {
-			await download(assetUrl, tmpPath);
-			const checksumVerified = await verifySha256(
-				tmpPath,
-				checksumUrl,
-				entry.asset,
-			);
-			if (checksumVerified === false) {
-				console.warn(
-					`  SHA-256 sidecar not found for legacy release v${version}; continuing without checksum verification`,
-				);
-			} else {
-				console.log("  Verified SHA-256 checksum");
+		for (const [i, assetUrl] of sources.entries()) {
+			console.log(`  From: ${assetUrl}`);
+			try {
+				await download(assetUrl, tmpPath);
+				const verified = await verifyDownload(tmpPath, assetUrl, entry.asset);
+				if (verified === "signature") {
+					console.log("  Verified signature");
+				} else if (verified === "checksum") {
+					console.log("  Verified SHA-256 checksum from GitHub Releases");
+				} else {
+					console.warn(
+						`  SHA-256 sidecar not found for legacy release v${version}; continuing without checksum verification`,
+					);
+				}
+				fs.renameSync(tmpPath, assetPath);
+				break;
+			} catch (err) {
+				fs.rmSync(tmpPath, { force: true });
+				if (i === sources.length - 1) {
+					throw err;
+				}
+				console.warn(`  ${err.message.split("\n")[0]}`);
+				console.warn("  Falling back to GitHub Releases…");
 			}
-			fs.renameSync(tmpPath, assetPath);
-		} catch (err) {
-			fs.rmSync(tmpPath, { force: true });
-			throw err;
 		}
 		console.log("  Extracting…");
 		extract(entry, assetPath, cacheDir);

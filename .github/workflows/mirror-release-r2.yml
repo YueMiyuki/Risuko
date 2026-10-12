@@ -1,0 +1,88 @@
+name: Mirror release to R2
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to mirror (e.g. v1.0.0)
+        required: true
+        type: string
+    secrets:
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to mirror (e.g. v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  mirror:
+    name: Upload release assets to R2
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET: risuko-releases
+      AWS_ENDPOINT_URL: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
+      AWS_DEFAULT_REGION: auto
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download release assets and build manifest
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Tag '$TAG' is not of the form vX.Y.Z"
+            exit 1
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+          RELEASE_NAME=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name --jq .name) \
+          PUBLISHED_AT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt) \
+            node scripts/build-download-manifest.mjs assets manifest.json
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the latest release ($latest); manifest.json at the bucket root stays as is"
+          fi
+
+      - name: Upload to R2
+        env:
+          TAG: ${{ inputs.tag }}
+          LATEST: ${{ steps.release.outputs.latest }}
+        run: |
+          set -euo pipefail
+          aws s3 cp assets "s3://$R2_BUCKET/$TAG/" --recursive --only-show-errors \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp manifest.json "s3://$R2_BUCKET/$TAG/manifest.json" --only-show-errors \
+            --cache-control "public, max-age=300" --content-type application/json
+          if [[ "$LATEST" == "true" ]]; then
+            aws s3 cp manifest.json "s3://$R2_BUCKET/manifest.json" --only-show-errors \
+              --cache-control "public, max-age=300" --content-type application/json
+          fi
+          echo "Mirrored $(find assets -type f | wc -l) files to https://dl.risuko.app/$TAG/"

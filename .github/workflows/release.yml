@@ -433,6 +433,17 @@ jobs:
           set -euo pipefail
           node scripts/write-sha256-sidecar.mjs "$PORTABLE_ASSET"
 
+      - name: Sign Windows portable exe
+        if: runner.os == 'Windows' && github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm tauri signer sign "$PORTABLE_ASSET"
+          test -s "$PORTABLE_ASSET.sig"
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
       - name: Upload Windows portable exe to GitHub Release
         if: runner.os == 'Windows' && github.event_name == 'release'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
@@ -441,6 +452,7 @@ jobs:
           files: |
             ${{ env.PORTABLE_ASSET }}
             ${{ env.PORTABLE_ASSET }}.sha256
+            ${{ env.PORTABLE_ASSET }}.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -569,6 +581,17 @@ jobs:
       tag: ${{ needs.meta.outputs.tag }}
     secrets:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  r2-mirror:
+    name: Mirror release to R2
+    needs: [meta, release, android-release, updater-manifest]
+    if: github.event_name == 'release'
+    uses: ./.github/workflows/mirror-release-r2.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   sync-version:
     name: Commit version bump
