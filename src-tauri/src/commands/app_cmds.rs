@@ -171,6 +171,26 @@ pub fn clear_android_download_notification() -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn show_linux_notification(title: String, body: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        // The notification plugin's blocking show() nests a tokio runtime here and aborts the app
+        let mut notification = notify_rust::Notification::new();
+        notification.summary(&title).body(&body).auto_icon();
+        notification
+            .show_async()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (title, body);
+        Ok(())
+    }
+}
+
+#[tauri::command]
 pub async fn shutdown_system(handle: AppHandle) -> Result<(), String> {
     tracing::info!("[Risuko] shutdown_system: initiating OS shutdown");
 

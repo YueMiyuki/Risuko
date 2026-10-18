@@ -814,6 +814,16 @@ export default {
 				? this.$t("task.bt-download-complete-notify")
 				: this.$t("task.download-complete-notify");
 
+			if (is.linux()) {
+				invoke("show_linux_notification", {
+					title: notifyMessage,
+					body: `${taskName}${tips}`,
+				}).catch((err) => {
+					logger.warn("[Risuko] Linux notification failed:", err);
+				});
+				return;
+			}
+
 			if (document.hidden && !is.android()) {
 				this.sendOsNotification(notifyMessage, `${taskName}${tips}`, path);
 			} else {

@@ -6870,6 +6870,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "ndk-context",
+ "notify-rust",
  "objc2-app-kit",
  "open",
  "percent-encoding",

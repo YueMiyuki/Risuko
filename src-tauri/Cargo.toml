@@ -104,6 +104,9 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4"
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 trash = "5"
 tauri-plugin-autostart = "2"
