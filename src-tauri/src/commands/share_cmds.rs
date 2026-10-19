@@ -21,8 +21,6 @@ pub async fn share_start_send(
     paths: Vec<String>,
     state: tauri::State<'_, ShareState>,
 ) -> Result<SendInfo, String> {
-    #[cfg(target_os = "android")]
-    crate::commands::android_intent::ensure_ndk_context()?;
     let manager = state.manager.clone();
     let paths = paths.into_iter().map(PathBuf::from).collect();
     manager
@@ -39,8 +37,6 @@ pub async fn share_start_receive(
     files: Vec<FileMeta>,
     state: tauri::State<'_, ShareState>,
 ) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    crate::commands::android_intent::ensure_ndk_context()?;
     let manager = state.manager.clone();
     manager
         .start_receive(id, ticket, PathBuf::from(dest_dir), files)

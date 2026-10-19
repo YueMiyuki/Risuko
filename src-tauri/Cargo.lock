@@ -6869,7 +6869,6 @@ dependencies = [
  "jni 0.22.4",
  "keyring-core",
  "libc",
- "ndk-context",
  "notify-rust",
  "objc2-app-kit",
  "open",
