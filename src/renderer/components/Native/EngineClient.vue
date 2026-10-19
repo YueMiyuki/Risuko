@@ -50,6 +50,17 @@ const ACTIVE_POLL_KEYS = [
 	"kind",
 ];
 
+const NOTIFICATION_MARKUP_ENTITIES: Record<string, string> = {
+	"&": "&amp;",
+	"<": "&lt;",
+	">": "&gt;",
+	'"': "&quot;",
+	"'": "&apos;",
+};
+
+const escapeNotificationMarkup = (text: string) =>
+	text.replace(/[&<>"']/g, (ch) => NOTIFICATION_MARKUP_ENTITIES[ch]);
+
 let listRefreshInFlight = false;
 let listRefreshQueued = false;
 let sessionSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -813,6 +824,16 @@ export default {
 			const notifyMessage = isBT
 				? this.$t("task.bt-download-complete-notify")
 				: this.$t("task.download-complete-notify");
+
+			if (is.linux()) {
+				invoke("show_linux_notification", {
+					title: notifyMessage,
+					body: `${escapeNotificationMarkup(taskName)}${tips}`,
+				}).catch((err) => {
+					logger.warn("[Risuko] Linux notification failed:", err);
+				});
+				return;
+			}
 
 			if (document.hidden && !is.android()) {
 				this.sendOsNotification(notifyMessage, `${taskName}${tips}`, path);

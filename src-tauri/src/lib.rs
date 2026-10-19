@@ -496,6 +496,7 @@ pub fn run() {
         commands::app_cmds::ensure_android_storage_access,
         commands::app_cmds::update_android_download_notification,
         commands::app_cmds::clear_android_download_notification,
+        commands::app_cmds::show_linux_notification,
         commands::app_cmds::shutdown_system,
         commands::file_cmds::reveal_in_folder,
         commands::file_cmds::select_android_directory,
