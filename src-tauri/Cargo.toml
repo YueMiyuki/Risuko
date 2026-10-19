@@ -124,7 +124,6 @@ libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22"
-ndk-context = "0.1"
 risuko-webview-upgrade = { workspace = true }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
