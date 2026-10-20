@@ -4,7 +4,7 @@ pub mod blocklist;
 pub mod conn_budget;
 pub mod core;
 pub mod dht;
-pub mod limiter;
+pub use risuko_util::limiter;
 pub mod lsd;
 pub mod magnet;
 pub mod peer;

@@ -476,9 +476,39 @@ async fn finish_task(
     proto_label: &str,
     counters: &Counters,
     result: Result<std::path::PathBuf, String>,
-    on_found: impl FnOnce(&mut DownloadTask),
-    on_ok: impl FnOnce(&mut DownloadTask, &Path) -> u64,
-    on_err: impl FnOnce(&mut DownloadTask, &str) -> super::error_code::ErrorCode,
+    on_found: impl FnOnce(&mut DownloadTask) + Send,
+    on_ok: impl FnOnce(&mut DownloadTask, &Path) -> u64 + Send,
+    on_err: impl FnOnce(&mut DownloadTask, &str) -> super::error_code::ErrorCode + Send,
+) {
+    finish_task_boxed(
+        tasks,
+        active,
+        events,
+        gid,
+        worker_epoch,
+        proto_label,
+        counters,
+        result,
+        Box::new(on_found),
+        Box::new(on_ok),
+        Box::new(on_err),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_task_boxed(
+    tasks: &Arc<RevLock>,
+    active: &Arc<RwLock<HashMap<String, ActiveDownload>>>,
+    events: &EventBroadcaster,
+    gid: &str,
+    worker_epoch: u64,
+    proto_label: &str,
+    counters: &Counters,
+    result: Result<std::path::PathBuf, String>,
+    on_found: Box<dyn FnOnce(&mut DownloadTask) + Send + '_>,
+    on_ok: Box<dyn FnOnce(&mut DownloadTask, &Path) -> u64 + Send + '_>,
+    on_err: Box<dyn FnOnce(&mut DownloadTask, &str) -> super::error_code::ErrorCode + Send + '_>,
 ) {
     let (is_current, final_kad_status) = {
         let active_guard = active.read().await;

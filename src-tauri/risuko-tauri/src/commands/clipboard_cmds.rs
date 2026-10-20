@@ -85,20 +85,137 @@ fn watch_exts(state: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[derive(Default)]
+pub struct ClipboardWatch {
+    context: std::sync::Mutex<Option<clipboard_rs::ClipboardContext>>,
+    shutdown: std::sync::Mutex<Option<clipboard_rs::WatcherShutdown>>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+struct ClipboardChange(AppHandle);
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+impl clipboard_rs::ClipboardHandler for ClipboardChange {
+    fn on_clipboard_change(&mut self) {
+        on_clipboard_update(&self.0);
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn read_clipboard_text(app: &AppHandle) -> Option<String> {
+    use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+    use tauri::Manager;
+
+    let watch = app.state::<ClipboardWatch>();
+    let mut context = watch.context.lock().ok()?;
+    if context.is_none() {
+        *context = ClipboardContext::new().ok();
+    }
+    let context = context.as_ref()?;
+    if !context.has(ContentFormat::Text) {
+        return None;
+    }
+    context.get_text().ok()
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub fn start_watch(app: &AppHandle) -> Result<(), String> {
+    use clipboard_rs::{ClipboardWatcher, ClipboardWatcherContext};
+    use tauri::Manager;
+
+    let watch = app.state::<ClipboardWatch>();
+    let mut shutdown = watch.shutdown.lock().map_err(|e| e.to_string())?;
+    if shutdown.is_some() {
+        return Ok(());
+    }
+    let mut watcher = ClipboardWatcherContext::new().map_err(|e| e.to_string())?;
+    let channel = watcher
+        .add_handler(ClipboardChange(app.clone()))
+        .get_shutdown_channel();
+    std::thread::Builder::new()
+        .name("clipboard-watch".into())
+        .spawn(move || watcher.start_watch())
+        .map_err(|e| e.to_string())?;
+    *shutdown = Some(channel);
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn stop_watch(app: &AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let watch = app.state::<ClipboardWatch>();
+    if let Some(channel) = watch.shutdown.lock().map_err(|e| e.to_string())?.take() {
+        channel.stop();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+pub struct ClipboardWatch(std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>);
+
+#[cfg(target_os = "macos")]
+fn read_clipboard_text(app: &AppHandle) -> Option<String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard().read_text().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn start_watch(app: &AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let watch = app.state::<ClipboardWatch>();
+    let mut stop = watch.0.lock().map_err(|e| e.to_string())?;
+    if stop.is_some() {
+        return Ok(());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name("clipboard-watch".into())
+        .spawn(move || watch_pasteboard(&handle, &rx))
+        .map_err(|e| e.to_string())?;
+    *stop = Some(tx);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_watch(app: &AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let watch = app.state::<ClipboardWatch>();
+    watch.0.lock().map_err(|e| e.to_string())?.take();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn watch_pasteboard(app: &AppHandle, stop: &std::sync::mpsc::Receiver<()>) {
+    use objc2_app_kit::NSPasteboard;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let mut last = pasteboard.changeCount();
+    while let Err(RecvTimeoutError::Timeout) =
+        stop.recv_timeout(std::time::Duration::from_millis(500))
+    {
+        let count = pasteboard.changeCount();
+        if last == 0 {
+            last = count;
+        } else if count != last {
+            last = count;
+            on_clipboard_update(app);
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn on_clipboard_update(app: &AppHandle) {
     use tauri::Manager;
-    use tauri_plugin_clipboard::Clipboard;
 
     let state = app.state::<AppState>();
     if !watch_enabled(&state) {
         return;
     }
-    let clipboard = app.state::<Clipboard>();
-    if !clipboard.has_text().unwrap_or(false) {
-        return;
-    }
-    let Ok(text) = clipboard.read_text() else {
+    let Some(text) = read_clipboard_text(app) else {
         return;
     };
     let text = text.trim();
@@ -134,14 +251,7 @@ pub fn mark_clipboard_self_write(state: State<'_, AppState>, text: String) {
 #[tauri::command]
 pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "android"))]
-    {
-        use tauri::Manager;
-        use tauri_plugin_clipboard::Clipboard;
-        let clipboard = app.state::<Clipboard>();
-        if !clipboard.is_monitor_running() {
-            clipboard.start_monitor(app.clone())?;
-        }
-    }
+    start_watch(&app)?;
     #[cfg(target_os = "android")]
     let _ = app;
     Ok(())
@@ -150,14 +260,7 @@ pub fn start_clipboard_watch(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn stop_clipboard_watch(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "android"))]
-    {
-        use tauri::Manager;
-        use tauri_plugin_clipboard::Clipboard;
-        let clipboard = app.state::<Clipboard>();
-        if clipboard.is_monitor_running() {
-            clipboard.stop_monitor(app.clone())?;
-        }
-    }
+    stop_watch(&app)?;
     #[cfg(target_os = "android")]
     let _ = app;
     Ok(())

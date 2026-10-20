@@ -4,7 +4,7 @@
 )]
 
 use clap::Parser;
-use risuko_lib::cli;
+use risuko_tauri::cli;
 
 fn main() {
     let args: Vec<String> = std::env::args_os()
@@ -35,5 +35,5 @@ fn main() {
         std::process::exit(code);
     }
 
-    risuko_lib::run();
+    risuko_tauri::run(tauri::generate_context!());
 }

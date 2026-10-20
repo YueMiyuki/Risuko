@@ -1,5 +1,5 @@
 [workspace]
-members = ["risuko-engine", "risuko-bt", "risuko-cli", "risuko-napi", "risuko-http", "risuko-cookies", "risuko-webview-upgrade", "risuko-share"]
+members = ["risuko-engine", "risuko-bt", "risuko-ed2k", "risuko-util", "risuko-tauri", "risuko-cli", "risuko-napi", "risuko-http", "risuko-cookies", "risuko-webview-upgrade", "risuko-share"]
 
 [workspace.package]
 version = "1.0.0"
@@ -10,6 +10,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 risuko-engine = { path = "risuko-engine" }
 risuko-bt = { path = "risuko-bt" }
+risuko-ed2k = { path = "risuko-ed2k" }
+risuko-util = { path = "risuko-util" }
+risuko-tauri = { path = "risuko-tauri" }
+risuko-cli = { path = "risuko-cli" }
 risuko-http = { path = "risuko-http" }
 risuko-cookies = { path = "risuko-cookies" }
 risuko-webview-upgrade = { path = "risuko-webview-upgrade" }
@@ -18,8 +22,25 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "sync", "time", "rt", "net", "macros", "signal", "io-util"] }
-dirs = "6"
 clap = { version = "4", features = ["derive"] }
+tauri = { version = "2", features = [
+	"tray-icon",
+	"image-png",
+	"macos-private-api",
+] }
+tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-dialog = { version = "2", default-features = false, features = [
+	"xdg-portal",
+] }
+tauri-plugin-shell = "2"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-barcode-scanner = "2.4.5"
 
 [package]
 name = "risuko"
@@ -30,10 +51,28 @@ edition.workspace = true
 
 [lib]
 name = "risuko_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib", "cdylib"]
 
 [lints.rust]
 linker_messages = "allow"
+
+[package.metadata.cargo-machete]
+ignored = [
+	"serde_json",
+	"tauri-plugin-store",
+	"tauri-plugin-deep-link",
+	"tauri-plugin-dialog",
+	"tauri-plugin-shell",
+	"tauri-plugin-clipboard-manager",
+	"tauri-plugin-autostart",
+	"tauri-plugin-single-instance",
+	"tauri-plugin-notification",
+	"tauri-plugin-process",
+	"tauri-plugin-updater",
+	"tauri-plugin-barcode-scanner",
+	"risuko-webview-upgrade",
+	"reqwest",
+]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -48,85 +87,37 @@ panic = "abort"
 [profile.dev]
 split-debuginfo = "unpacked"
 
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [dependencies]
-risuko-engine = { workspace = true }
-risuko-bt = { workspace = true }
-risuko-share = { workspace = true }
-risuko-cli = { path = "risuko-cli" }
+risuko-tauri = { workspace = true }
 tauri = { version = "2", features = [
 	"tray-icon",
 	"image-png",
 	"macos-private-api",
 ] }
-tauri-plugin-store = "2"
-tauri-plugin-deep-link = "2"
-tauri-plugin-dialog = { version = "2", default-features = false, features = [
-	"xdg-portal",
-] }
-tauri-plugin-shell = "2"
+tauri-plugin-store = { workspace = true }
+tauri-plugin-deep-link = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-shell = { workspace = true }
+tauri-plugin-clipboard-manager = { workspace = true }
 clap = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-dirs = { workspace = true }
-open = "5"
-tauri-plugin-clipboard-manager = "2.3.2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-risuko-http = { workspace = true }
-risuko-cookies = { workspace = true }
-base64 = "0.22"
-percent-encoding = "2"
-sha1 = "0.11"
-keyring-core = "1"
-fs4 = "1"
-tempfile = "3"
-async-trait = "0.1"
-futures-util = "0.3"
-
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-apple-native-keyring-store = { version = "1", features = ["keychain"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication", "libc"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = "1"
-windows-sys = { version = "0.61", features = [
-	"Win32_Foundation",
-	"Win32_Storage_FileSystem",
-	"Win32_System_Threading",
-	"Win32_UI_Shell",
-	"Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
-dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-notify-rust = "4"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-trash = "5"
-tauri-plugin-autostart = "2"
-tauri-plugin-single-instance = "2"
-tauri-plugin-clipboard = "2.1.11"
-tauri-plugin-notification = "2"
+tauri-plugin-autostart = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
+tauri-plugin-notification = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
-tauri-plugin-process = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-process = { workspace = true }
+tauri-plugin-updater = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.22"
 risuko-webview-upgrade = { workspace = true }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-tauri-plugin-barcode-scanner = "2.4.5"
-
-[dev-dependencies]
+tauri-plugin-barcode-scanner = { workspace = true }

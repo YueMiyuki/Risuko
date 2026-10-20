@@ -1,6 +1,6 @@
 pub mod cookie_store;
 pub mod dns;
-pub mod ed2k;
+pub use risuko_ed2k as ed2k;
 pub mod error_code;
 pub mod events;
 pub mod falloc;
