@@ -321,7 +321,14 @@ jobs:
               return
             fi
             echo "Publishing $name@$VERSION ($DIST_TAG)"
-            (cd "$dir" && npm publish --access public --provenance --tag "$DIST_TAG")
+            local log="$RUNNER_TEMP/npm-publish.log"
+            if ! (cd "$dir" && npm publish --access public --provenance --tag "$DIST_TAG") 2>&1 | tee "$log"; then
+              if grep -qF "previously staged version \"$VERSION\"" "$log"; then
+                echo "::warning::$name@$VERSION is already staged on npm and not visible yet, skipping"
+                return
+              fi
+              return 1
+            fi
           }
           for dir in packages/risuko-cli/npm/*/ packages/risuko-js/npm/*/; do
             publish "${dir%/}"
