@@ -171,9 +171,10 @@ pub fn start_watch(app: &AppHandle) -> Result<(), String> {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = app.clone();
+    let last = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
     std::thread::Builder::new()
         .name("clipboard-watch".into())
-        .spawn(move || watch_pasteboard(&handle, &rx))
+        .spawn(move || watch_pasteboard(&handle, &rx, last))
         .map_err(|e| e.to_string())?;
     *stop = Some(tx);
     Ok(())
@@ -188,12 +189,11 @@ fn stop_watch(app: &AppHandle) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn watch_pasteboard(app: &AppHandle, stop: &std::sync::mpsc::Receiver<()>) {
+fn watch_pasteboard(app: &AppHandle, stop: &std::sync::mpsc::Receiver<()>, mut last: isize) {
     use objc2_app_kit::NSPasteboard;
     use std::sync::mpsc::RecvTimeoutError;
 
     let pasteboard = NSPasteboard::generalPasteboard();
-    let mut last = pasteboard.changeCount();
     while let Err(RecvTimeoutError::Timeout) =
         stop.recv_timeout(std::time::Duration::from_millis(500))
     {
