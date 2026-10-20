@@ -27,7 +27,7 @@ pub fn safe_filename(name: &str, fallback: &str) -> String {
 }
 
 pub fn is_windows_device_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let stem = name.split('.').next().unwrap_or(name).trim();
     let upper = stem.to_ascii_uppercase();
     if matches!(
         upper.as_str(),
@@ -35,14 +35,13 @@ pub fn is_windows_device_name(name: &str) -> bool {
     ) {
         return true;
     }
-    if upper.len() == 4 {
-        let b = upper.as_bytes();
-        let port = b[3];
-        if (b[0..3] == *b"COM" || b[0..3] == *b"LPT") && (b'1'..=b'9').contains(&port) {
-            return true;
-        }
-    }
-    false
+    let port = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"));
+    matches!(
+        port,
+        Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+    )
 }
 
 #[cfg(test)]
@@ -71,5 +70,26 @@ mod tests {
         assert_eq!(safe_filename(" CON", "fallback"), "fallback");
         assert_eq!(safe_filename(" COM1.txt", "fallback"), "fallback");
         assert_eq!(safe_filename("console.log", "fallback"), "console.log");
+    }
+
+    #[test]
+    fn safe_filename_superscript_port_device_names() {
+        assert_eq!(safe_filename("COM¹", "fallback"), "fallback");
+        assert_eq!(safe_filename("com².txt", "fallback"), "fallback");
+        assert_eq!(safe_filename("LPT³", "fallback"), "fallback");
+        assert_eq!(safe_filename("lpt¹.log", "fallback"), "fallback");
+        assert_eq!(safe_filename("COM⁴", "fallback"), "COM⁴");
+    }
+
+    #[test]
+    fn is_windows_device_name_leading_spaces() {
+        assert!(is_windows_device_name(" CON"));
+        assert!(is_windows_device_name(" COM1.txt"));
+        assert!(is_windows_device_name("  lpt9 .txt"));
+        assert!(is_windows_device_name(" COM²"));
+        assert!(is_windows_device_name("CON"));
+        assert!(!is_windows_device_name(" console.log"));
+        assert!(!is_windows_device_name("COM0"));
+        assert!(!is_windows_device_name("COM10"));
     }
 }
