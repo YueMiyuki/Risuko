@@ -198,9 +198,7 @@ fn watch_pasteboard(app: &AppHandle, stop: &std::sync::mpsc::Receiver<()>) {
         stop.recv_timeout(std::time::Duration::from_millis(500))
     {
         let count = pasteboard.changeCount();
-        if last == 0 {
-            last = count;
-        } else if count != last {
+        if count != last {
             last = count;
             on_clipboard_update(app);
         }

@@ -14,7 +14,9 @@ pub fn safe_filename(name: &str, fallback: &str) -> String {
             }
         })
         .collect();
-    let trimmed = cleaned.trim_end().trim_matches('.');
+    let trimmed = cleaned
+        .trim_start_matches('.')
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
     if trimmed.is_empty() {
         return fallback.to_string();
     }
@@ -61,6 +63,9 @@ mod tests {
         assert_eq!(safe_filename("NUL.txt", "fallback"), "fallback");
         assert_eq!(safe_filename("com9", "fallback"), "fallback");
         assert_eq!(safe_filename("foo  ", "fallback"), "foo");
+        assert_eq!(safe_filename("foo. .", "fallback"), "foo");
+        assert_eq!(safe_filename(" .", "fallback"), "fallback");
+        assert_eq!(safe_filename("   ", "fallback"), "fallback");
         assert_eq!(safe_filename("con.tar.gz", "fallback"), "fallback");
         assert_eq!(safe_filename("lpt1 .txt", "fallback"), "fallback");
         assert_eq!(safe_filename("console.log", "fallback"), "console.log");

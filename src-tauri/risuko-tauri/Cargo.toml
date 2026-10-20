@@ -58,7 +58,7 @@ dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] 
 notify-rust = "4"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-clipboard-rs = "0.2"
+clipboard-rs = { version = "0.3", default-features = false, features = ["wayland"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 trash = "5"
