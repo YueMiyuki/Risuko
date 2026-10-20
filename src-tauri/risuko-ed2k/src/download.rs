@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use risuko_bt::limiter::Throttle;
+use risuko_util::limiter::Throttle;
 
 use super::chunks::{hash_part_from_disk, write_block, ChunkManager};
 use super::kad::{routing::is_public_ipv4, KadLookupStatus, KadService, KadState};

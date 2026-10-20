@@ -1,0 +1,17 @@
+[package]
+name = "risuko-util"
+version.workspace = true
+description = "Shared rate limiting and filename helpers for Risuko"
+authors.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[lib]
+name = "risuko_util"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+[dev-dependencies]
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

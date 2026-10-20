@@ -49,7 +49,7 @@ impl Met {
 }
 
 pub fn final_path(dir: &str, file_name: &str) -> PathBuf {
-    let safe = crate::engine::util::safe_filename(file_name, "ed2k-download");
+    let safe = risuko_util::safe_filename(file_name, "ed2k-download");
     PathBuf::from(dir).join(safe)
 }
 

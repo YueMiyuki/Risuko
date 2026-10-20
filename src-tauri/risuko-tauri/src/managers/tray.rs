@@ -77,7 +77,7 @@ pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
     let menu = build_tray_menu(handle, &HashMap::new())?;
 
-    let icon_bytes = include_bytes!("../../icons/icon.png");
+    let icon_bytes = include_bytes!("../../../icons/icon.png");
     let icon = Image::from_bytes(icon_bytes).expect("Failed to load tray icon");
 
     let _tray = TrayIconBuilder::with_id("main")
