@@ -6445,7 +6445,7 @@ dependencies = [
 
 [[package]]
 name = "risuko"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "clap",
  "reqwest",
@@ -6470,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-bt"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6501,7 +6501,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -6516,7 +6516,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-cookies"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -6542,7 +6542,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-ed2k"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -6564,7 +6564,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-engine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes 0.9.3",
  "async-trait",
@@ -6621,7 +6621,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-http"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -6654,7 +6654,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-napi"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -6667,7 +6667,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-share"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "iroh",
@@ -6682,7 +6682,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-tauri"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",
@@ -6733,7 +6733,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-util"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "parking_lot",
  "tokio",
@@ -6741,7 +6741,7 @@ dependencies = [
 
 [[package]]
 name = "risuko-webview-upgrade"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "tauri",
  "tauri-plugin",
