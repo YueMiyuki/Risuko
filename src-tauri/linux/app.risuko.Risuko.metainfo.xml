@@ -2,30 +2,77 @@
 <component type="desktop-application">
   <id>app.risuko.Risuko</id>
   <name>Risuko</name>
-  <summary>Download manager</summary>
+  <summary>Multi-protocol download manager</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
   <developer id="app.risuko">
     <name>YueMiyuki</name>
   </developer>
   <description>
-    <p>Risuko is a download manager for HTTP downloads, BitTorrent files, and magnet links.</p>
+    <p>Risuko downloads files from the web, torrents and more. Paste a link or a magnet, or open a .torrent file, and Risuko splits the download across connections and resumes it after interruptions.</p>
+    <p>Supported sources:</p>
+    <ul>
+      <li>HTTP and HTTPS, with multiple connections and mirror failover</li>
+      <li>BitTorrent and magnet links, including v2 torrents, DHT and peer exchange</li>
+      <li>FTP, FTPS and SFTP</li>
+      <li>ed2k links</li>
+      <li>Usenet NZB files, with PAR2 repair</li>
+      <li>HLS video streams</li>
+    </ul>
+    <p>Risuko can also follow RSS feeds and download new items automatically, upload finished files to WebDAV, S3, SFTP or FTP servers, and be controlled remotely through an aria2-compatible RPC interface.</p>
   </description>
   <launchable type="desktop-id">app.risuko.Risuko.desktop</launchable>
   <provides>
     <binary>risuko</binary>
   </provides>
+  <keywords>
+    <keyword>download</keyword>
+    <keyword>torrent</keyword>
+    <keyword>BitTorrent</keyword>
+    <keyword>magnet</keyword>
+    <keyword>FTP</keyword>
+    <keyword>Usenet</keyword>
+  </keywords>
+  <branding>
+    <color type="primary" scheme_preference="light">#e9e3ff</color>
+    <color type="primary" scheme_preference="dark">#3b2a6b</color>
+  </branding>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">480</display_length>
+  </requires>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/YueMiyuki/Risuko/v0.4.1/static/readme/UI.png</image>
+      <image>https://raw.githubusercontent.com/YueMiyuki/Risuko/v1.0.1/static/readme/UI.png</image>
       <caption>Main Risuko window</caption>
     </screenshot>
   </screenshots>
   <url type="homepage">https://risuko.app</url>
+  <url type="help">https://risuko.app/docs</url>
   <url type="bugtracker">https://github.com/YueMiyuki/Risuko/issues</url>
   <url type="vcs-browser">https://github.com/YueMiyuki/Risuko</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.0.1" date="2026-10-20">
+      <description>
+        <p>Fixes a crash when showing desktop notifications on Linux.</p>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-10-10">
+      <description>
+        <p>This release reworks the BitTorrent engine and secures remote control.</p>
+        <ul>
+          <li>More reliable BitTorrent downloads, with a stricter endgame, a session-wide connection limit and bans for peers that send corrupt data</li>
+          <li>One speed limit shared by HTTP, BitTorrent, ed2k and Usenet downloads, applied without a restart</li>
+          <li>ed2k downloads resume from partial files and support files larger than 4 GiB</li>
+          <li>The RPC server now requires a secret, generated on first run</li>
+          <li>BitTorrent listens on port 21301 by default</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-06-09">
       <description>
         <p>Release 0.4.1</p>

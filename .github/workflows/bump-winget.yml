@@ -1,0 +1,46 @@
+name: Bump WinGet manifests
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to bump to (e.g. v0.1.11)
+        required: true
+        type: string
+    secrets:
+      WINGET_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bump to (e.g. v0.1.11)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  bump:
+    name: Bump ${{ matrix.identifier }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - identifier: YueMiyuki.Risuko
+            installers-regex: '_win32_(x64|ia32)\.setup\.exe$'
+          - identifier: YueMiyuki.Risuko.CLI
+            installers-regex: '^risuko-cli-win32-x64\.zip$'
+    steps:
+      - name: Open the winget-pkgs pull request
+        uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54
+        with:
+          identifier: ${{ matrix.identifier }}
+          installers-regex: ${{ matrix.installers-regex }}
+          release-tag: ${{ inputs.tag }}
+          token: ${{ secrets.WINGET_TOKEN }}

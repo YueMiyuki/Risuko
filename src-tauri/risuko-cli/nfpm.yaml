@@ -1,0 +1,23 @@
+name: risuko-cli
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: YueMiyuki
+description: Command-line client and download engine for Risuko
+vendor: YueMiyuki
+homepage: https://risuko.app
+license: MIT
+contents:
+  - src: nfpm-staging/risuko-cli
+    dst: /usr/bin/risuko-cli
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/licenses/risuko-cli/LICENSE
+    type: license
+    packager: rpm
+  - src: LICENSE
+    dst: /usr/share/doc/risuko-cli/copyright
+    packager: deb

@@ -417,6 +417,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload Linux packages for the APT/RPM repos
+        if: runner.os == 'Linux' && github.event_name == 'release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-packages-${{ matrix.target }}
+          path: ${{ env.LINUX_PACKAGE_ASSETS }}
+          if-no-files-found: error
+
       - name: Upload standardized app bundle artifact (manual builds)
         if: github.event_name != 'release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -486,6 +494,50 @@ jobs:
           esac
           tar czf "risuko-cli-${label}.tar.gz" -C "$(dirname "$bin")" risuko
           echo "CLI_ASSET=risuko-cli-${label}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package risuko-cli for the APT/RPM repos
+        if: runner.os == 'Linux' && github.event_name == 'release'
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          CLI_BINARY: src-tauri/target/${{ matrix.target }}/release/risuko
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            linux/x64)
+              NFPM_ARCH=amd64
+              nfpm_asset=nfpm_2.48.0_Linux_x86_64.tar.gz
+              nfpm_sha256=6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+              ;;
+            linux/arm64)
+              NFPM_ARCH=arm64
+              nfpm_asset=nfpm_2.48.0_Linux_arm64.tar.gz
+              nfpm_sha256=a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
+              ;;
+            *)
+              echo "::error::No nfpm build for ${{ matrix.platform }}"
+              exit 1
+              ;;
+          esac
+          export NFPM_ARCH
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/$nfpm_asset"
+          echo "$nfpm_sha256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP" nfpm
+          install -Dm755 "$CLI_BINARY" nfpm-staging/risuko-cli
+          mkdir -p cli-packages
+          for packager in deb rpm; do
+            "$RUNNER_TEMP/nfpm" package --config src-tauri/risuko-cli/nfpm.yaml \
+              --packager "$packager" --target cli-packages/
+          done
+
+      - name: Upload risuko-cli packages for the APT/RPM repos
+        if: runner.os == 'Linux' && github.event_name == 'release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-packages-cli-${{ matrix.target }}
+          path: cli-packages/
+          if-no-files-found: error
 
       - name: Package risuko-cli binary (windows)
         if: matrix.target != 'i686-pc-windows-msvc' && runner.os == 'Windows'
@@ -581,6 +633,28 @@ jobs:
       tag: ${{ needs.meta.outputs.tag }}
     secrets:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  winget:
+    name: Bump WinGet manifests
+    needs: [meta, release]
+    if: github.event_name == 'release' && !github.event.release.prerelease && vars.WINGET_ENABLED == 'true'
+    uses: ./.github/workflows/bump-winget.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+    secrets:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+
+  linux-repos:
+    name: Publish APT/RPM repos
+    needs: [meta, release]
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    uses: ./.github/workflows/publish-linux-repos.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
 
   r2-mirror:
     name: Mirror release to R2

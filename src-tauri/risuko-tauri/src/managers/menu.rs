@@ -191,7 +191,7 @@ fn build_default_menu(
         );
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    {
+    if !crate::commands::config_cmds::updates_via_package_manager() {
         file_menu = file_menu.item(&mi("check-for-updates", "Check for Updates...").build(handle)?);
     }
 

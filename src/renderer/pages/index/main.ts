@@ -18,7 +18,10 @@ import store from "@/store";
 import { useAuthStore } from "@/store/auth";
 import { usePreferenceStore } from "@/store/preference";
 import { useSyncStore } from "@/store/sync";
-import { maybeCheckForUpdates } from "@/utils/updater";
+import {
+	detectPackageManagedInstall,
+	maybeCheckForUpdates,
+} from "@/utils/updater";
 import TrayWorker from "@/workers/tray.worker?worker";
 import App from "./App.vue";
 import "./commands";
@@ -260,6 +263,7 @@ async function init(config: AppConfig) {
 		const syncStore = useSyncStore();
 		syncStore.syncOnStartup();
 
+		void detectPackageManagedInstall();
 		maybeCheckForUpdates(config);
 	});
 }

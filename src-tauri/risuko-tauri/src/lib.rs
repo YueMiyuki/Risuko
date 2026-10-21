@@ -466,6 +466,7 @@ pub fn run(context: tauri::Context) {
         commands::config_cmds::prepare_preference_patch,
         commands::config_cmds::resolve_configured_proxy,
         commands::config_cmds::is_signed_updater_available,
+        commands::config_cmds::updates_via_package_manager,
         commands::config_cmds::fetch_tracker_sources,
         commands::clipboard_cmds::mark_clipboard_self_write,
         commands::clipboard_cmds::start_clipboard_watch,

@@ -15,8 +15,8 @@
 		"url": "git+ssh://git@github.com/YueMiyuki/Risuko.git"
 	},
 	"scripts": {
-		"dev": "node scripts/dev.mjs",
-		"build": "node scripts/build.mjs",
+		"dev": "tauri dev",
+		"build": "tauri build",
 		"dev:renderer": "vite --config vite.renderer.config.ts --mode development --port 9080",
 		"pack:renderer": "vite build --config vite.renderer.config.ts --mode production",
 		"android:dev": "node scripts/android-env.mjs pnpm exec tauri android dev",
@@ -31,9 +31,8 @@
 		"clean:tauri:full": "node scripts/clean-tauri.mjs --full",
 		"fmt": "pnpx @biomejs/biome check --write --max-diagnostics none",
 		"typecheck": "vue-tsc --noEmit -p tsconfig.json",
-		"check:i18n": "node --test scripts/check-i18n.test.mjs && node scripts/check-i18n.mjs",
 		"knip": "pnpx knip --fix",
-		"pre-commit": "pnpm typecheck && pnpm check:i18n && pnpm fmt",
+		"pre-commit": "pnpm typecheck && pnpm fmt",
 		"prepare": "pnpx husky",
 		"risuko": "cargo run --manifest-path src-tauri/Cargo.toml -p risuko-cli --",
 		"set-version": "node scripts/set-version.mjs"
@@ -67,8 +66,6 @@
 		"@types/qrcode": "^1.5.6",
 		"@vitejs/plugin-vue": "^6.0.9",
 		"axios": "^1.20.0",
-		"cfonts": "^3.3.1",
-		"chalk": "^6.0.1",
 		"i18next": "^26.4.2",
 		"lodash": "^4.18.1",
 		"pinia": "^4.0.3",

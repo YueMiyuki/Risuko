@@ -129,6 +129,16 @@ pub fn start_watch(app: &AppHandle) -> Result<(), String> {
     if shutdown.is_some() {
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    {
+        let mut context = watch.context.lock().map_err(|e| e.to_string())?;
+        if context.is_none() {
+            *context = Some(
+                clipboard_rs::ClipboardContext::new()
+                    .map_err(|e| format!("X11 clipboard unavailable: {e}"))?,
+            );
+        }
+    }
     let mut watcher = ClipboardWatcherContext::new().map_err(|e| e.to_string())?;
     let channel = watcher
         .add_handler(ClipboardChange(app.clone()))

@@ -110,13 +110,10 @@ function copyAsset(source, outputDir, name) {
 	return name;
 }
 
-function copySignature(source, outputDir, name, { required = false } = {}) {
+function copySignature(source, outputDir, name) {
 	const signature = `${source}.sig`;
 	if (!existsSync(signature)) {
-		if (required) {
-			throw new Error(`Missing required signature: ${signature}`);
-		}
-		return null;
+		throw new Error(`Missing required signature: ${signature}`);
 	}
 	return copyAsset(signature, outputDir, `${name}.sig`);
 }
@@ -140,18 +137,13 @@ function createMacTarball(appBundle, outputPath) {
 	}
 }
 
-function copyLinuxPackage(bundleDir, outputDir, version, arch, extension, extraAssets) {
+function copyLinuxPackage(bundleDir, outputDir, version, arch, extension) {
 	const source = findOne(
 		join(bundleDir, extension),
 		(path) => path.endsWith(`.${extension}`),
 		`Linux ${extension.toUpperCase()} package`,
 	);
-	const name = canonicalAssetName(version, "linux", arch, extension);
-	copyAsset(source, outputDir, name);
-	extraAssets.push(name);
-
-	const signature = copySignature(source, outputDir, name);
-	if (signature) extraAssets.push(signature);
+	return copyAsset(source, outputDir, canonicalAssetName(version, "linux", arch, extension));
 }
 
 export function packageReleaseAssets(options = {}) {
@@ -190,6 +182,7 @@ export function packageReleaseAssets(options = {}) {
 		plainAppImageAsset: "",
 		portableAsset: "",
 		extraAssets,
+		linuxPackages: [],
 	};
 
 	if (os === "darwin") {
@@ -201,12 +194,7 @@ export function packageReleaseAssets(options = {}) {
 				"macOS updater signature",
 			);
 			copyAsset(sourceFromSignature(signature, "macOS updater"), outputDir, appAsset);
-			result.updaterSignature = copySignature(
-				signature.slice(0, -4),
-				outputDir,
-				appAsset,
-				{ required: true },
-			);
+			result.updaterSignature = copySignature(signature.slice(0, -4), outputDir, appAsset);
 
 			const dmg = findOne(
 				join(bundleDir, "dmg"),
@@ -251,9 +239,7 @@ export function packageReleaseAssets(options = {}) {
 				: "AppImage";
 			const appAsset = canonicalAssetName(version, os, arch, extension);
 			copyAsset(updaterSource, outputDir, appAsset);
-			result.updaterSignature = copySignature(updaterSource, outputDir, appAsset, {
-				required: true,
-			});
+			result.updaterSignature = copySignature(updaterSource, outputDir, appAsset);
 			result.appAsset = appAsset;
 
 			const plainAppImage = canonicalAssetName(version, os, arch, "AppImage");
@@ -263,8 +249,10 @@ export function packageReleaseAssets(options = {}) {
 				extraAssets.push(plainAppImage, `${plainAppImage}.sha256`);
 			}
 
-			copyLinuxPackage(bundleDir, outputDir, version, arch, "deb", extraAssets);
-			copyLinuxPackage(bundleDir, outputDir, version, arch, "rpm", extraAssets);
+			result.linuxPackages = [
+				copyLinuxPackage(bundleDir, outputDir, version, arch, "deb"),
+				copyLinuxPackage(bundleDir, outputDir, version, arch, "rpm"),
+			];
 		} else {
 			result.appAsset = canonicalAssetName(version, os, arch, "AppImage");
 			copyAsset(appImage, outputDir, result.appAsset);
@@ -279,12 +267,7 @@ export function packageReleaseAssets(options = {}) {
 				"Windows updater signature",
 			);
 			copyAsset(sourceFromSignature(signature, "Windows updater"), outputDir, appAsset);
-			result.updaterSignature = copySignature(
-				signature.slice(0, -4),
-				outputDir,
-				appAsset,
-				{ required: true },
-			);
+			result.updaterSignature = copySignature(signature.slice(0, -4), outputDir, appAsset);
 		} else {
 			const setup = findOne(
 				nsisDir,
@@ -316,6 +299,7 @@ export function writeGithubEnvironment(result, envFile = process.env.GITHUB_ENV)
 		PLAIN_APPIMAGE_ASSET: result.plainAppImageAsset,
 		PORTABLE_ASSET: result.portableAsset,
 		EXTRA_APP_ASSETS: result.extraAssets.join("\n"),
+		LINUX_PACKAGE_ASSETS: result.linuxPackages.join("\n"),
 	};
 
 	for (const [key, value] of Object.entries(values)) {
@@ -338,6 +322,7 @@ function run() {
 				plainAppImageAsset: result.plainAppImageAsset,
 				portableAsset: result.portableAsset,
 				extraAssets: result.extraAssets,
+				linuxPackages: result.linuxPackages,
 			},
 			null,
 			2,

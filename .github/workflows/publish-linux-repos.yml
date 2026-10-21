@@ -1,0 +1,133 @@
+name: Publish Linux package repos
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag the packages were built for (e.g. v1.0.1)
+        required: true
+        type: string
+    secrets:
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      LINUX_REPO_GPG_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  latest:
+    name: Check the release is the latest
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.latest.outputs.publish }}
+    steps:
+      - name: Compare with the latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the latest release ($latest); the APT/RPM repos stay as they are"
+          fi
+
+  publish:
+    name: Build and upload APT/RPM repos
+    needs: latest
+    if: needs.latest.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET: risuko-releases
+      AWS_ENDPOINT_URL: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
+      AWS_DEFAULT_REGION: auto
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      BASE_URL: https://dl.risuko.app
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Linux packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: packages
+          pattern: linux-packages-*
+          merge-multiple: true
+
+      - name: Install repo tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apt-utils createrepo-c rpm
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          gpg --batch --import <<< "$GPG_PRIVATE_KEY"
+          key=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+          echo "GPG_KEY_ID=$key" >> "$GITHUB_ENV"
+
+      - name: Download stored packages
+        run: |
+          set -euo pipefail
+          aws s3 sync "s3://$R2_BUCKET/apt/pool/" repo/apt/pool/ --only-show-errors
+          aws s3 sync "s3://$R2_BUCKET/rpm/packages/" repo/rpm/packages/ --only-show-errors
+          tags=$(aws s3 ls "s3://$R2_BUCKET/" | awk '$1 == "PRE" { sub("/$", "", $2); print $2 }' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          for tag in $tags; do
+            version=${tag#v}
+            [[ "$(printf '%s\n' 1.0.0 "$version" | sort -V | head -n1)" == 1.0.0 ]] || continue
+            if compgen -G "repo/apt/pool/main/r/risuko/risuko_${version}_*.deb" >/dev/null &&
+              compgen -G "repo/rpm/packages/risuko-${version}-*.rpm" >/dev/null; then
+              continue
+            fi
+            aws s3 cp "s3://$R2_BUCKET/$tag/" packages/ --recursive --only-show-errors \
+              --exclude "*" --include "*.deb" --include "*.rpm"
+          done
+
+      - name: Build repos
+        run: bash scripts/build-linux-repos.sh packages repo
+
+      - name: Upload to R2
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          immutable="public, max-age=31536000, immutable"
+          upload() {
+            aws s3 cp "$@" --only-show-errors
+          }
+          upload_new() {
+            aws s3 sync "$@" --size-only --only-show-errors --cache-control "$immutable"
+          }
+          upload_new repo/apt/pool "s3://$R2_BUCKET/apt/pool/"
+          upload_new repo/rpm/packages "s3://$R2_BUCKET/rpm/packages/"
+          upload_new repo/rpm/repodata "s3://$R2_BUCKET/rpm/repodata/" --exclude "repomd.xml*"
+          upload repo/apt/dists/stable/main "s3://$R2_BUCKET/apt/dists/stable/main/" --recursive --cache-control no-cache
+          upload repo/apt/risuko.gpg "s3://$R2_BUCKET/apt/risuko.gpg" --cache-control no-cache
+          upload repo/rpm/risuko.asc "s3://$R2_BUCKET/rpm/risuko.asc" --cache-control no-cache
+          upload repo/rpm/risuko.repo "s3://$R2_BUCKET/rpm/risuko.repo" --cache-control no-cache
+          for file in Release Release.gpg InRelease; do
+            upload "repo/apt/dists/stable/$file" "s3://$R2_BUCKET/apt/dists/stable/$file" --cache-control no-cache
+          done
+          for file in repomd.xml repomd.xml.asc; do
+            upload "repo/rpm/repodata/$file" "s3://$R2_BUCKET/rpm/repodata/$file" --cache-control no-cache
+          done
+          echo "Published the APT/RPM repos for $TAG to $BASE_URL"

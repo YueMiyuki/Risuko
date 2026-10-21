@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Map, Value};
-use tauri::{AppHandle, State};
+use tauri::{utils::config::BundleType, AppHandle, State};
 
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_autostart::ManagerExt;
@@ -498,7 +498,8 @@ pub fn resolve_configured_proxy(
 pub fn is_signed_updater_available(handle: AppHandle) -> bool {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
-        has_signed_updater_pubkey(handle.config().plugins.0.get("updater"))
+        !updates_via_package_manager()
+            && has_signed_updater_pubkey(handle.config().plugins.0.get("updater"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -506,6 +507,14 @@ pub fn is_signed_updater_available(handle: AppHandle) -> bool {
         let _ = handle;
         false
     }
+}
+
+#[tauri::command]
+pub fn updates_via_package_manager() -> bool {
+    matches!(
+        tauri::utils::platform::bundle_type(),
+        Some(BundleType::Deb | BundleType::Rpm)
+    ) || std::env::var_os("FLATPAK_ID").is_some()
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]

@@ -1,7 +1,7 @@
 import type { AppConfig } from "@shared/types/config";
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
-import { reactive } from "vue";
+import { reactive, ref } from "vue";
 import { toast } from "vue-sonner";
 import { getLocaleManager } from "@/components/Locale";
 import { confirm } from "@/components/ui/confirm-dialog";
@@ -51,6 +51,7 @@ type ToastId = string | number;
 let activeCheck: ActiveCheck | null = null;
 let activeOperation: Promise<void> | null = null;
 let automaticCheckTimer: ReturnType<typeof setTimeout> | null = null;
+const packageManagedInstall = ref(false);
 
 function isTauriRuntime(): boolean {
 	return Boolean(
@@ -63,8 +64,22 @@ export function isDesktopUpdaterAvailable(): boolean {
 	return (
 		isTauriRuntime() &&
 		!is.android() &&
-		(is.macOS() || is.windows() || is.linux())
+		(is.macOS() || is.windows() || is.linux()) &&
+		!packageManagedInstall.value
 	);
+}
+
+export async function detectPackageManagedInstall(): Promise<void> {
+	if (!isTauriRuntime() || !is.linux()) {
+		return;
+	}
+	try {
+		packageManagedInstall.value = await invoke<boolean>(
+			"updates_via_package_manager",
+		);
+	} catch (error) {
+		logger.warn("[Risuko] failed to detect package-managed install:", error);
+	}
 }
 
 function translate(key: string, options?: Record<string, unknown>): string {

@@ -302,6 +302,23 @@ test("unsupported mobile and non-Tauri runtimes are no-ops", async () => {
 	assert.equal(state.checkCalls.length, 0);
 });
 
+test("package-managed Linux installs hide the in-app updater", async () => {
+	useDesktop(state);
+	state.invokeResult = (command) => command === "updates_via_package_manager";
+
+	await updater.detectPackageManagedInstall();
+	assert.equal(updater.isDesktopUpdaterAvailable(), false);
+	assert.equal(await updater.checkForUpdates("manual"), null);
+	assert.deepEqual(state.invokeCalls, [
+		["updates_via_package_manager", undefined],
+	]);
+	assert.equal(state.checkCalls.length, 0);
+
+	state.invokeResult = () => false;
+	await updater.detectPackageManagedInstall();
+	assert.equal(updater.isDesktopUpdaterAvailable(), true);
+});
+
 test("unsigned desktop builds do not invoke the updater plugin", async () => {
 	useDesktop(state);
 	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };
