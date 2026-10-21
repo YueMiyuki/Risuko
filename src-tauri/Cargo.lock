@@ -6692,6 +6692,7 @@ dependencies = [
  "dbus-secret-service-keyring-store",
  "fs4",
  "futures-util",
+ "gtk",
  "jni 0.22.4",
  "keyring-core",
  "libc",

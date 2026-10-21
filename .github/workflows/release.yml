@@ -97,6 +97,8 @@ jobs:
     name: Release (android)
     needs: meta
     runs-on: ubuntu-22.04
+    env:
+      SCCACHE_ENABLED: ${{ secrets.R2_CACHE_ACCESS_KEY_ID != '' }}
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
@@ -145,11 +147,36 @@ jobs:
         with:
           targets: ${{ needs.meta.outputs.android_rust_targets }}
 
-      - name: Cache Rust (cargo registry + build artifacts)
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: "src-tauri -> target"
           key: android
+          cache-targets: false
+          save-if: ${{ github.event_name != 'release' }}
+
+      - name: Setup sccache
+        if: env.SCCACHE_ENABLED == 'true'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+        with:
+          version: v0.18.0
+
+      - name: Start sccache on the R2 build cache
+        if: env.SCCACHE_ENABLED == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          SCCACHE_BUCKET: risuko-build-cache
+          SCCACHE_ENDPOINT: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
+          SCCACHE_REGION: auto
+          SCCACHE_IDLE_TIMEOUT: "0"
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          sccache --start-server
+          sccache --show-stats
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -239,6 +266,8 @@ jobs:
     name: Release (${{ matrix.platform }})
     needs: meta
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_ENABLED: ${{ secrets.R2_CACHE_ACCESS_KEY_ID != '' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.meta.outputs.desktop_matrix) }}
@@ -274,11 +303,36 @@ jobs:
         with:
           arch: ${{ matrix.target == 'i686-pc-windows-msvc' && 'x86' || 'amd64' }}
 
-      - name: Cache Rust (cargo registry + build artifacts)
+      - name: Cache cargo registry
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: "src-tauri -> target"
           key: ${{ matrix.target }}
+          cache-targets: false
+          save-if: ${{ github.event_name != 'release' }}
+
+      - name: Setup sccache
+        if: env.SCCACHE_ENABLED == 'true'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+        with:
+          version: v0.18.0
+
+      - name: Start sccache on the R2 build cache
+        if: env.SCCACHE_ENABLED == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          SCCACHE_BUCKET: risuko-build-cache
+          SCCACHE_ENDPOINT: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
+          SCCACHE_REGION: auto
+          SCCACHE_IDLE_TIMEOUT: "0"
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          sccache --start-server
+          sccache --show-stats
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.os, 'ubuntu')

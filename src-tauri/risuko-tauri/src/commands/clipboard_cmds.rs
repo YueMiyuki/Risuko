@@ -135,7 +135,7 @@ pub fn start_watch(app: &AppHandle) -> Result<(), String> {
         if context.is_none() {
             *context = Some(
                 clipboard_rs::ClipboardContext::new()
-                    .map_err(|e| format!("X11 clipboard unavailable: {e}"))?,
+                    .map_err(|e| format!("clipboard unavailable: {e}"))?,
             );
         }
     }
@@ -215,17 +215,42 @@ fn watch_pasteboard(app: &AppHandle, stop: &std::sync::mpsc::Receiver<()>, mut l
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn check_on_focus(app: &AppHandle) {
+    use tauri::Manager;
+
+    let watching = app
+        .try_state::<ClipboardWatch>()
+        .and_then(|watch| watch.shutdown.lock().ok().map(|s| s.is_some()))
+        .unwrap_or(true);
+    if watching || !watch_enabled(&app.state::<AppState>()) {
+        return;
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).request_text(move |_, text| {
+            if let Some(text) = text {
+                handle_clipboard_text(&handle, text);
+            }
+        });
+    });
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn on_clipboard_update(app: &AppHandle) {
+    if let Some(text) = read_clipboard_text(app) {
+        handle_clipboard_text(app, &text);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn handle_clipboard_text(app: &AppHandle, text: &str) {
     use tauri::Manager;
 
     let state = app.state::<AppState>();
     if !watch_enabled(&state) {
         return;
     }
-    let Some(text) = read_clipboard_text(app) else {
-        return;
-    };
     let text = text.trim();
     if text.is_empty() || text.len() > MAX_CLIPBOARD_BYTES {
         return;

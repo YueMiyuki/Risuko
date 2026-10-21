@@ -445,6 +445,13 @@ pub fn run(context: tauri::Context) {
             let _ = commands::app_cmds::hide_main_window(window.app_handle());
         }
 
+        #[cfg(target_os = "linux")]
+        if let tauri::WindowEvent::Focused(true) = event {
+            if window.label() == "main" {
+                commands::clipboard_cmds::check_on_focus(window.app_handle());
+            }
+        }
+
         if let tauri::WindowEvent::Focused(false) = event {
             #[cfg(not(target_os = "android"))]
             if window.label() == managers::flyout::FLYOUT_LABEL {
