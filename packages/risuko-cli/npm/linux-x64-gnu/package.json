@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/cli-linux-x64-gnu",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"description": "Risuko CLI binary for Linux x64",
 	"repository": {
 		"type": "git",
