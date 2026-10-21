@@ -1,6 +1,6 @@
 {
 	"name": "@risuko/app",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Risuko download manager — launches the desktop app, downloading the latest release when it is not cached yet",
 	"license": "MIT",
 	"repository": {
