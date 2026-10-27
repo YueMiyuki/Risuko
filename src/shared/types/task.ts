@@ -68,6 +68,8 @@ export interface DownloadTask {
 	bittorrent?: BitTorrentInfo;
 	seeder?: string;
 	numSeeders?: string;
+	swarmSeeders?: string;
+	swarmLeechers?: string;
 	ed2kLink?: string;
 	ed2kKad?: Ed2kKadTaskStatus;
 	numPeers?: string;

@@ -139,18 +139,7 @@ async fn replay_magnet_trackers(
         guard
             .iter()
             .find(|task| task.gid == gid)
-            .map(|task| {
-                let mut seen = HashSet::new();
-                let mut urls = Vec::new();
-                for tier in &task.bt_announce_list {
-                    for url in tier {
-                        if seen.insert(url.clone()) {
-                            urls.push(url.clone());
-                        }
-                    }
-                }
-                urls
-            })
+            .map(|task| unique_tracker_urls(&task.bt_announce_list))
             .unwrap_or_default()
     };
     if let Some(announced) = engine.private_tracker_tiers(torrent_id) {
@@ -162,6 +151,10 @@ async fn replay_magnet_trackers(
         }
         let mut guard = tasks.write().await;
         if let Some(task) = guard.iter_mut().find(|task| task.gid == gid) {
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String(unique_tracker_urls(&announced).join("\n")),
+            );
             task.bt_announce_list = announced;
         }
     } else if !tracker_urls.is_empty() {
@@ -169,6 +162,16 @@ async fn replay_magnet_trackers(
             tracing::warn!("[task:{gid}] Failed to replay persisted magnet trackers: {e}");
         }
     }
+}
+
+fn unique_tracker_urls(tiers: &[Vec<String>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tiers
+        .iter()
+        .flatten()
+        .filter(|url| seen.insert(url.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn decode_thunder_http_uris(uris: Vec<String>) -> Result<Vec<String>, String> {
@@ -390,17 +393,10 @@ fn apply_task_patch(
         }
         if !tracker_urls_to_add.is_empty() {
             task.bt_announce_list.push(tracker_urls_to_add.clone());
-            let mut merged: Vec<String> = Vec::new();
-            let mut seen = HashSet::new();
-            for tier in &task.bt_announce_list {
-                for url in tier {
-                    if seen.insert(url.clone()) {
-                        merged.push(url.clone());
-                    }
-                }
-            }
-            task.options
-                .insert("bt-tracker".into(), Value::String(merged.join("\n")));
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String(unique_tracker_urls(&task.bt_announce_list).join("\n")),
+            );
         }
     }
 
@@ -3555,6 +3551,8 @@ impl TaskManager {
                             task.peers = Vec::new();
                         }
                         task.bt_peers_key = None;
+                        task.swarm_seeders = None;
+                        task.swarm_leechers = None;
                         continue;
                     }
                     if let Some(stats) = torrent_stats_by_gid.get(&task.gid) {
@@ -3565,6 +3563,8 @@ impl TaskManager {
                         task.upload_speed = stats.upload_speed;
                         task.connections = stats.num_peers;
                         task.num_seeders = stats.num_seeders;
+                        task.swarm_seeders = stats.swarm_seeders;
+                        task.swarm_leechers = stats.swarm_leechers;
 
                         let num_pieces = stats
                             .metadata
@@ -4570,14 +4570,27 @@ impl TaskManager {
     }
 
     async fn torrent_is_private(&self, gid: &str) -> bool {
-        let Some(tid) = self.torrent_ids.read().await.get(gid).copied() else {
-            return false;
-        };
-        self.torrent_engine
+        let tid = self.torrent_ids.read().await.get(gid).copied();
+        if let Some(tid) = tid {
+            if let Some(engine) = self.torrent_engine.read().await.clone() {
+                return engine.private_tracker_tiers(tid).is_some();
+            }
+        }
+        let info_hash = self
+            .tasks
             .read()
             .await
-            .as_ref()
-            .is_some_and(|engine| engine.private_tracker_tiers(tid).is_some())
+            .iter()
+            .find(|task| task.gid == gid)
+            .and_then(|task| task.info_hash.clone());
+        let Some(path) = info_hash.and_then(|hash| self.saved_torrent_path(&hash)) else {
+            return false;
+        };
+        tokio::fs::read(path)
+            .await
+            .ok()
+            .and_then(|data| risuko_bt::parse_torrent(&data).ok())
+            .is_some_and(|meta| meta.info.private)
     }
 
     pub async fn update_task(
@@ -7884,6 +7897,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_task_refuses_new_trackers_on_a_private_torrent_not_yet_re_added() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "private-restored", true).await;
+        mgr.torrent_ids.write().await.remove(&gid);
+
+        let err = mgr
+            .update_task(&gid, add_tracker_patch("http://b.example/announce"))
+            .await
+            .expect_err("the saved metainfo marks the torrent private");
+        assert!(err.contains("Private torrents"), "{err}");
+    }
+
+    #[tokio::test]
     async fn update_task_still_adds_trackers_to_a_public_torrent_with_an_engine() {
         let (mgr, _dir) = make_test_manager_with_engine().await;
         let gid = paused_torrent_task(&mgr, "public-edit", false).await;
@@ -7908,13 +7934,15 @@ mod tests {
         let gid = paused_torrent_task(&mgr, "private-replay", true).await;
         let tid = mgr.torrent_ids.read().await[&gid];
         let engine = mgr.torrent_engine.read().await.clone().unwrap();
-        mgr.tasks
-            .write()
-            .await
-            .iter_mut()
-            .find(|t| t.gid == gid)
-            .unwrap()
-            .bt_announce_list = vec![vec!["http://b.example/announce".to_string()]];
+        {
+            let mut tasks = mgr.tasks.write().await;
+            let task = tasks.iter_mut().find(|t| t.gid == gid).unwrap();
+            task.bt_announce_list = vec![vec!["http://b.example/announce".to_string()]];
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String("http://b.example/announce".into()),
+            );
+        }
 
         replay_magnet_trackers(&engine, &mgr.tasks, &gid, tid).await;
 
@@ -7923,6 +7951,10 @@ mod tests {
         assert_eq!(
             task.bt_announce_list,
             vec![vec!["http://own.example/announce".to_string()]]
+        );
+        assert_eq!(
+            task.options.get("bt-tracker").and_then(Value::as_str),
+            Some("http://own.example/announce")
         );
     }
 

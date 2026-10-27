@@ -215,6 +215,10 @@ mod tests {
         assert_eq!(client_name_from_peer_id(&[0u8; 20]), None);
         assert_eq!(client_name_from_peer_id(&id_from(b"-ZZ1234-")), None);
         assert_eq!(client_name_from_peer_id(&id_from(b"-qB46")), None);
+    }
+
+    #[test]
+    fn a_known_client_with_a_malformed_version_is_named_without_one() {
         assert_eq!(
             client_name_from_peer_id(&id_from(b"-qB4_20-")).as_deref(),
             Some("qBittorrent")

@@ -166,7 +166,12 @@ async fn race_endpoints_staggered(
                 let transport = Direct(&sock);
                 let announcing = announce(&transport, conn_id, req, &url_data);
                 let outcome = if attempts.is_empty() && pending.as_slice().is_empty() {
-                    announcing.await
+                    match give_up {
+                        Some(deadline) => timeout_at(deadline, announcing)
+                            .await
+                            .unwrap_or(Err(TrackerError::Timeout)),
+                        None => announcing.await,
+                    }
                 } else {
                     timeout(failover, announcing)
                         .await
@@ -1252,6 +1257,37 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(rejection(&error), Some("overloaded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_last_endpoint_announce_respects_the_failover_deadline() {
+        let rejecting = mock_tracker(|kind, txn, _, from| match kind {
+            Seen::Connect => vec![connect_reply(txn, bound_id(from))],
+            Seen::Announce => vec![error_reply(txn, "overloaded")],
+        })
+        .await;
+        let drops_announce = mock_tracker(|kind, txn, _, from| match kind {
+            Seen::Connect => vec![connect_reply(txn, bound_id(from))],
+            Seen::Announce => Vec::new(),
+        })
+        .await;
+        let url_data: Arc<[u8]> = Vec::new().into();
+        let error = within(
+            2,
+            race_endpoints_staggered(
+                vec![rejecting.addr, drops_announce.addr],
+                "tracker.test",
+                &announce_req(),
+                None,
+                url_data,
+                Duration::from_secs(60),
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejection(&error), Some("overloaded"), "{error}");
+        assert_eq!(drops_announce.count(Seen::Announce), 1);
     }
 
     #[test]

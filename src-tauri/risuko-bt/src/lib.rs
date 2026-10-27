@@ -27,8 +27,8 @@ pub mod wire;
 pub use api::TorrentIdOrHash;
 pub use blocklist::{BlockList, BlocklistApplyResult};
 pub use core::metainfo::{
-    dedupe_paths, is_padding_entry, parse_torrent, FileDetails, TorrentMeta, TorrentMetaInfo,
-    ValidatedTorrentMetaV1Info,
+    dedupe_paths, entry_path_list, is_padding_entry, parse_torrent, torrent_name, FileDetails,
+    TorrentMeta, TorrentMetaInfo, ValidatedTorrentMetaV1Info,
 };
 pub use core::{generate_peer_id, Id20, Lengths, Magnet};
 pub use external_ip::ExternalAddresses;

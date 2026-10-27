@@ -365,7 +365,10 @@ fn bt_listen_port_check(ports: &[u16], bt: Option<&BtHealthSnapshot>) -> HealthC
             Some(HealthFix::open_pref("advanced")),
         ),
         Some(bound) => HealthCheck::ok(ID, format!("BT listen port: {bound}")),
-        None => HealthCheck::ok(ID, format!("BT listen port: {first}")),
+        None => HealthCheck::skipped(
+            ID,
+            format!("BT listen port: {first} (BT session not started yet)"),
+        ),
     }
 }
 
@@ -1847,7 +1850,7 @@ mod tests {
     fn listen_port_checks_parse_ranges_and_lists_like_the_engine() {
         let options = options_with_ports("6881-6999", "26701,26702");
         let [bt, dht] = listen_port_checks(&options, None);
-        assert_eq!(bt.status, HealthStatus::Ok);
+        assert_eq!(bt.status, HealthStatus::Skipped);
         assert!(bt.message.contains("6881"), "{}", bt.message);
         assert_eq!(dht.status, HealthStatus::Skipped);
         assert!(dht.message.contains("26701"), "{}", dht.message);
@@ -1876,7 +1879,7 @@ mod tests {
         assert!(moved.fix.is_some());
 
         let pending = bt_listen_port_check(&ports, None);
-        assert_eq!(pending.status, HealthStatus::Ok);
+        assert_eq!(pending.status, HealthStatus::Skipped);
         assert!(pending.message.contains("6881"));
     }
 

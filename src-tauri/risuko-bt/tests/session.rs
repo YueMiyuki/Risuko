@@ -311,7 +311,7 @@ async fn a_verified_file_with_the_x_attribute_becomes_executable() {
         .await
         .unwrap();
     for (name, attr) in [("tool.bin", "x"), ("plain.bin", "h")] {
-        session
+        let added = session
             .add_torrent(
                 AddTorrent::TorrentFileBytes(
                     make_hashed_torrent_with_attr(name, &payload, attr).into(),
@@ -323,14 +323,12 @@ async fn a_verified_file_with_the_x_attribute_becomes_executable() {
             )
             .await
             .expect("add");
+        let AddTorrentResponse::Added(_, handle) = added else {
+            panic!("expected Added");
+        };
+        wait_until_finished(&handle, std::time::Duration::from_secs(10)).await;
     }
 
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while mode_of("tool.bin") & 0o111 == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("x file never became executable");
+    assert_ne!(mode_of("tool.bin") & 0o111, 0);
     assert_eq!(mode_of("plain.bin") & 0o111, 0);
 }

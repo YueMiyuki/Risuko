@@ -52,19 +52,22 @@ const INTERNAL_DOMAIN_SUFFIXES: [&str; 6] = [
 pub(crate) fn has_internal_suffix(name: &str) -> bool {
     INTERNAL_DOMAIN_SUFFIXES.iter().any(|suffix| {
         name.strip_suffix(suffix)
-            .is_some_and(|rest| rest.ends_with('.'))
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
     })
 }
 
 pub(crate) fn is_allowed_webseed_url(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Ipv4(ip)) => is_allowed_destination(IpAddr::V4(ip)),
-        Some(Host::Ipv6(ip)) => is_allowed_destination(IpAddr::V6(ip)),
-        Some(Host::Domain(name)) => {
-            let name = name.trim_end_matches('.');
+    url.host().is_some_and(|host| is_allowed_host(&host))
+}
+
+pub(crate) fn is_allowed_host<S: AsRef<str>>(host: &Host<S>) -> bool {
+    match host {
+        Host::Ipv4(ip) => is_allowed_destination(IpAddr::V4(*ip)),
+        Host::Ipv6(ip) => is_allowed_destination(IpAddr::V6(*ip)),
+        Host::Domain(name) => {
+            let name = name.as_ref().trim_end_matches('.');
             name.contains('.') && !has_internal_suffix(name)
         }
-        None => false,
     }
 }
 
@@ -557,6 +560,8 @@ mod tests {
             "http://printer.local/x",
             "http://metadata.google.internal/x",
             "http://router.home.arpa/x",
+            "http://home.arpa/x",
+            "http://home.arpa./x",
             "http://nas/x",
         ] {
             assert!(

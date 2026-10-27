@@ -386,12 +386,16 @@ impl EngineOptions {
                 continue;
             };
             for port in lo.max(1)..=hi {
+                if ports.contains(&port) {
+                    continue;
+                }
                 if ports.len() >= MAX_LISTEN_PORT_CANDIDATES {
+                    tracing::warn!(
+                        "listen-port {raw:?} has more than {MAX_LISTEN_PORT_CANDIDATES} ports; using the first {MAX_LISTEN_PORT_CANDIDATES}"
+                    );
                     return ports;
                 }
-                if !ports.contains(&port) {
-                    ports.push(port);
-                }
+                ports.push(port);
             }
         }
         ports

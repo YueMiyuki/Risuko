@@ -27,6 +27,7 @@ pub(crate) async fn socks5_grant_udp_associate(
     control.write_all(&[5, 0]).await.unwrap();
     let mut associate = [0u8; 10];
     control.read_exact(&mut associate).await.unwrap();
+    assert_eq!(&associate[..4], &[5, 3, 0, 1]);
     let [hi, lo] = relay_port.to_be_bytes();
     control
         .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, hi, lo])

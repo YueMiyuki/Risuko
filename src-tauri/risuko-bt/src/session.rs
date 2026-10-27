@@ -1478,13 +1478,7 @@ async fn run_accept_loop(
                     let policy = s.opts.encryption;
                     let res = within_handshake_deadline(
                         deadline,
-                        super::peer::accept_deferred(
-                            stream,
-                            s.peer_id,
-                            allowed,
-                            std::time::Duration::from_secs(30),
-                            policy,
-                        ),
+                        super::peer::accept_deferred(stream, s.peer_id, allowed, deadline, policy),
                     )
                     .await;
                     drop(slot);
@@ -1547,7 +1541,7 @@ async fn run_utp_accept_loop(
                     stream,
                     s.peer_id,
                     allowed,
-                    std::time::Duration::from_secs(30),
+                    deadline,
                     s.opts.encryption,
                 ),
             )

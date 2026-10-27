@@ -223,10 +223,14 @@ async fn announce_family(
 
 fn tracker_voter(url: &str) -> Option<Voter> {
     let parsed = url::Url::parse(url).ok()?;
-    if !super::webseed::is_allowed_webseed_url(&parsed) {
+    let host = match parsed.host()? {
+        url::Host::Domain(name) => url::Host::parse(name).ok()?,
+        host => host.to_owned(),
+    };
+    if !super::webseed::is_allowed_host(&host) {
         return None;
     }
-    match parsed.host()? {
+    match host {
         url::Host::Ipv4(ip) => Some(Voter::Ip(IpAddr::V4(ip))),
         url::Host::Ipv6(ip) => Some(Voter::Ip(IpAddr::V6(ip))),
         url::Host::Domain(_) => Some(Voter::Host),
@@ -242,8 +246,13 @@ fn note_external_ip(
     let Some(observed) = response.external_ip else {
         return;
     };
+    let route = if proxy.is_some_and(|proxy| routes_via_proxy(url, proxy)) {
+        Route::Proxied
+    } else {
+        Route::Direct
+    };
     if let Some(voter) = tracker_voter(url) {
-        external.vote(observed, Source::Tracker, voter, Route::of(proxy));
+        external.vote(observed, Source::Tracker, voter, route);
     }
 }
 
@@ -603,6 +612,45 @@ mod tests {
     }
 
     #[test]
+    fn udp_tracker_hosts_are_read_like_http_ones() {
+        let ip = |raw: &str| Some(Voter::Ip(raw.parse().unwrap()));
+        assert_eq!(tracker_voter("udp://8.8.4.4:6969/announce"), ip("8.8.4.4"));
+        assert_eq!(
+            tracker_voter("udp://[2001:4860::8888]:6969/announce"),
+            ip("2001:4860::8888")
+        );
+        assert_eq!(
+            tracker_voter("udp://Tracker.Example:6969/announce"),
+            Some(Voter::Host)
+        );
+        for url in [
+            "udp://127.0.0.1:6969/announce",
+            "udp://192.168.1.2:6969",
+            "udp://0x7f.1:6969",
+            "udp://2130706433:6969",
+            "udp://[::1]:6969",
+            "udp://LOCALHOST:6969",
+            "udp://tracker.LOCAL:6969",
+        ] {
+            assert_eq!(tracker_voter(url), None, "{url}");
+        }
+
+        let external = ExternalIp::new();
+        let reported = reporting("93.184.216.34");
+        for url in [
+            "udp://8.8.4.4:6969/announce",
+            "udp://1.1.1.1:6969/announce",
+            "udp://9.9.9.9:6969/announce",
+        ] {
+            note_external_ip(&external, url, None, &reported);
+        }
+        assert_eq!(
+            external.external_v4(),
+            Some("93.184.216.34".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn proxied_tracker_announces_never_vote() {
         use risuko_http::{Proxy, ProxyConnector};
 
@@ -624,6 +672,30 @@ mod tests {
             "http://9.9.9.9/announce",
         ] {
             note_external_ip(&external, url, Some(&ProxyConnector::direct()), &reported);
+        }
+        assert_eq!(
+            external.external_v4(),
+            Some("93.184.216.34".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn trackers_that_bypass_the_proxy_still_vote() {
+        use risuko_http::{Proxy, ProxyConnector};
+
+        let external = ExternalIp::new();
+        let reported = reporting("93.184.216.34");
+        let proxy = ProxyConnector::from_proxy(
+            Proxy::all("socks5://127.0.0.1:1080")
+                .unwrap()
+                .with_bypass("8.8.4.4,1.1.1.1,9.9.9.9"),
+        );
+        for url in [
+            "http://8.8.4.4/announce",
+            "http://1.1.1.1/announce",
+            "http://9.9.9.9/announce",
+        ] {
+            note_external_ip(&external, url, Some(&proxy), &reported);
         }
         assert_eq!(
             external.external_v4(),

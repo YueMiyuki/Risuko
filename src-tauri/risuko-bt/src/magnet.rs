@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -162,12 +162,14 @@ pub async fn resolve_with_conn_budget(
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<(SocketAddr, PeerSource)>();
     let tracker_peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let tracker_ids: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
 
     let mut tracker_set: JoinSet<()> = JoinSet::new();
     for url in trackers.clone() {
         let req = req.clone();
         let tx = peer_tx.clone();
         let tracker_peers = own_trackers.contains(&url).then(|| tracker_peers.clone());
+        let tracker_ids = tracker_ids.clone();
         let per_tracker = budget.min(TRACKER_TIMEOUT);
         let tracker_proxy = proxy.clone();
         tracker_set.spawn(async move {
@@ -186,6 +188,9 @@ pub async fn resolve_with_conn_budget(
                         super::tracker::redacted_tracker_url(&url),
                         r.peers.len()
                     );
+                    if let Some(id) = r.tracker_id {
+                        tracker_ids.lock().insert(url.clone(), id);
+                    }
                     for p in r.peers {
                         if let Some(tracker_peers) = &tracker_peers {
                             if is_dialable_peer_addr(p) {
@@ -363,7 +368,8 @@ pub async fn resolve_with_conn_budget(
 
     tracker_set.abort_all();
     while tracker_set.join_next().await.is_some() {}
-    send_stopped(&trackers, &req, proxy.clone(), tracker_source);
+    let tracker_ids = std::mem::take(&mut *tracker_ids.lock());
+    send_stopped(&trackers, &req, tracker_ids, proxy.clone(), tracker_source);
     if let Some(h) = dht_handle {
         h.abort();
     }
@@ -415,6 +421,7 @@ pub async fn resolve_with_conn_budget(
 fn send_stopped(
     trackers: &[String],
     started: &AnnounceRequest,
+    tracker_ids: HashMap<String, Vec<u8>>,
     proxy: Option<risuko_http::ProxyConnector>,
     tracker_source: Option<SocketAddr>,
 ) {
@@ -428,7 +435,8 @@ fn send_stopped(
     tokio::spawn(async move {
         let mut set: JoinSet<()> = JoinSet::new();
         for url in trackers {
-            let stopped = stopped.clone();
+            let mut stopped = stopped.clone();
+            stopped.tracker_id = tracker_ids.get(&url).cloned();
             let proxy = proxy.clone();
             set.spawn(async move {
                 if let Err(e) = super::tracker::announce_with_proxy_and_source(
@@ -1787,7 +1795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_attempt_sends_stopped_to_trackers_it_announced_to() {
+    async fn metadata_attempt_sends_stopped_with_the_tracker_id_to_trackers_it_announced_to() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/announce", listener.local_addr().unwrap());
@@ -1810,8 +1818,13 @@ mod tests {
                         .and_then(|rest| rest.split(['&', ' ']).next())
                         .unwrap_or("")
                         .to_string();
-                    let _ = events_tx.send(event);
-                    let body = b"d8:intervali600e5:peers0:e";
+                    let tracker_id = head
+                        .split("trackerid=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(['&', ' ']).next())
+                        .unwrap_or("");
+                    let _ = events_tx.send(format!("{event}:{tracker_id}"));
+                    let body = b"d8:intervali600e5:peers0:10:tracker id4:t-42e";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -1835,7 +1848,8 @@ mod tests {
 
         let mut seen = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !(seen.contains(&"started".to_string()) && seen.contains(&"stopped".to_string()))
+            while !(seen.contains(&"started:".to_string())
+                && seen.contains(&"stopped:t-42".to_string()))
             {
                 match events_rx.recv().await {
                     Some(event) => seen.push(event),
@@ -1845,8 +1859,8 @@ mod tests {
         })
         .await
         .unwrap_or_default();
-        assert!(seen.contains(&"started".to_string()), "{seen:?}");
-        assert!(seen.contains(&"stopped".to_string()), "{seen:?}");
+        assert!(seen.contains(&"started:".to_string()), "{seen:?}");
+        assert!(seen.contains(&"stopped:t-42".to_string()), "{seen:?}");
     }
 
     async fn datagrams_reaching_udp_tracker(tracker_source: Option<SocketAddr>) -> usize {

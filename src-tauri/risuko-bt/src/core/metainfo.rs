@@ -454,7 +454,7 @@ fn component_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace('\\', "_")
 }
 
-fn entry_path_list(entry: &Value) -> Option<&[Value]> {
+pub fn entry_path_list(entry: &Value) -> Option<&[Value]> {
     let path = entry.get(b"path").and_then(Value::as_list)?;
     Some(
         entry
@@ -483,7 +483,7 @@ fn is_executable_entry(entry: &Value) -> bool {
         .is_some_and(|attr| attr.contains(&b'x') && !attr.contains(&b'l') && !attr.contains(&b'p'))
 }
 
-fn torrent_name(value: &Value) -> Option<String> {
+pub fn torrent_name(value: &Value) -> Option<String> {
     text_with_utf8_alt(value, b"name.utf-8", b"name").map(|name| name.replace('\\', "_"))
 }
 

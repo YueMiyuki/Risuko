@@ -153,7 +153,10 @@ impl Client {
                 .join(&location)
                 .map_err(|e| Error::Redirect(e.to_string()))?;
             if self.inner.redirect.allow.is_some_and(|allow| !allow(&next)) {
-                return Err(Error::Redirect("redirect target not allowed".into()));
+                return Err(Error::Redirect(format!(
+                    "redirect target not allowed: {}",
+                    next.origin().ascii_serialization()
+                )));
             }
 
             if matches!(
@@ -987,7 +990,7 @@ mod tests {
         let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let second_port = second.local_addr().unwrap().port();
         let redirect = format!(
-            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{second_port}/admin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{second_port}/admin?token=SECRET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let a = tokio::spawn(serve_once(first, redirect.into_bytes()));
 
@@ -1002,6 +1005,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Redirect(_)), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("http://localhost:{second_port}")),
+            "{message}"
+        );
+        assert!(
+            !message.contains("SECRET") && !message.contains("/admin"),
+            "{message}"
+        );
         a.await.unwrap();
         let connected = tokio::time::timeout(Duration::from_millis(300), second.accept()).await;
         assert!(connected.is_err(), "redirect target was contacted");

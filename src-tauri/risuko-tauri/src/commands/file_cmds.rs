@@ -335,10 +335,6 @@ fn as_length(value: Option<&bencode::Value>) -> i64 {
     }
 }
 
-fn dict_get_first<'a>(dict: &'a bencode::Value, keys: &[&[u8]]) -> Option<&'a bencode::Value> {
-    keys.iter().find_map(|key| dict.get(key))
-}
-
 fn normalize_torrent_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_string()
 }
@@ -364,8 +360,7 @@ pub(crate) fn inspect_torrent_metadata(
         Some(files) if !files.is_empty()
     );
 
-    let name = dict_get_first(info, &[b"name.utf-8", b"name"])
-        .map(component_name)
+    let name = risuko_bt::torrent_name(info)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback.to_string());
     Ok((is_multi_file, name))
@@ -444,8 +439,7 @@ fn torrent_file_segments(raw_files: &[&bencode::Value]) -> Vec<Vec<String>> {
     let mut all: Vec<Vec<String>> = raw_files
         .iter()
         .map(|item| {
-            dict_get_first(item, &[b"path.utf-8", b"path"])
-                .and_then(bencode::Value::as_list)
+            risuko_bt::entry_path_list(item)
                 .map(|parts| {
                     parts
                         .iter()
@@ -595,8 +589,7 @@ fn resolve_torrent_from_bytes(
         .filter(|value| value.as_dict().is_some())
         .ok_or_else(|| "Invalid torrent metadata".to_string())?;
 
-    let root_name = dict_get_first(info, &[b"name.utf-8", b"name"])
-        .map(component_name)
+    let root_name = risuko_bt::torrent_name(info)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| file_name.to_string());
     let normalized_root_name = normalize_torrent_path(&root_name);
@@ -1394,6 +1387,52 @@ mod tests {
         assert_eq!(previewed[0], "root_x/dir_file.txt");
         let (_, name) = inspect_torrent_metadata(&bytes, "x").unwrap();
         assert_eq!(name, meta.info.name);
+    }
+
+    #[test]
+    fn preview_ignores_unusable_utf8_alternatives_like_the_download() {
+        let list = |parts: &[&[u8]]| {
+            bencode::Value::List(
+                parts
+                    .iter()
+                    .map(|part| bencode::Value::Bytes(part.to_vec()))
+                    .collect(),
+            )
+        };
+        let file = |path: &[&[u8]], utf8: &[&[u8]]| {
+            bencode::Value::Dict(vec![
+                (b"length".to_vec(), bencode::Value::Int(5)),
+                (b"path".to_vec(), list(path)),
+                (b"path.utf-8".to_vec(), list(utf8)),
+            ])
+        };
+        let info = bencode::Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                bencode::Value::List(vec![
+                    file(&[b"a.txt"], &[b"x", b"y.txt"]),
+                    file(&[b"b.txt"], &[&[0xff, 0xfe]]),
+                ]),
+            ),
+            (b"name".to_vec(), bencode::Value::Bytes(b"root".to_vec())),
+            (b"name.utf-8".to_vec(), bencode::Value::Bytes(vec![0xff])),
+            (b"piece length".to_vec(), bencode::Value::Int(16384)),
+            (b"pieces".to_vec(), bencode::Value::Bytes(vec![0; 20])),
+        ]);
+        let bytes = bencode::encode_to_vec(&bencode::Value::Dict(vec![(b"info".to_vec(), info)]));
+        let meta = risuko_bt::parse_torrent(&bytes).unwrap();
+        let downloaded: Vec<String> = meta
+            .info
+            .files
+            .iter()
+            .map(|f| format!("{}/{}", meta.info.name, f.path.join("/")))
+            .collect();
+        let payload = resolve_torrent_from_bytes(&bytes, "x", false, None, 0, 100).unwrap();
+        let previewed: Vec<&str> = payload.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(previewed, downloaded);
+        assert_eq!(previewed, ["root/a.txt", "root/b.txt"]);
+        let (_, name) = inspect_torrent_metadata(&bytes, "x").unwrap();
+        assert_eq!(name, "root");
     }
 
     #[test]
