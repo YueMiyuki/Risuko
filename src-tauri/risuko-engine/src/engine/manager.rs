@@ -3520,8 +3520,9 @@ impl TaskManager {
             };
 
             let resume_seq = self.torrent_resume_seq.load(Ordering::SeqCst);
+            let has_active_torrents = !active_torrent_gids.is_empty();
             let torrent_stats_by_gid: HashMap<String, torrent::TorrentStats> =
-                if active_torrent_gids.is_empty() {
+                if !has_active_torrents {
                     HashMap::new()
                 } else {
                     let te_guard = self.torrent_engine.read().await;
@@ -3541,7 +3542,7 @@ impl TaskManager {
 
             let mut halted = Vec::new();
             let mut write_halted = Vec::new();
-            if !torrent_stats_by_gid.is_empty() {
+            if has_active_torrents {
                 let mut tasks = self.tasks.write().await;
                 let resumed_since_snapshot =
                     self.torrent_resume_seq.load(Ordering::SeqCst) != resume_seq;
@@ -3752,6 +3753,9 @@ impl TaskManager {
                                 });
                             }
                         }
+                    } else {
+                        task.swarm_seeders = None;
+                        task.swarm_leechers = None;
                     }
                 }
             }

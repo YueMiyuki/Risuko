@@ -773,11 +773,13 @@ impl DownloadTask {
                 "numSeeders".into(),
                 Value::String(self.num_seeders.to_string()),
             );
-            if let Some(n) = self.swarm_seeders {
-                m.insert("swarmSeeders".into(), Value::String(n.to_string()));
-            }
-            if let Some(n) = self.swarm_leechers {
-                m.insert("swarmLeechers".into(), Value::String(n.to_string()));
+            if self.status == TaskStatus::Active {
+                if let Some(n) = self.swarm_seeders {
+                    m.insert("swarmSeeders".into(), Value::String(n.to_string()));
+                }
+                if let Some(n) = self.swarm_leechers {
+                    m.insert("swarmLeechers".into(), Value::String(n.to_string()));
+                }
             }
             if self.piece_length > 0 {
                 m.insert(
@@ -1275,6 +1277,7 @@ mod tests {
     #[test]
     fn rpc_status_reports_tracker_swarm_counts_once_known() {
         let mut task = DownloadTask::new_torrent("tgid".into(), "/dl".into(), None, Map::new());
+        task.status = TaskStatus::Active;
         let status = task.to_rpc_status(&[]);
         assert!(status.get("swarmSeeders").is_none());
         assert!(status.get("swarmLeechers").is_none());
@@ -1284,6 +1287,11 @@ mod tests {
         let status = task.to_rpc_status(&[]);
         assert_eq!(status.get("swarmSeeders"), Some(&json!("7")));
         assert_eq!(status.get("swarmLeechers"), Some(&json!("3")));
+
+        task.status = TaskStatus::Paused;
+        let status = task.to_rpc_status(&[]);
+        assert!(status.get("swarmSeeders").is_none());
+        assert!(status.get("swarmLeechers").is_none());
     }
 
     #[test]
