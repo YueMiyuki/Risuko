@@ -92,7 +92,12 @@ debug = "line-tables-only"
 
 [dependencies]
 risuko-tauri = { workspace = true }
-tauri = { workspace = true }
+# tauri-cli ignores inherited features, so tray-icon (and the bundled appindicator) must be listed here
+tauri = { version = "2", features = [
+	"tray-icon",
+	"image-png",
+	"macos-private-api",
+] }
 tauri-plugin-store = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 tauri-plugin-dialog = { workspace = true }

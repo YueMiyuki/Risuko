@@ -55,6 +55,7 @@ windows-sys = { version = "0.61", features = [
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = "0.11"
 notify-rust = "4"
 gtk = "0.18"
 
