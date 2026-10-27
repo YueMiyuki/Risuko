@@ -760,7 +760,10 @@ mod tests {
             .unwrap();
 
         let _ = client.get("http://mirror.example:8080/").send().await;
-        let request = server.await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("proxy was never contacted")
+            .unwrap();
         assert_eq!(&request[..4], &[5, 1, 0, 1]);
         assert_eq!(&request[4..8], &[192, 0, 2, 7]);
         assert_eq!(u16::from_be_bytes([request[8], request[9]]), 8080);
