@@ -22,7 +22,7 @@ Risuko 是一款全能的下载工具，支持下载 HTTP、FTP、BT、磁力链
 ## 💽 安装
 
 ### Github 下载
-从 [GitHub Releases](https://github.com/YueMiyuki/Risuko/releases) 下载并安装
+从 [GitHub Releases](https://github.com/YueMiyuki/Risuko/releases) 下载并安装。Debian、Ubuntu 和 Fedora 请使用下方的 APT / DNF 软件源
 
 ### NPM 包
 Risuko 提供 NPM 包，包含 UI 和 Risuko 引擎
@@ -45,6 +45,39 @@ brew install yuemiyuki/risuko/risuko-cli
 
 # 桌面应用 (Cask)
 brew install --cask yuemiyuki/risuko/risuko-app
+```
+
+### WinGet
+```powershell
+# 桌面应用
+winget install YueMiyuki.Risuko
+
+# CLI
+winget install YueMiyuki.Risuko.CLI
+```
+
+### APT (Debian / Ubuntu)
+```bash
+sudo curl -fsSLo /usr/share/keyrings/risuko.gpg https://dl.risuko.app/apt/risuko.gpg
+echo "deb [signed-by=/usr/share/keyrings/risuko.gpg] https://dl.risuko.app/apt stable main" | sudo tee /etc/apt/sources.list.d/risuko.list
+sudo apt update
+
+# 桌面应用
+sudo apt install risuko
+
+# CLI（命令为 risuko-cli）
+sudo apt install risuko-cli
+```
+
+### DNF (Fedora / RHEL)
+```bash
+sudo curl -fsSLo /etc/yum.repos.d/risuko.repo https://dl.risuko.app/rpm/risuko.repo
+
+# 桌面应用
+sudo dnf install risuko
+
+# CLI（命令为 risuko-cli）
+sudo dnf install risuko-cli
 ```
 
 ## 🖥 应用界面

@@ -42,6 +42,47 @@ pub fn compute_root(leaves: &[Id32]) -> Id32 {
     layer[0]
 }
 
+#[derive(Default)]
+struct LayerFold {
+    stack: Vec<(u32, Id32)>,
+}
+
+impl LayerFold {
+    fn push(&mut self, leaf: Id32) {
+        let mut node = (0u32, leaf);
+        while let Some((height, left)) = self.stack.last().copied() {
+            if height != node.0 {
+                break;
+            }
+            self.stack.pop();
+            node = (height + 1, hash_pair(&left, &node.1));
+        }
+        self.stack.push(node);
+    }
+
+    fn finish(mut self, height: u32, pad: Id32) -> Id32 {
+        let mut pads = Vec::with_capacity(height as usize);
+        let mut subtree = pad;
+        for _ in 0..height {
+            pads.push(subtree);
+            subtree = hash_pair(&subtree, &subtree);
+        }
+        let Some(mut node) = self.stack.pop() else {
+            return Id32([0u8; 32]);
+        };
+        while node.0 < height {
+            node = match self.stack.last().copied() {
+                Some((left_height, left)) if left_height == node.0 => {
+                    self.stack.pop();
+                    (left_height + 1, hash_pair(&left, &node.1))
+                }
+                _ => (node.0 + 1, hash_pair(&node.1, &pads[node.0 as usize])),
+            };
+        }
+        node.1
+    }
+}
+
 pub fn pad_hash(blocks: u32) -> Id32 {
     let mut pad = Id32([0u8; 32]);
     let mut span = 1u32;
@@ -85,7 +126,7 @@ pub struct MerkleProofTable {
     pub piece_length: u32,
     pub piece_count: u32,
     pub blocks_per_piece: u32,
-    pub piece_root_hashes: Vec<Id32>,
+    pub piece_root_hashes: std::sync::Arc<[Id32]>,
     upper_layers: std::sync::OnceLock<Vec<Vec<Id32>>>,
 }
 
@@ -146,7 +187,7 @@ impl MerkleProofTable {
                 piece_length,
                 piece_count,
                 blocks_per_piece,
-                piece_root_hashes: Vec::new(),
+                piece_root_hashes: std::sync::Arc::from([]),
                 upper_layers: std::sync::OnceLock::new(),
             });
         }
@@ -161,7 +202,7 @@ impl MerkleProofTable {
                 expected: piece_count as usize,
             });
         }
-        let piece_root_hashes: Vec<Id32> = layer_bytes
+        let piece_root_hashes: std::sync::Arc<[Id32]> = layer_bytes
             .chunks_exact(32)
             .map(|c| Id32::from_slice(c).expect("32-byte chunk"))
             .collect();
@@ -226,7 +267,7 @@ impl MerkleProofTable {
         }
         let pad = pad_hash(self.blocks_per_piece);
         let mut out = Vec::with_capacity(padded * 32);
-        for h in &self.piece_root_hashes {
+        for h in self.piece_root_hashes.iter() {
             out.extend_from_slice(&h.0);
         }
         while out.len() < padded * 32 {
@@ -238,7 +279,7 @@ impl MerkleProofTable {
     fn upper_layers(&self) -> &[Vec<Id32>] {
         self.upper_layers.get_or_init(|| {
             let padded = self.piece_layer_padded_len() as usize;
-            let mut layer = self.piece_root_hashes.clone();
+            let mut layer = self.piece_root_hashes.to_vec();
             layer.resize(padded, pad_hash(self.blocks_per_piece));
             let mut layers = vec![layer];
             while layers.last().is_some_and(|l| l.len() > 1) {
@@ -303,12 +344,12 @@ impl MerkleProofTable {
         Some(((lo / bpp) as u32..=((hi - 1) / bpp) as u32).collect())
     }
 
-    pub fn answer_leaf_request(
+    pub fn answer_leaf_request<B: std::ops::Deref<Target = [Id32]>>(
         &self,
         index: u32,
         length: u32,
         proof_layers: u32,
-        piece_blocks: &std::collections::HashMap<u32, Vec<Id32>>,
+        piece_blocks: &std::collections::HashMap<u32, B>,
     ) -> Option<Vec<u8>> {
         self.leaf_request_pieces(index, length, proof_layers)?;
         let bpp = self.blocks_per_piece as u64;
@@ -393,12 +434,12 @@ impl MerkleProofTable {
         Some(out)
     }
 
-    pub fn verify_full_piece_layer_response(
+    pub(crate) fn verify_piece_layer_chunks(
         file_root: Id32,
         file_length: u64,
         piece_length: u32,
-        response_hashes: &[u8],
-    ) -> Result<Vec<u8>, MerkleError> {
+        chunks: &[&[u8]],
+    ) -> Result<(), MerkleError> {
         if !piece_length.is_power_of_two() || piece_length < BLOCK_SIZE {
             return Err(MerkleError::LayerLengthMismatch {
                 got: piece_length as usize,
@@ -406,40 +447,39 @@ impl MerkleProofTable {
             });
         }
         let piece_count = file_length.div_ceil(piece_length as u64) as u32;
+        let received_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
         if piece_count <= 1 || file_length <= piece_length as u64 {
             return Err(MerkleError::LayerLengthMismatch {
-                got: response_hashes.len(),
+                got: received_bytes,
                 expected: 0,
             });
         }
-        if !response_hashes.len().is_multiple_of(32) {
+        if chunks.iter().any(|chunk| !chunk.len().is_multiple_of(32)) {
             return Err(MerkleError::LayerNotAligned);
         }
-        let padded = (piece_count as usize).next_power_of_two().max(2);
-        if response_hashes.len() != padded * 32 {
+        let piece_count = piece_count as usize;
+        let padded = piece_count.next_power_of_two().max(2);
+        let received = received_bytes / 32;
+        if received < piece_count || received > padded {
             return Err(MerkleError::LayerLengthMismatch {
-                got: response_hashes.len() / 32,
+                got: received,
                 expected: padded,
             });
         }
-        let leaves: Vec<Id32> = response_hashes
-            .chunks_exact(32)
-            .map(|c| Id32::from_slice(c).expect("32-byte chunk"))
-            .collect();
-        let blocks_per_piece = piece_length / BLOCK_SIZE;
-        let pad = pad_hash(blocks_per_piece);
-        if leaves[piece_count as usize..].iter().any(|h| *h != pad) {
+        let pad = pad_hash(piece_length / BLOCK_SIZE);
+        let mut fold = LayerFold::default();
+        let hashes = chunks.iter().flat_map(|chunk| chunk.chunks_exact(32));
+        for (index, hash) in hashes.enumerate() {
+            let leaf = Id32::from_slice(hash).expect("32-byte chunk");
+            if index >= piece_count && leaf != pad {
+                return Err(MerkleError::RootMismatch);
+            }
+            fold.push(leaf);
+        }
+        if fold.finish(padded.trailing_zeros(), pad) != file_root {
             return Err(MerkleError::RootMismatch);
         }
-        let recomputed = compute_root_with_pad(&leaves, padded, pad);
-        if recomputed != file_root {
-            return Err(MerkleError::RootMismatch);
-        }
-        let mut out = Vec::with_capacity(piece_count as usize * 32);
-        for h in &leaves[..piece_count as usize] {
-            out.extend_from_slice(&h.0);
-        }
-        Ok(out)
+        Ok(())
     }
 
     pub fn verify_piece(&self, piece_index: u32, piece_bytes: &[u8]) -> Result<(), MerkleError> {
@@ -514,6 +554,12 @@ pub enum PieceVerifier {
     V1Sha1 {
         pieces: Arc<Vec<u8>>,
     },
+    Hybrid {
+        pieces: Arc<Vec<u8>>,
+        tables: Arc<Vec<Option<MerkleProofTable>>>,
+        file_starts: Arc<Vec<u64>>,
+        piece_length: u32,
+    },
     V2Merkle {
         tables: Arc<Vec<MerkleProofTable>>,
         file_offsets: Arc<Vec<u64>>,
@@ -524,9 +570,8 @@ pub enum PieceVerifier {
 impl PieceVerifier {
     pub fn from_meta(meta: &TorrentMeta) -> Result<Self, MerkleError> {
         if meta.meta_version.has_v1() {
-            return Ok(Self::V1Sha1 {
-                pieces: Arc::new(meta.info.pieces.clone()),
-            });
+            let pieces = Arc::new(meta.info.pieces.clone());
+            return Ok(Self::hybrid(meta, pieces.clone()).unwrap_or(Self::V1Sha1 { pieces }));
         }
         let v2 = meta
             .info_v2
@@ -558,18 +603,84 @@ impl PieceVerifier {
         })
     }
 
+    fn hybrid(meta: &TorrentMeta, pieces: Arc<Vec<u8>>) -> Option<Self> {
+        let v2 = meta.info_v2.as_ref()?;
+        let mut file_starts = Vec::with_capacity(v2.files.len());
+        let mut offset = 0u64;
+        for f in &meta.info.files {
+            if !f.padding && f.length > 0 {
+                file_starts.push(offset);
+            }
+            offset += f.length;
+        }
+        if file_starts.len() != v2.files.len() {
+            return None;
+        }
+        let tables: Vec<Option<MerkleProofTable>> = v2
+            .files
+            .iter()
+            .map(|file| {
+                build_v2_table(meta, v2.piece_length, file)
+                    .map_err(|e| {
+                        tracing::debug!(
+                            "hybrid torrent: v2 hashes unusable for {:?}, checking SHA-1 only: {e}",
+                            file.path
+                        )
+                    })
+                    .ok()
+            })
+            .collect();
+        if tables.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(Self::Hybrid {
+            pieces,
+            tables: Arc::new(tables),
+            file_starts: Arc::new(file_starts),
+            piece_length: v2.piece_length,
+        })
+    }
+
+    pub(crate) fn serving_tables(&self) -> Option<Arc<Vec<MerkleProofTable>>> {
+        match self {
+            Self::V1Sha1 { .. } => None,
+            Self::Hybrid { tables, .. } => tables
+                .iter()
+                .cloned()
+                .collect::<Option<Vec<_>>>()
+                .map(Arc::new),
+            Self::V2Merkle { tables, .. } => Some(Arc::clone(tables)),
+        }
+    }
+
     pub fn verify(&self, piece_index: u32, piece_bytes: &[u8]) -> Result<(), VerifyError> {
         match self {
-            Self::V1Sha1 { pieces } => {
-                let start = piece_index as usize * 20;
-                let expected = pieces
-                    .get(start..start + 20)
-                    .ok_or(VerifyError::PieceOutOfRange(piece_index))?;
-                let got = super::hash::sha1(piece_bytes);
-                if got.as_bytes() != expected {
-                    return Err(VerifyError::HashMismatch);
-                }
-                Ok(())
+            Self::V1Sha1 { pieces } => verify_sha1(pieces, piece_index, piece_bytes),
+            Self::Hybrid {
+                pieces,
+                tables,
+                file_starts,
+                piece_length,
+            } => {
+                verify_sha1(pieces, piece_index, piece_bytes)?;
+                let piece_offset = piece_index as u64 * *piece_length as u64;
+                let Some(file_idx) = file_starts
+                    .partition_point(|start| *start <= piece_offset)
+                    .checked_sub(1)
+                else {
+                    return Ok(());
+                };
+                let Some(Some(table)) = tables.get(file_idx) else {
+                    return Ok(());
+                };
+                let local_piece_idx =
+                    ((piece_offset - file_starts[file_idx]) / *piece_length as u64) as u32;
+                let Some(own_len) = table.piece_size(local_piece_idx) else {
+                    return Ok(());
+                };
+                let piece_bytes = piece_bytes.get(..own_len as usize).unwrap_or(piece_bytes);
+                verify_in_table(table, local_piece_idx, piece_bytes)
+                    .map_err(|_| VerifyError::InconsistentHashes)
             }
             Self::V2Merkle {
                 tables,
@@ -577,15 +688,9 @@ impl PieceVerifier {
                 piece_length,
             } => {
                 let piece_offset = piece_index as u64 * *piece_length as u64;
-                let file_idx = match file_offsets.binary_search_by(|off| {
-                    if *off <= piece_offset {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                }) {
-                    Ok(i) | Err(i) => i.saturating_sub(1),
-                };
+                let file_idx = file_offsets
+                    .partition_point(|off| *off <= piece_offset)
+                    .saturating_sub(1);
                 let table = tables
                     .get(file_idx)
                     .ok_or(VerifyError::PieceOutOfRange(piece_index))?;
@@ -596,16 +701,36 @@ impl PieceVerifier {
                     .ok_or(VerifyError::PieceOutOfRange(piece_index))?
                     as usize;
                 let piece_bytes = piece_bytes.get(..own_len).unwrap_or(piece_bytes);
-                table
-                    .verify_piece(local_piece_idx, piece_bytes)
-                    .map_err(|e| match e {
-                        MerkleError::PieceOutOfRange(i) => VerifyError::PieceOutOfRange(i),
-                        MerkleError::RootMismatch => VerifyError::HashMismatch,
-                        other => VerifyError::Merkle(other.to_string()),
-                    })
+                verify_in_table(table, local_piece_idx, piece_bytes)
             }
         }
     }
+}
+
+fn verify_sha1(pieces: &[u8], piece_index: u32, piece_bytes: &[u8]) -> Result<(), VerifyError> {
+    let start = piece_index as usize * 20;
+    let expected = pieces
+        .get(start..start + 20)
+        .ok_or(VerifyError::PieceOutOfRange(piece_index))?;
+    let got = super::hash::sha1(piece_bytes);
+    if got.as_bytes() != expected {
+        return Err(VerifyError::HashMismatch);
+    }
+    Ok(())
+}
+
+fn verify_in_table(
+    table: &MerkleProofTable,
+    local_piece_idx: u32,
+    piece_bytes: &[u8],
+) -> Result<(), VerifyError> {
+    table
+        .verify_piece(local_piece_idx, piece_bytes)
+        .map_err(|e| match e {
+            MerkleError::PieceOutOfRange(i) => VerifyError::PieceOutOfRange(i),
+            MerkleError::RootMismatch => VerifyError::HashMismatch,
+            other => VerifyError::Merkle(other.to_string()),
+        })
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -616,12 +741,30 @@ pub enum VerifyError {
     PieceOutOfRange(u32),
     #[error("verify: merkle: {0}")]
     Merkle(String),
+    #[error("verify: the piece matches its v1 hash but not its v2 hash")]
+    InconsistentHashes,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn verify_piece_layer_response(
+        file_root: Id32,
+        file_length: u64,
+        piece_length: u32,
+        response_hashes: &[u8],
+    ) -> Result<Vec<u8>, MerkleError> {
+        MerkleProofTable::verify_piece_layer_chunks(
+            file_root,
+            file_length,
+            piece_length,
+            &[response_hashes],
+        )?;
+        let piece_count = file_length.div_ceil(piece_length as u64) as usize;
+        Ok(response_hashes[..piece_count * 32].to_vec())
+    }
 
     fn synth_file(file_length: u64, piece_length: u32) -> (Vec<u8>, MerkleProofTable) {
         let data: Vec<u8> = (0..file_length).map(|i| (i & 0xff) as u8).collect();
@@ -752,13 +895,8 @@ mod tests {
         assert!(served[(5 * 32)..(8 * 32)]
             .chunks_exact(32)
             .all(|entry| entry == pad.0));
-        let canonical = MerkleProofTable::verify_full_piece_layer_response(
-            table.file_root,
-            file_len,
-            piece_len,
-            &served,
-        )
-        .expect("verifies");
+        let canonical = verify_piece_layer_response(table.file_root, file_len, piece_len, &served)
+            .expect("verifies");
         assert_eq!(canonical.len(), 5 * 32);
         let rebuilt =
             MerkleProofTable::from_layer_bytes(table.file_root, file_len, piece_len, &canonical)
@@ -927,14 +1065,122 @@ mod tests {
         let (_data, table) = synth_file(file_len, piece_len);
         let mut served = table.serve_full_piece_layer().unwrap();
         served[6 * 32] ^= 0xff;
-        let err = MerkleProofTable::verify_full_piece_layer_response(
-            table.file_root,
-            file_len,
-            piece_len,
-            &served,
-        )
-        .unwrap_err();
+        let err =
+            verify_piece_layer_response(table.file_root, file_len, piece_len, &served).unwrap_err();
         assert!(matches!(err, MerkleError::RootMismatch));
+    }
+
+    #[test]
+    fn piece_layer_response_accepts_any_prefix_covering_the_pieces() {
+        let piece_len: u32 = 64 * 1024;
+        let file_len: u64 = 5 * piece_len as u64 - 1024;
+        let (_data, table) = synth_file(file_len, piece_len);
+        let served = table.serve_full_piece_layer().unwrap();
+        let canonical = &served[..5 * 32];
+        for entries in [5, 6, 7, 8] {
+            let got = verify_piece_layer_response(
+                table.file_root,
+                file_len,
+                piece_len,
+                &served[..entries * 32],
+            )
+            .unwrap_or_else(|e| panic!("{entries} entries rejected: {e}"));
+            assert_eq!(got, canonical);
+        }
+        for entries in [0, 4] {
+            let err = verify_piece_layer_response(
+                table.file_root,
+                file_len,
+                piece_len,
+                &served[..entries * 32],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, MerkleError::LayerLengthMismatch { .. }),
+                "{entries} entries: {err}"
+            );
+        }
+        let mut longer = served.clone();
+        longer.extend_from_slice(&pad_hash(4).0);
+        assert!(
+            verify_piece_layer_response(table.file_root, file_len, piece_len, &longer,).is_err()
+        );
+        let mut tampered = served[..7 * 32].to_vec();
+        tampered[6 * 32] ^= 0xff;
+        assert!(matches!(
+            verify_piece_layer_response(table.file_root, file_len, piece_len, &tampered,),
+            Err(MerkleError::RootMismatch)
+        ));
+    }
+
+    #[test]
+    fn streamed_piece_layer_verification_matches_the_materialized_root() {
+        for piece_length in [BLOCK_SIZE, 4 * BLOCK_SIZE] {
+            let blocks_per_piece = piece_length / BLOCK_SIZE;
+            let pad = pad_hash(blocks_per_piece);
+            for piece_count in 2usize..=40 {
+                let padded = piece_count.next_power_of_two();
+                let pieces: Vec<Id32> = (0..piece_count as u32)
+                    .map(|i| sha256(&i.to_be_bytes()))
+                    .collect();
+                let root = piece_layer_root(&pieces, blocks_per_piece);
+                let file_length = piece_count as u64 * piece_length as u64 - 1;
+                let mut layer: Vec<u8> = pieces.iter().flat_map(|p| p.0).collect();
+                layer.extend(std::iter::repeat_n(pad.0, padded - piece_count).flatten());
+                for received in piece_count..=padded {
+                    let bytes = &layer[..received * 32];
+                    for step in [1usize, 3, 512] {
+                        let slices: Vec<&[u8]> = bytes.chunks(step * 32).collect();
+                        MerkleProofTable::verify_piece_layer_chunks(
+                            root,
+                            file_length,
+                            piece_length,
+                            &slices,
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("{piece_count} pieces, {received} received, step {step}: {e}")
+                        });
+                    }
+                    let mut tampered = bytes.to_vec();
+                    tampered[(piece_count - 1) * 32] ^= 1;
+                    assert!(matches!(
+                        MerkleProofTable::verify_piece_layer_chunks(
+                            root,
+                            file_length,
+                            piece_length,
+                            &[&tampered],
+                        ),
+                        Err(MerkleError::RootMismatch)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn piece_layer_chunks_must_each_be_whole_hashes() {
+        let piece_length = BLOCK_SIZE;
+        let pieces: Vec<Id32> = (0u8..4).map(|i| hash_block(&[i; 8])).collect();
+        let root = piece_layer_root(&pieces, 1);
+        let layer: Vec<u8> = pieces.iter().flat_map(|p| p.0).collect();
+        let (head, tail) = layer.split_at(48);
+        assert!(matches!(
+            MerkleProofTable::verify_piece_layer_chunks(
+                root,
+                4 * piece_length as u64,
+                piece_length,
+                &[head, tail],
+            ),
+            Err(MerkleError::LayerNotAligned)
+        ));
+        let (head, tail) = layer.split_at(64);
+        MerkleProofTable::verify_piece_layer_chunks(
+            root,
+            4 * piece_length as u64,
+            piece_length,
+            &[head, tail],
+        )
+        .expect("whole-hash chunks verify");
     }
 
     #[test]
@@ -944,13 +1190,8 @@ mod tests {
         let (_data, table) = synth_file(file_len, piece_len);
         let mut served = table.serve_full_piece_layer().unwrap();
         served[100] ^= 0x01;
-        let err = MerkleProofTable::verify_full_piece_layer_response(
-            table.file_root,
-            file_len,
-            piece_len,
-            &served,
-        )
-        .unwrap_err();
+        let err =
+            verify_piece_layer_response(table.file_root, file_len, piece_len, &served).unwrap_err();
         assert!(matches!(err, MerkleError::RootMismatch));
     }
 
@@ -1013,5 +1254,183 @@ mod tests {
         let (_data, table) = synth_file(8 * 1024, piece_len);
         assert_eq!(table.piece_layer_padded_len(), 0);
         assert!(table.serve_full_piece_layer().is_none());
+    }
+
+    fn v2_roots_for(data: &[u8], piece_length: u32) -> (Id32, Vec<u8>) {
+        let blocks_per_piece = piece_length / BLOCK_SIZE;
+        if data.len() as u64 <= piece_length as u64 {
+            let blocks: Vec<Id32> = data.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+            return (compute_root(&blocks), Vec::new());
+        }
+        let piece_roots: Vec<Id32> = data
+            .chunks(piece_length as usize)
+            .map(|piece| {
+                let mut hashes: Vec<Id32> =
+                    piece.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+                hashes.resize(blocks_per_piece as usize, Id32([0u8; 32]));
+                compute_root_padded(&hashes, hashes.len().next_power_of_two())
+            })
+            .collect();
+        let layer = piece_roots.iter().flat_map(|h| h.0).collect();
+        (piece_layer_root(&piece_roots, blocks_per_piece), layer)
+    }
+
+    fn hybrid_meta(v1_files: &[&[u8]], v2_files: &[&[u8]], include_layers: bool) -> TorrentMeta {
+        use crate::bencode::{encode_to_vec, Value};
+        let piece_len: u32 = 16 * 1024;
+        let mut stream = Vec::new();
+        let mut v1_entries = Vec::new();
+        for (i, data) in v1_files.iter().enumerate() {
+            v1_entries.push(Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(data.len() as i64)),
+                (
+                    b"path".to_vec(),
+                    Value::List(vec![Value::Bytes(format!("f{i}").into_bytes())]),
+                ),
+            ]));
+            stream.extend_from_slice(data);
+            let rem = stream.len() % piece_len as usize;
+            if i + 1 < v1_files.len() && rem != 0 {
+                let pad = piece_len as usize - rem;
+                v1_entries.push(Value::Dict(vec![
+                    (b"attr".to_vec(), Value::Bytes(b"p".to_vec())),
+                    (b"length".to_vec(), Value::Int(pad as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![
+                            Value::Bytes(b".pad".to_vec()),
+                            Value::Bytes(pad.to_string().into_bytes()),
+                        ]),
+                    ),
+                ]));
+                stream.resize(stream.len() + pad, 0);
+            }
+        }
+        let v1_pieces: Vec<u8> = stream
+            .chunks(piece_len as usize)
+            .flat_map(|piece| super::super::hash::sha1(piece).0)
+            .collect();
+        let mut tree = Vec::new();
+        let mut layers = Vec::new();
+        for (i, data) in v2_files.iter().enumerate() {
+            let (root, layer) = v2_roots_for(data, piece_len);
+            tree.push((
+                format!("f{i}").into_bytes(),
+                Value::Dict(vec![(
+                    Vec::new(),
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(data.len() as i64)),
+                        (b"pieces root".to_vec(), Value::Bytes(root.0.to_vec())),
+                    ]),
+                )]),
+            ));
+            if !layer.is_empty() {
+                layers.push((root.0.to_vec(), Value::Bytes(layer)));
+            }
+        }
+        layers.sort_by(|a, b| a.0.cmp(&b.0));
+        let info = Value::Dict(vec![
+            (b"file tree".to_vec(), Value::Dict(tree)),
+            (b"files".to_vec(), Value::List(v1_entries)),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(piece_len as i64)),
+            (b"pieces".to_vec(), Value::Bytes(v1_pieces)),
+        ]);
+        let mut top = vec![(b"info".to_vec(), info)];
+        if include_layers {
+            top.push((b"piece layers".to_vec(), Value::Dict(layers)));
+        }
+        super::super::metainfo::parse_torrent(&encode_to_vec(&Value::Dict(top))).unwrap()
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn hybrid_pieces_that_pass_sha1_but_not_v2_are_a_hash_conflict() {
+        let good = pattern(3 * 16 * 1024, 1);
+        let other = pattern(3 * 16 * 1024, 2);
+        let meta = hybrid_meta(&[&good], &[&other], true);
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        for (i, piece) in good.chunks(16 * 1024).enumerate() {
+            assert_eq!(
+                verifier.verify(i as u32, piece),
+                Err(VerifyError::InconsistentHashes),
+                "piece {i}"
+            );
+        }
+        for (i, piece) in other.chunks(16 * 1024).enumerate() {
+            assert_eq!(
+                verifier.verify(i as u32, piece),
+                Err(VerifyError::HashMismatch),
+                "piece {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_pieces_that_match_both_hash_formats_verify() {
+        let a = pattern(2 * 16 * 1024 + 5000, 3);
+        let b = pattern(16 * 1024 + 100, 4);
+        let meta = hybrid_meta(&[&a, &b], &[&a, &b], true);
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        let mut stream = a.clone();
+        stream.resize(3 * 16 * 1024, 0);
+        stream.extend_from_slice(&b);
+        for (i, piece) in stream.chunks(16 * 1024).enumerate() {
+            verifier.verify(i as u32, piece).unwrap();
+        }
+        let mut bad = stream[16 * 1024..2 * 16 * 1024].to_vec();
+        bad[0] ^= 1;
+        assert_eq!(verifier.verify(1, &bad), Err(VerifyError::HashMismatch));
+    }
+
+    #[test]
+    fn hybrid_serving_tables_share_the_verifiers_piece_hashes() {
+        let a = pattern(3 * 16 * 1024, 6);
+        let b = pattern(2 * 16 * 1024 + 7, 7);
+        let meta = hybrid_meta(&[&a, &b], &[&a, &b], true);
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        let PieceVerifier::Hybrid { tables, .. } = &verifier else {
+            panic!("expected a hybrid verifier");
+        };
+        let serving = verifier.serving_tables().expect("every layer is present");
+        assert_eq!(serving.len(), tables.len());
+        for (serving, own) in serving.iter().zip(tables.iter()) {
+            let own = own.as_ref().unwrap();
+            assert!(Arc::ptr_eq(
+                &serving.piece_root_hashes,
+                &own.piece_root_hashes
+            ));
+        }
+    }
+
+    #[test]
+    fn hybrid_with_a_missing_layer_serves_no_tables() {
+        let a = pattern(3 * 16 * 1024, 8);
+        let b = pattern(2 * 16 * 1024 + 7, 9);
+        let mut meta = hybrid_meta(&[&a, &b], &[&a, &b], true);
+        let first_root = meta.info_v2.as_ref().unwrap().files[0].pieces_root;
+        assert!(meta.piece_layers.remove(&first_root).is_some());
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        assert!(matches!(verifier, PieceVerifier::Hybrid { .. }));
+        assert!(verifier.serving_tables().is_none());
+    }
+
+    #[test]
+    fn hybrid_without_piece_layers_falls_back_to_sha1() {
+        let data = pattern(3 * 16 * 1024, 5);
+        let meta = hybrid_meta(&[&data], &[&data], false);
+        let verifier = PieceVerifier::from_meta(&meta).unwrap();
+        for (i, piece) in data.chunks(16 * 1024).enumerate() {
+            verifier.verify(i as u32, piece).unwrap();
+        }
+        let mut bad = data[..16 * 1024].to_vec();
+        bad[7] ^= 1;
+        assert_eq!(verifier.verify(0, &bad), Err(VerifyError::HashMismatch));
     }
 }

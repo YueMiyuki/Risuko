@@ -101,7 +101,7 @@ impl UtpHeader {
                     "truncated utp extension data",
                 ));
             }
-            if ext == EXT_SELECTIVE_ACK {
+            if ext == EXT_SELECTIVE_ACK && len >= 4 && len % 4 == 0 {
                 selective_ack = Some(buf[off..off + len].to_vec());
             }
             off += len;
@@ -181,6 +181,24 @@ mod tests {
         assert_eq!(bytes[HEADER_LEN + 1], 4);
         let (decoded, rest) = UtpHeader::decode(&bytes).unwrap();
         assert_eq!(decoded.selective_ack, h.selective_ack);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn malformed_selective_ack_lengths_are_ignored_but_the_packet_survives() {
+        let mut h = sample(PacketType::Data);
+        for (len, kept) in [(1, false), (3, false), (4, true), (5, false), (8, true)] {
+            h.selective_ack = Some(vec![0xFF; len]);
+            let bytes = h.encode(b"payload");
+            let (decoded, rest) = UtpHeader::decode(&bytes).unwrap();
+            assert_eq!(decoded.selective_ack.is_some(), kept, "length {len}");
+            assert_eq!(rest, b"payload", "length {len}");
+        }
+        let mut bytes = sample(PacketType::State).encode(&[]);
+        bytes[1] = EXT_SELECTIVE_ACK;
+        bytes.extend_from_slice(&[0, 0]);
+        let (decoded, rest) = UtpHeader::decode(&bytes).unwrap();
+        assert_eq!(decoded.selective_ack, None);
         assert!(rest.is_empty());
     }
 

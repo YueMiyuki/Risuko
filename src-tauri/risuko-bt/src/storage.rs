@@ -20,6 +20,28 @@ pub enum StorageError {
     OutOfRange { offset: u64, total: u64 },
 }
 
+#[cfg(unix)]
+fn executable_bits(mode: u32) -> u32 {
+    0o100 | ((mode & 0o040) >> 2) | ((mode & 0o004) >> 2)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if !meta.is_file() || mode & 0o111 != 0 {
+        return Ok(());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(
+        mode | executable_bits(mode),
+    ))
+}
+
 const MAX_OPEN_HANDLES: usize = 64;
 
 static HANDLE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -182,6 +204,46 @@ impl FilesystemStorage {
 
     pub fn layout(&self) -> &FileSet {
         &self.layout
+    }
+
+    pub(crate) async fn files_completed(&self, files: &[usize]) {
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .filter_map(|&idx| {
+                self.layout
+                    .files()
+                    .get(idx)
+                    .filter(|f| f.executable && f.length > 0 && !self.is_shadowed(idx))
+                    .map(|f| f.path.clone())
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        #[cfg(unix)]
+        let _ = task::spawn_blocking(move || {
+            for path in paths {
+                if let Err(e) = set_executable(&path) {
+                    tracing::debug!("could not mark {} executable: {e}", path.display());
+                }
+            }
+        })
+        .await;
+    }
+
+    pub(crate) async fn settle_promoted_files(&self, promoted: &[usize], file_progress: &[u64]) {
+        let complete: Vec<usize> = promoted
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                self.layout.files().get(idx).is_some_and(|file| {
+                    file_progress
+                        .get(idx)
+                        .is_some_and(|done| *done >= file.length)
+                })
+            })
+            .collect();
+        self.files_completed(&complete).await;
     }
 
     pub async fn has_existing_payload_files(&self) -> bool {
@@ -352,6 +414,8 @@ impl FilesystemStorage {
         {
             let path = f.path.clone();
             let target_len = f.length;
+            #[cfg(unix)]
+            let executable = f.executable;
             task::spawn_blocking(move || -> io::Result<()> {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -366,6 +430,12 @@ impl FilesystemStorage {
                 let current = file.metadata()?.len();
                 if current != target_len {
                     file.set_len(target_len)?;
+                }
+                #[cfg(unix)]
+                if executable && target_len == 0 {
+                    if let Err(e) = set_executable(&path) {
+                        tracing::debug!("could not mark {} executable: {e}", path.display());
+                    }
                 }
                 Ok(())
             })
@@ -816,6 +886,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_file_without_a_path_never_touches_the_torrent_root() {
+        use crate::core::metainfo::{TorrentMetaInfo, ValidatedTorrentMetaV1Info};
+        let info = ValidatedTorrentMetaV1Info {
+            name: "root".into(),
+            piece_length: 16 * 1024,
+            pieces: vec![0; 20],
+            private: false,
+            files: vec![
+                TorrentMetaInfo {
+                    path: Vec::new(),
+                    length: 0,
+                    padding: false,
+                    executable: false,
+                },
+                TorrentMetaInfo {
+                    path: vec!["x".into()],
+                    length: 1,
+                    padding: false,
+                    executable: false,
+                },
+            ],
+            single_file_mode: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        tokio::fs::write(&root, vec![7u8; 100]).await.unwrap();
+        let storage = FilesystemStorage::new(&info, &root);
+        let _ = storage.preallocate().await;
+        assert_eq!(tokio::fs::metadata(&root).await.unwrap().len(), 100);
+        assert!(storage.layout().files()[0].padding);
+    }
+
+    #[tokio::test]
     async fn round_trip_spanning_files() {
         let bytes = build_multi_file_torrent();
         let meta = parse_torrent(&bytes).unwrap();
@@ -1028,5 +1131,160 @@ mod tests {
         storage.write_at(0, &payload).await.unwrap();
         assert_eq!(storage.read_owned(5, 10).await.unwrap(), &payload[5..15]);
         assert!(storage.read_owned(25, 10).await.is_err());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn file_with_mode(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bits_follow_the_read_bits() {
+        assert_eq!(executable_bits(0o644), 0o111);
+        assert_eq!(executable_bits(0o600), 0o100);
+        assert_eq!(executable_bits(0o640), 0o110);
+        assert_eq!(executable_bits(0o604), 0o101);
+        assert_eq!(executable_bits(0o000), 0o100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_executable_adds_x_wherever_read_is_granted() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (before, after) in [
+            (0o644, 0o755),
+            (0o600, 0o700),
+            (0o640, 0o750),
+            (0o664, 0o775),
+            (0o400, 0o500),
+        ] {
+            let path = file_with_mode(tmp.path(), &format!("m{before:o}"), before);
+            set_executable(&path).unwrap();
+            assert_eq!(mode_of(&path), after, "from {before:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_executable_leaves_a_file_that_already_has_exec_bits_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = file_with_mode(tmp.path(), "tool", 0o754);
+        set_executable(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o754);
+        let owner_only = file_with_mode(tmp.path(), "mine", 0o710);
+        set_executable(&owner_only).unwrap();
+        assert_eq!(mode_of(&owner_only), 0o710);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_executable_never_follows_a_symlink_or_touches_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = file_with_mode(tmp.path(), "target", 0o644);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(set_executable(&link).is_err());
+        assert_eq!(mode_of(&target), 0o644);
+
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let before = mode_of(&dir);
+        set_executable(&dir).unwrap();
+        assert_eq!(mode_of(&dir), before);
+    }
+
+    #[cfg(unix)]
+    fn executable_fixture() -> (tempfile::TempDir, FilesystemStorage, PathBuf) {
+        use crate::bencode::{encode_to_vec, Value};
+        let file = |len: i64, name: &[u8], attr: Option<&[u8]>| {
+            let mut entry = Vec::new();
+            if let Some(attr) = attr {
+                entry.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            entry.push((b"length".to_vec(), Value::Int(len)));
+            entry.push((
+                b"path".to_vec(),
+                Value::List(vec![Value::Bytes(name.to_vec())]),
+            ));
+            Value::Dict(entry)
+        };
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![
+                    file(10, b"plain.txt", None),
+                    file(4, b"run.sh", Some(b"x")),
+                    file(0, b"empty.sh", Some(b"x")),
+                ]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16 * 1024)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 20])),
+        ]);
+        let meta =
+            parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        (tmp, FilesystemStorage::new(&meta.info, &root), root)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completing_an_x_file_sets_its_exec_bits_and_leaves_siblings_alone() {
+        let (_tmp, storage, root) = executable_fixture();
+        storage.preallocate().await.unwrap();
+        storage.write_at(0, &[7u8; 14]).await.unwrap();
+        storage.flush().await.unwrap();
+
+        storage.files_completed(&[0, 1]).await;
+        assert_ne!(mode_of(&root.join("run.sh")) & 0o111, 0);
+        assert_eq!(mode_of(&root.join("plain.txt")) & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preallocation_marks_empty_x_files_executable_at_creation() {
+        let (_tmp, storage, root) = executable_fixture();
+        storage.preallocate().await.unwrap();
+        assert_ne!(mode_of(&root.join("empty.sh")) & 0o111, 0);
+        assert_eq!(mode_of(&root.join("run.sh")) & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settling_only_touches_promoted_x_files_that_are_fully_downloaded() {
+        let (_tmp, storage, root) = executable_fixture();
+        storage.preallocate().await.unwrap();
+        let run = root.join("run.sh");
+
+        storage.settle_promoted_files(&[0, 1, 2], &[10, 3, 0]).await;
+        assert_eq!(mode_of(&run) & 0o111, 0, "run.sh is not fully downloaded");
+
+        storage.settle_promoted_files(&[0, 2], &[10, 4, 0]).await;
+        assert_eq!(mode_of(&run) & 0o111, 0, "run.sh was not promoted");
+
+        storage.settle_promoted_files(&[0, 1, 2], &[10, 4, 0]).await;
+        assert_ne!(mode_of(&run) & 0o111, 0);
+        assert_eq!(mode_of(&root.join("plain.txt")) & 0o111, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marking_a_missing_or_unknown_file_neither_panics_nor_creates_it() {
+        let (_tmp, storage, root) = executable_fixture();
+        storage.files_completed(&[1, 99]).await;
+        storage.settle_promoted_files(&[1, 99], &[10, 4]).await;
+        assert!(!root.join("run.sh").exists());
     }
 }

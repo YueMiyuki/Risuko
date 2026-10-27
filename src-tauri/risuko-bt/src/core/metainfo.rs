@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::super::bencode::Value;
@@ -22,6 +22,10 @@ pub enum MetaError {
     BadInfoV2(&'static str),
     #[error("metainfo: missing required piece layers for one or more files")]
     MissingPieceLayers,
+    #[error("metainfo: hybrid torrent v1 and v2 file lists describe different data")]
+    HybridMismatch,
+    #[error("metainfo: unsupported meta version {0}")]
+    UnsupportedMetaVersion(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +118,7 @@ pub struct TorrentMetaInfo {
     pub path: Vec<String>,
     pub length: u64,
     pub padding: bool,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +168,7 @@ pub struct TorrentMetaInfoV2 {
     pub path: Vec<String>,
     pub length: u64,
     pub pieces_root: Id32,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +177,7 @@ pub enum FileTreeNode {
     File {
         length: u64,
         pieces_root: Option<Id32>,
+        executable: bool,
     },
 }
 
@@ -194,6 +201,7 @@ pub fn parse_info_v2_from_bytes(
 ) -> Result<Option<ValidatedTorrentMetaV2Info>, MetaError> {
     let value = super::super::bencode::decode_all(info_bytes)?;
     value.as_dict().ok_or(MetaError::BadInfo("info not dict"))?;
+    check_meta_version(&value)?;
     let has_v2 = matches!(value.get(b"meta version").and_then(Value::as_int), Some(2))
         && value.get(b"file tree").is_some();
     if !has_v2 {
@@ -241,6 +249,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
     info_value
         .as_dict()
         .ok_or(MetaError::BadInfo("info not dict"))?;
+    check_meta_version(info_value)?;
 
     let has_v1 = info_value.get(b"pieces").is_some();
     let has_v2 = matches!(
@@ -290,16 +299,18 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, MetaError> {
     }
 
     let info_hash = sha1(info_raw);
-    let mut info = validate_info(info_value)?;
+    let mut info = validate_info_undeduped(info_value)?;
 
     let (info_v2, info_hash_v2) = if has_v2 {
         let v2 = validate_info_v2(info_value)?;
+        check_hybrid_layout(&info, info_value, &v2)?;
         info.private |= v2.private;
         let h = sha256(info_raw);
         (Some(v2), Some(h))
     } else {
         (None, None)
     };
+    dedupe_file_list(&mut info.files);
 
     let piece_layers = if has_v2 {
         parse_piece_layers(&value)?
@@ -437,6 +448,52 @@ fn get_str(value: &Value, key: &[u8]) -> Option<String> {
     value.get(key).and_then(|v| v.as_str().map(String::from))
 }
 
+const BITCOMET_PADDING_PREFIX: &str = "_____padding_file_";
+
+fn component_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace('\\', "_")
+}
+
+fn entry_path_list(entry: &Value) -> Option<&[Value]> {
+    let path = entry.get(b"path").and_then(Value::as_list)?;
+    Some(
+        entry
+            .get(b"path.utf-8")
+            .and_then(Value::as_list)
+            .filter(|l| l.len() == path.len() && l.iter().all(|c| c.as_str().is_some()))
+            .unwrap_or(path),
+    )
+}
+
+pub fn is_padding_entry(entry: &Value) -> bool {
+    entry
+        .get(b"attr")
+        .and_then(Value::as_bytes)
+        .is_some_and(|attr| attr.contains(&b'p'))
+        || entry_path_list(entry)
+            .and_then(|list| list.last())
+            .and_then(Value::as_bytes)
+            .is_some_and(|c| component_text(c).starts_with(BITCOMET_PADDING_PREFIX))
+}
+
+fn is_executable_entry(entry: &Value) -> bool {
+    entry
+        .get(b"attr")
+        .and_then(Value::as_bytes)
+        .is_some_and(|attr| attr.contains(&b'x') && !attr.contains(&b'l') && !attr.contains(&b'p'))
+}
+
+fn torrent_name(value: &Value) -> Option<String> {
+    text_with_utf8_alt(value, b"name.utf-8", b"name").map(|name| name.replace('\\', "_"))
+}
+
+fn check_meta_version(info: &Value) -> Result<(), MetaError> {
+    match info.get(b"meta version").and_then(Value::as_int) {
+        Some(version) if version > 2 => Err(MetaError::UnsupportedMetaVersion(version)),
+        _ => Ok(()),
+    }
+}
+
 const MAX_PIECES: u64 = 1 << 22;
 const MAX_PIECE_LENGTH: u32 = 256 * 1024 * 1024;
 
@@ -448,6 +505,12 @@ fn check_piece_count(total_len: u64, piece_length: u32) -> Result<(), MetaError>
         return Err(MetaError::BadInfo("too many pieces"));
     }
     Ok(())
+}
+
+pub(crate) fn info_private(info: &Value) -> bool {
+    info.get(b"private")
+        .and_then(Value::as_int)
+        .is_some_and(|n| n != 0)
 }
 
 pub(crate) fn is_safe_component(s: &str) -> bool {
@@ -513,7 +576,6 @@ fn numbered_name(name: &str, n: usize) -> String {
 }
 
 pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
-    use std::collections::HashSet;
     let skipped_at: Vec<bool> = (0..paths.len())
         .map(|i| skip.get(i).copied().unwrap_or(false) || paths[i].is_empty())
         .collect();
@@ -523,22 +585,26 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
         .map(|i| disk_path_key(&paths[i]))
         .collect();
     let mut seen: HashSet<String> = HashSet::with_capacity(taken.len());
+    let mut next_suffix: HashMap<String, usize> = HashMap::new();
     for (i, &is_skipped) in skipped_at.iter().enumerate() {
         if is_skipped {
             continue;
         }
         let key = disk_path_key(&paths[i]);
-        if seen.insert(key) {
+        if !seen.contains(&key) {
+            seen.insert(key);
             continue;
         }
         let Some(last) = paths[i].last().cloned() else {
             continue;
         };
-        for n in 1usize.. {
+        let next = next_suffix.entry(key).or_insert(1);
+        loop {
             let mut candidate = paths[i].clone();
             if let Some(slot) = candidate.last_mut() {
-                *slot = numbered_name(&last, n);
+                *slot = numbered_name(&last, *next);
             }
+            *next += 1;
             let ck = disk_path_key(&candidate);
             if taken.insert(ck.clone()) {
                 seen.insert(ck);
@@ -561,7 +627,7 @@ fn dedupe_file_list(files: &mut [TorrentMetaInfo]) {
     }
 }
 
-fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError> {
+fn validate_info_undeduped(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError> {
     value.as_dict().ok_or(MetaError::BadInfo("info not dict"))?;
 
     let piece_length = value
@@ -581,16 +647,12 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
         return Err(MetaError::BadPieces);
     }
 
-    let name = text_with_utf8_alt(value, b"name.utf-8", b"name")
-        .ok_or(MetaError::BadUtf8 { field: "name" })?;
+    let name = torrent_name(value).ok_or(MetaError::BadUtf8 { field: "name" })?;
     if !is_safe_component(&name) {
         return Err(MetaError::BadInfo("torrent name unsafe"));
     }
 
-    let private = value
-        .get(b"private")
-        .and_then(Value::as_int)
-        .is_some_and(|n| n != 0);
+    let private = info_private(value);
 
     let (files, single_file_mode) = if let Some(list) = value.get(b"files").and_then(Value::as_list)
     {
@@ -606,34 +668,34 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
             if length < 0 {
                 return Err(MetaError::BadInfo("file length negative"));
             }
-            let path_list = entry
-                .get(b"path")
-                .and_then(Value::as_list)
-                .ok_or(MetaError::BadInfo("file path missing"))?;
-            let path_list = entry
-                .get(b"path.utf-8")
-                .and_then(Value::as_list)
-                .filter(|l| l.len() == path_list.len() && l.iter().all(|c| c.as_str().is_some()))
-                .unwrap_or(path_list);
+            let padding = is_padding_entry(entry);
+            let path_list = match entry_path_list(entry) {
+                Some(list) => list,
+                None if padding => &[],
+                None => return Err(MetaError::BadInfo("file path missing")),
+            };
             let mut path_components = Vec::with_capacity(path_list.len());
             for c in path_list {
                 let s = c
                     .as_bytes()
-                    .map(String::from_utf8_lossy)
+                    .map(component_text)
                     .ok_or(MetaError::BadUtf8 { field: "file path" })?;
                 if !is_safe_component(&s) {
                     return Err(MetaError::BadInfo("file path component unsafe"));
                 }
-                path_components.push(s.into_owned());
+                path_components.push(s);
             }
-            let padding = entry
-                .get(b"attr")
-                .and_then(Value::as_bytes)
-                .is_some_and(|attr| attr.contains(&b'p'));
+            if path_components.is_empty() {
+                if !padding {
+                    return Err(MetaError::BadInfo("file path empty"));
+                }
+                path_components = vec![".pad".into(), length.to_string()];
+            }
             files.push(TorrentMetaInfo {
                 path: path_components,
                 length: length as u64,
                 padding,
+                executable: !padding && is_executable_entry(entry),
             });
         }
         (files, false)
@@ -650,13 +712,11 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
                 path: vec![name.clone()],
                 length: length as u64,
                 padding: false,
+                executable: is_executable_entry(value),
             }],
             true,
         )
     };
-
-    let mut files = files;
-    dedupe_file_list(&mut files);
 
     let mut total_len: u64 = 0;
     for f in &files {
@@ -682,12 +742,78 @@ fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError>
     })
 }
 
+fn collect_tree_files(node: &Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, u64)>) {
+    let Some(dict) = node.as_dict() else {
+        return;
+    };
+    if dict.len() == 1 && dict[0].0.is_empty() {
+        let length = dict[0]
+            .1
+            .get(b"length")
+            .and_then(Value::as_int)
+            .unwrap_or(0);
+        out.push((path.clone(), length.max(0) as u64));
+        return;
+    }
+    for (key, child) in dict {
+        path.push(component_text(key));
+        collect_tree_files(child, path, out);
+        path.pop();
+    }
+}
+
+fn check_hybrid_layout(
+    v1: &ValidatedTorrentMetaV1Info,
+    info_value: &Value,
+    v2: &ValidatedTorrentMetaV2Info,
+) -> Result<(), MetaError> {
+    let mut tree_files = Vec::new();
+    if let Some(tree) = info_value.get(b"file tree") {
+        collect_tree_files(tree, &mut Vec::new(), &mut tree_files);
+    }
+    let mut expected = tree_files.iter();
+    let mut v1_offset = 0u64;
+    let mut v2_offset = 0u64;
+    for file in &v1.files {
+        if !file.padding {
+            let Some((path, length)) = expected.next() else {
+                return Err(MetaError::HybridMismatch);
+            };
+            if file.path != *path || file.length != *length {
+                return Err(MetaError::HybridMismatch);
+            }
+            if file.length > 0 {
+                let start =
+                    v2_offset + v2_alignment_padding(v2_offset, file.length, v2.piece_length);
+                if v1_offset != start {
+                    return Err(MetaError::HybridMismatch);
+                }
+                v2_offset = start + file.length;
+            }
+        }
+        v1_offset += file.length;
+    }
+    if expected.next().is_some()
+        || v1_offset.div_ceil(v1.piece_length as u64) != v2_offset.div_ceil(v2.piece_length as u64)
+    {
+        return Err(MetaError::HybridMismatch);
+    }
+    Ok(())
+}
+
 fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTorrentMetaV1Info {
     let single_file_mode = v2.empty_files.is_empty()
         && v2.files.len() == 1
         && v2.files[0].path.len() == 1
         && v2.files[0].path[0] == v2.name;
 
+    let strip_name = |path: &[String]| {
+        if !single_file_mode && path.len() > 1 && path[0] == v2.name {
+            path[1..].to_vec()
+        } else {
+            path.to_vec()
+        }
+    };
     let mut files = Vec::with_capacity(v2.files.len());
     let mut offset = 0u64;
     for f in &v2.files {
@@ -697,31 +823,24 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
                 path: vec![".pad".into(), pad.to_string()],
                 length: pad,
                 padding: true,
+                executable: false,
             });
             offset += pad;
         }
-        let path = if !single_file_mode && f.path.first().is_some_and(|p| p == &v2.name) {
-            f.path[1..].to_vec()
-        } else {
-            f.path.clone()
-        };
         files.push(TorrentMetaInfo {
-            path,
+            path: strip_name(&f.path),
             length: f.length,
             padding: false,
+            executable: f.executable,
         });
         offset += f.length;
     }
     for path in &v2.empty_files {
-        let path = if !single_file_mode && path.first().is_some_and(|p| p == &v2.name) {
-            path[1..].to_vec()
-        } else {
-            path.clone()
-        };
         files.push(TorrentMetaInfo {
-            path,
+            path: strip_name(path),
             length: 0,
             padding: false,
+            executable: false,
         });
     }
     dedupe_file_list(&mut files);
@@ -779,8 +898,7 @@ fn validate_info_v2(value: &Value) -> Result<ValidatedTorrentMetaV2Info, MetaErr
         ));
     }
 
-    let name = text_with_utf8_alt(value, b"name.utf-8", b"name")
-        .ok_or(MetaError::BadUtf8 { field: "v2 name" })?;
+    let name = torrent_name(value).ok_or(MetaError::BadUtf8 { field: "v2 name" })?;
     if !is_safe_component(&name) {
         return Err(MetaError::BadInfoV2("v2 name unsafe"));
     }
@@ -790,6 +908,9 @@ fn validate_info_v2(value: &Value) -> Result<ValidatedTorrentMetaV2Info, MetaErr
         .ok_or(MetaError::BadInfoV2("file tree missing"))?;
 
     let file_tree = parse_file_tree(file_tree_value)?;
+    if matches!(file_tree, FileTreeNode::File { .. }) {
+        return Err(MetaError::BadInfoV2("file tree root is a file"));
+    }
     let mut files = Vec::new();
     let mut empty_files = Vec::new();
     flatten_file_tree(&file_tree, &mut Vec::new(), &mut files, &mut empty_files)?;
@@ -808,11 +929,7 @@ fn validate_info_v2(value: &Value) -> Result<ValidatedTorrentMetaV2Info, MetaErr
         return Err(MetaError::BadInfoV2("too many pieces"));
     }
 
-    let private = value
-        .get(b"private")
-        .and_then(Value::as_int)
-        .map(|i| i != 0)
-        .unwrap_or(false);
+    let private = info_private(value);
 
     Ok(ValidatedTorrentMetaV2Info {
         name,
@@ -853,22 +970,26 @@ fn parse_file_tree(value: &Value) -> Result<FileTreeNode, MetaError> {
         return Ok(FileTreeNode::File {
             length: length as u64,
             pieces_root,
+            executable: is_executable_entry(leaf),
         });
     }
 
     let mut children: Vec<(String, FileTreeNode)> = Vec::with_capacity(dict.len());
-    let mut used = std::collections::HashSet::<String>::with_capacity(dict.len());
+    let mut used = HashSet::<String>::with_capacity(dict.len());
+    let mut suffixes = HashMap::<String, usize>::new();
     for (k, v) in dict {
-        let name = String::from_utf8_lossy(k).into_owned();
+        let name = component_text(k);
         if !is_safe_component(&name) {
             return Err(MetaError::BadInfoV2("file tree key unsafe"));
         }
         let mut name = name;
-        let base = name.clone();
-        let mut n = 0usize;
-        while used.contains(&name) {
-            n += 1;
-            name = numbered_name(&base, n);
+        if used.contains(&name) {
+            let base = name.clone();
+            let next = suffixes.entry(base.clone()).or_insert(0usize);
+            while used.contains(&name) {
+                *next += 1;
+                name = numbered_name(&base, *next);
+            }
         }
         used.insert(name.clone());
         children.push((name, parse_file_tree(v)?));
@@ -894,6 +1015,7 @@ fn flatten_file_tree(
         FileTreeNode::File {
             length,
             pieces_root,
+            executable,
         } => {
             if *length == 0 {
                 empty.push(path.clone());
@@ -905,6 +1027,7 @@ fn flatten_file_tree(
                 path: path.clone(),
                 length: *length,
                 pieces_root: root,
+                executable: *executable,
             });
             Ok(())
         }
@@ -938,6 +1061,12 @@ fn parse_piece_layers(top: &Value) -> Result<std::collections::BTreeMap<Id32, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError> {
+        let mut info = validate_info_undeduped(value)?;
+        dedupe_file_list(&mut info.files);
+        Ok(info)
+    }
 
     fn synth_single_file(name: &str, piece_len: u32, data_len: u64) -> Vec<u8> {
         let piece_count = data_len.div_ceil(piece_len as u64);
@@ -1312,6 +1441,7 @@ mod tests {
                 path: vec![i.to_string()],
                 length: 1,
                 pieces_root: Id32([1u8; 32]),
+                executable: false,
             })
             .collect();
         let v2 = ValidatedTorrentMetaV2Info {
@@ -1386,6 +1516,17 @@ mod tests {
         files.iter().map(|f| f.path.join("/")).collect()
     }
 
+    fn v1_info_bytes(files: Vec<Value>, total: u64) -> Vec<u8> {
+        let pieces = vec![0u8; (total.div_ceil(16384) * 20) as usize];
+        let info = Value::Dict(vec![
+            (b"files".to_vec(), Value::List(files)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+            (b"pieces".to_vec(), Value::Bytes(pieces)),
+        ]);
+        super::super::super::bencode::encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
+    }
+
     fn v1_multi(entries: &[(&[&[u8]], u64, bool)]) -> Vec<u8> {
         let total: u64 = entries.iter().map(|e| e.1).sum();
         let files = entries
@@ -1404,14 +1545,7 @@ mod tests {
                 Value::Dict(d)
             })
             .collect();
-        let pieces = vec![0u8; (total.div_ceil(16384) * 20) as usize];
-        let info = Value::Dict(vec![
-            (b"files".to_vec(), Value::List(files)),
-            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
-            (b"piece length".to_vec(), Value::Int(16384)),
-            (b"pieces".to_vec(), Value::Bytes(pieces)),
-        ]);
-        super::super::super::bencode::encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
+        v1_info_bytes(files, total)
     }
 
     #[test]
@@ -1521,30 +1655,520 @@ mod tests {
         assert_eq!(shown, ["a\u{fffd}.txt", "a\u{fffd} (1).txt"]);
     }
 
-    #[test]
-    fn hybrid_uses_the_deduped_v1_layout() {
-        let mut v1 = parse_torrent(&v1_multi(&[
-            (&[b"x\xfe"], 100, false),
-            (&[b"x\xff"], 100, false),
-        ]))
-        .unwrap();
-        let top = crate::bencode::decode_all(&v1.info_bytes).unwrap();
-        let mut dict = top.as_dict().unwrap().to_vec();
+    fn hybrid_bytes(v1: &[u8], tree: Vec<(&[u8], Value)>) -> Vec<u8> {
+        let top = crate::bencode::decode_all(v1).unwrap();
+        let info = top.get(b"info").unwrap();
+        let mut dict = info.as_dict().unwrap().to_vec();
         dict.push((b"meta version".to_vec(), Value::Int(2)));
-        dict.push((
-            b"file tree".to_vec(),
-            Value::Dict(vec![(
-                b"root".to_vec(),
-                Value::Dict(vec![
-                    (b"p".to_vec(), v2_leaf(100)),
-                    (b"q".to_vec(), v2_leaf(100)),
-                ]),
-            )]),
-        ));
+        let mut tree: Vec<(Vec<u8>, Value)> =
+            tree.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        tree.sort_by(|a, b| a.0.cmp(&b.0));
+        dict.push((b"file tree".to_vec(), Value::Dict(tree)));
         dict.sort_by(|a, b| a.0.cmp(&b.0));
         let outer = Value::Dict(vec![(b"info".to_vec(), Value::Dict(dict))]);
-        v1 = parse_torrent(&super::super::super::bencode::encode_to_vec(&outer)).unwrap();
-        assert!(matches!(v1.meta_version, MetaVersion::Hybrid));
-        assert_eq!(names(&v1.info.files), ["x\u{fffd}", "x\u{fffd} (1)"]);
+        super::super::super::bencode::encode_to_vec(&outer)
+    }
+
+    #[test]
+    fn hybrid_uses_the_deduped_v1_layout() {
+        let v1 = v1_multi(&[
+            (&[b"x\xfe"], 100, false),
+            (&[b".pad", b"16284"], 16284, true),
+            (&[b"x\xff"], 100, false),
+        ]);
+        let bytes = hybrid_bytes(
+            &v1,
+            vec![(b"x\xfe", v2_leaf(100)), (b"x\xff", v2_leaf(100))],
+        );
+        let meta = parse_torrent(&bytes).unwrap();
+        assert!(matches!(meta.meta_version, MetaVersion::Hybrid));
+        assert_eq!(
+            names(&meta.info.files),
+            ["x\u{fffd}", ".pad/16284", "x\u{fffd} (1)"]
+        );
+    }
+
+    #[test]
+    fn hybrid_with_different_v1_and_v2_files_is_rejected() {
+        let v1 = v1_multi(&[(&[b"a"], 100, false)]);
+        let bytes = hybrid_bytes(&v1, vec![(b"b", v2_leaf(200))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_with_different_file_lengths_is_rejected() {
+        let v1 = v1_multi(&[(&[b"a"], 100, false)]);
+        let bytes = hybrid_bytes(&v1, vec![(b"a", v2_leaf(101))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_with_extra_v2_file_is_rejected() {
+        let v1 = v1_multi(&[(&[b"a"], 100, false)]);
+        let bytes = hybrid_bytes(&v1, vec![(b"a", v2_leaf(100)), (b"b", v2_leaf(100))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_with_reordered_v1_files_is_rejected() {
+        let v1 = v1_multi(&[
+            (&[b"b"], 100, false),
+            (&[b".pad", b"16284"], 16284, true),
+            (&[b"a"], 100, false),
+        ]);
+        let bytes = hybrid_bytes(&v1, vec![(b"a", v2_leaf(100)), (b"b", v2_leaf(100))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_without_v1_padding_to_piece_boundaries_is_rejected() {
+        let v1 = v1_multi(&[(&[b"a"], 100, false), (&[b"b"], 100, false)]);
+        let bytes = hybrid_bytes(&v1, vec![(b"a", v2_leaf(100)), (b"b", v2_leaf(100))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_with_wrong_pad_length_is_rejected() {
+        let v1 = v1_multi(&[
+            (&[b"a"], 100, false),
+            (&[b".pad", b"16385"], 16385, true),
+            (&[b"b"], 100, false),
+        ]);
+        let bytes = hybrid_bytes(&v1, vec![(b"a", v2_leaf(100)), (b"b", v2_leaf(100))]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::HybridMismatch)
+        ));
+    }
+
+    #[test]
+    fn hybrid_with_matching_padded_files_and_empty_file_is_accepted() {
+        let v1 = v1_multi(&[
+            (&[b"a"], 100, false),
+            (&[b".pad", b"16284"], 16284, true),
+            (&[b"b"], 100, false),
+            (&[b"z"], 0, false),
+        ]);
+        let empty = Value::Dict(vec![(
+            b"".to_vec(),
+            Value::Dict(vec![(b"length".to_vec(), Value::Int(0))]),
+        )]);
+        let bytes = hybrid_bytes(
+            &v1,
+            vec![(b"a", v2_leaf(100)), (b"b", v2_leaf(100)), (b"z", empty)],
+        );
+        let meta = parse_torrent(&bytes).unwrap();
+        assert!(matches!(meta.meta_version, MetaVersion::Hybrid));
+    }
+
+    #[test]
+    fn hybrid_with_nested_directories_in_both_views_is_accepted() {
+        let v1 = v1_multi(&[
+            (&[b"d", b"a"], 100, false),
+            (&[b".pad", b"16284"], 16284, true),
+            (&[b"d", b"b"], 100, false),
+        ]);
+        let dir = Value::Dict(vec![
+            (b"a".to_vec(), v2_leaf(100)),
+            (b"b".to_vec(), v2_leaf(100)),
+        ]);
+        let bytes = hybrid_bytes(&v1, vec![(b"d", dir)]);
+        assert!(parse_torrent(&bytes).is_ok());
+    }
+
+    #[test]
+    fn hybrid_with_case_only_names_parses_on_every_platform() {
+        let v1 = v1_multi(&[
+            (&[b"A.txt"], 100, false),
+            (&[b".pad", b"16284"], 16284, true),
+            (&[b"a.txt"], 100, false),
+        ]);
+        let bytes = hybrid_bytes(
+            &v1,
+            vec![(b"A.txt", v2_leaf(100)), (b"a.txt", v2_leaf(100))],
+        );
+        assert!(parse_torrent(&bytes).is_ok());
+    }
+
+    #[test]
+    fn empty_path_list_in_a_multi_file_torrent_is_rejected() {
+        let bytes = v1_multi(&[(&[], 5, false), (&[b"a"], 5, false)]);
+        assert!(matches!(
+            parse_torrent(&bytes),
+            Err(MetaError::BadInfo("file path empty"))
+        ));
+    }
+
+    #[test]
+    fn padding_entry_without_a_path_is_accepted() {
+        let pad = Value::Dict(vec![
+            (b"attr".to_vec(), Value::Bytes(b"p".to_vec())),
+            (b"length".to_vec(), Value::Int(16284)),
+        ]);
+        let real = |name: &[u8]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(100)),
+                (
+                    b"path".to_vec(),
+                    Value::List(vec![Value::Bytes(name.to_vec())]),
+                ),
+            ])
+        };
+        let bytes = v1_info_bytes(vec![real(b"a"), pad, real(b"b")], 16484);
+        let meta = parse_torrent(&bytes).unwrap();
+        let flags: Vec<bool> = meta.info.files.iter().map(|f| f.padding).collect();
+        assert_eq!(flags, [false, true, false]);
+        assert!(!meta.info.files[1].path.is_empty());
+    }
+
+    #[test]
+    fn padding_entry_with_an_empty_path_list_is_accepted() {
+        let bytes = v1_multi(&[
+            (&[b"a"], 100, false),
+            (&[], 16284, true),
+            (&[b"b"], 100, false),
+        ]);
+        let meta = parse_torrent(&bytes).unwrap();
+        assert!(meta.info.files[1].padding);
+        assert!(!meta.info.files[1].path.is_empty());
+    }
+
+    #[test]
+    fn bitcomet_padding_names_without_attr_are_padding() {
+        let bytes = v1_multi(&[
+            (&[b"a"], 100, false),
+            (&[b"_____padding_file_0_pad"], 16284, false),
+            (&[b"d", b"_____padding_file_1"], 10, false),
+            (&[b"_____padding_file"], 10, false),
+        ]);
+        let meta = parse_torrent(&bytes).unwrap();
+        let flags: Vec<bool> = meta.info.files.iter().map(|f| f.padding).collect();
+        assert_eq!(flags, [false, true, true, false]);
+    }
+
+    #[test]
+    fn is_padding_entry_agrees_with_the_parsed_flags() {
+        let entry = |attr: Option<&[u8]>, path: &[u8], utf8: Option<&[u8]>| {
+            let mut dict = Vec::new();
+            if let Some(attr) = attr {
+                dict.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            dict.push((b"length".to_vec(), Value::Int(10)));
+            dict.push((
+                b"path".to_vec(),
+                Value::List(vec![Value::Bytes(path.to_vec())]),
+            ));
+            if let Some(utf8) = utf8 {
+                dict.push((
+                    b"path.utf-8".to_vec(),
+                    Value::List(vec![Value::Bytes(utf8.to_vec())]),
+                ));
+            }
+            Value::Dict(dict)
+        };
+        let entries = vec![
+            entry(None, b"a", None),
+            entry(Some(b"p"), b"a", None),
+            entry(None, b"_____padding_file_0", None),
+            entry(None, b"_____padding_file_1", Some(b"b")),
+            entry(None, b"b", Some(b"_____padding_file_2")),
+        ];
+        let expected: Vec<bool> = entries.iter().map(is_padding_entry).collect();
+        assert_eq!(expected, [false, true, true, false, true]);
+        let bytes = v1_info_bytes(entries, 50);
+        let meta = parse_torrent(&bytes).unwrap();
+        let flags: Vec<bool> = meta.info.files.iter().map(|f| f.padding).collect();
+        assert_eq!(flags, expected);
+    }
+
+    fn attr_entry(attr: Option<&[u8]>, name: &[u8]) -> Value {
+        let mut dict = Vec::new();
+        if let Some(attr) = attr {
+            dict.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+        }
+        dict.push((b"length".to_vec(), Value::Int(10)));
+        dict.push((
+            b"path".to_vec(),
+            Value::List(vec![Value::Bytes(name.to_vec())]),
+        ));
+        Value::Dict(dict)
+    }
+
+    #[test]
+    fn the_executable_attribute_marks_only_regular_non_padding_files() {
+        let entries = vec![
+            attr_entry(None, b"plain"),
+            attr_entry(Some(b"x"), b"exec"),
+            attr_entry(Some(b"hx"), b"hidden-exec"),
+            attr_entry(Some(b"xl"), b"link"),
+            attr_entry(Some(b"px"), b"pad"),
+            attr_entry(Some(b"h"), b"hidden"),
+            attr_entry(Some(b"?"), b"unknown"),
+        ];
+        let meta = parse_torrent(&v1_info_bytes(entries, 70)).unwrap();
+        let flags: Vec<bool> = meta.info.files.iter().map(|f| f.executable).collect();
+        assert_eq!(flags, [false, true, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn a_single_file_torrent_takes_its_attribute_from_the_info_dict() {
+        let single = |attr: Option<&[u8]>| {
+            let mut info = Vec::new();
+            if let Some(attr) = attr {
+                info.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            info.push((b"length".to_vec(), Value::Int(10)));
+            info.push((b"name".to_vec(), Value::Bytes(b"tool".to_vec())));
+            info.push((b"piece length".to_vec(), Value::Int(16384)));
+            info.push((b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])));
+            let top = Value::Dict(vec![(b"info".to_vec(), Value::Dict(info))]);
+            parse_torrent(&super::super::super::bencode::encode_to_vec(&top)).unwrap()
+        };
+        assert!(single(Some(b"x")).info.files[0].executable);
+        assert!(!single(Some(b"h")).info.files[0].executable);
+        assert!(!single(None).info.files[0].executable);
+    }
+
+    #[test]
+    fn v2_file_tree_leaves_carry_the_executable_attribute() {
+        let leaf = |attr: Option<&[u8]>| {
+            let mut inner = Vec::new();
+            if let Some(attr) = attr {
+                inner.push((b"attr".to_vec(), Value::Bytes(attr.to_vec())));
+            }
+            inner.push((b"length".to_vec(), Value::Int(10)));
+            inner.push((b"pieces root".to_vec(), Value::Bytes(vec![7u8; 32])));
+            Value::Dict(vec![(b"".to_vec(), Value::Dict(inner))])
+        };
+        let bytes = v2_info_bytes(
+            b"root",
+            vec![
+                (b"a", leaf(Some(b"x"))),
+                (b"b", leaf(None)),
+                (b"c", leaf(Some(b"xl"))),
+            ],
+        );
+        let meta = parse_torrent(&bytes).unwrap();
+        let v2: Vec<(String, bool)> = meta
+            .info_v2
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| (f.path.join("/"), f.executable))
+            .collect();
+        assert_eq!(
+            v2,
+            [
+                ("a".to_string(), true),
+                ("b".to_string(), false),
+                ("c".to_string(), false)
+            ]
+        );
+        let facade: Vec<(String, bool)> = meta
+            .info
+            .files
+            .iter()
+            .filter(|f| !f.padding)
+            .map(|f| (f.path.join("/"), f.executable))
+            .collect();
+        assert_eq!(facade, v2);
+    }
+
+    fn v2_info_bytes(name: &[u8], tree: Vec<(&[u8], Value)>) -> Vec<u8> {
+        let mut tree: Vec<(Vec<u8>, Value)> =
+            tree.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        tree.sort_by(|a, b| a.0.cmp(&b.0));
+        let info = Value::Dict(vec![
+            (b"file tree".to_vec(), Value::Dict(tree)),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(name.to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]);
+        super::super::super::bencode::encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
+    }
+
+    #[test]
+    fn v2_file_tree_root_that_is_a_file_is_rejected() {
+        let info = Value::Dict(vec![
+            (b"file tree".to_vec(), v2_leaf(10)),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]);
+        assert!(validate_info_v2(&info).is_err());
+        let bytes = super::super::super::bencode::encode_to_vec(&Value::Dict(vec![(
+            b"info".to_vec(),
+            info,
+        )]));
+        assert!(parse_torrent(&bytes).is_err());
+    }
+
+    #[test]
+    fn pure_v2_file_named_like_the_torrent_keeps_a_non_empty_path() {
+        let bytes = v2_info_bytes(b"x", vec![(b"x", v2_leaf(10)), (b"y", v2_leaf(10))]);
+        let meta = parse_torrent(&bytes).unwrap();
+        let shown: Vec<String> = meta
+            .info
+            .iter_file_details()
+            .filter(|d| !d.padding)
+            .map(|d| d.filename)
+            .collect();
+        assert_eq!(shown, ["x", "y"]);
+    }
+
+    #[test]
+    fn pure_v2_empty_file_named_like_the_torrent_keeps_a_non_empty_path() {
+        let empty = Value::Dict(vec![(
+            b"".to_vec(),
+            Value::Dict(vec![(b"length".to_vec(), Value::Int(0))]),
+        )]);
+        let bytes = v2_info_bytes(b"x", vec![(b"x", empty), (b"y", v2_leaf(10))]);
+        let meta = parse_torrent(&bytes).unwrap();
+        assert!(meta.info.files.iter().all(|f| !f.path.is_empty()));
+    }
+
+    #[test]
+    fn pure_v2_tree_that_repeats_the_torrent_name_is_not_nested_twice() {
+        let dir = Value::Dict(vec![
+            (b"a".to_vec(), v2_leaf(10)),
+            (b"b".to_vec(), v2_leaf(10)),
+        ]);
+        let bytes = v2_info_bytes(b"root", vec![(b"root", dir)]);
+        let meta = parse_torrent(&bytes).unwrap();
+        let shown: Vec<String> = meta
+            .info
+            .iter_file_details()
+            .filter(|d| !d.padding)
+            .map(|d| d.filename)
+            .collect();
+        assert_eq!(shown, ["a", "b"]);
+    }
+
+    #[test]
+    fn meta_version_above_two_is_reported_as_unsupported() {
+        for with_pieces in [false, true] {
+            let mut info = vec![
+                (
+                    b"file tree".to_vec(),
+                    Value::Dict(vec![(b"a".to_vec(), v2_leaf(10))]),
+                ),
+                (b"length".to_vec(), Value::Int(10)),
+                (b"meta version".to_vec(), Value::Int(3)),
+                (b"name".to_vec(), Value::Bytes(b"a".to_vec())),
+                (b"piece length".to_vec(), Value::Int(16384)),
+            ];
+            if with_pieces {
+                info.push((b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])));
+            }
+            let bytes = super::super::super::bencode::encode_to_vec(&Value::Dict(vec![(
+                b"info".to_vec(),
+                Value::Dict(info.clone()),
+            )]));
+            assert!(
+                matches!(
+                    parse_torrent(&bytes),
+                    Err(MetaError::UnsupportedMetaVersion(3))
+                ),
+                "with_pieces={with_pieces}"
+            );
+            let info_bytes = super::super::super::bencode::encode_to_vec(&Value::Dict(info));
+            assert!(matches!(
+                parse_info_v2_from_bytes(&info_bytes),
+                Err(MetaError::UnsupportedMetaVersion(3))
+            ));
+        }
+    }
+
+    #[test]
+    fn backslashes_in_names_and_path_components_are_replaced() {
+        let multi = v1_multi(&[(&[b"dir\\file.txt"], 100, false)]);
+        let meta = parse_torrent(&multi).unwrap();
+        assert_eq!(names(&meta.info.files), ["dir_file.txt"]);
+
+        let single = synth_single_file("a\\b.bin", 16 * 1024, 100);
+        let meta = parse_torrent(&single).unwrap();
+        assert_eq!(meta.info.name, "a_b.bin");
+        assert_eq!(names(&meta.info.files), ["a_b.bin"]);
+
+        let bytes = v2_info_bytes(b"root", vec![(b"x\\y", v2_leaf(10))]);
+        let meta = parse_torrent(&bytes).unwrap();
+        assert_eq!(names(&meta.info.files), ["x_y"]);
+    }
+
+    #[test]
+    fn backslash_replacement_keeps_hybrid_views_comparable() {
+        let v1 = v1_multi(&[(&[b"d\\a"], 100, false)]);
+        let bytes = hybrid_bytes(&v1, vec![(b"d\\a", v2_leaf(100))]);
+        let meta = parse_torrent(&bytes).unwrap();
+        assert_eq!(names(&meta.info.files), ["d_a"]);
+    }
+
+    #[test]
+    fn dedupe_handles_many_identical_paths_in_linear_time() {
+        let count = 10_000;
+        let mut paths = vec![vec!["a".to_string()]; count];
+        let started = std::time::Instant::now();
+        dedupe_paths(&mut paths, &[]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let unique: HashSet<String> = paths.iter().map(|p| p.join("/")).collect();
+        assert_eq!(unique.len(), count);
+        assert_eq!(paths[0], ["a"]);
+        assert_eq!(paths[1], ["a (1)"]);
+        assert_eq!(paths[count - 1], [format!("a ({})", count - 1)]);
+    }
+
+    #[test]
+    fn dedupe_skips_preexisting_numbered_names_without_rescanning() {
+        let count = 5_000;
+        let mut paths: Vec<Vec<String>> = (1..=count).map(|n| vec![format!("a ({n})")]).collect();
+        paths.push(vec!["a".to_string()]);
+        paths.extend((0..count).map(|_| vec!["a".to_string()]));
+        let started = std::time::Instant::now();
+        dedupe_paths(&mut paths, &[]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let unique: HashSet<String> = paths.iter().map(|p| p.join("/")).collect();
+        assert_eq!(unique.len(), paths.len());
+    }
+
+    #[test]
+    fn v2_tree_with_many_lossy_colliding_keys_parses_in_linear_time() {
+        let count = 10_000usize;
+        let tree: Vec<(Vec<u8>, Value)> = (0..count)
+            .map(|i| {
+                let key = vec![
+                    0x80 + ((i >> 12) & 63) as u8,
+                    0x80 + ((i >> 6) & 63) as u8,
+                    0x80 + (i & 63) as u8,
+                ];
+                (key, v2_leaf(1))
+            })
+            .collect();
+        let info = Value::Dict(vec![
+            (b"file tree".to_vec(), Value::Dict(tree)),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]);
+        let started = std::time::Instant::now();
+        let v2 = validate_info_v2(&info).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let unique: HashSet<String> = v2.files.iter().map(|f| f.path.join("/")).collect();
+        assert_eq!(unique.len(), count);
     }
 }

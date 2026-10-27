@@ -6,6 +6,7 @@ use super::speed_limiter::parse_speed_limit;
 pub const DEFAULT_ED2K_PORT: u16 = 4662;
 pub const DEFAULT_ED2K_KAD_PORT: u16 = 4672;
 pub const DEFAULT_PBH_LISTEN_PORT: u16 = 16801;
+const MAX_LISTEN_PORT_CANDIDATES: usize = 256;
 pub(crate) const TASK_P2P_PROXY_OVERRIDE_KEY: &str = "risuko-task-p2p-proxy-override";
 
 fn is_reserved_engine_key(key: &str) -> bool {
@@ -364,8 +365,40 @@ impl EngineOptions {
         }
     }
 
-    pub fn bt_listen_port(&self) -> Option<u16> {
-        let raw = match self.global.get("listen-port")? {
+    pub fn bt_listen_ports(&self) -> Vec<u16> {
+        let raw = match self.global.get("listen-port") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            _ => return Vec::new(),
+        };
+        let mut ports = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            let bounds = match part.split_once('-') {
+                Some((lo, hi)) => lo
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .zip(hi.trim().parse::<u16>().ok()),
+                None => part.parse::<u16>().ok().map(|port| (port, port)),
+            };
+            let Some((lo, hi)) = bounds else {
+                continue;
+            };
+            for port in lo.max(1)..=hi {
+                if ports.len() >= MAX_LISTEN_PORT_CANDIDATES {
+                    return ports;
+                }
+                if !ports.contains(&port) {
+                    ports.push(port);
+                }
+            }
+        }
+        ports
+    }
+
+    pub fn dht_listen_port(&self) -> Option<u16> {
+        let raw = match self.global.get("dht-listen-port")? {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.clone(),
             _ => return None,
@@ -1394,17 +1427,44 @@ mod tests {
     }
 
     #[test]
-    fn bt_listen_port_parses_numbers_and_ranges() {
-        let port = |v: Value| {
+    fn bt_listen_ports_expand_numbers_ranges_and_lists() {
+        let ports = |v: Value| {
             let mut sys = Map::new();
             sys.insert("listen-port".into(), v);
-            EngineOptions::from_config(&sys, &Map::new()).bt_listen_port()
+            EngineOptions::from_config(&sys, &Map::new()).bt_listen_ports()
         };
-        assert_eq!(port(json!(21301)), Some(21301));
-        assert_eq!(port(json!("6881-6999")), Some(6881));
-        assert_eq!(port(json!("6881,6890")), Some(6881));
-        assert_eq!(port(json!("0")), None);
-        assert_eq!(port(json!("junk")), None);
+        assert_eq!(ports(json!(21301)), vec![21301]);
+        assert_eq!(ports(json!("6881-6883")), vec![6881, 6882, 6883]);
+        assert_eq!(ports(json!("6881,6890")), vec![6881, 6890]);
+        assert_eq!(
+            ports(json!("6881-6882, 6890,6882,6891-6890")),
+            vec![6881, 6882, 6890]
+        );
+        assert_eq!(ports(json!("65534-65535")), vec![65534, 65535]);
+        assert_eq!(ports(json!("1-65535")).len(), MAX_LISTEN_PORT_CANDIDATES);
+        assert!(ports(json!("0")).is_empty());
+        assert!(ports(json!("junk")).is_empty());
+        assert!(ports(json!("70000")).is_empty());
+        assert!(EngineOptions::from_config(&Map::new(), &Map::new())
+            .bt_listen_ports()
+            .is_empty());
+    }
+
+    #[test]
+    fn dht_listen_port_parses_numbers_and_rejects_invalid_values() {
+        let port = |v: Option<Value>| {
+            let mut sys = Map::new();
+            if let Some(v) = v {
+                sys.insert("dht-listen-port".into(), v);
+            }
+            EngineOptions::from_config(&sys, &Map::new()).dht_listen_port()
+        };
+        assert_eq!(port(Some(json!(26701))), Some(26701));
+        assert_eq!(port(Some(json!("26702"))), Some(26702));
+        assert_eq!(port(Some(json!(0))), None);
+        assert_eq!(port(Some(json!(70000))), None);
+        assert_eq!(port(Some(json!("junk"))), None);
+        assert_eq!(port(None), None);
     }
 
     #[test]

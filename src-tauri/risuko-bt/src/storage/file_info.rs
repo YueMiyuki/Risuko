@@ -8,6 +8,7 @@ pub struct FileInfo {
     pub length: u64,
     pub offset: u64,
     pub padding: bool,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +39,8 @@ impl FileSet {
                     path,
                     length: f.length,
                     offset,
-                    padding: f.padding,
+                    padding: f.padding || f.path.is_empty(),
+                    executable: f.executable && !f.padding && !f.path.is_empty(),
                 };
                 offset += f.length;
                 info
@@ -56,6 +58,14 @@ impl FileSet {
 
     pub fn total_length(&self) -> u64 {
         self.total_length
+    }
+
+    pub(crate) fn padding_ranges(&self) -> Vec<(u64, u64)> {
+        self.files
+            .iter()
+            .filter(|f| f.padding && f.length > 0)
+            .map(|f| (f.offset, f.offset + f.length))
+            .collect()
     }
 
     pub fn spans_for(&self, offset: u64, len: u64) -> SpansIter<'_> {
@@ -135,16 +145,19 @@ mod tests {
                     path: vec!["a".into()],
                     length: 10,
                     padding: false,
+                    executable: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["b".into()],
                     length: 20,
                     padding: false,
+                    executable: false,
                 },
                 TorrentMetaInfo {
                     path: vec!["c".into()],
                     length: 5,
                     padding: false,
+                    executable: false,
                 },
             ],
             single_file_mode: false,
@@ -182,5 +195,47 @@ mod tests {
         assert_eq!(spans[0].file_index, 1);
         assert_eq!(spans[0].file_offset, 2);
         assert_eq!(spans[0].len, 3);
+    }
+
+    #[test]
+    fn padding_ranges_list_only_non_empty_padding_files() {
+        let mut info = fixture();
+        info.files[1].padding = true;
+        info.files.push(TorrentMetaInfo {
+            path: vec![".pad".into(), "0".into()],
+            length: 0,
+            padding: true,
+            executable: false,
+        });
+        info.files.push(TorrentMetaInfo {
+            path: vec![".pad".into(), "7".into()],
+            length: 7,
+            padding: true,
+            executable: false,
+        });
+        let set = FileSet::from_meta(&info, Path::new("/tmp"));
+        assert_eq!(set.padding_ranges(), [(10, 30), (35, 42)]);
+    }
+
+    #[test]
+    fn the_executable_attribute_survives_into_the_layout_except_for_padding() {
+        let mut info = fixture();
+        info.files[0].executable = true;
+        info.files[1].executable = true;
+        info.files[1].padding = true;
+        info.files[2].path.clear();
+        info.files[2].executable = true;
+        let set = FileSet::from_meta(&info, Path::new("/tmp"));
+        let flags: Vec<bool> = set.files().iter().map(|f| f.executable).collect();
+        assert_eq!(flags, [true, false, false]);
+    }
+
+    #[test]
+    fn a_file_without_a_path_is_treated_as_padding() {
+        let mut info = fixture();
+        info.files[0].path.clear();
+        let set = FileSet::from_meta(&info, Path::new("/tmp"));
+        assert!(set.files()[0].padding);
+        assert!(!set.files()[1].padding);
     }
 }

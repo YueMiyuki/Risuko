@@ -1,4 +1,8 @@
+mod common;
+
 use std::path::PathBuf;
+
+use common::{quiet_session_opts, wait_until_finished};
 
 use risuko_bt::bencode::{encode_to_vec, Value};
 use risuko_bt::session::{
@@ -6,16 +10,13 @@ use risuko_bt::session::{
 };
 use sha1::{Digest, Sha1};
 
+const FINISH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn make_torrent_bytes(name: &str) -> Vec<u8> {
-    let pieces = vec![0u8; 20];
-    let info = Value::Dict(vec![
-        (b"length".to_vec(), Value::Int(1024)),
-        (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
-        (b"piece length".to_vec(), Value::Int(1024)),
-        (b"pieces".to_vec(), Value::Bytes(pieces)),
-    ]);
-    let top = Value::Dict(vec![(b"info".to_vec(), info)]);
-    encode_to_vec(&top)
+    encode_to_vec(&Value::Dict(vec![(
+        b"info".to_vec(),
+        common::tiny_info(name, false),
+    )]))
 }
 
 fn make_hashed_torrent(name: &str, payload: &[u8]) -> Vec<u8> {
@@ -31,29 +32,19 @@ fn make_hashed_torrent(name: &str, payload: &[u8]) -> Vec<u8> {
     encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
 }
 
-fn quiet_session_opts() -> SessionOptions {
-    SessionOptions {
-        disable_dht: true,
-        disable_local_service_discovery: true,
-        ..Default::default()
-    }
-}
-
-async fn wait_until_finished(handle: &risuko_bt::ManagedTorrent) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let stats = handle.stats();
-        if stats.finished {
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "timed out waiting for finished: progress={} / {}",
-                stats.progress_bytes, stats.total_bytes
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+#[cfg(unix)]
+fn make_hashed_torrent_with_attr(name: &str, payload: &[u8], attr: &str) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(payload);
+    let digest: [u8; 20] = hasher.finalize().into();
+    let info = Value::Dict(vec![
+        (b"attr".to_vec(), Value::Bytes(attr.as_bytes().to_vec())),
+        (b"length".to_vec(), Value::Int(payload.len() as i64)),
+        (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
+        (b"piece length".to_vec(), Value::Int(payload.len() as i64)),
+        (b"pieces".to_vec(), Value::Bytes(digest.to_vec())),
+    ]);
+    encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,7 +158,7 @@ async fn readd_after_deleting_payload_does_not_stay_complete() {
         AddTorrentResponse::Added(id, handle) => (id, handle),
         AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
     };
-    wait_until_finished(&handle1).await;
+    wait_until_finished(&handle1, FINISH_LIMIT).await;
 
     std::fs::remove_file(dir.join("payload.bin")).unwrap();
 
@@ -218,7 +209,7 @@ async fn readd_of_complete_torrent_rehashes_existing_files() {
         .expect("first add");
     let id1 = match first {
         AddTorrentResponse::Added(id, handle) => {
-            wait_until_finished(&handle).await;
+            wait_until_finished(&handle, FINISH_LIMIT).await;
             id
         }
         AddTorrentResponse::AlreadyManaged(..) => panic!("expected Added"),
@@ -234,7 +225,7 @@ async fn readd_of_complete_torrent_rehashes_existing_files() {
     match second {
         AddTorrentResponse::Added(id, handle) => {
             assert_ne!(id, id1);
-            wait_until_finished(&handle).await;
+            wait_until_finished(&handle, FINISH_LIMIT).await;
         }
         AddTorrentResponse::AlreadyManaged(_, _) => {
             panic!("complete torrent should be respawned so disk is rehashed");
@@ -295,4 +286,51 @@ async fn adding_first_tracker_to_trackerless_torrent_starts_polling() {
         .expect("tracker poller should announce immediately")
         .expect("tracker request observed");
     assert!(announced, "announce query should include info_hash");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verified_file_with_the_x_attribute_becomes_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let payload = vec![9u8; 2048];
+    std::fs::write(dir.join("tool.bin"), &payload).unwrap();
+    std::fs::write(dir.join("plain.bin"), &payload).unwrap();
+    let mode_of = |name: &str| {
+        std::fs::metadata(dir.join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode_of("tool.bin") & 0o111, 0);
+
+    let session = Session::new_with_opts(dir.to_path_buf(), quiet_session_opts())
+        .await
+        .unwrap();
+    for (name, attr) in [("tool.bin", "x"), ("plain.bin", "h")] {
+        session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(
+                    make_hashed_torrent_with_attr(name, &payload, attr).into(),
+                ),
+                Some(AddTorrentOptions {
+                    create_subfolder: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add");
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while mode_of("tool.bin") & 0o111 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("x file never became executable");
+    assert_eq!(mode_of("plain.bin") & 0o111, 0);
 }

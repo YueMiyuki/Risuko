@@ -152,6 +152,9 @@ impl Client {
             let next = url
                 .join(&location)
                 .map_err(|e| Error::Redirect(e.to_string()))?;
+            if self.inner.redirect.allow.is_some_and(|allow| !allow(&next)) {
+                return Err(Error::Redirect("redirect target not allowed".into()));
+            }
 
             if matches!(
                 status,
@@ -971,6 +974,37 @@ mod tests {
         assert_eq!(body, "ok");
         a.await.unwrap();
         b.await.unwrap();
+    }
+
+    fn not_localhost(url: &Url) -> bool {
+        url.host_str() != Some("localhost")
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_filter_refuses_disallowed_targets_without_connecting() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_port = second.local_addr().unwrap().port();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{second_port}/admin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let a = tokio::spawn(serve_once(first, redirect.into_bytes()));
+
+        let client = Client::builder()
+            .redirect(Policy::limited(3).allow_only(not_localhost))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://127.0.0.1:{first_port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Redirect(_)), "{error}");
+        a.await.unwrap();
+        let connected = tokio::time::timeout(Duration::from_millis(300), second.accept()).await;
+        assert!(connected.is_err(), "redirect target was contacted");
     }
 
     #[tokio::test]

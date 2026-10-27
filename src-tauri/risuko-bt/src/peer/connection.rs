@@ -1092,12 +1092,6 @@ where
     dec_in.apply_keystream(&mut enc_buf[14..14 + pad_c_len + 2]);
     let ia_len_off = 14 + pad_c_len;
     let ia_len = u16::from_be_bytes([enc_buf[ia_len_off], enc_buf[ia_len_off + 1]]) as usize;
-    if ia_len > 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ia too long",
-        ));
-    }
     let ia_off = ia_len_off + 2;
     read_until(
         &mut read_h,
@@ -1174,24 +1168,7 @@ where
         let mut r = Rc4ReadHalf::new(read_h, dec_in, leftover);
         let remote_hs = match remote_hs_from_ia {
             Some(hs) => hs,
-            None => {
-                let mut buf = [0u8; HANDSHAKE_LEN];
-                timeout(read_timeout, r.read_exact(&mut buf))
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "mse deferred hs timeout")
-                    })??;
-                let hs = Handshake::parse(&buf).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}"))
-                })?;
-                if hs.info_hash != skey {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "info hash mismatch in deferred handshake",
-                    ));
-                }
-                hs
-            }
+            None => read_deferred_handshake(&mut r, skey, read_timeout).await?,
         };
         let mut w = Rc4WriteHalf::new(write_h, enc_out);
         write_ext_handshake_if_supported(
@@ -1221,15 +1198,10 @@ where
         write_h.write_all(&our_hs).await?;
         let mut prefix = ia_extra;
         prefix.extend_from_slice(&leftover);
-        let r = std::io::Cursor::new(prefix).chain(read_h);
+        let mut r = std::io::Cursor::new(prefix).chain(read_h);
         let remote_hs = match remote_hs_from_ia {
             Some(hs) => hs,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "empty ia with plaintext crypto not supported",
-                ));
-            }
+            None => read_deferred_handshake(&mut r, skey, read_timeout).await?,
         };
         write_ext_handshake_if_supported(
             &mut write_h,
@@ -1249,6 +1221,28 @@ where
             deferred,
         )
     }
+}
+
+async fn read_deferred_handshake<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    info_hash: Id20,
+    read_timeout: Duration,
+) -> std::io::Result<Handshake> {
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    timeout(read_timeout, reader.read_exact(&mut buf))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "mse deferred hs timeout")
+        })??;
+    let hs = Handshake::parse(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    if hs.info_hash != info_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "info hash mismatch in deferred handshake",
+        ));
+    }
+    Ok(hs)
 }
 
 async fn write_ext_handshake_if_supported<W: AsyncWrite + Unpin + ?Sized>(
@@ -2452,5 +2446,168 @@ mod tests {
         .await;
         result.expect("inbound µTP accept handshake timed out");
         server.await.unwrap();
+    }
+
+    struct RawInitiator {
+        stream: TcpStream,
+        crypto_select: u32,
+        leftover: Vec<u8>,
+    }
+
+    async fn raw_mse_initiate(
+        mut stream: TcpStream,
+        info_hash: Id20,
+        crypto_provide: u32,
+        ia: &[u8],
+    ) -> RawInitiator {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let keys = DhKeys::generate();
+        stream.write_all(&keys.public_be).await.unwrap();
+        let mut yb = [0u8; DH_LEN];
+        stream.read_exact(&mut yb).await.unwrap();
+        let s = keys.shared_secret(&yb).unwrap();
+        let key_a = mse::rc4_key(b"keyA", &s, &info_hash.0);
+        let key_b = mse::rc4_key(b"keyB", &s, &info_hash.0);
+        let mut enc_out = mse::init_rc4(&key_a);
+        let mut payload = mse::build_initiator_payload(crypto_provide, &[], ia).unwrap();
+        enc_out.apply_keystream(&mut payload);
+        let mut to_send = mse::req1(&s).to_vec();
+        to_send.extend_from_slice(&mse::xor20(&mse::req2(&info_hash.0), &mse::req3(&s)));
+        to_send.extend_from_slice(&payload);
+        stream.write_all(&to_send).await.unwrap();
+
+        let mut vc = [0u8; 8];
+        mse::init_rc4(&key_b).apply_keystream(&mut vc);
+        let mut seen = Vec::new();
+        let vc_at = loop {
+            let mut chunk = [0u8; 256];
+            let n = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("responder never answered")
+                .expect("responder dropped the connection instead of replying");
+            assert_ne!(n, 0, "responder closed before replying");
+            let from = mse::scan_start_after_append(seen.len(), vc.len());
+            seen.extend_from_slice(&chunk[..n]);
+            if let Some(at) = mse::find_subsequence_from(&seen, &vc, from) {
+                break at;
+            }
+        };
+        let mut dec_in = mse::init_rc4(&key_b);
+        let mut tail = seen[vc_at..].to_vec();
+        read_until(&mut stream, &mut tail, 14, deadline, "reply head")
+            .await
+            .unwrap();
+        dec_in.apply_keystream(&mut tail[..14]);
+        let crypto_select = u32::from_be_bytes([tail[8], tail[9], tail[10], tail[11]]);
+        let pad_d = usize::from(u16::from_be_bytes([tail[12], tail[13]]));
+        read_until(&mut stream, &mut tail, 14 + pad_d, deadline, "reply pad")
+            .await
+            .unwrap();
+        dec_in.apply_keystream(&mut tail[14..14 + pad_d]);
+        RawInitiator {
+            stream,
+            crypto_select,
+            leftover: tail[14 + pad_d..].to_vec(),
+        }
+    }
+
+    async fn accept_one(
+        listener: TcpListener,
+        info_hash: Id20,
+    ) -> std::io::Result<(PeerHandle, mpsc::Receiver<PeerEvent>)> {
+        let (stream, _) = listener.accept().await.unwrap();
+        accept(
+            stream,
+            Id20([0x62u8; 20]),
+            vec![info_hash.into()],
+            Duration::from_secs(5),
+            EncryptionPolicy::Prefer,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mse_responder_accepts_an_initial_payload_beyond_one_kilobyte() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = Id20([0x61u8; 20]);
+        let server = tokio::spawn(accept_one(listener, info_hash));
+
+        let mut ia =
+            Handshake::new_with_features(info_hash, Id20([0x63u8; 20]), false, false, true)
+                .to_bytes()
+                .to_vec();
+        for _ in 0..400 {
+            ia.extend_from_slice(&MessageEncoder::encode(&Message::Choke));
+        }
+        assert!(ia.len() > 1024);
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let exchange = async {
+            let initiator = raw_mse_initiate(stream, info_hash, mse::crypto::RC4, &ia).await;
+            assert_eq!(initiator.crypto_select, mse::crypto::RC4);
+            let (_handle, mut rx) = server.await.unwrap().expect("responder rejected a long IA");
+            assert!(matches!(
+                rx.recv().await,
+                Some(PeerEvent::Handshook {
+                    encrypted: true,
+                    ..
+                })
+            ));
+            for _ in 0..400 {
+                assert!(matches!(
+                    rx.recv().await,
+                    Some(PeerEvent::Message(Message::Choke))
+                ));
+            }
+            drop(initiator);
+        };
+        timeout(Duration::from_secs(15), exchange)
+            .await
+            .expect("long IA exchange timed out");
+    }
+
+    #[tokio::test]
+    async fn mse_responder_reads_the_plaintext_handshake_after_an_empty_ia() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = Id20([0x64u8; 20]);
+        let server = tokio::spawn(accept_one(listener, info_hash));
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let exchange = async {
+            let mut initiator =
+                raw_mse_initiate(stream, info_hash, mse::crypto::PLAINTEXT, &[]).await;
+            assert_eq!(initiator.crypto_select, mse::crypto::PLAINTEXT);
+            let ours =
+                Handshake::new_with_features(info_hash, Id20([0x65u8; 20]), false, false, true);
+            initiator.stream.write_all(&ours.to_bytes()).await.unwrap();
+            let mut theirs = initiator.leftover.clone();
+            read_until(
+                &mut initiator.stream,
+                &mut theirs,
+                HANDSHAKE_LEN,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                "responder handshake",
+            )
+            .await
+            .unwrap();
+            let theirs = Handshake::parse(&theirs[..HANDSHAKE_LEN].try_into().unwrap()).unwrap();
+            assert_eq!(theirs.info_hash, info_hash);
+
+            let (_handle, mut rx) = server
+                .await
+                .unwrap()
+                .expect("responder rejected a plaintext handshake sent after the reply");
+            assert!(matches!(
+                rx.recv().await,
+                Some(PeerEvent::Handshook {
+                    encrypted: false,
+                    ..
+                })
+            ));
+        };
+        timeout(Duration::from_secs(15), exchange)
+            .await
+            .expect("plaintext exchange timed out");
     }
 }

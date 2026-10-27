@@ -193,13 +193,11 @@ pub async fn run_health_checks(
 
     let (bt_snapshot, tracker_urls, kad_snapshot) = match engine::get_manager().await {
         Some(mgr) if want("bittorrent") || want("network") => {
-            let (snap, urls) = if want("bittorrent") {
-                (
-                    mgr.bt_health_snapshot().await,
-                    mgr.list_active_tracker_urls().await,
-                )
+            let snap = mgr.bt_health_snapshot().await;
+            let urls = if want("bittorrent") {
+                mgr.list_active_tracker_urls().await
             } else {
-                (None, Vec::new())
+                Vec::new()
             };
             let kad = if want("network") {
                 Some(mgr.kad_health_snapshot().await)
@@ -222,7 +220,14 @@ pub async fn run_health_checks(
     if want("network") {
         cats.push(HealthCategory::from_checks(
             "network",
-            check_network(&options, user_cfg.get("proxy"), slow, kad_snapshot.as_ref()).await,
+            check_network(
+                &options,
+                user_cfg.get("proxy"),
+                slow,
+                kad_snapshot.as_ref(),
+                bt_snapshot.as_ref(),
+            )
+            .await,
         ));
     }
     if want("bittorrent") {
@@ -335,41 +340,85 @@ fn parse_boolish(v: Option<&Value>, default: bool) -> bool {
     }
 }
 
+fn listen_port_checks(options: &EngineOptions, bt: Option<&BtHealthSnapshot>) -> [HealthCheck; 2] {
+    [
+        bt_listen_port_check(&options.bt_listen_ports(), bt),
+        dht_listen_port_check(options.dht_listen_port().map_or(0, u64::from), bt),
+    ]
+}
+
+fn bt_listen_port_check(ports: &[u16], bt: Option<&BtHealthSnapshot>) -> HealthCheck {
+    const ID: &str = "listen-port";
+    let Some(&first) = ports.first() else {
+        return HealthCheck::warn(
+            ID,
+            "BT listen port is not configured",
+            Some(HealthFix::open_pref("advanced")),
+        );
+    };
+    match bt.map(|snap| snap.listen_port).filter(|port| *port != 0) {
+        Some(bound) if !ports.contains(&bound) => HealthCheck::warn(
+            ID,
+            format!(
+                "BT is listening on port {bound} because the configured ports were unavailable"
+            ),
+            Some(HealthFix::open_pref("advanced")),
+        ),
+        Some(bound) => HealthCheck::ok(ID, format!("BT listen port: {bound}")),
+        None => HealthCheck::ok(ID, format!("BT listen port: {first}")),
+    }
+}
+
+fn dht_listen_port_check(configured: u64, bt: Option<&BtHealthSnapshot>) -> HealthCheck {
+    const ID: &str = "dht-listen-port";
+    if !(1..=65535).contains(&configured) {
+        return HealthCheck::warn(
+            ID,
+            "DHT listen port is not configured",
+            Some(HealthFix::open_pref("advanced")),
+        );
+    }
+    let Some(snap) = bt else {
+        return HealthCheck::skipped(
+            ID,
+            format!("DHT listen port: {configured} (BT session not started yet)"),
+        );
+    };
+    if !snap.dht_active {
+        return HealthCheck::skipped(ID, "DHT disabled");
+    }
+    let details = serde_json::json!({
+        "configured": configured,
+        "bound": snap.dht_port,
+    });
+    match snap.dht_port {
+        Some(bound) if u64::from(bound) == configured => {
+            HealthCheck::ok(ID, format!("DHT listen port: {bound}")).with_details(details)
+        }
+        Some(bound) => HealthCheck::warn(
+            ID,
+            format!("DHT is listening on port {bound} because port {configured} was unavailable"),
+            Some(HealthFix::open_pref("advanced")),
+        )
+        .with_details(details),
+        None => HealthCheck::skipped(
+            ID,
+            "DHT is routed through the P2P proxy and has no local listen port",
+        )
+        .with_details(details),
+    }
+}
+
 async fn check_network(
     options: &EngineOptions,
     proxy_config: Option<&Value>,
     slow: bool,
     kad: Option<&KadHealthSnapshot>,
+    bt: Option<&BtHealthSnapshot>,
 ) -> Vec<HealthCheck> {
     let mut out = Vec::new();
 
-    let listen_port = options.get_u64("listen-port").unwrap_or(0);
-    if (1..=65535).contains(&listen_port) {
-        out.push(HealthCheck::ok(
-            "listen-port",
-            format!("BT listen port: {}", listen_port),
-        ));
-    } else {
-        out.push(HealthCheck::warn(
-            "listen-port",
-            "BT listen port is not configured",
-            Some(HealthFix::open_pref("advanced")),
-        ));
-    }
-
-    let dht_port = options.get_u64("dht-listen-port").unwrap_or(0);
-    if (1..=65535).contains(&dht_port) {
-        out.push(HealthCheck::ok(
-            "dht-listen-port",
-            format!("DHT listen port: {}", dht_port),
-        ));
-    } else {
-        out.push(HealthCheck::warn(
-            "dht-listen-port",
-            "DHT listen port is not configured",
-            Some(HealthFix::open_pref("advanced")),
-        ));
-    }
+    out.extend(listen_port_checks(options, bt));
 
     if options.bt_listen_v6() {
         out.push(HealthCheck::ok("ipv6", "IPv6 listener enabled"));
@@ -834,6 +883,7 @@ async fn check_bittorrent(
         out.push(dht_check.with_details(serde_json::json!({
             "active": snap.dht_active,
             "nodes": snap.dht_nodes,
+            "nodeIdCompliant": snap.dht_node_id_compliant,
         })));
     }
 
@@ -1746,6 +1796,88 @@ mod tests {
                 None
             },
         }
+    }
+
+    fn bt_snapshot(dht_active: bool, dht_port: Option<u16>) -> BtHealthSnapshot {
+        BtHealthSnapshot {
+            listen_port: 21301,
+            lsd_active: true,
+            upnp_enabled: false,
+            upnp_mappings: 0,
+            upnp_attempts: 0,
+            torrents: 0,
+            dht_active,
+            dht_port,
+            dht_nodes: 0,
+            dht_node_id_compliant: None,
+        }
+    }
+
+    #[test]
+    fn dht_listen_port_check_reports_the_port_actually_bound() {
+        let bound = dht_listen_port_check(26701, Some(&bt_snapshot(true, Some(26701))));
+        assert_eq!(bound.status, HealthStatus::Ok);
+        assert!(bound.message.contains("26701"));
+
+        let moved = dht_listen_port_check(26701, Some(&bt_snapshot(true, Some(51234))));
+        assert_eq!(moved.status, HealthStatus::Warn);
+        assert!(moved.message.contains("51234") && moved.message.contains("26701"));
+        assert!(moved.fix.is_some());
+
+        let proxied = dht_listen_port_check(26701, Some(&bt_snapshot(true, None)));
+        assert_eq!(proxied.status, HealthStatus::Skipped);
+        let disabled = dht_listen_port_check(26701, Some(&bt_snapshot(false, None)));
+        assert_eq!(disabled.status, HealthStatus::Skipped);
+        let pending = dht_listen_port_check(26701, None);
+        assert_eq!(pending.status, HealthStatus::Skipped);
+
+        let unset = dht_listen_port_check(0, None);
+        assert_eq!(unset.status, HealthStatus::Warn);
+        assert!(unset.message.contains("not configured"));
+    }
+
+    fn options_with_ports(listen: &str, dht: &str) -> EngineOptions {
+        let mut system = serde_json::Map::new();
+        system.insert("listen-port".into(), Value::String(listen.into()));
+        system.insert("dht-listen-port".into(), Value::String(dht.into()));
+        EngineOptions::from_config(&system, &serde_json::Map::new())
+    }
+
+    #[test]
+    fn listen_port_checks_parse_ranges_and_lists_like_the_engine() {
+        let options = options_with_ports("6881-6999", "26701,26702");
+        let [bt, dht] = listen_port_checks(&options, None);
+        assert_eq!(bt.status, HealthStatus::Ok);
+        assert!(bt.message.contains("6881"), "{}", bt.message);
+        assert_eq!(dht.status, HealthStatus::Skipped);
+        assert!(dht.message.contains("26701"), "{}", dht.message);
+
+        let [bt, dht] = listen_port_checks(&options_with_ports("0", "abc"), None);
+        assert_eq!(bt.status, HealthStatus::Warn);
+        assert_eq!(dht.status, HealthStatus::Warn);
+    }
+
+    #[test]
+    fn bt_listen_port_check_reports_the_port_actually_bound() {
+        let options = options_with_ports("6881-6999", "26701");
+        let ports = options.bt_listen_ports();
+        let snapshot = |bound: u16| BtHealthSnapshot {
+            listen_port: bound,
+            ..bt_snapshot(true, None)
+        };
+
+        let inside = bt_listen_port_check(&ports, Some(&snapshot(6890)));
+        assert_eq!(inside.status, HealthStatus::Ok);
+        assert!(inside.message.contains("6890"));
+
+        let moved = bt_listen_port_check(&ports, Some(&snapshot(51234)));
+        assert_eq!(moved.status, HealthStatus::Warn);
+        assert!(moved.message.contains("51234"));
+        assert!(moved.fix.is_some());
+
+        let pending = bt_listen_port_check(&ports, None);
+        assert_eq!(pending.status, HealthStatus::Ok);
+        assert!(pending.message.contains("6881"));
     }
 
     #[test]
