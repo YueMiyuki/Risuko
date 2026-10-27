@@ -171,12 +171,22 @@ pub fn clear_android_download_notification() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn show_linux_notification(title: String, body: String) -> Result<(), String> {
+pub async fn show_linux_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
+        if ashpd::is_sandboxed().await {
+            return show_portal_notification(&app.config().identifier, &title, &body).await;
+        }
         // The notification plugin's blocking show() nests a tokio runtime here and aborts the app
         let mut notification = notify_rust::Notification::new();
-        notification.summary(&title).body(&body).auto_icon();
+        notification
+            .summary(&title)
+            .body(&escape_notification_markup(&body))
+            .auto_icon();
         notification
             .show_async()
             .await
@@ -185,9 +195,48 @@ pub async fn show_linux_notification(title: String, body: String) -> Result<(), 
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (title, body);
+        let _ = (app, title, body);
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn show_portal_notification(app_id: &str, title: &str, body: &str) -> Result<(), String> {
+    use ashpd::desktop::{
+        notification::{Notification, NotificationProxy},
+        Icon,
+    };
+
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+        .to_string();
+    let notification = Notification::new(title)
+        .body(body)
+        .icon(Icon::with_names([app_id]));
+    NotificationProxy::new()
+        .await
+        .map_err(|e| e.to_string())?
+        .add_notification(&id, notification)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn escape_notification_markup(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[tauri::command]

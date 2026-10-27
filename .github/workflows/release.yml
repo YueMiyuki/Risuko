@@ -404,6 +404,13 @@ jobs:
             exit 1
           fi
           find "$bundle_dir" -maxdepth 3 -type f | sed 's/^/built: /'
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            deb="$(find "$bundle_dir/deb" -name '*.deb' -print -quit)"
+            if ! dpkg-deb -f "$deb" Depends | grep -q appindicator; then
+              echo "::error::$deb does not depend on appindicator, so tauri-cli missed the tray-icon feature and the AppImage lacks the tray library"
+              exit 1
+            fi
+          fi
 
       - name: Package canonical desktop assets
         shell: bash
