@@ -222,6 +222,10 @@ pub struct DownloadTask {
     pub seeder: bool,
     pub num_seeders: u32,
     #[serde(skip)]
+    pub swarm_seeders: Option<u32>,
+    #[serde(skip)]
+    pub swarm_leechers: Option<u32>,
+    #[serde(skip)]
     pub peers: Vec<PeerInfo>,
     #[serde(default)]
     pub piece_length: u32,
@@ -769,6 +773,14 @@ impl DownloadTask {
                 "numSeeders".into(),
                 Value::String(self.num_seeders.to_string()),
             );
+            if self.status == TaskStatus::Active {
+                if let Some(n) = self.swarm_seeders {
+                    m.insert("swarmSeeders".into(), Value::String(n.to_string()));
+                }
+                if let Some(n) = self.swarm_leechers {
+                    m.insert("swarmLeechers".into(), Value::String(n.to_string()));
+                }
+            }
             if self.piece_length > 0 {
                 m.insert(
                     "pieceLength".into(),
@@ -1260,6 +1272,26 @@ mod tests {
         assert!(obj.contains_key("seeder"));
         let bt = obj.get("bittorrent").unwrap().as_object().unwrap();
         assert_eq!(bt.get("infoHash").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn rpc_status_reports_tracker_swarm_counts_once_known() {
+        let mut task = DownloadTask::new_torrent("tgid".into(), "/dl".into(), None, Map::new());
+        task.status = TaskStatus::Active;
+        let status = task.to_rpc_status(&[]);
+        assert!(status.get("swarmSeeders").is_none());
+        assert!(status.get("swarmLeechers").is_none());
+
+        task.swarm_seeders = Some(7);
+        task.swarm_leechers = Some(3);
+        let status = task.to_rpc_status(&[]);
+        assert_eq!(status.get("swarmSeeders"), Some(&json!("7")));
+        assert_eq!(status.get("swarmLeechers"), Some(&json!("3")));
+
+        task.status = TaskStatus::Paused;
+        let status = task.to_rpc_status(&[]);
+        assert!(status.get("swarmSeeders").is_none());
+        assert!(status.get("swarmLeechers").is_none());
     }
 
     #[test]

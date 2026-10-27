@@ -1,6 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 
+use crate::net::{ipv4_mask, ipv6_mask};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlocklistApplyResult {
     pub revision: u32,
@@ -200,22 +202,6 @@ fn parse_prefix(ip: IpAddr, prefix: u8) -> Option<Prefix> {
                 mask,
             })
         }
-    }
-}
-
-fn ipv4_mask(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix)
-    }
-}
-
-fn ipv6_mask(prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        !0u128 << (128 - prefix)
     }
 }
 

@@ -152,6 +152,12 @@ impl Client {
             let next = url
                 .join(&location)
                 .map_err(|e| Error::Redirect(e.to_string()))?;
+            if self.inner.redirect.allow.is_some_and(|allow| !allow(&next)) {
+                return Err(Error::Redirect(format!(
+                    "redirect target not allowed: {}",
+                    next.origin().ascii_serialization()
+                )));
+            }
 
             if matches!(
                 status,
@@ -700,6 +706,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_address_filter_applies_to_locally_resolved_socks5_targets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::builder()
+            .resolver_arc(Arc::new(RoutingResolver(HashMap::from([(
+                "blocked.example".to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+            )]))))
+            .proxy(Proxy::all(format!("socks5://{address}")).unwrap())
+            .direct_address_filter(|ip| !ip.is_loopback())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let error = client
+            .get("http://blocked.example/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Connect"),
+            "unexpected error: {error}"
+        );
+        let contacted = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+        assert!(contacted.is_err(), "proxy was asked to connect");
+    }
+
+    #[tokio::test]
+    async fn locally_resolved_socks5_target_sends_the_validated_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            socket.read_exact(&mut methods).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0u8; 10];
+            socket.read_exact(&mut request).await.unwrap();
+            request
+        });
+        let client = Client::builder()
+            .resolver_arc(Arc::new(RoutingResolver(HashMap::from([(
+                "mirror.example".to_string(),
+                "192.0.2.7:0".parse().unwrap(),
+            )]))))
+            .proxy(Proxy::all(format!("socks5://{address}")).unwrap())
+            .direct_address_filter(|ip| !ip.is_loopback())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let _ = client.get("http://mirror.example:8080/").send().await;
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("proxy was never contacted")
+            .unwrap();
+        assert_eq!(&request[..4], &[5, 1, 0, 1]);
+        assert_eq!(&request[4..8], &[192, 0, 2, 7]);
+        assert_eq!(u16::from_be_bytes([request[8], request[9]]), 8080);
+    }
+
+    #[tokio::test]
     async fn plain_http_proxy_uses_absolute_form_and_authentication() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -971,6 +1041,46 @@ mod tests {
         assert_eq!(body, "ok");
         a.await.unwrap();
         b.await.unwrap();
+    }
+
+    fn not_localhost(url: &Url) -> bool {
+        url.host_str() != Some("localhost")
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_filter_refuses_disallowed_targets_without_connecting() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_port = second.local_addr().unwrap().port();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{second_port}/admin?token=SECRET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let a = tokio::spawn(serve_once(first, redirect.into_bytes()));
+
+        let client = Client::builder()
+            .redirect(Policy::limited(3).allow_only(not_localhost))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://127.0.0.1:{first_port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Redirect(_)), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("http://localhost:{second_port}")),
+            "{message}"
+        );
+        assert!(
+            !message.contains("SECRET") && !message.contains("/admin"),
+            "{message}"
+        );
+        a.await.unwrap();
+        let connected = tokio::time::timeout(Duration::from_millis(300), second.accept()).await;
+        assert!(connected.is_err(), "redirect target was contacted");
     }
 
     #[tokio::test]

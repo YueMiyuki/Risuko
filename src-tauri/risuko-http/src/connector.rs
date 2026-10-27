@@ -1661,6 +1661,13 @@ impl Connector {
                 }
             }
             ProxyScheme::Socks5 { resolve_locally } => {
+                let target = if *resolve_locally && self.direct_address_filter.is_some() {
+                    let addrs = self.resolve_addrs(host).await?;
+                    self.validate_addrs(host, &addrs)?;
+                    addrs[0].ip().to_string()
+                } else {
+                    host.to_string()
+                };
                 let phost = proxy
                     .url()
                     .host_str()
@@ -1679,7 +1686,7 @@ impl Connector {
                         d,
                         socks5_connect(
                             proxy_stream,
-                            host,
+                            &target,
                             port,
                             *resolve_locally,
                             auth,
@@ -1692,7 +1699,7 @@ impl Connector {
                     None => {
                         socks5_connect(
                             proxy_stream,
-                            host,
+                            &target,
                             port,
                             *resolve_locally,
                             auth,

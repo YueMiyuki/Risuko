@@ -24,7 +24,7 @@ Risuko has a clean and easy to use interface. I hope you will like it 👻.
 ## 💽 Installation
 
 ### Github release
-Download from [GitHub Releases](https://github.com/YueMiyuki/Risuko/releases) and install it.
+Download from [GitHub Releases](https://github.com/YueMiyuki/Risuko/releases) and install it. On Debian, Ubuntu and Fedora, install from the APT / DNF repos below instead.
 
 ### NPM Package
 Risuko provide a npm package together with the engine
@@ -48,6 +48,39 @@ brew install yuemiyuki/risuko/risuko-cli
 
 # Desktop app (Cask)
 brew install --cask yuemiyuki/risuko/risuko-app
+```
+
+### WinGet
+```powershell
+# Desktop app
+winget install YueMiyuki.Risuko
+
+# CLI
+winget install YueMiyuki.Risuko.CLI
+```
+
+### APT (Debian / Ubuntu)
+```bash
+sudo curl -fsSLo /usr/share/keyrings/risuko.gpg https://dl.risuko.app/apt/risuko.gpg
+echo "deb [signed-by=/usr/share/keyrings/risuko.gpg] https://dl.risuko.app/apt stable main" | sudo tee /etc/apt/sources.list.d/risuko.list
+sudo apt update
+
+# Desktop app
+sudo apt install risuko
+
+# CLI (installed as risuko-cli)
+sudo apt install risuko-cli
+```
+
+### DNF (Fedora / RHEL)
+```bash
+sudo curl -fsSLo /etc/yum.repos.d/risuko.repo https://dl.risuko.app/rpm/risuko.repo
+
+# Desktop app
+sudo dnf install risuko
+
+# CLI (installed as risuko-cli)
+sudo dnf install risuko-cli
 ```
 
 

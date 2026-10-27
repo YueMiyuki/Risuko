@@ -1,5 +1,6 @@
 mod dontfrag;
 pub mod packet;
+pub(crate) mod slots;
 pub mod socket;
 pub mod stream;
 

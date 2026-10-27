@@ -1,3 +1,4 @@
+pub(crate) mod crc32c;
 pub mod hash;
 pub mod lengths;
 pub mod magnet;

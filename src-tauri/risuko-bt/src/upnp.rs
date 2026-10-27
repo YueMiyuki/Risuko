@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
+
+use super::external_ip::{ExternalIp, Route, Source};
 
 const SSDP_MCAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
 const ST_WAN_IP: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
@@ -65,6 +67,7 @@ impl UpnpPortForwarder {
             .await;
         });
         UpnpHandle {
+            ports: self.ports,
             shutdown: Some(shutdown_tx),
             join: Some(join),
             active,
@@ -74,6 +77,7 @@ impl UpnpPortForwarder {
 }
 
 pub struct UpnpHandle {
+    ports: Vec<(u16, MapProto)>,
     shutdown: Option<mpsc::Sender<()>>,
     join: Option<JoinHandle<()>>,
     active: Arc<Mutex<Vec<ActiveMapping>>>,
@@ -81,6 +85,10 @@ pub struct UpnpHandle {
 }
 
 impl UpnpHandle {
+    pub(crate) fn ports(&self) -> &[(u16, MapProto)] {
+        &self.ports
+    }
+
     pub fn mapping_count(&self) -> usize {
         self.active.lock().len()
     }
@@ -188,6 +196,9 @@ async fn discover_and_map(
             continue;
         };
         let external_ip = get_external_ip(&control_url, &service_type).await.ok();
+        if let Some(reported) = external_ip {
+            report_external_address(ExternalIp::shared(), gateway, reported);
+        }
         for &(port, proto) in ports {
             match add_port_mapping_compat(
                 &control_url,
@@ -231,6 +242,15 @@ async fn discover_and_map(
         }
     }
     Ok(mapped)
+}
+
+fn report_external_address(external: &ExternalIp, gateway: Ipv4Addr, reported: Ipv4Addr) {
+    external.vote(
+        IpAddr::V4(reported),
+        Source::Upnp,
+        IpAddr::V4(gateway),
+        Route::Direct,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -655,6 +675,26 @@ fn io_other<E: std::fmt::Display>(e: E) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_public_gateway_report_elects_the_external_address() {
+        let external = ExternalIp::new();
+        let gateway = Ipv4Addr::new(192, 168, 1, 1);
+        report_external_address(&external, gateway, Ipv4Addr::new(100, 72, 3, 4));
+        report_external_address(&external, gateway, Ipv4Addr::new(10, 0, 0, 2));
+        report_external_address(&external, gateway, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(external.addresses(), Default::default());
+        report_external_address(&external, gateway, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(
+            external.external_v4(),
+            Some(Ipv4Addr::new(93, 184, 216, 34))
+        );
+        report_external_address(&external, gateway, Ipv4Addr::new(100, 72, 3, 4));
+        assert_eq!(
+            external.external_v4(),
+            Some(Ipv4Addr::new(93, 184, 216, 34))
+        );
+    }
 
     #[test]
     fn pass_delay_backs_off_without_a_gateway() {

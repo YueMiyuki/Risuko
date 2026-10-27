@@ -45,8 +45,8 @@ pub struct ExtHandshake {
     pub port: Option<u16>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
-    pub prefers_encryption: bool,
-    pub upload_only: bool,
+    pub prefers_encryption: Option<bool>,
+    pub upload_only: Option<bool>,
 }
 
 impl ExtHandshake {
@@ -63,18 +63,18 @@ impl ExtHandshake {
             port: None,
             ipv4: None,
             ipv6: None,
-            prefers_encryption: false,
-            upload_only: false,
+            prefers_encryption: None,
+            upload_only: None,
         }
     }
 
     pub fn with_encryption_preference(mut self, prefers: bool) -> Self {
-        self.prefers_encryption = prefers;
+        self.prefers_encryption = prefers.then_some(true);
         self
     }
 
     pub fn with_yourip(mut self, ip: IpAddr) -> Self {
-        self.yourip = Some(ip);
+        self.yourip = Some(ip.to_canonical());
         self
     }
 
@@ -114,11 +114,11 @@ impl ExtHandshake {
             .collect();
         m_entries.sort_by(|a, b| a.0.cmp(&b.0));
         let mut dict = vec![(b"m".to_vec(), Value::Dict(m_entries))];
-        if self.prefers_encryption {
-            dict.push((b"e".to_vec(), Value::Int(1)));
+        if let Some(prefers) = self.prefers_encryption {
+            dict.push((b"e".to_vec(), Value::Int(i64::from(prefers))));
         }
-        if self.upload_only {
-            dict.push((b"upload_only".to_vec(), Value::Int(1)));
+        if let Some(upload_only) = self.upload_only {
+            dict.push((b"upload_only".to_vec(), Value::Int(i64::from(upload_only))));
         }
         if let Some(sz) = self.metadata_size {
             dict.push((b"metadata_size".to_vec(), Value::Int(sz as i64)));
@@ -156,7 +156,7 @@ impl ExtHandshake {
             if let Some(m_dict) = m.as_dict() {
                 for (k, v) in m_dict {
                     if let Some(id) = v.as_int() {
-                        if (1..=255).contains(&id) {
+                        if (0..=255).contains(&id) {
                             supported.insert(k.clone(), id as u8);
                         }
                     }
@@ -176,22 +176,13 @@ impl ExtHandshake {
             .iter()
             .find(|(k, _)| k == b"yourip")
             .and_then(|(_, v)| v.as_bytes())
-            .and_then(|bytes| match bytes.len() {
-                4 => {
-                    let arr: [u8; 4] = bytes.try_into().ok()?;
-                    Some(IpAddr::V4(std::net::Ipv4Addr::from(arr)))
-                }
-                16 => {
-                    let arr: [u8; 16] = bytes.try_into().ok()?;
-                    Some(IpAddr::V6(std::net::Ipv6Addr::from(arr)))
-                }
-                _ => None,
-            });
+            .and_then(crate::net::ip_from_bytes);
         let reqq = dict
             .iter()
             .find(|(k, _)| k == b"reqq")
             .and_then(|(_, v)| v.as_int())
-            .and_then(|n| if n > 0 { Some(n as u32) } else { None });
+            .filter(|&n| n > 0)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
         let port = dict
             .iter()
             .find(|(k, _)| k == b"p")
@@ -213,7 +204,7 @@ impl ExtHandshake {
             dict.iter()
                 .find(|(k, _)| k == key)
                 .and_then(|(_, v)| v.as_int())
-                .is_some_and(|n| n != 0)
+                .map(|n| n != 0)
         };
         Some(Self {
             supported,
@@ -229,16 +220,22 @@ impl ExtHandshake {
         })
     }
 
+    pub fn advertised_id(&self, name: &[u8]) -> Option<u8> {
+        self.supported.get(name).copied()
+    }
+
     pub fn ut_metadata_id(&self) -> Option<u8> {
-        self.supported.get(EXT_NAME_UT_METADATA).copied()
+        self.advertised_id(EXT_NAME_UT_METADATA)
+            .filter(|&id| id != 0)
     }
 
     pub fn ut_pex_id(&self) -> Option<u8> {
-        self.supported.get(EXT_NAME_UT_PEX).copied()
+        self.advertised_id(EXT_NAME_UT_PEX).filter(|&id| id != 0)
     }
 
     pub fn ut_holepunch_id(&self) -> Option<u8> {
-        self.supported.get(EXT_NAME_UT_HOLEPUNCH).copied()
+        self.advertised_id(EXT_NAME_UT_HOLEPUNCH)
+            .filter(|&id| id != 0)
     }
 }
 
@@ -546,12 +543,32 @@ mod tests {
     #[test]
     fn handshake_carries_encryption_and_upload_only() {
         let mut hs = ExtHandshake::new_outgoing(3, 4, None).with_encryption_preference(true);
-        hs.upload_only = true;
+        hs.upload_only = Some(true);
         let decoded = ExtHandshake::decode(&hs.encode()).unwrap();
-        assert!(decoded.prefers_encryption);
-        assert!(decoded.upload_only);
+        assert_eq!(decoded.prefers_encryption, Some(true));
+        assert_eq!(decoded.upload_only, Some(true));
         let plain = ExtHandshake::decode(&ExtHandshake::new_outgoing(3, 4, None).encode()).unwrap();
-        assert!(!plain.prefers_encryption && !plain.upload_only);
+        assert_eq!((plain.prefers_encryption, plain.upload_only), (None, None));
+        hs.upload_only = Some(false);
+        let cleared = ExtHandshake::decode(&hs.encode()).unwrap();
+        assert_eq!(cleared.upload_only, Some(false));
+    }
+
+    #[test]
+    fn handshake_keeps_disabled_extensions_distinct_from_absent_ones() {
+        let payload = encode_to_vec(&Value::Dict(vec![(
+            b"m".to_vec(),
+            Value::Dict(vec![
+                (b"ut_pex".to_vec(), Value::Int(0)),
+                (b"ut_metadata".to_vec(), Value::Int(2)),
+            ]),
+        )]));
+        let parsed = ExtHandshake::decode(&payload).unwrap();
+        assert_eq!(parsed.advertised_id(EXT_NAME_UT_PEX), Some(0));
+        assert_eq!(parsed.ut_pex_id(), None);
+        assert_eq!(parsed.ut_metadata_id(), Some(2));
+        assert_eq!(parsed.advertised_id(EXT_NAME_UT_HOLEPUNCH), None);
+        assert_eq!(parsed.upload_only, None);
     }
 
     #[test]
@@ -603,6 +620,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_reqq_saturates_instead_of_wrapping() {
+        let decode = |reqq: i64| {
+            let payload = encode_to_vec(&Value::Dict(vec![(b"reqq".to_vec(), Value::Int(reqq))]));
+            ExtHandshake::decode(&payload).unwrap().reqq
+        };
+        assert_eq!(decode(1 << 32), Some(u32::MAX));
+        assert_eq!(decode(i64::MAX), Some(u32::MAX));
+        assert_eq!(decode(u32::MAX as i64), Some(u32::MAX));
+        assert_eq!(decode(250), Some(250));
+        assert_eq!(decode(0), None);
+        assert_eq!(decode(-5), None);
+    }
+
+    #[test]
     fn ut_metadata_request_parse() {
         let bytes = ut_metadata_request(5);
         let parsed = parse_ut_metadata(bytes).unwrap();
@@ -647,6 +678,17 @@ mod tests {
         let bytes = out.encode();
         let parsed = ExtHandshake::decode(&bytes).unwrap();
         assert_eq!(parsed.yourip, Some(ip));
+    }
+
+    #[test]
+    fn yourip_for_a_mapped_ipv4_peer_goes_out_as_four_bytes() {
+        let mapped = std::net::IpAddr::V6("::ffff:198.51.100.9".parse().unwrap());
+        let out = ExtHandshake::new_outgoing(3, 4, None).with_yourip(mapped);
+        let parsed = ExtHandshake::decode(&out.encode()).unwrap();
+        assert_eq!(
+            parsed.yourip,
+            Some(std::net::IpAddr::V4("198.51.100.9".parse().unwrap()))
+        );
     }
 
     #[test]

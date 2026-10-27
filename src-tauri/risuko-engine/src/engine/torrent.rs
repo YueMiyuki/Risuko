@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::options::TASK_P2P_PROXY_OVERRIDE_KEY;
 
+pub const DHT_ROUTING_STATE_FILENAME: &str = "dht-routing.state";
+
 #[derive(Clone, Debug, Default)]
 pub struct BtTuning {
     pub max_outstanding_per_peer: Option<usize>,
@@ -27,7 +29,9 @@ pub struct BtTuning {
     pub encryption_policy: Option<String>,
     pub listen_ipv6: Option<bool>,
     pub enable_lsd: Option<bool>,
-    pub listen_port: Option<u16>,
+    pub listen_ports: Vec<u16>,
+    pub dht_port: Option<u16>,
+    pub dht_routing_state_path: Option<PathBuf>,
     pub p2p_proxy: Option<risuko_http::ProxyConnector>,
 }
 
@@ -50,8 +54,44 @@ impl BtTuning {
             encryption_policy: Some(options.bt_encryption_policy().to_string()),
             listen_ipv6: Some(options.bt_listen_v6()),
             enable_lsd: Some(options.bt_enable_lsd()),
-            listen_port: options.bt_listen_port(),
+            listen_ports: options.bt_listen_ports(),
+            dht_port: options.dht_listen_port(),
+            dht_routing_state_path: None,
             p2p_proxy,
+        }
+    }
+
+    pub fn with_config_dir(mut self, config_dir: &Path) -> Self {
+        self.dht_routing_state_path = Some(config_dir.join(DHT_ROUTING_STATE_FILENAME));
+        self
+    }
+
+    pub fn dht_options(&self) -> bt::dht::DhtOptions {
+        bt::dht::DhtOptions {
+            port: self.dht_port,
+            routing_state_path: self.dht_routing_state_path.clone(),
+        }
+    }
+
+    pub fn session_options(&self, listen_port: u16) -> bt::SessionOptions {
+        bt::SessionOptions {
+            listen: Some(bt::ListenerOptions {
+                listen_addr: Some((Ipv4Addr::UNSPECIFIED, listen_port).into()),
+                enable_upnp_port_forwarding: self.enable_upnp.unwrap_or(true),
+                upnp_lease: self.upnp_lease,
+                listen_ipv6: self.listen_ipv6.unwrap_or(false),
+            }),
+            max_outstanding_requests_per_peer: self.max_outstanding_per_peer,
+            max_peers_per_torrent: self.max_peers_per_torrent,
+            max_connections: self.max_connections,
+            hash_fail_ban_strikes: self.hash_fail_ban_strikes,
+            download_limiter: self.download_limiter.clone(),
+            upload_limiter: self.upload_limiter.clone(),
+            disable_local_service_discovery: !self.enable_lsd.unwrap_or(true),
+            encryption: encryption_policy_from_str(self.encryption_policy.as_deref()),
+            p2p_proxy: self.p2p_proxy.clone(),
+            dht: self.dht_options(),
+            ..Default::default()
         }
     }
 }
@@ -71,7 +111,9 @@ pub struct BtHealthSnapshot {
     pub upnp_attempts: usize,
     pub torrents: usize,
     pub dht_active: bool,
+    pub dht_port: Option<u16>,
     pub dht_nodes: usize,
+    pub dht_node_id_compliant: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -289,43 +331,31 @@ impl TorrentEngine {
         std::fs::create_dir_all(output_dir)
             .map_err(|e| format!("Failed to create torrent output dir: {}", e))?;
 
-        let encryption = encryption_policy_from_str(tuning.encryption_policy.as_deref());
-
-        let session_opts = |port: u16| bt::SessionOptions {
-            listen: Some(bt::ListenerOptions {
-                listen_addr: Some((Ipv4Addr::UNSPECIFIED, port).into()),
-                enable_upnp_port_forwarding: tuning.enable_upnp.unwrap_or(true),
-                upnp_lease: tuning.upnp_lease,
-                listen_ipv6: tuning.listen_ipv6.unwrap_or(false),
-            }),
-            max_outstanding_requests_per_peer: tuning.max_outstanding_per_peer,
-            max_peers_per_torrent: tuning.max_peers_per_torrent,
-            max_connections: tuning.max_connections,
-            hash_fail_ban_strikes: tuning.hash_fail_ban_strikes,
-            download_limiter: tuning.download_limiter.clone(),
-            upload_limiter: tuning.upload_limiter.clone(),
-            disable_local_service_discovery: !tuning.enable_lsd.unwrap_or(true),
-            encryption,
-            p2p_proxy: tuning.p2p_proxy.clone(),
-            ..Default::default()
-        };
-        let preferred_port = tuning.listen_port.unwrap_or(0);
-        let session = match bt::Session::new_with_opts(
-            output_dir.to_path_buf(),
-            session_opts(preferred_port),
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(e) if preferred_port != 0 => {
-                tracing::warn!(
-                    "BT listen port {preferred_port} unavailable ({e}); using a random port"
-                );
-                bt::Session::new_with_opts(output_dir.to_path_buf(), session_opts(0))
-                    .await
-                    .map_err(|e| format!("Failed to create torrent session: {}", e))?
+        let mut session = None;
+        let mut last_error = String::new();
+        for port in tuning.listen_ports.iter().copied().chain([0]) {
+            match bt::Session::new_with_opts(output_dir.to_path_buf(), tuning.session_options(port))
+                .await
+            {
+                Ok(created) => {
+                    if port == 0 && !tuning.listen_ports.is_empty() {
+                        tracing::warn!(
+                            "no configured BT listen port is available; using a random port"
+                        );
+                    }
+                    session = Some(created);
+                    break;
+                }
+                Err(e) => {
+                    if port != 0 {
+                        tracing::debug!("BT listen port {port} unavailable ({e})");
+                    }
+                    last_error = e.to_string();
+                }
             }
-            Err(e) => return Err(format!("Failed to create torrent session: {}", e)),
+        }
+        let Some(session) = session else {
+            return Err(format!("Failed to create torrent session: {last_error}"));
         };
 
         tracing::info!(
@@ -389,7 +419,9 @@ impl TorrentEngine {
             upnp_attempts: upnp.discovery_attempts,
             torrents: session.with_torrents(|i| i.count()),
             dht_active: session.dht_active(),
+            dht_port: session.dht_local_port(),
             dht_nodes: session.dht_routing_table_len(),
+            dht_node_id_compliant: session.dht_node_id_compliant(),
         })
     }
 
@@ -719,7 +751,10 @@ impl TorrentEngine {
             )
             .await
             {
-                Ok(socket) => Some(socket),
+                Ok(socket) => {
+                    socket.refuse_inbound();
+                    Some(socket)
+                }
                 Err(error) => {
                     tracing::warn!("task µTP route unavailable during magnet resolve: {error}");
                     None
@@ -806,6 +841,7 @@ impl TorrentEngine {
                 utp,
                 p2p_proxy,
                 Some(conn_budget),
+                None,
             ),
         )
         .await
@@ -817,6 +853,7 @@ impl TorrentEngine {
                 bt::magnet::synth_torrent_bytes(
                     &resolved.info_bytes,
                     &resolved.trackers,
+                    &resolved.web_seeds,
                     &resolved.piece_layers,
                 )
                 .into_boxed_slice(),
@@ -908,6 +945,8 @@ impl TorrentEngine {
             upload_speed,
             num_peers,
             num_seeders,
+            swarm_seeders: stats.swarm_seeders,
+            swarm_leechers: stats.swarm_leechers,
             is_finished: stats.finished,
             name,
             file_progress: stats.file_progress,
@@ -967,6 +1006,17 @@ impl TorrentEngine {
             .add_trackers(handle.info_hash(), urls)
             .await
             .map_err(|e| format!("Failed to add trackers: {}", e))
+    }
+
+    pub fn private_tracker_tiers(&self, torrent_id: usize) -> Option<Vec<Vec<String>>> {
+        let handle = self
+            .session
+            .as_ref()?
+            .get(bt::TorrentIdOrHash::Id(torrent_id))?;
+        handle
+            .with_metadata(|meta| meta.info.private.then(|| build_announce_list(meta)))
+            .ok()
+            .flatten()
     }
 
     pub async fn reconfigure_p2p_proxy(
@@ -1062,6 +1112,7 @@ fn initial_file_selection(
     };
     let display = torrent_to_display_indices(so, selectable);
     if display.is_empty() {
+        tracing::warn!("magnet so= matches none of the torrent's files; selecting everything");
         return (None, None);
     }
     let only_files = display_to_torrent_indices(&display, selectable);
@@ -1172,6 +1223,8 @@ pub struct TorrentStats {
     pub upload_speed: u64,
     pub num_peers: u32,
     pub num_seeders: u32,
+    pub swarm_seeders: Option<u32>,
+    pub swarm_leechers: Option<u32>,
     pub is_finished: bool,
     pub name: Option<String>,
     pub file_progress: Arc<Vec<u64>>,
@@ -1345,9 +1398,9 @@ async fn load_saved_torrent_metadata(
         return None;
     }
     let magnet = bt::Magnet::parse(magnet_uri).ok()?;
-    let want_v1 = magnet.info_hash_v1()?;
+    let want = magnet.info_hash();
     let want_v2 = magnet.info_hash_v2();
-    let name = format!("{}.torrent", want_v1.to_hex());
+    let name = format!("{}.torrent", want.to_hex());
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = options.get("dir").and_then(Value::as_str) {
         dirs.push(PathBuf::from(dir));
@@ -1371,7 +1424,7 @@ async fn load_saved_torrent_metadata(
         let Ok(meta) = bt::parse_torrent(&bytes) else {
             continue;
         };
-        if meta.info_hash == want_v1 && want_v2.is_none_or(|v2| meta.info_hash_v2 == Some(v2)) {
+        if meta.info_hash == want && want_v2.is_none_or(|v2| meta.info_hash_v2 == Some(v2)) {
             tracing::info!("Using saved torrent metadata from {}", dir.display());
             return Some(bytes);
         }
@@ -1467,6 +1520,144 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn pure_v2_torrent_bytes(name: &str) -> Vec<u8> {
+        use bt::bencode::{encode_to_vec, Value};
+        let leaf = Value::Dict(vec![(
+            Vec::new(),
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(100)),
+                (b"pieces root".to_vec(), Value::Bytes(vec![3u8; 32])),
+            ]),
+        )]);
+        let info = Value::Dict(vec![
+            (
+                b"file tree".to_vec(),
+                Value::Dict(vec![(name.as_bytes().to_vec(), leaf)]),
+            ),
+            (b"meta version".to_vec(), Value::Int(2)),
+            (b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+        ]);
+        encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))
+    }
+
+    fn saved_metadata_options(dir: &Path) -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("bt-save-metadata".into(), json!(true));
+        options.insert("bt-load-saved-metadata".into(), json!(true));
+        options.insert("dir".into(), json!(dir.to_str().unwrap()));
+        options
+    }
+
+    #[tokio::test]
+    async fn saved_metadata_is_reused_for_a_v2_only_magnet() {
+        let bytes = pure_v2_torrent_bytes("saved-v2");
+        let meta = bt::parse_torrent(&bytes).unwrap();
+        assert!(meta.info_hash_v2.is_some());
+        let dir = tempfile::tempdir().unwrap();
+        let options = saved_metadata_options(dir.path());
+        save_torrent_metadata_if_enabled(&bytes, &options, dir.path()).await;
+
+        let magnet = format!(
+            "magnet:?xt=urn:btmh:1220{}",
+            meta.info_hash_v2.unwrap().to_hex()
+        );
+        let loaded = load_saved_torrent_metadata(&magnet, &options, dir.path()).await;
+        assert_eq!(loaded.as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn saved_v2_metadata_under_the_wrong_name_is_not_trusted() {
+        let bytes = pure_v2_torrent_bytes("saved-v2");
+        let other = pure_v2_torrent_bytes("some-other-v2");
+        let meta = bt::parse_torrent(&bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let options = saved_metadata_options(dir.path());
+        std::fs::write(
+            dir.path()
+                .join(format!("{}.torrent", meta.info_hash.to_hex())),
+            &other,
+        )
+        .unwrap();
+
+        let magnet = format!(
+            "magnet:?xt=urn:btmh:1220{}",
+            meta.info_hash_v2.unwrap().to_hex()
+        );
+        assert!(load_saved_torrent_metadata(&magnet, &options, dir.path())
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn tuning_carries_dht_port_and_routing_state_path() {
+        let mut system = Map::new();
+        system.insert("dht-listen-port".into(), json!(26701));
+        let options = super::super::options::EngineOptions::from_config(&system, &Map::new());
+        let tuning = BtTuning::from_options(
+            &options,
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            None,
+        );
+        assert_eq!(tuning.dht_port, Some(26701));
+        assert_eq!(tuning.dht_routing_state_path, None);
+
+        let tuning = tuning.with_config_dir(Path::new("cfg"));
+        assert_eq!(
+            tuning.dht_routing_state_path,
+            Some(Path::new("cfg").join(DHT_ROUTING_STATE_FILENAME))
+        );
+    }
+
+    #[test]
+    fn tuning_dht_options_use_the_first_configured_port_and_the_config_dir() {
+        let mut system = Map::new();
+        system.insert("dht-listen-port".into(), json!("26701-26710"));
+        let options = super::super::options::EngineOptions::from_config(&system, &Map::new());
+        let tuning = BtTuning::from_options(
+            &options,
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            None,
+        );
+        assert_eq!(
+            tuning.dht_options(),
+            bt::dht::DhtOptions {
+                port: Some(26701),
+                routing_state_path: None,
+            }
+        );
+        assert_eq!(
+            tuning.with_config_dir(Path::new("cfg")).dht_options(),
+            bt::dht::DhtOptions {
+                port: Some(26701),
+                routing_state_path: Some(Path::new("cfg").join(DHT_ROUTING_STATE_FILENAME)),
+            }
+        );
+    }
+
+    #[test]
+    fn session_options_install_the_dht_options_of_the_tuning() {
+        let mut system = Map::new();
+        system.insert("dht-listen-port".into(), json!("26701-26710"));
+        let options = super::super::options::EngineOptions::from_config(&system, &Map::new());
+        let tuning = BtTuning::from_options(
+            &options,
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            Arc::new(bt::limiter::RateLimiter::unlimited()),
+            None,
+        )
+        .with_config_dir(Path::new("cfg"));
+        let session = tuning.session_options(0);
+        assert_eq!(session.dht, tuning.dht_options());
+        assert_eq!(session.dht.port, Some(26701));
+        assert_eq!(
+            session.dht.routing_state_path,
+            Some(Path::new("cfg").join(DHT_ROUTING_STATE_FILENAME))
+        );
+    }
+
     #[test]
     fn select_file_accepts_aria2_ranges() {
         assert_eq!(parse_select_file("1-3,5"), Some(vec![0, 1, 2, 4]));
@@ -1487,6 +1678,7 @@ mod tests {
             path: vec![name.to_string()],
             length: 10,
             padding,
+            executable: false,
         };
         let info = bt::ValidatedTorrentMetaV1Info {
             name: "t".into(),
@@ -1723,6 +1915,30 @@ mod tests {
                 "http://c:3/announce".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn listen_port_list_falls_through_to_the_next_free_port() {
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let free = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let tuning = BtTuning {
+            enable_upnp: Some(false),
+            enable_lsd: Some(false),
+            listen_ports: vec![busy, free],
+            ..Default::default()
+        };
+        let mut engine = TorrentEngine::new_with_tuning(dir.path(), tuning)
+            .await
+            .unwrap();
+        assert_eq!(engine.get_session().unwrap().listen_port(), free);
+        engine.shutdown().await;
+        drop(held);
     }
 
     #[tokio::test]

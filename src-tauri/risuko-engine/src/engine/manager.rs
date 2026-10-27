@@ -128,6 +128,52 @@ async fn worker_startup_aborted(
     }
 }
 
+async fn replay_magnet_trackers(
+    engine: &TorrentEngine,
+    tasks: &Arc<RevLock>,
+    gid: &str,
+    torrent_id: usize,
+) {
+    let tracker_urls = {
+        let guard = tasks.read().await;
+        guard
+            .iter()
+            .find(|task| task.gid == gid)
+            .map(|task| unique_tracker_urls(&task.bt_announce_list))
+            .unwrap_or_default()
+    };
+    if let Some(announced) = engine.private_tracker_tiers(torrent_id) {
+        if !tracker_urls.is_empty() {
+            tracing::warn!(
+                "[task:{gid}] Private torrent: not replaying {} added trackers",
+                tracker_urls.len()
+            );
+        }
+        let mut guard = tasks.write().await;
+        if let Some(task) = guard.iter_mut().find(|task| task.gid == gid) {
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String(unique_tracker_urls(&announced).join("\n")),
+            );
+            task.bt_announce_list = announced;
+        }
+    } else if !tracker_urls.is_empty() {
+        if let Err(e) = engine.add_trackers(torrent_id, tracker_urls).await {
+            tracing::warn!("[task:{gid}] Failed to replay persisted magnet trackers: {e}");
+        }
+    }
+}
+
+fn unique_tracker_urls(tiers: &[Vec<String>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tiers
+        .iter()
+        .flatten()
+        .filter(|url| seen.insert(url.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn decode_thunder_http_uris(uris: Vec<String>) -> Result<Vec<String>, String> {
     uris.into_iter()
         .map(|uri| match torrent::decode_thunder_uri(&uri) {
@@ -347,17 +393,10 @@ fn apply_task_patch(
         }
         if !tracker_urls_to_add.is_empty() {
             task.bt_announce_list.push(tracker_urls_to_add.clone());
-            let mut merged: Vec<String> = Vec::new();
-            let mut seen = HashSet::new();
-            for tier in &task.bt_announce_list {
-                for url in tier {
-                    if seen.insert(url.clone()) {
-                        merged.push(url.clone());
-                    }
-                }
-            }
-            task.options
-                .insert("bt-tracker".into(), Value::String(merged.join("\n")));
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String(unique_tracker_urls(&task.bt_announce_list).join("\n")),
+            );
         }
     }
 
@@ -1050,7 +1089,8 @@ impl TaskManager {
             global_speed_limiter.clone(),
             global_upload_limiter.clone(),
             p2p_proxy,
-        );
+        )
+        .with_config_dir(config_dir);
         let torrent_engine = if p2p_proxy_invalid {
             None
         } else {
@@ -1894,35 +1934,7 @@ impl TaskManager {
                                         );
                                     }
                                 }
-                                let tracker_urls = {
-                                    let guard = tasks.read().await;
-                                    guard
-                                        .iter()
-                                        .find(|task| task.gid == gid)
-                                        .map(|task| {
-                                            let mut seen = HashSet::new();
-                                            let mut urls = Vec::new();
-                                            for tier in &task.bt_announce_list {
-                                                for url in tier {
-                                                    if seen.insert(url.clone()) {
-                                                        urls.push(url.clone());
-                                                    }
-                                                }
-                                            }
-                                            urls
-                                        })
-                                        .unwrap_or_default()
-                                };
-                                if !tracker_urls.is_empty() {
-                                    if let Err(e) =
-                                        engine.add_trackers(handle.id, tracker_urls).await
-                                    {
-                                        tracing::warn!(
-                                            "[task:{}] Failed to replay persisted magnet trackers: {e}",
-                                            gid
-                                        );
-                                    }
-                                }
+                                replay_magnet_trackers(&engine, &tasks, &gid, handle.id).await;
                             } else if !handle.already_managed {
                                 let _ = engine.remove(handle.id, false).await;
                             }
@@ -3508,8 +3520,9 @@ impl TaskManager {
             };
 
             let resume_seq = self.torrent_resume_seq.load(Ordering::SeqCst);
+            let has_active_torrents = !active_torrent_gids.is_empty();
             let torrent_stats_by_gid: HashMap<String, torrent::TorrentStats> =
-                if active_torrent_gids.is_empty() {
+                if !has_active_torrents {
                     HashMap::new()
                 } else {
                     let te_guard = self.torrent_engine.read().await;
@@ -3529,7 +3542,7 @@ impl TaskManager {
 
             let mut halted = Vec::new();
             let mut write_halted = Vec::new();
-            if !torrent_stats_by_gid.is_empty() {
+            if has_active_torrents {
                 let mut tasks = self.tasks.write().await;
                 let resumed_since_snapshot =
                     self.torrent_resume_seq.load(Ordering::SeqCst) != resume_seq;
@@ -3539,6 +3552,8 @@ impl TaskManager {
                             task.peers = Vec::new();
                         }
                         task.bt_peers_key = None;
+                        task.swarm_seeders = None;
+                        task.swarm_leechers = None;
                         continue;
                     }
                     if let Some(stats) = torrent_stats_by_gid.get(&task.gid) {
@@ -3549,6 +3564,8 @@ impl TaskManager {
                         task.upload_speed = stats.upload_speed;
                         task.connections = stats.num_peers;
                         task.num_seeders = stats.num_seeders;
+                        task.swarm_seeders = stats.swarm_seeders;
+                        task.swarm_leechers = stats.swarm_leechers;
 
                         let num_pieces = stats
                             .metadata
@@ -3736,6 +3753,9 @@ impl TaskManager {
                                 });
                             }
                         }
+                    } else {
+                        task.swarm_seeders = None;
+                        task.swarm_leechers = None;
                     }
                 }
             }
@@ -4553,6 +4573,30 @@ impl TaskManager {
         }
     }
 
+    async fn torrent_is_private(&self, gid: &str) -> bool {
+        let tid = self.torrent_ids.read().await.get(gid).copied();
+        if let Some(tid) = tid {
+            if let Some(engine) = self.torrent_engine.read().await.clone() {
+                return engine.private_tracker_tiers(tid).is_some();
+            }
+        }
+        let info_hash = self
+            .tasks
+            .read()
+            .await
+            .iter()
+            .find(|task| task.gid == gid)
+            .and_then(|task| task.info_hash.clone());
+        let Some(path) = info_hash.and_then(|hash| self.saved_torrent_path(&hash)) else {
+            return false;
+        };
+        tokio::fs::read(path)
+            .await
+            .ok()
+            .and_then(|data| risuko_bt::parse_torrent(&data).ok())
+            .is_some_and(|meta| meta.info.private)
+    }
+
     pub async fn update_task(
         &self,
         gid: &str,
@@ -4617,6 +4661,7 @@ impl TaskManager {
 
         let normalized_trackers: Vec<String> =
             risuko_bt::torrent::split_tracker_lists(patch.trackers.unwrap_or_default());
+        let private_torrent = !normalized_trackers.is_empty() && self.torrent_is_private(gid).await;
 
         let mut pending_apply: Option<DownloadTask> = None;
         let mut updating_guard: Option<UpdatingGuard> = None;
@@ -4706,6 +4751,11 @@ impl TaskManager {
                 &normalized_trackers,
                 patch.options,
             );
+            if private_torrent && !applied.tracker_urls_to_add.is_empty() {
+                return Err(
+                    "Private torrents only announce to the trackers in their metainfo".to_string(),
+                );
+            }
             let needs_restart = was_active
                 && kind != TaskKind::Torrent
                 && (applied.uris_changed || applied.path_changed || applied.options_need_restart);
@@ -5129,7 +5179,12 @@ impl TaskManager {
         let old_dht = risuko_bt::dht::Dht::current_shared().await;
 
         let engine_was_missing = self.torrent_engine.read().await.is_none();
-        let mut dht_swap = match risuko_bt::dht::Dht::prepare_shared_with_proxy(proxy.clone()).await
+        let dht_options = self.bt_tuning(&new_options, proxy.clone()).dht_options();
+        let mut dht_swap = match risuko_bt::dht::Dht::prepare_shared_with_proxy(
+            proxy.clone(),
+            dht_options,
+        )
+        .await
         {
             Ok(swap) => Some(swap),
             Err(error) => {
@@ -5295,15 +5350,24 @@ impl TaskManager {
         proxy: Option<risuko_http::ProxyConnector>,
     ) -> Result<(), String> {
         let output_dir = options.dir();
-        let tuning = super::torrent::BtTuning::from_options(
+        let tuning = self.bt_tuning(options, proxy);
+        let engine = TorrentEngine::new_with_tuning(Path::new(&output_dir), tuning).await?;
+        *self.torrent_engine.write().await = Some(engine);
+        Ok(())
+    }
+
+    fn bt_tuning(
+        &self,
+        options: &EngineOptions,
+        proxy: Option<risuko_http::ProxyConnector>,
+    ) -> super::torrent::BtTuning {
+        super::torrent::BtTuning::from_options(
             options,
             self.global_speed_limiter.clone(),
             self.global_upload_limiter.clone(),
             proxy,
-        );
-        let engine = TorrentEngine::new_with_tuning(Path::new(&output_dir), tuning).await?;
-        *self.torrent_engine.write().await = Some(engine);
-        Ok(())
+        )
+        .with_config_dir(&self.config_dir)
     }
 
     async fn mark_p2p_reload_failed(&self, gids: &HashSet<String>, error: &str) {
@@ -6549,6 +6613,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_dht_swap_options_are_the_ones_the_session_tuning_carries() {
+        let mgr = make_test_manager(Vec::new());
+        let mut system = Map::new();
+        system.insert("dht-listen-port".into(), Value::from("26701-26710"));
+        let options = EngineOptions::from_config(&system, &Map::new());
+        let expected = risuko_bt::dht::DhtOptions {
+            port: Some(26701),
+            routing_state_path: Some(
+                mgr.config_dir
+                    .join(super::super::torrent::DHT_ROUTING_STATE_FILENAME),
+            ),
+        };
+        assert_eq!(mgr.bt_tuning(&options, None).dht_options(), expected);
+        let from_new = super::super::torrent::BtTuning::from_options(
+            &options,
+            mgr.global_speed_limiter.clone(),
+            mgr.global_upload_limiter.clone(),
+            None,
+        )
+        .with_config_dir(&mgr.config_dir);
+        assert_eq!(from_new.dht_options(), expected);
+    }
+
+    #[tokio::test]
     async fn finish_task_retains_terminal_ed2k_kad_status_without_progress_tick() {
         let mut task = DownloadTask::new_ed2k(
             "ed2k-kad-finish".into(),
@@ -7754,6 +7842,153 @@ mod tests {
             .unwrap();
         assert!(raw.contains("http://b.example/announce"));
         assert!(raw.contains("udp://a.example:80/announce"));
+    }
+
+    fn torrent_file_bytes(name: &str, private: bool) -> Vec<u8> {
+        use risuko_bt::bencode::{encode_to_vec, Value as Bencode};
+        let mut info = vec![
+            (b"length".to_vec(), Bencode::Int(1024)),
+            (b"name".to_vec(), Bencode::Bytes(name.as_bytes().to_vec())),
+            (b"piece length".to_vec(), Bencode::Int(1024)),
+            (b"pieces".to_vec(), Bencode::Bytes(vec![0u8; 20])),
+        ];
+        if private {
+            info.push((b"private".to_vec(), Bencode::Int(1)));
+        }
+        encode_to_vec(&Bencode::Dict(vec![
+            (
+                b"announce".to_vec(),
+                Bencode::Bytes(b"http://own.example/announce".to_vec()),
+            ),
+            (b"info".to_vec(), Bencode::Dict(info)),
+        ]))
+    }
+
+    async fn paused_torrent_task(mgr: &TaskManager, name: &str, private: bool) -> String {
+        let mut options = Map::new();
+        options.insert("pause".to_string(), Value::Bool(true));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            mgr.add_torrent_task(torrent_file_bytes(name, private), options),
+        )
+        .await
+        .expect("add_torrent_task did not finish")
+        .expect("torrent task")
+    }
+
+    fn add_tracker_patch(url: &str) -> TaskPatch {
+        TaskPatch {
+            trackers: Some(vec![url.to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn update_task_refuses_new_trackers_on_a_private_torrent() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "private-edit", true).await;
+
+        let err = mgr
+            .update_task(&gid, add_tracker_patch("http://b.example/announce"))
+            .await
+            .expect_err("a private torrent only announces to its metainfo trackers");
+        assert!(err.contains("Private torrents"), "{err}");
+
+        let tasks = mgr.tasks.read().await;
+        let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert!(task.bt_announce_list.is_empty());
+        assert!(!task.options.contains_key("bt-tracker"));
+    }
+
+    #[tokio::test]
+    async fn update_task_refuses_new_trackers_on_a_private_torrent_not_yet_re_added() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "private-restored", true).await;
+        mgr.torrent_ids.write().await.remove(&gid);
+
+        let err = mgr
+            .update_task(&gid, add_tracker_patch("http://b.example/announce"))
+            .await
+            .expect_err("the saved metainfo marks the torrent private");
+        assert!(err.contains("Private torrents"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn update_task_still_adds_trackers_to_a_public_torrent_with_an_engine() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "public-edit", false).await;
+
+        let outcome = mgr
+            .update_task(&gid, add_tracker_patch("http://b.example/announce"))
+            .await
+            .expect("public torrents take extra trackers");
+        assert_eq!(outcome.trackers_added, 1);
+
+        let tasks = mgr.tasks.read().await;
+        let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(
+            task.bt_announce_list,
+            vec![vec!["http://b.example/announce".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn magnet_tracker_replay_leaves_a_private_torrent_with_its_metainfo_trackers() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "private-replay", true).await;
+        let tid = mgr.torrent_ids.read().await[&gid];
+        let engine = mgr.torrent_engine.read().await.clone().unwrap();
+        {
+            let mut tasks = mgr.tasks.write().await;
+            let task = tasks.iter_mut().find(|t| t.gid == gid).unwrap();
+            task.bt_announce_list = vec![vec!["http://b.example/announce".to_string()]];
+            task.options.insert(
+                "bt-tracker".into(),
+                Value::String("http://b.example/announce".into()),
+            );
+        }
+
+        replay_magnet_trackers(&engine, &mgr.tasks, &gid, tid).await;
+
+        let tasks = mgr.tasks.read().await;
+        let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(
+            task.bt_announce_list,
+            vec![vec!["http://own.example/announce".to_string()]]
+        );
+        assert_eq!(
+            task.options.get("bt-tracker").and_then(Value::as_str),
+            Some("http://own.example/announce")
+        );
+    }
+
+    #[tokio::test]
+    async fn magnet_tracker_replay_adds_the_listed_trackers_to_a_public_torrent() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let gid = paused_torrent_task(&mgr, "public-replay", false).await;
+        let tid = mgr.torrent_ids.read().await[&gid];
+        let engine = mgr.torrent_engine.read().await.clone().unwrap();
+        let listed = vec![vec!["http://b.example/announce".to_string()]];
+        mgr.tasks
+            .write()
+            .await
+            .iter_mut()
+            .find(|t| t.gid == gid)
+            .unwrap()
+            .bt_announce_list = listed.clone();
+
+        replay_magnet_trackers(&engine, &mgr.tasks, &gid, tid).await;
+
+        assert_eq!(
+            engine
+                .add_trackers(tid, vec!["http://b.example/announce".to_string()])
+                .await,
+            Ok(0),
+            "the replay already handed the tracker to the torrent"
+        );
+        let tasks = mgr.tasks.read().await;
+        let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(task.bt_announce_list, listed);
     }
 
     #[tokio::test]

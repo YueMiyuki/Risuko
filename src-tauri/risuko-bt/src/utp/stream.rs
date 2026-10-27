@@ -16,9 +16,10 @@ use risuko_http::{Error as HttpError, ProxyAssociation};
 use super::dontfrag::{is_message_too_big, UdpSender};
 use super::now_micros;
 use super::packet::{PacketType, UtpHeader, HEADER_LEN};
+use super::slots::IpSlot;
 use super::socket::{
     remove_connection_registration, remove_proxy_connection_registration, ConnKey, ConnRegistry,
-    ConnectionToken, ProxyConnRegistry,
+    ConnectionToken, HalfOpenTicket, ProxyConnRegistry,
 };
 const MSS: usize = 1200;
 const UTP_OVERHEAD: usize = HEADER_LEN + 2 + MAX_SACK_BYTES;
@@ -42,6 +43,9 @@ const MAX_RETRANSMITS: u32 = 8;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_SEND_RETRIES: u32 = 8;
 const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
+const DROPPED_LIFETIME: Duration = Duration::from_secs(60);
+const PENDING_INBOUND_TIMEOUT: Duration = Duration::from_secs(10);
+const PENDING_REORDER_PACKETS: usize = 16;
 const ACK_BATCH: usize = 64;
 const DUP_ACK_THRESHOLD: usize = 3;
 const MAX_SACK_BYTES: usize = 32;
@@ -207,6 +211,10 @@ pub(crate) struct ConnState {
     last_maxed_out: Option<Instant>,
     pace_at: Option<Instant>,
     fin_acked_at: Option<Instant>,
+    reader_gone: bool,
+    abort_on_drop: bool,
+    pending_deadline: Option<Instant>,
+    drop_deadline: Option<Instant>,
 
     outbox: Vec<Vec<u8>>,
     send_retry_at: Option<Instant>,
@@ -723,14 +731,43 @@ impl ConnState {
         self.max_window = (next as i64).clamp(MIN_WINDOW as i64, MAX_CWND as i64) as usize;
     }
 
+    fn recv_id(&self) -> u16 {
+        if self.is_initiator {
+            self.conn_id_send.wrapping_sub(1)
+        } else {
+            self.conn_id_send.wrapping_add(1)
+        }
+    }
+
+    fn accepts_reset(&self, header: &UtpHeader) -> bool {
+        if header.connection_id != self.recv_id() && header.connection_id != self.conn_id_send {
+            return false;
+        }
+        let oldest = self.unacked.front().map_or(self.seq_nr, |p| p.seq_nr);
+        let floor = oldest.wrapping_sub(1);
+        header.ack_nr.wrapping_sub(floor) <= self.seq_nr.wrapping_sub(floor)
+    }
+
     fn handle_packet(&mut self, header: &UtpHeader, payload: &[u8]) {
         if self.state == State::Closed {
+            return;
+        }
+        if header.packet_type == PacketType::Reset {
+            if self.accepts_reset(header) {
+                self.fail(io::ErrorKind::ConnectionReset);
+            }
             return;
         }
         if header.packet_type == PacketType::Syn {
             if !self.is_initiator {
                 self.needs_ack = true;
             }
+            return;
+        }
+        if self.state == State::SynSent && header.packet_type != PacketType::State {
+            return;
+        }
+        if self.pending_deadline.is_some() && header.ack_nr != self.seq_nr.wrapping_sub(1) {
             return;
         }
         if seq_after(header.ack_nr, self.seq_nr.wrapping_sub(1)) {
@@ -763,14 +800,10 @@ impl ConnState {
         }
 
         match header.packet_type {
-            PacketType::Reset => {
-                self.fail(io::ErrorKind::ConnectionReset);
-                return;
-            }
             PacketType::Data | PacketType::Fin => {
                 self.accept_inorder(header, payload);
             }
-            PacketType::State | PacketType::Syn => {}
+            PacketType::State | PacketType::Syn | PacketType::Reset => {}
         }
 
         if let Some(fin) = self.peer_fin {
@@ -782,11 +815,17 @@ impl ConnState {
         self.maybe_finish();
     }
 
+    fn reorder_limit(&self) -> usize {
+        if self.pending_deadline.is_some() {
+            PENDING_REORDER_PACKETS
+        } else {
+            RECV_BUF_MAX / self.packet_size
+        }
+    }
+
     fn accept_inorder(&mut self, header: &UtpHeader, payload: &[u8]) {
         self.needs_ack = true;
-        if self.fin_acked_at.is_some() {
-            self.fin_acked_at = Some(Instant::now());
-        }
+        let payload = if self.reader_gone { &[] } else { payload };
         let distance = header.seq_nr.wrapping_sub(self.ack_nr);
         if distance == 0 || distance >= 0x8000 {
             return;
@@ -817,7 +856,7 @@ impl ConnState {
             if header.packet_type == PacketType::Fin {
                 self.peer_fin = Some(header.seq_nr);
             }
-            if self.reorder.len() < RECV_BUF_MAX / self.packet_size {
+            if self.reorder.len() < self.reorder_limit() {
                 if let Some(old) = self.reorder.insert(header.seq_nr, payload.to_vec()) {
                     self.reorder_bytes = self.reorder_bytes.saturating_sub(old.len());
                 }
@@ -830,14 +869,29 @@ impl ConnState {
         self.ack_nr = seq;
         if ty == PacketType::Fin {
             self.peer_fin = Some(seq);
-        } else if !payload.is_empty() {
+        } else if !payload.is_empty() && !self.reader_gone {
             self.recv_ready.extend(payload);
             self.notify_read();
+            if self.fin_acked_at.is_some() {
+                self.fin_acked_at = Some(Instant::now());
+            }
         }
+    }
+
+    fn teardown_at(&self) -> Option<Instant> {
+        [self.pending_deadline, self.drop_deadline]
+            .into_iter()
+            .flatten()
+            .min()
+            .filter(|_| self.state != State::Closed)
     }
 
     fn check_timers(&mut self) {
         let now = Instant::now();
+        if self.teardown_at().is_some_and(|at| now >= at) {
+            self.abort();
+            return;
+        }
         if let Some(at) = self.probe_at {
             if now >= at {
                 self.probe_at = None;
@@ -931,12 +985,14 @@ impl ConnState {
         let pace = self
             .pace_at
             .filter(|_| matches!(self.state, State::Connected | State::FinSent));
+        let teardown = self.teardown_at();
         [
             retransmit_at,
             self.probe_at,
             self.send_retry_at,
             fin_wait,
             pace,
+            teardown,
         ]
         .into_iter()
         .flatten()
@@ -983,6 +1039,20 @@ impl ConnState {
         self.notify_write();
     }
 
+    pub(crate) fn abort(&mut self) {
+        if self.state == State::Closed {
+            return;
+        }
+        let reset = self
+            .header(PacketType::Reset, self.conn_id_send, self.seq_nr)
+            .encode(&[]);
+        self.fail(io::ErrorKind::ConnectionAborted);
+        self.outbox.push(reset);
+        self.needs_ack = false;
+        self.pending_deadline = None;
+        self.drop_deadline = None;
+    }
+
     pub(crate) fn seed_responder(&mut self, syn: &UtpHeader) {
         self.ack_nr = syn.seq_nr;
         self.peer_wnd = syn.wnd_size;
@@ -1023,9 +1093,15 @@ pub(crate) struct Shared {
     pub(crate) nudge: Notify,
 }
 
+pub(crate) struct Inbound {
+    pub accept_tx: mpsc::Sender<UtpStream>,
+    pub half_open: HalfOpenTicket,
+    pub live: IpSlot,
+}
+
 pub(crate) enum Role {
     Initiator(oneshot::Sender<io::Result<()>>),
-    Responder,
+    Responder(Inbound),
 }
 
 #[derive(Clone, Copy)]
@@ -1104,6 +1180,10 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
             last_maxed_out: None,
             pace_at: None,
             fin_acked_at: None,
+            reader_gone: false,
+            abort_on_drop: false,
+            pending_deadline: None,
+            drop_deadline: None,
             outbox: Vec::new(),
             send_retry_at: None,
             send_retry_count: 0,
@@ -1115,16 +1195,32 @@ pub(crate) fn new_shared(remote: SocketAddr, conn_id_send: u16, kind: RoleKind) 
     })
 }
 
+enum Handoff {
+    Keep,
+    Release,
+    Deliver,
+}
+
 pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role) {
+    let (initiator_done, mut handoff, _live) = match role {
+        Role::Initiator(tx) => (Some(tx), None, None),
+        Role::Responder(Inbound {
+            accept_tx,
+            half_open,
+            live,
+        }) => (None, Some((accept_tx, half_open)), Some(live)),
+    };
     {
         let mut st = shared.state.lock();
         st.pmtud =
             matches!(&cfg.transport, DatagramTransport::Direct(sender) if sender.can_probe());
-        if let Role::Initiator(tx) = role {
+        if let Some(tx) = initiator_done {
             st.connect_notify = Some(tx);
+            let isn: u16 = rand::random();
+            st.seq_nr = isn.wrapping_add(1);
             let syn = OutPacket {
                 packet_type: PacketType::Syn,
-                seq_nr: 1,
+                seq_nr: isn,
                 payload: Vec::new(),
                 sent_at: Instant::now(),
                 transmissions: 1,
@@ -1136,6 +1232,7 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             st.unacked.push_back(syn);
             st.arm_rto();
         } else {
+            st.pending_deadline = Some(Instant::now() + PENDING_INBOUND_TIMEOUT);
             let state_bytes = st.encode_state();
             st.outbox.push(state_bytes);
         }
@@ -1160,6 +1257,7 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
                 st.unacked.is_empty() && st.send_buf.is_empty()
             };
             if drained || since.elapsed() > LINGER_TIMEOUT {
+                flush(&shared, &cfg).await;
                 break;
             }
         }
@@ -1205,17 +1303,43 @@ pub(crate) async fn drive(shared: Arc<Shared>, mut cfg: DriverConfig, role: Role
             }
         }
 
-        {
+        let handoff_action = {
             let mut st = shared.state.lock();
             st.fill_send_window();
             st.maybe_send_fin();
             st.fill_send_window();
+            let action = if handoff.is_none() {
+                Handoff::Keep
+            } else if st.state == State::Closed {
+                Handoff::Release
+            } else if !st.recv_ready.is_empty() {
+                st.pending_deadline = None;
+                Handoff::Deliver
+            } else {
+                if st.eof {
+                    st.abort();
+                }
+                Handoff::Keep
+            };
             if st.needs_ack && st.state != State::SynSent {
                 let ack = st.encode_state();
                 st.outbox.push(ack);
                 st.needs_ack = false;
             }
             st.maybe_finish();
+            action
+        };
+        match handoff_action {
+            Handoff::Keep => {}
+            Handoff::Release => handoff = None,
+            Handoff::Deliver => {
+                if let Some((accept_tx, _half_open)) = handoff.take() {
+                    match accept_tx.try_reserve() {
+                        Ok(permit) => permit.send(UtpStream::new(shared.clone())),
+                        Err(_) => shared.state.lock().abort(),
+                    }
+                }
+            }
         }
         flush(&shared, &cfg).await;
     }
@@ -1327,9 +1451,31 @@ impl UtpStream {
         self.shared.state.lock().remote
     }
 
+    pub(crate) fn abort(self) {
+        self.shared.state.lock().abort();
+        self.shared.nudge.notify_one();
+    }
+
+    pub(crate) fn arm_abort_on_drop(&self) -> AbortArm {
+        self.shared.state.lock().abort_on_drop = true;
+        AbortArm {
+            shared: self.shared.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn mtu_floor(&self) -> usize {
         self.shared.state.lock().mtu_floor
+    }
+}
+
+pub(crate) struct AbortArm {
+    shared: Arc<Shared>,
+}
+
+impl AbortArm {
+    pub(crate) fn disarm(self) {
+        self.shared.state.lock().abort_on_drop = false;
     }
 }
 
@@ -1438,9 +1584,22 @@ impl AsyncWrite for UtpStream {
 impl Drop for UtpStream {
     fn drop(&mut self) {
         let mut st = self.shared.state.lock();
+        if st.abort_on_drop {
+            st.abort();
+        }
         st.want_fin = true;
+        st.reader_gone = true;
+        st.recv_ready = VecDeque::new();
+        for payload in st.reorder.values_mut() {
+            *payload = Vec::new();
+        }
+        st.reorder_bytes = 0;
         st.read_waker = None;
         st.write_waker = None;
+        if st.state != State::Closed {
+            st.drop_deadline
+                .get_or_insert_with(|| Instant::now() + DROPPED_LIFETIME);
+        }
         drop(st);
         self.shared.nudge.notify_one();
     }
@@ -2068,6 +2227,294 @@ mod tests {
         assert_counters(&st);
         st.rtt = 0.0001;
         assert!(st.burst_limit() > 800);
+    }
+
+    fn reset_packet(connection_id: u16, ack_nr: u16) -> UtpHeader {
+        UtpHeader {
+            packet_type: PacketType::Reset,
+            connection_id,
+            timestamp_micros: now_micros(),
+            timestamp_diff_micros: 0,
+            wnd_size: 0,
+            seq_nr: 9,
+            ack_nr,
+            selective_ack: None,
+        }
+    }
+
+    #[test]
+    fn reset_answering_our_state_packet_closes_the_connection() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        let seq = st.seq_nr;
+        st.handle_packet(&reset_packet(1, seq), &[]);
+        assert_eq!(st.state, State::Closed);
+        assert_eq!(st.error, Some(io::ErrorKind::ConnectionReset));
+
+        let shared = new_shared("127.0.0.1:1".parse().unwrap(), 9, RoleKind::Responder);
+        let mut st = shared.state.lock();
+        let seq = st.seq_nr;
+        st.handle_packet(&reset_packet(10, seq), &[]);
+        assert_eq!(st.state, State::Closed);
+    }
+
+    #[test]
+    fn reset_outside_the_ack_window_or_for_another_connection_is_ignored() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.seq_nr = 5000;
+        st.handle_packet(&reset_packet(1, 40_000), &[]);
+        st.handle_packet(&reset_packet(1, 4_990), &[]);
+        st.handle_packet(&reset_packet(77, 5000), &[]);
+        st.handle_packet(&reset_packet(3, 5000), &[]);
+        assert_eq!(st.state, State::Connected);
+        st.handle_packet(&reset_packet(2, 4999), &[]);
+        assert_eq!(st.state, State::Closed);
+    }
+
+    #[test]
+    fn reset_ack_window_starts_at_the_oldest_unacked_packet() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        send_packets(&mut st, 6);
+        assert_eq!(st.seq_nr, 8);
+        st.handle_packet(&reset_packet(1, 0), &[]);
+        assert_eq!(st.state, State::Connected);
+        st.handle_packet(&reset_packet(1, 4), &[]);
+        assert_eq!(st.state, State::Closed);
+    }
+
+    #[test]
+    fn data_in_syn_sent_does_not_consume_the_queued_syn() {
+        let shared = new_shared("127.0.0.1:1".parse().unwrap(), 2, RoleKind::Initiator);
+        let mut st = shared.state.lock();
+        st.unacked.push_back(OutPacket {
+            packet_type: PacketType::Syn,
+            seq_nr: 1,
+            payload: Vec::new(),
+            sent_at: Instant::now(),
+            transmissions: 1,
+            need_resend: false,
+            fast_resent: false,
+        });
+        st.arm_rto();
+        let mut data = ack(1, None);
+        data.packet_type = PacketType::Data;
+        data.seq_nr = 777;
+        st.handle_packet(&data, b"x");
+        assert_eq!(st.state, State::SynSent);
+        assert_eq!(st.unacked.len(), 1);
+        assert!(st.rto_base.is_some());
+        assert!(st.recv_ready.is_empty());
+    }
+
+    fn data_packet(seq_nr: u16) -> UtpHeader {
+        let mut data = ack(1, None);
+        data.packet_type = PacketType::Data;
+        data.seq_nr = seq_nr;
+        data
+    }
+
+    fn decoded_types(st: &ConnState) -> Vec<PacketType> {
+        st.outbox
+            .iter()
+            .map(|d| UtpHeader::decode(d).unwrap().0.packet_type)
+            .collect()
+    }
+
+    #[test]
+    fn abort_queues_a_single_reset_and_never_a_fin() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.want_fin = true;
+        st.needs_ack = true;
+        st.abort();
+        assert_eq!(st.state, State::Closed);
+        assert_eq!(st.error, Some(io::ErrorKind::ConnectionAborted));
+        st.maybe_send_fin();
+        st.fill_send_window();
+        assert_eq!(decoded_types(&st), vec![PacketType::Reset]);
+        assert!(!st.needs_ack);
+        assert!(st.unacked.is_empty());
+        assert!(st.next_deadline().is_none());
+        st.abort();
+        assert_eq!(st.outbox.len(), 1, "a second abort adds nothing");
+    }
+
+    #[test]
+    fn data_after_the_reader_is_gone_is_discarded_and_cannot_extend_the_linger() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.reader_gone = true;
+        st.want_fin = true;
+        st.maybe_send_fin();
+        st.handle_packet(&ack(2, None), &[]);
+        assert_eq!(st.state, State::FinSent);
+        let acked_at = Instant::now() - Duration::from_secs(20);
+        st.fin_acked_at = Some(acked_at);
+
+        st.handle_packet(&data_packet(101), &[7u8; 900]);
+        assert!(st.recv_ready.is_empty());
+        assert_eq!(st.ack_nr, 101, "discarded data is still acknowledged");
+        st.handle_packet(&data_packet(101), &[7u8; 900]);
+        st.handle_packet(&data_packet(102), &[]);
+        st.handle_packet(&data_packet(103), b"x");
+        assert_eq!(st.fin_acked_at, Some(acked_at));
+        assert_eq!(st.advertised_window() as usize, RECV_BUF_MAX);
+
+        st.fin_acked_at = Some(Instant::now() - LINGER_TIMEOUT - Duration::from_secs(1));
+        st.check_timers();
+        assert_eq!(st.state, State::Closed);
+    }
+
+    #[test]
+    fn a_live_reader_extends_the_linger_only_for_new_payload() {
+        let shared = connected_initiator();
+        let mut st = shared.state.lock();
+        st.want_fin = true;
+        st.maybe_send_fin();
+        st.handle_packet(&ack(2, None), &[]);
+        let acked_at = Instant::now() - Duration::from_secs(20);
+        st.fin_acked_at = Some(acked_at);
+
+        st.handle_packet(&data_packet(101), &[]);
+        assert_eq!(
+            st.fin_acked_at,
+            Some(acked_at),
+            "empty data is not progress"
+        );
+        st.handle_packet(&data_packet(102), b"abc");
+        assert!(st.fin_acked_at.unwrap() > acked_at);
+        let refreshed = st.fin_acked_at;
+        st.handle_packet(&data_packet(102), b"abc");
+        assert_eq!(st.fin_acked_at, refreshed, "a duplicate is not progress");
+        assert_eq!(st.recv_ready.len(), 3);
+    }
+
+    #[test]
+    fn dropping_the_stream_frees_unread_bytes_and_bounds_its_lifetime() {
+        let shared = connected_initiator();
+        shared
+            .state
+            .lock()
+            .recv_ready
+            .extend(std::iter::repeat_n(1u8, 4096));
+        drop(UtpStream::new(shared.clone()));
+        let mut st = shared.state.lock();
+        assert!(st.recv_ready.is_empty());
+        assert!(st.reader_gone && st.want_fin);
+        assert!(st.drop_deadline.is_some());
+        assert!(st.next_deadline().is_some());
+        st.drop_deadline = Some(Instant::now() - Duration::from_millis(1));
+        st.check_timers();
+        assert_eq!(st.state, State::Closed);
+        assert_eq!(decoded_types(&st).last(), Some(&PacketType::Reset));
+    }
+
+    #[test]
+    fn dropping_the_stream_discards_buffered_out_of_order_payloads() {
+        let shared = connected_initiator();
+        {
+            let mut st = shared.state.lock();
+            st.handle_packet(&data_packet(102), b"bbb");
+            st.handle_packet(&data_packet(103), b"cc");
+            assert_eq!(st.reorder_bytes, 5);
+        }
+        drop(UtpStream::new(shared.clone()));
+        let mut st = shared.state.lock();
+        assert_eq!(st.reorder_bytes, 0);
+        assert_counters(&st);
+        st.handle_packet(&data_packet(101), b"a");
+        assert!(
+            st.recv_ready.is_empty(),
+            "late gap-filling resurrected bytes"
+        );
+        assert_eq!(
+            st.ack_nr, 103,
+            "the sequence still advances and is acknowledged"
+        );
+        assert_eq!(st.advertised_window() as usize, RECV_BUF_MAX);
+    }
+
+    #[test]
+    fn a_stream_armed_for_abort_resets_instead_of_closing_gracefully() {
+        let shared = connected_initiator();
+        let stream = UtpStream::new(shared.clone());
+        let arm = stream.arm_abort_on_drop();
+        drop(stream);
+        {
+            let st = shared.state.lock();
+            assert_eq!(st.state, State::Closed);
+            assert_eq!(decoded_types(&st), vec![PacketType::Reset]);
+        }
+        drop(arm);
+
+        let shared = connected_initiator();
+        let stream = UtpStream::new(shared.clone());
+        stream.arm_abort_on_drop().disarm();
+        drop(stream);
+        let st = shared.state.lock();
+        assert_eq!(st.state, State::Connected);
+        assert!(st.want_fin && st.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_half_open_responder_is_reset_when_no_data_arrives_in_time() {
+        let shared = new_shared("127.0.0.1:1".parse().unwrap(), 9, RoleKind::Responder);
+        let mut st = shared.state.lock();
+        let deadline = Instant::now() + PENDING_INBOUND_TIMEOUT;
+        st.pending_deadline = Some(deadline);
+        assert_eq!(st.next_deadline(), Some(deadline));
+        st.check_timers();
+        assert_eq!(st.state, State::Connected);
+        st.pending_deadline = Some(Instant::now() - Duration::from_millis(1));
+        st.check_timers();
+        assert_eq!(st.state, State::Closed);
+        assert_eq!(decoded_types(&st), vec![PacketType::Reset]);
+    }
+
+    #[test]
+    fn a_half_open_responder_only_accepts_data_that_acknowledges_its_syn_ack() {
+        let shared = new_shared("127.0.0.1:1".parse().unwrap(), 9, RoleKind::Responder);
+        let mut st = shared.state.lock();
+        st.seq_nr = 5;
+        st.ack_nr = 100;
+        st.pending_deadline = Some(Instant::now() + PENDING_INBOUND_TIMEOUT);
+        for ack_nr in [0, 1, 3, 5, 6, 40_000] {
+            let mut data = data_packet(101);
+            data.ack_nr = ack_nr;
+            st.handle_packet(&data, b"blind");
+            assert!(st.recv_ready.is_empty(), "ack {ack_nr}");
+            assert_eq!(st.ack_nr, 100);
+        }
+        let mut data = data_packet(101);
+        data.ack_nr = 4;
+        st.handle_packet(&data, b"seen");
+        assert_eq!(st.recv_ready.len(), 4);
+        st.pending_deadline = None;
+        let mut data = data_packet(102);
+        data.ack_nr = 3;
+        st.handle_packet(&data, b"ok");
+        assert_eq!(st.recv_ready.len(), 6, "established connections ack freely");
+    }
+
+    #[test]
+    fn a_half_open_responder_buffers_only_a_few_out_of_order_packets() {
+        let shared = new_shared("127.0.0.1:1".parse().unwrap(), 9, RoleKind::Responder);
+        let mut st = shared.state.lock();
+        st.seq_nr = 2;
+        st.ack_nr = 100;
+        st.pending_deadline = Some(Instant::now() + PENDING_INBOUND_TIMEOUT);
+        for seq in 102..202 {
+            st.handle_packet(&data_packet(seq), &[1u8; 1000]);
+        }
+        assert_eq!(st.reorder.len(), PENDING_REORDER_PACKETS);
+        assert_counters(&st);
+        st.pending_deadline = None;
+        for seq in 202..302 {
+            st.handle_packet(&data_packet(seq), &[1u8; 1000]);
+        }
+        assert!(st.reorder.len() > PENDING_REORDER_PACKETS);
     }
 
     #[test]

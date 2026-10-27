@@ -1,3 +1,5 @@
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -8,6 +10,8 @@ use risuko_bt::core::metainfo::{TorrentMeta, TorrentMetaInfo, ValidatedTorrentMe
 use risuko_bt::limiter::RateLimiter;
 use risuko_bt::session::{AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
 use sha1::{Digest, Sha1};
+
+use common::{loopback_session, wait_until_finished};
 
 const PIECE_LEN: u32 = 64 * 1024;
 const TOTAL: u64 = 256 * 1024;
@@ -41,6 +45,7 @@ fn build_meta(payload: &[u8]) -> TorrentMeta {
             path: vec!["payload.bin".to_string()],
             length: payload.len() as u64,
             padding: false,
+            executable: false,
         }],
         single_file_mode: true,
     };
@@ -254,23 +259,6 @@ async fn pause_if_halted_leaves_a_healthy_torrent_running() {
     assert_eq!(got, payload, "payload mismatch");
 }
 
-async fn loopback_session(dir: &std::path::Path) -> std::sync::Arc<Session> {
-    Session::new_with_opts(
-        dir.to_path_buf(),
-        SessionOptions {
-            disable_dht: true,
-            listen: Some(risuko_bt::session::ListenerOptions {
-                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
-                enable_upnp_port_forwarding: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap()
-}
-
 async fn timed_transfer(
     seed_opts: SessionOptions,
     seed_add: AddTorrentOptions,
@@ -297,7 +285,7 @@ async fn timed_transfer(
     )
     .await
     .unwrap();
-    let leech = loopback_session(leech_dir.path()).await;
+    let leech = loopback_session(leech_dir.path(), true).await;
     match seed.add_from_meta(meta.clone(), seed_add).await.unwrap() {
         AddTorrentResponse::Added(..) => {}
         _ => panic!("expected Added"),
@@ -336,7 +324,7 @@ async fn session_connection_budget_caps_live_peers() {
     for _ in 0..2 {
         let dir = tempfile::tempdir().unwrap();
         write_payload(dir.path(), &meta.info.name, &payload);
-        let seed = loopback_session(dir.path()).await;
+        let seed = loopback_session(dir.path(), true).await;
         seed.add_from_meta(meta.clone(), AddTorrentOptions::default())
             .await
             .unwrap();
@@ -469,11 +457,13 @@ async fn leecher_downloads_only_selected_file() {
             path: vec!["first.bin".to_string()],
             length: half as u64,
             padding: false,
+            executable: false,
         },
         TorrentMetaInfo {
             path: vec!["second.bin".to_string()],
             length: (payload.len() - half) as u64,
             padding: false,
+            executable: false,
         },
     ];
 
@@ -481,8 +471,8 @@ async fn leecher_downloads_only_selected_file() {
     let leech_dir = tempfile::tempdir().unwrap();
     write_payload(seed_dir.path(), "first.bin", &payload[..half]);
     write_payload(seed_dir.path(), "second.bin", &payload[half..]);
-    let seed = loopback_session(seed_dir.path()).await;
-    let leech = loopback_session(leech_dir.path()).await;
+    let seed = loopback_session(seed_dir.path(), true).await;
+    let leech = loopback_session(leech_dir.path(), true).await;
 
     let flat = |only_files| AddTorrentOptions {
         create_subfolder: false,
@@ -537,6 +527,77 @@ async fn leecher_downloads_only_selected_file() {
     assert!(got == payload[..half], "reselected file corrupted");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leecher_marks_a_completed_x_file_executable_and_not_its_sibling() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let payload = make_payload();
+    let mut meta = build_meta(&payload);
+    let half = payload.len() / 2;
+    meta.info.single_file_mode = false;
+    meta.info.name = "pair".to_string();
+    meta.info.files = vec![
+        TorrentMetaInfo {
+            path: vec!["data.bin".to_string()],
+            length: half as u64,
+            padding: false,
+            executable: false,
+        },
+        TorrentMetaInfo {
+            path: vec!["run.sh".to_string()],
+            length: (payload.len() - half) as u64,
+            padding: false,
+            executable: true,
+        },
+    ];
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    write_payload(seed_dir.path(), "data.bin", &payload[..half]);
+    write_payload(seed_dir.path(), "run.sh", &payload[half..]);
+    let seed = loopback_session(seed_dir.path(), true).await;
+    let leech = loopback_session(leech_dir.path(), true).await;
+
+    let flat = AddTorrentOptions {
+        create_subfolder: false,
+        ..Default::default()
+    };
+    let AddTorrentResponse::Added(_, _seed_handle) = seed
+        .add_from_meta(meta.clone(), flat.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected Added");
+    };
+    let AddTorrentResponse::Added(_, leech_handle) =
+        leech.add_from_meta(meta.clone(), flat).await.unwrap()
+    else {
+        panic!("expected Added");
+    };
+    let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+    leech.add_peer(meta.info_hash, seed_addr).await.unwrap();
+
+    let script = leech_dir.path().join("run.sh");
+    wait_until_finished(&leech_handle, Duration::from_secs(30)).await;
+    let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+    assert_ne!(
+        mode & 0o111,
+        0,
+        "the torrent reported finished before the x file was executable: {mode:o}"
+    );
+    assert_eq!(std::fs::read(&script).unwrap(), &payload[half..]);
+    let data_mode = std::fs::metadata(leech_dir.path().join("data.bin"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        data_mode & 0o111,
+        0,
+        "a plain file must not become executable"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
     let payload = make_payload();
@@ -549,19 +610,21 @@ async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
             path: vec!["a.bin".to_string()],
             length: split as u64,
             padding: false,
+            executable: false,
         },
         TorrentMetaInfo {
             path: vec!["b.bin".to_string()],
             length: (payload.len() - split) as u64,
             padding: false,
+            executable: false,
         },
     ];
     let seed_dir = tempfile::tempdir().unwrap();
     let leech_dir = tempfile::tempdir().unwrap();
     write_payload(seed_dir.path(), "a.bin", &payload[..split]);
     write_payload(seed_dir.path(), "b.bin", &payload[split..]);
-    let seed = loopback_session(seed_dir.path()).await;
-    let leech = loopback_session(leech_dir.path()).await;
+    let seed = loopback_session(seed_dir.path(), true).await;
+    let leech = loopback_session(leech_dir.path(), true).await;
     let flat = |only_files| AddTorrentOptions {
         create_subfolder: false,
         only_files,
@@ -605,6 +668,83 @@ async fn unselected_neighbour_of_a_boundary_piece_stays_in_a_part_file() {
     let got = std::fs::read(leech_dir.path().join("a.bin")).unwrap();
     assert!(got == payload[..split], "promoted file corrupted");
     assert!(!leech_dir.path().join(".risuko-parts").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn padding_chunks_are_zero_filled_instead_of_requested() {
+    let payload = make_payload();
+    let (a_len, pad_len, b_len) = (40 * 1024, 24 * 1024, 70 * 1024);
+    let mut stream = payload[..a_len].to_vec();
+    stream.resize(a_len + pad_len, 0);
+    stream.extend_from_slice(&payload[a_len..a_len + b_len]);
+    let mut meta = build_meta(&stream);
+    meta.info.single_file_mode = false;
+    meta.info.name = "padded".to_string();
+    meta.info.files = vec![
+        TorrentMetaInfo {
+            path: vec!["a.bin".to_string()],
+            length: a_len as u64,
+            padding: false,
+            executable: false,
+        },
+        TorrentMetaInfo {
+            path: vec![".pad".to_string(), pad_len.to_string()],
+            length: pad_len as u64,
+            padding: true,
+            executable: false,
+        },
+        TorrentMetaInfo {
+            path: vec!["b.bin".to_string()],
+            length: b_len as u64,
+            padding: false,
+            executable: false,
+        },
+    ];
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    let leech_dir = tempfile::tempdir().unwrap();
+    write_payload(seed_dir.path(), "a.bin", &payload[..a_len]);
+    write_payload(seed_dir.path(), "b.bin", &payload[a_len..a_len + b_len]);
+    let seed = loopback_session(seed_dir.path(), true).await;
+    let leech = loopback_session(leech_dir.path(), true).await;
+    let flat = AddTorrentOptions {
+        create_subfolder: false,
+        ..Default::default()
+    };
+    let AddTorrentResponse::Added(_, seed_handle) = seed
+        .add_from_meta(meta.clone(), flat.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected Added");
+    };
+    let AddTorrentResponse::Added(_, leech_handle) =
+        leech.add_from_meta(meta.clone(), flat).await.unwrap()
+    else {
+        panic!("expected Added");
+    };
+    let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+    leech.add_peer(meta.info_hash, seed_addr).await.unwrap();
+
+    wait_until_finished(&leech_handle, Duration::from_secs(30)).await;
+    assert!(std::fs::read(leech_dir.path().join("a.bin")).unwrap() == payload[..a_len]);
+    assert!(
+        std::fs::read(leech_dir.path().join("b.bin")).unwrap() == payload[a_len..a_len + b_len]
+    );
+    assert!(!leech_dir.path().join(".pad").exists());
+
+    let requested_payload = (stream.len() - 16 * 1024) as u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seed_handle.stats().uploaded_bytes < requested_payload {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seeder never reported the expected upload: {}",
+            seed_handle.stats().uploaded_bytes
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(seed_handle.stats().uploaded_bytes, requested_payload);
 }
 
 #[test]
@@ -840,6 +980,7 @@ mod v2 {
         let torrent_bytes = risuko_bt::magnet::synth_torrent_bytes(
             &resolved.info_bytes,
             &resolved.trackers,
+            &resolved.web_seeds,
             &resolved.piece_layers,
         );
         let leech_meta = parse_torrent(&torrent_bytes).expect("synthesised torrent parses");
@@ -907,7 +1048,7 @@ mod v2 {
         let root = meta.info_v2.as_ref().unwrap().files[0].pieces_root;
         let seed_dir = tempfile::tempdir().unwrap();
         write_payload(seed_dir.path(), &meta.info.name, &payload);
-        let seed = super::loopback_session(seed_dir.path()).await;
+        let seed = super::loopback_session(seed_dir.path(), true).await;
         let AddTorrentResponse::Added(_, seed_handle) = seed
             .add_from_meta(meta.clone(), AddTorrentOptions::default())
             .await

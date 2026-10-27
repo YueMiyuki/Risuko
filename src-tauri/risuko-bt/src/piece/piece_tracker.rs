@@ -4,6 +4,7 @@ pub struct PieceTracker {
     lengths: Lengths,
     have_local: Vec<bool>,
     wanted: Vec<bool>,
+    needed: Vec<u8>,
     left: u64,
     in_flight: Vec<bool>,
     availability: Vec<u32>,
@@ -13,18 +14,26 @@ pub struct PieceTracker {
     resort: bool,
     dead_prefix: usize,
     resort_deferred: u32,
+    order_tie: Vec<u64>,
 }
 
 const RESORT_EVERY_TICK_PIECES: usize = 65_536;
+
+fn scramble(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
 const MAX_RESORT_DEFERRAL: u32 = 20;
 
 impl PieceTracker {
     pub fn new(lengths: Lengths) -> Self {
         let n = lengths.total_pieces() as usize;
-        Self {
+        let mut tracker = Self {
             lengths,
             have_local: vec![false; n],
             wanted: vec![true; n],
+            needed: Vec::new(),
             left: lengths.total_length(),
             in_flight: vec![false; n],
             availability: vec![0; n],
@@ -34,7 +43,33 @@ impl PieceTracker {
             resort: false,
             dead_prefix: 0,
             resort_deferred: 0,
+            order_tie: Vec::new(),
+        };
+        tracker.rebuild_needed();
+        tracker
+    }
+
+    fn rebuild_needed(&mut self) {
+        self.needed = vec![0; self.lengths.piece_bitfield_bytes()];
+        for i in 0..self.have_local.len() {
+            self.mark_needed(i);
         }
+    }
+
+    fn mark_needed(&mut self, i: usize) {
+        let mask = 1 << (7 - (i % 8));
+        if self.wanted[i] && !self.have_local[i] {
+            self.needed[i / 8] |= mask;
+        } else {
+            self.needed[i / 8] &= !mask;
+        }
+    }
+
+    pub(crate) fn with_order_salt(mut self, salt: u64) -> Self {
+        self.order_tie = (0..self.have_local.len() as u64)
+            .map(|i| scramble(i ^ salt))
+            .collect();
+        self
     }
 
     pub fn lengths(&self) -> &Lengths {
@@ -73,6 +108,7 @@ impl PieceTracker {
             }
         }
         self.have_local[i] = have;
+        self.mark_needed(i);
         if have {
             self.in_flight[i] = false;
         }
@@ -87,6 +123,7 @@ impl PieceTracker {
     pub fn set_wanted(&mut self, wanted: Vec<bool>) {
         if wanted.len() == self.wanted.len() {
             self.wanted = wanted;
+            self.rebuild_needed();
             self.rebuild = true;
             self.dead_prefix = 0;
             self.left = self.scan_bytes_left();
@@ -226,22 +263,10 @@ impl PieceTracker {
     }
 
     pub fn any_useful(&self, peer_bitfield: &[u8]) -> bool {
-        let n = self.lengths.total_pieces() as usize;
-        for (byte_idx, &b) in peer_bitfield.iter().enumerate() {
-            if b == 0 {
-                continue;
-            }
-            for bit in 0..8 {
-                let i = byte_idx * 8 + bit;
-                if i >= n {
-                    return false;
-                }
-                if b & (1 << (7 - bit)) != 0 && self.wanted[i] && !self.have_local[i] {
-                    return true;
-                }
-            }
-        }
-        false
+        peer_bitfield
+            .iter()
+            .zip(&self.needed)
+            .any(|(theirs, needed)| theirs & needed != 0)
     }
 
     pub fn refresh_order(&mut self) {
@@ -276,9 +301,11 @@ impl PieceTracker {
     }
 
     fn sort_by_rarity(&mut self) {
-        let availability = &self.availability;
-        self.sorted
-            .sort_unstable_by_key(|idx| (availability[idx.get_usize()], idx.get()));
+        let (availability, tie) = (&self.availability, &self.order_tie);
+        self.sorted.sort_unstable_by_key(|idx| {
+            let i = idx.get_usize();
+            (availability[i], tie.get(i).copied().unwrap_or(i as u64))
+        });
         self.resort = false;
         self.resort_deferred = 0;
         self.dead_prefix = 0;
@@ -386,6 +413,41 @@ mod tests {
         assert_eq!(tracker.availability[1], 1);
     }
 
+    fn first_pick(salt: Option<u64>) -> u32 {
+        let mut t = PieceTracker::new(lengths(64));
+        if let Some(salt) = salt {
+            t = t.with_order_salt(salt);
+        }
+        t.add_peer_bitfield(&[0xff; 8]);
+        scan(&mut t, &[0xff; 8])[0]
+    }
+
+    #[test]
+    fn equally_rare_pieces_start_at_a_different_piece_for_each_salt() {
+        assert_eq!(first_pick(None), 0);
+        let firsts: std::collections::HashSet<u32> =
+            (1..=100u64).map(|salt| first_pick(Some(salt))).collect();
+        assert!(firsts.len() > 10, "{firsts:?}");
+    }
+
+    #[test]
+    fn salted_order_is_stable_complete_and_still_rarest_first() {
+        let build = || {
+            let mut t = PieceTracker::new(lengths(64)).with_order_salt(0x5eed);
+            t.add_peer_bitfield(&[0xff; 8]);
+            t.add_peer_bitfield(&[0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+            t
+        };
+        let order = scan(&mut build(), &[0xff; 8]);
+        assert_eq!(order, scan(&mut build(), &[0xff; 8]));
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+        assert!(order[..4].iter().all(|&piece| piece < 4));
+        assert!(order[4..].iter().all(|&piece| piece >= 4));
+        assert_ne!(order[4..], (4..64).collect::<Vec<_>>());
+    }
+
     #[test]
     fn rarest_first_order() {
         let mut t = PieceTracker::new(lengths(4));
@@ -436,6 +498,21 @@ mod tests {
         assert!(!t.any_useful(&[0b1000_0000]));
         assert!(t.any_useful(&[0b0100_0000]));
         assert!(t.is_useful(t.lengths.validate_piece(1).unwrap()));
+    }
+
+    #[test]
+    fn usefulness_follows_selection_losses_and_ignores_spare_bits() {
+        let mut t = PieceTracker::new(lengths(10));
+        let p = |t: &PieceTracker, i| t.lengths.validate_piece(i).unwrap();
+        assert!(!t.any_useful(&[0, 0b0011_1111]));
+        assert!(t.any_useful(&[0, 0b0100_0000]));
+        t.set_wanted(vec![true; 9].into_iter().chain([false]).collect());
+        assert!(!t.any_useful(&[0, 0b0100_0000]));
+        t.set_local(p(&t, 8), true);
+        assert!(!t.any_useful(&[0, 0b1100_0000]));
+        t.set_local(p(&t, 8), false);
+        assert!(t.any_useful(&[0, 0b1000_0000]));
+        assert!(!t.any_useful(&[]));
     }
 
     #[test]

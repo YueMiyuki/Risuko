@@ -9,6 +9,9 @@ use super::hash::{Id20, Id32};
 
 const PEER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_PEER_LOOKUPS: usize = 8;
+const MAX_MAGNET_TRACKERS: usize = 64;
+const MAX_MAGNET_WEB_SEEDS: usize = 32;
+const MAX_SO_TOTAL: usize = 100_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MagnetError {
@@ -64,9 +67,41 @@ pub struct Magnet {
     info_hash_v1: Option<Id20>,
     info_hash_v2: Option<Id32>,
     pub trackers: Vec<String>,
+    pub web_seeds: Vec<String>,
     pub display_name: Option<String>,
     pub select_only: Option<Vec<usize>>,
     pub peers: Vec<MagnetPeer>,
+}
+
+fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+fn parse_select_only(value: &str, out: &mut Vec<usize>) -> Option<()> {
+    const MAX_SO_RANGE: usize = 100_000;
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (first, last) = match part.split_once('-') {
+            Some((a, b)) => (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?),
+            None => {
+                let i = part.parse::<usize>().ok()?;
+                (i, i)
+            }
+        };
+        if last < first || last - first >= MAX_SO_RANGE {
+            return None;
+        }
+        if out.len().saturating_add(last - first + 1) > MAX_SO_TOTAL {
+            return None;
+        }
+        out.extend(first..=last);
+    }
+    Some(())
 }
 
 impl Magnet {
@@ -91,6 +126,7 @@ impl Magnet {
                     info_hash_v1: Some(id),
                     info_hash_v2: None,
                     trackers: vec![],
+                    web_seeds: vec![],
                     display_name: None,
                     select_only: None,
                     peers: vec![],
@@ -107,18 +143,20 @@ impl Magnet {
         let mut info_hash_v1: Option<Id20> = None;
         let mut info_hash_v2: Option<Id32> = None;
         let mut trackers = Vec::new();
+        let mut web_seeds: Vec<String> = Vec::new();
         let mut display_name: Option<String> = None;
         let mut select_only: Vec<usize> = Vec::new();
+        let mut so_invalid = false;
         let mut peers: Vec<MagnetPeer> = Vec::new();
 
         for (k, v) in url.query_pairs() {
             match &*k {
                 "xt" => {
-                    if let Some(rest) = v.strip_prefix("urn:btih:") {
+                    if let Some(rest) = strip_prefix_ignore_case(&v, "urn:btih:") {
                         let id = Id20::from_str(rest.trim())
                             .map_err(|_| MagnetError::BadInfoHash(rest.into()))?;
                         info_hash_v1 = Some(id);
-                    } else if let Some(rest) = v.strip_prefix("urn:btmh:") {
+                    } else if let Some(rest) = strip_prefix_ignore_case(&v, "urn:btmh:") {
                         let raw = hex::decode(rest.trim())
                             .map_err(|_| MagnetError::BadInfoHash(rest.into()))?;
                         if raw.len() != 34 || raw[0] != 0x12 || raw[1] != 0x20 {
@@ -132,7 +170,24 @@ impl Magnet {
                         info_hash_v2 = Some(id);
                     }
                 }
-                "tr" => trackers.push(v.into_owned()),
+                "tr" => {
+                    for url in crate::torrent::split_tracker_list(&v) {
+                        if trackers.len() < MAX_MAGNET_TRACKERS
+                            && !trackers.iter().any(|known| known == url)
+                        {
+                            trackers.push(url.to_string());
+                        }
+                    }
+                }
+                "ws" => {
+                    let url = v.trim();
+                    if !url.is_empty()
+                        && web_seeds.len() < MAX_MAGNET_WEB_SEEDS
+                        && !web_seeds.iter().any(|known| known == url)
+                    {
+                        web_seeds.push(url.to_string());
+                    }
+                }
                 "dn" => display_name = Some(v.into_owned()),
                 "x.pe" => {
                     const MAX_MAGNET_PEERS: usize = 64;
@@ -144,46 +199,11 @@ impl Magnet {
                         }
                     }
                 }
-                "so" => {
-                    const MAX_SO_TOTAL: usize = 100_000;
-                    for part in v.split(',') {
-                        let part = part.trim();
-                        if part.is_empty() {
-                            continue;
-                        }
-                        match part.split_once('-') {
-                            Some((a, b)) => {
-                                let a: usize = a.parse().map_err(|_| {
-                                    MagnetError::Parse(format!("bad so range {part}"))
-                                })?;
-                                let b: usize = b.parse().map_err(|_| {
-                                    MagnetError::Parse(format!("bad so range {part}"))
-                                })?;
-                                const MAX_SO_RANGE: usize = 100_000;
-                                if b < a || b.saturating_sub(a) >= MAX_SO_RANGE {
-                                    return Err(MagnetError::Parse(format!(
-                                        "so range too large: {part}"
-                                    )));
-                                }
-                                if select_only.len().saturating_add(b - a + 1) > MAX_SO_TOTAL {
-                                    return Err(MagnetError::Parse(
-                                        "so selection too large".into(),
-                                    ));
-                                }
-                                select_only.extend(a..=b);
-                            }
-                            None => {
-                                let i: usize = part
-                                    .parse()
-                                    .map_err(|_| MagnetError::Parse(format!("bad so {part}")))?;
-                                if select_only.len() >= MAX_SO_TOTAL {
-                                    return Err(MagnetError::Parse(
-                                        "so selection too large".into(),
-                                    ));
-                                }
-                                select_only.push(i);
-                            }
-                        }
+                "so" if !so_invalid => {
+                    so_invalid = parse_select_only(&v, &mut select_only).is_none();
+                    if so_invalid {
+                        select_only.clear();
+                        tracing::debug!("ignoring invalid magnet so= selection");
                     }
                 }
                 _ => {}
@@ -196,11 +216,14 @@ impl Magnet {
             (None, None) => return Err(MagnetError::MissingInfoHash),
         };
 
+        select_only.sort_unstable();
+        select_only.dedup();
         Ok(Self {
             info_hash,
             info_hash_v1,
             info_hash_v2,
             trackers,
+            web_seeds,
             display_name,
             select_only: (!select_only.is_empty()).then_some(select_only),
             peers,
@@ -335,16 +358,114 @@ mod tests {
     fn so_total_is_capped() {
         let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
         let many = ["0-99998"; 3].join(",");
-        assert!(Magnet::parse(&format!("{base}&so={many}")).is_err());
-        assert!(Magnet::parse(&format!("{base}&so=0-99998")).is_ok());
+        assert!(Magnet::parse(&format!("{base}&so={many}"))
+            .unwrap()
+            .select_only
+            .is_none());
+        assert!(Magnet::parse(&format!("{base}&so=0-99998"))
+            .unwrap()
+            .select_only
+            .is_some());
     }
 
     #[test]
     fn so_total_is_capped_across_repeated_fields() {
         let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
-        assert!(Magnet::parse(&format!("{base}&so=0-99998&so=0-99998")).is_err());
+        let m = Magnet::parse(&format!("{base}&so=0-99998&so=0-99998")).unwrap();
+        assert!(m.select_only.is_none());
         let spam = "&so=0-99998".repeat(50);
-        assert!(Magnet::parse(&format!("{base}{spam}")).is_err());
+        assert!(Magnet::parse(&format!("{base}{spam}"))
+            .unwrap()
+            .select_only
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_so_drops_the_selection_instead_of_rejecting_the_magnet() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        for so in ["abc", "0-100000", "5-2", "1,x,3", "1-", "-3"] {
+            let m = Magnet::parse(&format!("{base}&so={so}")).unwrap();
+            assert!(m.select_only.is_none(), "so={so}");
+        }
+        let m = Magnet::parse(&format!("{base}&so=1,2&so=oops&so=4")).unwrap();
+        assert!(m.select_only.is_none());
+        assert_eq!(m.info_hash().to_hex(), &base[20..]);
+    }
+
+    #[test]
+    fn select_only_is_sorted_and_deduplicated() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let m = Magnet::parse(&format!("{base}&so=5,1-3,2,5&so=0")).unwrap();
+        assert_eq!(m.select_only.as_deref(), Some(&[0usize, 1, 2, 3, 5][..]));
+    }
+
+    #[test]
+    fn urn_prefixes_match_case_insensitively() {
+        let hex = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let lower = Magnet::parse(&format!("magnet:?xt=urn:btih:{hex}")).unwrap();
+        let upper = Magnet::parse(&format!("magnet:?xt=urn:BTIH:{}", hex.to_uppercase())).unwrap();
+        assert_eq!(upper.info_hash(), lower.info_hash());
+        let mixed = Magnet::parse(&format!("magnet:?xt=Urn:BtIh:{hex}")).unwrap();
+        assert_eq!(mixed.info_hash(), lower.info_hash());
+
+        let mut multihash = vec![0x12u8, 0x20];
+        multihash.extend_from_slice(&[7u8; 32]);
+        let v2 = Magnet::parse(&format!("magnet:?xt=URN:BTMH:{}", hex::encode(multihash))).unwrap();
+        assert_eq!(v2.info_hash_v2().unwrap().0, [7u8; 32]);
+    }
+
+    #[test]
+    fn non_ascii_xt_values_do_not_panic_the_prefix_match() {
+        assert!(matches!(
+            Magnet::parse("magnet:?xt=urn:bt\u{e9}h:abc"),
+            Err(MagnetError::MissingInfoHash)
+        ));
+        assert!(matches!(
+            Magnet::parse("magnet:?xt=%E2%82%AC%E2%82%AC%E2%82%AC%E2%82%AC"),
+            Err(MagnetError::MissingInfoHash)
+        ));
+    }
+
+    #[test]
+    fn tracker_list_is_deduplicated_and_capped() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let many: String = (0..5_000)
+            .map(|i| format!("&tr=udp://t{i}.example:80/announce"))
+            .collect();
+        let m = Magnet::parse(&format!("{base}{many}")).unwrap();
+        assert_eq!(m.trackers.len(), MAX_MAGNET_TRACKERS);
+        assert_eq!(m.trackers[0], "udp://t0.example:80/announce");
+
+        let dup =
+            Magnet::parse(&format!("{base}&tr=http://a/x&tr=http://a/x&tr=http://b/x")).unwrap();
+        assert_eq!(dup.trackers, ["http://a/x", "http://b/x"]);
+    }
+
+    #[test]
+    fn ws_parameters_are_collected_deduplicated_and_capped() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let m = Magnet::parse(&format!(
+            "{base}&ws=http%3A%2F%2Fa.example%2Ffile&ws=http%3A%2F%2Fa.example%2Ffile&ws=&ws=https://b.example/"
+        ))
+        .unwrap();
+        assert_eq!(m.web_seeds, ["http://a.example/file", "https://b.example/"]);
+
+        let many: String = (0..500)
+            .map(|i| format!("&ws=http://w{i}.example/"))
+            .collect();
+        let m = Magnet::parse(&format!("{base}{many}")).unwrap();
+        assert_eq!(m.web_seeds.len(), MAX_MAGNET_WEB_SEEDS);
+    }
+
+    #[test]
+    fn comma_joined_tracker_values_count_against_the_cap() {
+        let base = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let joined = (0..5_000)
+            .map(|i| format!("udp://t{i}.example:80/announce"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let m = Magnet::parse(&format!("{base}&tr={joined}")).unwrap();
+        assert_eq!(m.trackers.len(), MAX_MAGNET_TRACKERS);
     }
 
     #[test]

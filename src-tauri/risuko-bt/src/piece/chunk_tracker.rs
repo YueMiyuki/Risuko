@@ -30,10 +30,19 @@ struct PieceChunks {
 }
 
 impl PieceChunks {
-    fn new(count: u32) -> Self {
+    fn new(prefilled: &[bool]) -> Self {
         Self {
-            states: vec![ChunkState::Missing; count as usize],
-            missing: count,
+            states: prefilled
+                .iter()
+                .map(|&done| {
+                    if done {
+                        ChunkState::Received
+                    } else {
+                        ChunkState::Missing
+                    }
+                })
+                .collect(),
+            missing: prefilled.iter().filter(|done| !**done).count() as u32,
             requested: 0,
         }
     }
@@ -55,6 +64,7 @@ impl PieceChunks {
 #[derive(Debug)]
 pub struct ChunkTracker {
     lengths: Lengths,
+    padding: Vec<(u64, u64)>,
     pieces: BTreeMap<u32, PieceChunks>,
     partial: BTreeSet<u32>,
     contested: BTreeSet<u32>,
@@ -65,11 +75,30 @@ impl ChunkTracker {
     pub fn new(lengths: Lengths) -> Self {
         Self {
             lengths,
+            padding: Vec::new(),
             pieces: BTreeMap::new(),
             partial: BTreeSet::new(),
             contested: BTreeSet::new(),
             endgame: false,
         }
+    }
+
+    pub(crate) fn with_padding(mut self, mut ranges: Vec<(u64, u64)>) -> Self {
+        ranges.retain(|r| r.0 < r.1);
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        self.padding = merged;
+        self
+    }
+
+    pub(crate) fn padding_chunks(&self, piece: ValidPieceIndex) -> Vec<bool> {
+        padding_flags(&self.lengths, &self.padding, piece)
     }
 
     pub fn lengths(&self) -> &Lengths {
@@ -218,9 +247,7 @@ impl ChunkTracker {
 
     pub fn reset_piece(&mut self, piece: ValidPieceIndex) {
         if let Some(chunks) = self.pieces.get_mut(&piece.get()) {
-            chunks.states.fill(ChunkState::Missing);
-            chunks.missing = chunks.states.len() as u32;
-            chunks.requested = 0;
+            *chunks = PieceChunks::new(&padding_flags(&self.lengths, &self.padding, piece));
         }
         self.reindex(piece.get());
     }
@@ -295,14 +322,37 @@ impl ChunkTracker {
 
     fn chunks_for(&mut self, piece: ValidPieceIndex) -> &mut PieceChunks {
         let lengths = &self.lengths;
-        self.pieces.entry(piece.get()).or_insert_with(|| {
-            PieceChunks::new(
-                lengths
-                    .piece_length_of(piece)
-                    .div_ceil(super::super::core::CHUNK_SIZE),
-            )
-        })
+        let padding = &self.padding;
+        self.pieces
+            .entry(piece.get())
+            .or_insert_with(|| PieceChunks::new(&padding_flags(lengths, padding, piece)))
     }
+}
+
+fn padding_flags(lengths: &Lengths, padding: &[(u64, u64)], piece: ValidPieceIndex) -> Vec<bool> {
+    let chunk_size = super::super::core::CHUNK_SIZE as u64;
+    let piece_len = lengths.piece_length_of(piece) as u64;
+    let mut flags = vec![false; piece_len.div_ceil(chunk_size) as usize];
+    if padding.is_empty() {
+        return flags;
+    }
+    let base = lengths.piece_offset(piece);
+    let piece_end = base + piece_len;
+    let mut idx = padding.partition_point(|range| range.1 <= base);
+    for (i, flag) in flags.iter_mut().enumerate() {
+        let start = base + i as u64 * chunk_size;
+        let end = (start + chunk_size).min(piece_end);
+        while idx < padding.len() && padding[idx].1 <= start {
+            idx += 1;
+        }
+        *flag = padding
+            .get(idx)
+            .is_some_and(|range| range.0 <= start && range.1 >= end);
+    }
+    if flags.iter().all(|flag| *flag) {
+        flags.fill(false);
+    }
+    flags
 }
 
 #[cfg(test)]
@@ -497,5 +547,73 @@ mod tests {
             }
             assert_eq!(l.chunk_info(p, l.chunks_of(p).count() as u32), None);
         }
+    }
+
+    #[test]
+    fn chunks_wholly_inside_padding_are_never_requested() {
+        let l = Lengths::new(1124 * 1024, 1024 * 1024).unwrap();
+        let mut t = ChunkTracker::new(l).with_padding(vec![(100 * 1024, 1024 * 1024)]);
+        let p0 = l.validate_piece(0).unwrap();
+        let mut got = Vec::new();
+        while let Some(r) = t.next_chunk(p0, 1) {
+            got.push(r);
+        }
+        let indices: Vec<u32> = got.iter().map(|r| r.info.chunk_index).collect();
+        assert_eq!(indices, (0..7).collect::<Vec<u32>>());
+        let done: Vec<bool> = got.into_iter().map(|r| t.mark_received(r.info)).collect();
+        assert_eq!(done, [false, false, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn padding_chunk_flags_mark_only_chunks_fully_covered() {
+        let l = Lengths::new(1124 * 1024, 1024 * 1024).unwrap();
+        let t = ChunkTracker::new(l).with_padding(vec![(100 * 1024, 1024 * 1024)]);
+        let flags = t.padding_chunks(l.validate_piece(0).unwrap());
+        assert_eq!(flags.len(), 64);
+        assert!(flags[..7].iter().all(|f| !f));
+        assert!(flags[7..].iter().all(|f| *f));
+        let tail = t.padding_chunks(l.validate_piece(1).unwrap());
+        assert!(tail.iter().all(|f| !f));
+    }
+
+    #[test]
+    fn reset_piece_keeps_padding_chunks_received() {
+        let l = Lengths::new(1124 * 1024, 1024 * 1024).unwrap();
+        let mut t = ChunkTracker::new(l).with_padding(vec![(100 * 1024, 1024 * 1024)]);
+        let p0 = l.validate_piece(0).unwrap();
+        while let Some(r) = t.next_chunk(p0, 1) {
+            t.mark_received(r.info);
+        }
+        t.reset_piece(p0);
+        let mut again = 0;
+        while t.next_chunk(p0, 2).is_some() {
+            again += 1;
+        }
+        assert_eq!(again, 7);
+    }
+
+    #[test]
+    fn a_piece_made_only_of_padding_is_still_downloaded() {
+        let l = Lengths::new(3 * 1024 * 1024, 1024 * 1024).unwrap();
+        let mut t = ChunkTracker::new(l).with_padding(vec![(1024 * 1024, 2 * 1024 * 1024)]);
+        let p1 = l.validate_piece(1).unwrap();
+        assert!(t.padding_chunks(p1).iter().all(|f| !f));
+        let mut n = 0;
+        while t.next_chunk(p1, 1).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 64);
+    }
+
+    #[test]
+    fn adjacent_padding_ranges_are_merged_before_covering_chunks() {
+        let l = Lengths::new(64 * 1024, 64 * 1024).unwrap();
+        let chunk = 16 * 1024u64;
+        let t = ChunkTracker::new(l).with_padding(vec![
+            (2 * chunk + 8192, 3 * chunk),
+            (chunk + 4096, 2 * chunk + 8192),
+        ]);
+        let flags = t.padding_chunks(l.validate_piece(0).unwrap());
+        assert_eq!(flags, [false, false, true, false]);
     }
 }

@@ -78,6 +78,8 @@ pub struct TorrentStats {
     pub live: Option<LiveStats>,
     pub peers: Arc<[PeerSnapshot]>,
     pub peers_seq: u64,
+    pub swarm_seeders: Option<u32>,
+    pub swarm_leechers: Option<u32>,
 }
 
 impl TorrentStats {
@@ -95,6 +97,8 @@ impl TorrentStats {
             live: Some(LiveStats::default()),
             peers: Arc::from(Vec::new()),
             peers_seq: 0,
+            swarm_seeders: None,
+            swarm_leechers: None,
         }
     }
 
