@@ -56,6 +56,14 @@
   <url type="vcs-browser">https://github.com/YueMiyuki/Risuko</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.1.0" date="2026-10-27">
+      <description>
+        <ul>
+          <li>feat(bt): BEP audit fixes, add BEP 24/40/42 and uTP over IPv6</li>
+          <li>Fix launching on Arch Linux</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0.3" date="2026-10-21">
       <description>
         <p>feat: detect copied links on focus under Wayland, cache Rust builds in R2</p>
