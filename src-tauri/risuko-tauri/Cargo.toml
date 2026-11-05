@@ -26,7 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 risuko-http = { workspace = true }
 risuko-cookies = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 percent-encoding = "2"
 sha1 = "0.11"
 keyring-core = "1"
@@ -55,7 +55,7 @@ windows-sys = { version = "0.61", features = [
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = "0.11"
+ashpd = { version = "0.13", features = ["notification"] }
 notify-rust = "4"
 gtk = "0.18"
 

@@ -56,9 +56,9 @@ impl client::Handler for TofuHandler {
 
     async fn check_server_key(
         &mut self,
-        key: &russh::keys::PublicKey,
+        key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let fp = match fingerprint(key) {
+        let fp = match fingerprint(&key.public_key()) {
             Ok(fp) => fp,
             Err(e) => {
                 tracing::warn!(

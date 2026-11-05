@@ -61,15 +61,11 @@ macro_rules! ftp_transfer {
             tracing::info!("FTP .part already complete ({existing_size} bytes), skipping transfer");
             let _ = $ftp.quit().await;
         } else {
-            let resume_offset =
+            let mut resume_offset =
                 if existing_size > 0 && (effective_size == 0 || existing_size < effective_size) {
                     match usize::try_from(existing_size) {
                         Ok(off) => match $ftp.resume_transfer(off).await {
-                            Ok(()) => {
-                                $completed.store(existing_size, Ordering::Relaxed);
-                                tracing::info!("Resuming FTP download from byte {existing_size}");
-                                existing_size
-                            }
+                            Ok(()) => existing_size,
                             Err(e) => {
                                 tracing::warn!("FTP resume not supported: {e}");
                                 0
@@ -87,6 +83,22 @@ macro_rules! ftp_transfer {
                     0
                 };
 
+            let mut data_stream = match $ftp.retr_as_stream(remote_path).await {
+                Ok(stream) => stream,
+                Err(e) if resume_offset > 0 => {
+                    tracing::warn!("FTP resume not supported: {e}");
+                    resume_offset = 0;
+                    $ftp.retr_as_stream(remote_path)
+                        .await
+                        .map_err(|e| format!("FTP RETR failed: {e}"))?
+                }
+                Err(e) => return Err(format!("FTP RETR failed: {e}")),
+            };
+            if resume_offset > 0 {
+                $completed.store(resume_offset, Ordering::Relaxed);
+                tracing::info!("Resuming FTP download from byte {resume_offset}");
+            }
+
             let mut file = if resume_offset > 0 {
                 tokio::fs::OpenOptions::new()
                     .write(true)
@@ -99,11 +111,6 @@ macro_rules! ftp_transfer {
                     .await
                     .map_err(|e| format!("Failed to create part file: {e}"))?
             };
-
-            let mut data_stream = $ftp
-                .retr_as_stream(remote_path)
-                .await
-                .map_err(|e| format!("FTP RETR failed: {e}"))?;
 
             let mut bytes_downloaded = resume_offset;
             let mut buf = vec![0u8; BUF_SIZE];
@@ -156,7 +163,7 @@ macro_rules! ftp_transfer {
             drop(file);
 
             // Idle control connection can fail the closing 226 although every byte arrived
-            if let Err(e) = $ftp.finalize_retr_stream(data_stream).await {
+            if let Err(e) = data_stream.finish().await {
                 if remote_size > 0 && bytes_downloaded == remote_size {
                     tracing::warn!("FTP finalize failed after a complete transfer: {e}");
                 } else {

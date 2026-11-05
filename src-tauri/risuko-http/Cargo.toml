@@ -34,9 +34,9 @@ tracing = "0.1"
 socket2 = { version = "0.6", features = ["all"] }
 cookie_store = "0.22"
 cookie = "0.18"
-base64 = "0.22"
+base64 = "0.23"
 async-stream = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-serial_test = "3"
+serial_test = "4"

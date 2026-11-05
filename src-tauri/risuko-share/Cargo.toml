@@ -7,7 +7,7 @@ description = "Peer-to-peer encrypted file sharing for Risuko, built on iroh"
 
 [dependencies]
 iroh = "1"
-iroh-blobs = "0.103"
+iroh-blobs = "0.104"
 n0-future = "0.3"
 tokio = { workspace = true }
 serde = { workspace = true }

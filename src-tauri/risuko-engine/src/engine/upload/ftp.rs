@@ -149,11 +149,12 @@ macro_rules! copy_to {
         .await;
 
         if let Err(e) = copy_res {
-            let _ = $ftp.finalize_put_stream(writer).await;
+            let _ = writer.finish().await;
             let _ = $ftp.rm(part_remote.as_str()).await;
             return Err(e);
         }
-        $ftp.finalize_put_stream(writer)
+        writer
+            .finish()
             .await
             .map_err(|e| format!("FTP finalize: {e}"))?;
 
