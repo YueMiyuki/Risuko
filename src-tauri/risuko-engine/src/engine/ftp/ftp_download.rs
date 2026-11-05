@@ -85,8 +85,10 @@ macro_rules! ftp_transfer {
 
             let mut data_stream = match $ftp.retr_as_stream(remote_path).await {
                 Ok(stream) => stream,
-                Err(e) if resume_offset > 0 => {
-                    tracing::warn!("FTP resume not supported: {e}");
+                Err(e) if resume_offset > 0 && non_transient_refusal(&e) => {
+                    tracing::warn!(
+                        "FTP server refused resuming at byte {resume_offset}, restarting from 0: {e}"
+                    );
                     resume_offset = 0;
                     $ftp.retr_as_stream(remote_path)
                         .await
@@ -180,6 +182,13 @@ macro_rules! ftp_transfer {
         }
         Ok::<(), String>(())
     }};
+}
+
+fn non_transient_refusal(error: &suppaftp::FtpError) -> bool {
+    let suppaftp::FtpError::UnexpectedResponse(response) = error else {
+        return false;
+    };
+    response.body.first() != Some(&b'4')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -769,6 +778,43 @@ mod tests {
         assert!(is_transient_error("FTP read error: reset"));
         assert!(!is_transient_error("FTP login failed: 530"));
         assert!(!is_transient_error("Download cancelled"));
+    }
+
+    #[test]
+    fn only_non_transient_refusals_restart_a_resumed_retr() {
+        use suppaftp::types::Response;
+        use suppaftp::{FtpError, Status};
+        let reply = |status: Status, line: &str| {
+            FtpError::UnexpectedResponse(Response::new(status, line.as_bytes().to_vec()))
+        };
+        assert!(non_transient_refusal(&reply(
+            Status::NotImplemented,
+            "502 REST not implemented\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::Unknown,
+            "554 Invalid REST parameter\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::FileUnavailable,
+            "550 Restart not allowed\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::CommandOk,
+            "200 REST ignored\r\n"
+        )));
+        assert!(!non_transient_refusal(&reply(
+            Status::CannotOpenDataConnection,
+            "425 Can't open data connection\r\n"
+        )));
+        assert!(!non_transient_refusal(&reply(
+            Status::NotAvailable,
+            "421 Timeout\r\n"
+        )));
+        assert!(!non_transient_refusal(&FtpError::ConnectionError(
+            io::Error::from(io::ErrorKind::ConnectionReset)
+        )));
+        assert!(!non_transient_refusal(&FtpError::BadResponse));
     }
 
     #[tokio::test]
