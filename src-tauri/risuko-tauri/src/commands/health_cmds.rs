@@ -799,29 +799,32 @@ async fn check_bittorrent(
     match (upnp_cfg, bt) {
         (false, _) => out.push(HealthCheck::skipped(
             "upnp",
-            "UPnP port forwarding disabled",
+            "UPnP / NAT-PMP port forwarding disabled",
         )),
         (true, None) => out.push(HealthCheck::skipped(
             "upnp",
-            "UPnP enabled (BT session not started yet)",
+            "UPnP / NAT-PMP enabled (BT session not started yet)",
         )),
-        (true, Some(snap)) if snap.upnp_mappings > 0 => out.push(
+        (true, Some(snap)) if snap.upnp_mappings + snap.natpmp_mappings > 0 => out.push(
             HealthCheck::ok(
                 "upnp",
-                format!("UPnP active — {} mapping(s) confirmed", snap.upnp_mappings),
+                format!(
+                    "Port forwarding active — {} UPnP, {} NAT-PMP/PCP mapping(s) confirmed",
+                    snap.upnp_mappings, snap.natpmp_mappings
+                ),
             )
             .with_details(serde_json::json!({
                 "mappings": snap.upnp_mappings,
+                "natpmpMappings": snap.natpmp_mappings,
                 "listenPort": snap.listen_port,
             })),
         ),
-        (true, Some(snap)) if snap.upnp_attempts == 0 => out.push(HealthCheck::skipped(
-            "upnp",
-            "UPnP negotiating with router…",
-        )),
+        (true, Some(snap)) if snap.upnp_attempts == 0 || snap.natpmp_attempts == 0 => out.push(
+            HealthCheck::skipped("upnp", "UPnP / NAT-PMP negotiating with router…"),
+        ),
         (true, Some(_)) => out.push(HealthCheck::warn(
             "upnp",
-            "UPnP enabled but no IGD responded — router may not support UPnP or has it disabled",
+            "UPnP / NAT-PMP enabled but the router answered neither — it may not support them or has them disabled",
             None,
         )),
     }
@@ -1808,6 +1811,8 @@ mod tests {
             upnp_enabled: false,
             upnp_mappings: 0,
             upnp_attempts: 0,
+            natpmp_mappings: 0,
+            natpmp_attempts: 0,
             torrents: 0,
             dht_active,
             dht_port,

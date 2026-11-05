@@ -6031,7 +6031,7 @@ mod tests {
 
     fn vote_upnp(external: &ExternalIp, address: &str, route: Route) {
         let address = ip(address);
-        external.vote(address, Source::Upnp, address, route);
+        external.vote(address, Source::Gateway, address, route);
     }
 
     #[tokio::test]

@@ -1,0 +1,158 @@
+name: Bump Flathub
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to bump to (e.g. v1.1.1)
+        required: true
+        type: string
+    secrets:
+      FLATHUB_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to bump to (e.g. v1.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FLATHUB_REPO: flathub/app.risuko.Risuko
+
+jobs:
+  bump:
+    name: Open the flathub/app.risuko.Risuko pull request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [[ ! "$tag" =~ ^v ]]; then
+            echo "::error::Resolved tag '$tag' does not start with 'v'"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the source archive
+        id: source
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+          curl -fsSL --retry 3 -o source.tar.gz "$url"
+          mkdir source
+          tar -xzf source.tar.gz -C source --strip-components=1
+          if ! grep -q "<release version=\"$VERSION\"" source/src-tauri/linux/app.risuko.Risuko.metainfo.xml; then
+            echo "::warning::app.risuko.Risuko.metainfo.xml at $TAG has no release entry for $VERSION"
+          fi
+
+          pnpm=$(jq -r .packageManager source/package.json)
+          if [[ ! "$pnpm" =~ ^pnpm@([0-9][^+]*) ]]; then
+            echo "::error::Unexpected packageManager '$pnpm' in package.json"
+            exit 1
+          fi
+          pnpm_url="https://registry.npmjs.org/pnpm/-/pnpm-${BASH_REMATCH[1]}.tgz"
+          curl -fsSL --retry 3 -o pnpm.tgz "$pnpm_url"
+
+          {
+            echo "url=$url"
+            echo "sha256=$(sha256sum source.tar.gz | awk '{print $1}')"
+            echo "pnpm_url=$pnpm_url"
+            echo "pnpm_sha256=$(sha256sum pnpm.tgz | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out flatpak-builder-tools
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: flatpak/flatpak-builder-tools
+          ref: 9d86d336a39b9af38b86f114b6ce5820fe260f91
+          path: flatpak-builder-tools
+          persist-credentials: false
+
+      - name: Generate offline sources
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ./flatpak-builder-tools/node 'tomlkit>=0.13.3,<1.0'
+          "$RUNNER_TEMP/venv/bin/python" flatpak-builder-tools/cargo/flatpak-cargo-generator.py \
+            source/src-tauri/Cargo.lock -o cargo-sources.json
+          "$RUNNER_TEMP/venv/bin/flatpak-node-generator" pnpm source/pnpm-lock.yaml \
+            --pnpm-store-version v11 -o generated-sources.json
+
+      - name: Check out the Flathub repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ env.FLATHUB_REPO }}
+          token: ${{ secrets.FLATHUB_TOKEN }}
+          path: flathub
+
+      - name: Update the manifest and sources
+        env:
+          SOURCE_URL: ${{ steps.source.outputs.url }}
+          SOURCE_SHA256: ${{ steps.source.outputs.sha256 }}
+          PNPM_URL: ${{ steps.source.outputs.pnpm_url }}
+          PNPM_SHA256: ${{ steps.source.outputs.pnpm_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          manifest = pathlib.Path("flathub/app.risuko.Risuko.yaml")
+          src = manifest.read_text()
+
+          def bump(src, url_pattern, url, sha):
+              pattern = re.compile(r"(url: )" + url_pattern + r"(\s*\n\s*sha256: )[0-9a-f]{64}")
+              new_src, n = pattern.subn(lambda m: m.group(1) + url + m.group(2) + sha, src)
+              if n != 1:
+                  raise SystemExit(f"Expected one source matching {url_pattern} in {manifest}, found {n}")
+              return new_src
+
+          src = bump(src, r"https://github\.com/\S+/archive/refs/tags/\S+", os.environ["SOURCE_URL"], os.environ["SOURCE_SHA256"])
+          src = bump(src, r"https://registry\.npmjs\.org/pnpm/-/pnpm-\S+", os.environ["PNPM_URL"], os.environ["PNPM_SHA256"])
+          manifest.write_text(src)
+          PY
+          cp cargo-sources.json generated-sources.json flathub/
+          git -C flathub add app.risuko.Risuko.yaml cargo-sources.json generated-sources.json
+          git -C flathub diff --cached --stat
+
+      - name: Open the pull request
+        working-directory: flathub
+        env:
+          GH_TOKEN: ${{ secrets.FLATHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          AUTOMERGE: ${{ vars.FLATHUB_AUTOMERGE }}
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "No changes — Flathub already builds $TAG"
+            exit 0
+          fi
+          base=$(git branch --show-current)
+          branch="update-$TAG"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -m "Update to $TAG"
+          git push --force origin "HEAD:refs/heads/$branch"
+          pr=$(gh pr list --repo "$FLATHUB_REPO" --head "$branch" --state open --json url --jq '.[0].url')
+          if [[ -z "$pr" ]]; then
+            pr=$(gh pr create --repo "$FLATHUB_REPO" --base "$base" --head "$branch" \
+              --title "Update to $TAG" \
+              --body "Release notes: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG")
+          fi
+          echo "::notice::Flathub update for $TAG: $pr"
+          if [[ "$AUTOMERGE" == "true" ]]; then
+            gh pr merge "$pr" --merge --auto
+          fi

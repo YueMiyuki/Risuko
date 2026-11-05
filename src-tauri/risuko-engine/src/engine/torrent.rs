@@ -109,6 +109,8 @@ pub struct BtHealthSnapshot {
     pub upnp_enabled: bool,
     pub upnp_mappings: usize,
     pub upnp_attempts: usize,
+    pub natpmp_mappings: usize,
+    pub natpmp_attempts: usize,
     pub torrents: usize,
     pub dht_active: bool,
     pub dht_port: Option<u16>,
@@ -417,6 +419,8 @@ impl TorrentEngine {
             upnp_enabled: upnp.enabled,
             upnp_mappings: upnp.mapping_count,
             upnp_attempts: upnp.discovery_attempts,
+            natpmp_mappings: upnp.natpmp_mapping_count,
+            natpmp_attempts: upnp.natpmp_attempts,
             torrents: session.with_torrents(|i| i.count()),
             dht_active: session.dht_active(),
             dht_port: session.dht_local_port(),
@@ -473,8 +477,32 @@ impl TorrentEngine {
         options: &Map<String, Value>,
         initial_peers: Vec<std::net::SocketAddr>,
     ) -> Result<TorrentHandle, String> {
-        self.add_torrent_bytes_with_peer_sources(data, options, initial_peers, Vec::new(), None)
-            .await
+        self.add_torrent_bytes_with_peer_sources(
+            data,
+            options,
+            initial_peers,
+            Vec::new(),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn add_verified_torrent_bytes(
+        &self,
+        data: &[u8],
+        options: &Map<String, Value>,
+        verified_files: Vec<bt::create::FileStamp>,
+    ) -> Result<TorrentHandle, String> {
+        self.add_torrent_bytes_with_peer_sources(
+            data,
+            options,
+            Vec::new(),
+            Vec::new(),
+            None,
+            verified_files,
+        )
+        .await
     }
 
     async fn add_torrent_bytes_with_peer_sources(
@@ -484,6 +512,7 @@ impl TorrentEngine {
         initial_peers: Vec<std::net::SocketAddr>,
         initial_tracker_peers: Vec<std::net::SocketAddr>,
         magnet_select: Option<&[usize]>,
+        verified_files: Vec<bt::create::FileStamp>,
     ) -> Result<TorrentHandle, String> {
         let session = self.get_session()?;
 
@@ -527,6 +556,7 @@ impl TorrentEngine {
             p2p_proxy_is_task_override: task_p2p_proxy_is_override,
             download_limit: task_limit(options, "max-download-limit"),
             upload_limit: task_limit(options, "max-upload-limit"),
+            verified_files,
         };
 
         tracing::info!("Adding torrent bytes ({} bytes) to dir={}", data.len(), dir);
@@ -647,6 +677,7 @@ impl TorrentEngine {
             initial_peers,
             tracker_peers,
             magnet_select.as_deref(),
+            Vec::new(),
         )
         .await
     }
@@ -1064,6 +1095,72 @@ fn extract_handle(response: bt::AddTorrentResponse) -> Result<TorrentHandle, Str
             already_managed,
         }),
     }
+}
+
+pub fn adopt_stripped_v2_layout(data: &[u8], options: &Map<String, Value>) -> usize {
+    use bt::storage::file_info::FileSet;
+    let Ok(meta) = bt::parse_torrent(data) else {
+        return 0;
+    };
+    let info = &meta.info;
+    if meta.meta_version != bt::core::MetaVersion::V2 || info.single_file_mode {
+        return 0;
+    }
+    let Some(dir) = options.get("dir").and_then(Value::as_str) else {
+        return 0;
+    };
+    let root = if options
+        .get("bt-create-subfolder")
+        .and_then(super::options::json_bool)
+        .unwrap_or(true)
+    {
+        Path::new(dir).join(disk_component(&info.name))
+    } else {
+        PathBuf::from(dir)
+    };
+    let mut stripped = info.clone();
+    for file in &mut stripped.files {
+        if file.path.len() > 1 && file.path[0] == info.name {
+            file.path.remove(0);
+        }
+    }
+    let current = FileSet::from_meta(info, &root);
+    let legacy = FileSet::from_meta(&stripped, &root);
+    let taken: std::collections::HashSet<&Path> =
+        current.files().iter().map(|f| f.path.as_path()).collect();
+    let mut moved = 0;
+    for (new, old) in current.files().iter().zip(legacy.files()) {
+        if new.padding
+            || new.length == 0
+            || new.path == old.path
+            || taken.contains(old.path.as_path())
+            || std::fs::symlink_metadata(&new.path).is_ok()
+            || !std::fs::symlink_metadata(&old.path)
+                .is_ok_and(|m| m.is_file() && m.len() == new.length)
+        {
+            continue;
+        }
+        let renamed = new
+            .path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::rename(&old.path, &new.path));
+        if let Err(e) = renamed {
+            tracing::warn!(
+                "could not move {} to {}: {e}",
+                old.path.display(),
+                new.path.display()
+            );
+            continue;
+        }
+        moved += 1;
+        for parent in old.path.ancestors().skip(1) {
+            if parent == root || std::fs::remove_dir(parent).is_err() {
+                break;
+            }
+        }
+    }
+    moved
 }
 
 pub fn disk_component(name: &str) -> String {
@@ -1503,6 +1600,88 @@ pub(crate) fn p2p_proxy_from_options(
 
 #[cfg(test)]
 mod tests {
+    fn v2_torrent(source: &Path) -> Vec<u8> {
+        bt::create::create_torrent(
+            source,
+            &bt::create::CreateOptions {
+                version: bt::core::MetaVersion::V2,
+                ..Default::default()
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap()
+        .bytes
+    }
+
+    fn write(path: &Path, body: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn dir_options(dir: &Path) -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("dir".into(), Value::String(dir.to_string_lossy().into()));
+        options
+    }
+
+    #[test]
+    fn restore_moves_files_out_of_the_stripped_v2_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source/Pack");
+        write(&source.join("Pack/a.bin"), b"aaaa");
+        write(&source.join("Pack/sub/b.bin"), b"bbbbbb");
+        write(&source.join("c.bin"), b"cc");
+        let torrent = v2_torrent(&source);
+
+        let downloads = tmp.path().join("downloads");
+        let root = downloads.join("Pack");
+        write(&root.join("a.bin"), b"aaaa");
+        write(&root.join("sub/b.bin"), b"bbbbbb");
+        write(&root.join("c.bin"), b"cc");
+        let options = dir_options(&downloads);
+
+        assert_eq!(adopt_stripped_v2_layout(&torrent, &options), 2);
+        assert_eq!(std::fs::read(root.join("Pack/a.bin")).unwrap(), b"aaaa");
+        assert_eq!(
+            std::fs::read(root.join("Pack/sub/b.bin")).unwrap(),
+            b"bbbbbb"
+        );
+        assert_eq!(std::fs::read(root.join("c.bin")).unwrap(), b"cc");
+        assert!(!root.join("a.bin").exists());
+        assert!(!root.join("sub").exists());
+        assert_eq!(adopt_stripped_v2_layout(&torrent, &options), 0);
+    }
+
+    #[test]
+    fn restore_leaves_files_that_do_not_fit_the_stripped_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source/Pack");
+        write(&source.join("Pack/a.bin"), b"aaaa");
+        write(&source.join("Pack/b.bin"), b"bbbb");
+        write(&source.join("b.bin"), b"top!");
+        let torrent = v2_torrent(&source);
+
+        let downloads = tmp.path().join("downloads");
+        let root = downloads.join("Pack");
+        write(&root.join("a.bin"), b"short");
+        write(&root.join("b.bin"), b"top!");
+        assert_eq!(
+            adopt_stripped_v2_layout(&torrent, &dir_options(&downloads)),
+            0
+        );
+        assert!(root.join("a.bin").exists());
+        assert!(root.join("b.bin").exists());
+
+        std::fs::write(root.join("a.bin"), b"aaaa").unwrap();
+        write(&root.join("Pack/a.bin"), b"new!");
+        assert_eq!(
+            adopt_stripped_v2_layout(&torrent, &dir_options(&downloads)),
+            0
+        );
+        assert_eq!(std::fs::read(root.join("Pack/a.bin")).unwrap(), b"new!");
+    }
+
     #[test]
     fn disk_path_maps_each_component() {
         let win = |c: &str| bt::core::metainfo::sanitize_windows_component(c);

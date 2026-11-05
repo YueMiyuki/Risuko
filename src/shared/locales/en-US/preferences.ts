@@ -333,12 +333,12 @@ export default {
 	"bt-ban-corrupt-strikes": "Failed Pieces Before Ban",
 	"bt-ban-corrupt-strikes-tips":
 		"How many failed pieces an IP address may contribute to before it is banned. Higher values tolerate occasional corruption (requires engine restart)",
-	"bt-enable-upnp": "UPnP Port Forwarding",
+	"bt-enable-upnp": "UPnP / NAT-PMP Port Forwarding",
 	"bt-enable-upnp-tips":
-		"Automatically open the BitTorrent listen port on the router via UPnP IGD (requires engine restart)",
-	"bt-upnp-lease": "UPnP Lease (seconds)",
+		"Automatically open the BitTorrent listen port on the router via UPnP IGD, NAT-PMP or PCP (requires engine restart)",
+	"bt-upnp-lease": "Port Mapping Lease (seconds)",
 	"bt-upnp-lease-tips":
-		"Lease duration for UPnP port mappings. Shorter leases recover faster from stale mappings (requires engine restart)",
+		"Lease duration for UPnP and NAT-PMP port mappings. Shorter leases recover faster from stale mappings (requires engine restart)",
 	"bt-enable-lsd": "Local Service Discovery",
 	"bt-enable-lsd-tips":
 		"Discover peers on the local network via BEP-14 multicast (requires engine restart)",

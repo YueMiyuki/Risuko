@@ -67,6 +67,8 @@ export const useAppStore = defineStore("app", {
 			numPaused: 0,
 		},
 		addTaskVisible: false,
+		createTorrentVisible: false,
+		pendingAddTaskType: "",
 		missedScheduledVisible: false,
 		missedScheduledTasks: [] as DownloadTask[],
 		addTaskType: ADD_TASK_TYPE.URI,
@@ -100,6 +102,18 @@ export const useAppStore = defineStore("app", {
 		},
 		hideAboutPanel() {
 			this.aboutPanelVisible = false;
+		},
+		showCreateTorrentDialog() {
+			if (this.addTaskVisible) {
+				return;
+			}
+			this.createTorrentVisible = true;
+		},
+		hideCreateTorrentDialog() {
+			this.createTorrentVisible = false;
+			if (this.pendingAddTaskType) {
+				setTimeout(() => this.openPendingAddTask(), 300);
+			}
 		},
 		async fetchEngineInfo() {
 			try {
@@ -149,8 +163,20 @@ export const useAppStore = defineStore("app", {
 			}
 		},
 		showAddTaskDialog(taskType: string) {
+			if (this.createTorrentVisible) {
+				this.pendingAddTaskType = taskType;
+				return;
+			}
 			this.addTaskType = taskType;
 			this.addTaskVisible = true;
+		},
+		openPendingAddTask() {
+			const taskType = this.pendingAddTaskType;
+			if (!taskType || this.createTorrentVisible) {
+				return;
+			}
+			this.pendingAddTaskType = "";
+			this.showAddTaskDialog(taskType);
 		},
 		hideAddTaskDialog() {
 			this.addTaskVisible = false;
@@ -207,7 +233,10 @@ export const useAppStore = defineStore("app", {
 			}
 		},
 		updateAddTaskUrl(uri = "") {
-			this.addTaskUrl = uri;
+			this.addTaskUrl =
+				uri && this.pendingAddTaskType && this.addTaskUrl
+					? `${this.addTaskUrl}\n${uri}`
+					: uri;
 		},
 		addTaskAddTorrents({
 			fileList,

@@ -29,6 +29,8 @@ url = "2"
 quick-xml = { version = "0.41", features = ["serialize"] }
 httparse = "1"
 network-interface = "2"
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
+dunce = "1"
 serde = { version = "1", features = ["derive"] }
 num-bigint = "0.4"
 

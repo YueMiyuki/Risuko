@@ -281,6 +281,7 @@ pub fn run(context: tauri::Context) {
 
         let app_state = state::AppState::new(config, storage, log_dir, log_guard)?;
         app.manage(app_state);
+        app.manage(commands::torrent_create_cmds::TorrentCreateState::default());
         sync_open_at_login_setting(app);
 
         {
@@ -607,6 +608,9 @@ pub fn run(context: tauri::Context) {
         commands::share_cmds::share_start_send,
         commands::share_cmds::share_start_receive,
         commands::share_cmds::share_cancel,
+        commands::torrent_create_cmds::create_torrent,
+        commands::torrent_create_cmds::inspect_torrent_source,
+        commands::torrent_create_cmds::cancel_create_torrent,
     ])
     .build(context)
     .expect("error while building Risuko");

@@ -6474,11 +6474,13 @@ version = "1.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "dunce",
  "env_logger",
  "futures-util",
  "hex",
  "httparse",
  "libc",
+ "netdev 0.46.3",
  "network-interface",
  "num-bigint",
  "parking_lot",
@@ -6505,6 +6507,7 @@ version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
+ "risuko-bt",
  "risuko-engine",
  "risuko-http",
  "serde_json",

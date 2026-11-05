@@ -184,6 +184,9 @@ commands.register("application:about", showAboutPanel);
 commands.register("application:new-task", addTask);
 commands.register("application:new-bt-task", showAddBtTask);
 commands.register("application:new-bt-task-with-file", showAddBtTaskWithFile);
+commands.register("application:create-torrent", () =>
+	getAppStore().showCreateTorrentDialog(),
+);
 commands.register("application:pause-task", pauseTask);
 commands.register("application:resume-task", resumeTask);
 commands.register("application:delete-task", deleteTask);

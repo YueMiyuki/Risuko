@@ -535,9 +535,15 @@ jobs:
             ${{ env.PORTABLE_ASSET }}.sha256
 
       - name: Build risuko-cli binary
-        if: matrix.target != 'i686-pc-windows-msvc'
+        if: matrix.target != 'i686-pc-windows-msvc' && runner.os != 'Linux'
         working-directory: src-tauri
         run: cargo build --release --target ${{ matrix.target }} -p risuko-cli
+
+      - name: Build risuko-cli binary (glibc 2.17)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/build-cli-glibc
+        with:
+          target: ${{ matrix.target }}
 
       - name: Package risuko-cli binary (unix)
         if: matrix.target != 'i686-pc-windows-msvc' && runner.os != 'Windows'
@@ -717,6 +723,16 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
 
+  flathub:
+    name: Bump Flathub
+    needs: [meta, release]
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    uses: ./.github/workflows/bump-flathub.yml
+    with:
+      tag: ${{ needs.meta.outputs.tag }}
+    secrets:
+      FLATHUB_TOKEN: ${{ secrets.FLATHUB_TOKEN }}
+
   r2-mirror:
     name: Mirror release to R2
     needs: [meta, release, android-release, updater-manifest]
@@ -729,22 +745,35 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   sync-version:
-    name: Commit version bump
+    name: Commit version bump (${{ matrix.branch }})
     needs: [meta, release, android-release, updater-manifest]
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [release, dev]
     steps:
-      - name: Resolve release branch
+      - name: Resolve branch
         id: branch
         shell: bash
         env:
           TARGET: ${{ github.event.release.target_commitish }}
+          DEV_BRANCH: next-dev
+          KIND: ${{ matrix.branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ "$KIND" == dev ]]; then
+            if [[ "$TARGET" == "$DEV_BRANCH" ]]; then
+              echo "::notice::The release already targets $DEV_BRANCH"
+              exit 0
+            fi
+            TARGET="$DEV_BRANCH"
+          fi
           if gh api "repos/$GITHUB_REPOSITORY/branches/$TARGET" >/dev/null 2>&1; then
             echo "name=$TARGET" >> "$GITHUB_OUTPUT"
           else
@@ -777,7 +806,7 @@ jobs:
           if git push origin "HEAD:$BRANCH"; then
             exit 0
           fi
-          pr_branch="release/v$VERSION"
+          pr_branch="release/v$VERSION-$BRANCH"
           git push --force origin "HEAD:refs/heads/$pr_branch"
           gh pr create --base "$BRANCH" --head "$pr_branch" \
             --title "chore(release): v$VERSION" \

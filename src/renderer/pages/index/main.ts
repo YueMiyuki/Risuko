@@ -82,6 +82,7 @@ const updateAppMenuLabels = (i18n: { t: (key: string) => string }) => {
 		"new-task": i18n.t("task.new-task"),
 		"new-bt-task": i18n.t("task.new-bt-task"),
 		"open-file": i18n.t("task.open-file"),
+		"create-torrent": i18n.t("task.create-torrent-menu"),
 		"task-list": i18n.t("app.task-list"),
 		"pause-task": i18n.t("task.pause-task"),
 		"resume-task": i18n.t("task.resume-task"),

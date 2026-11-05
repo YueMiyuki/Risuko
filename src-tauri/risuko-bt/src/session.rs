@@ -125,11 +125,36 @@ impl Drop for PrivateHashReleaseGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct UpnpStatus {
     pub enabled: bool,
     pub mapping_count: usize,
     pub discovery_attempts: usize,
+    pub natpmp_mapping_count: usize,
+    pub natpmp_attempts: usize,
+}
+
+struct PortForwarding {
+    ports: Vec<(u16, super::upnp::MapProto)>,
+    upnp: super::upnp::UpnpHandle,
+    natpmp: super::natpmp::NatPmpHandle,
+}
+
+impl PortForwarding {
+    fn spawn(
+        ports: Vec<(u16, super::upnp::MapProto)>,
+        lease: std::time::Duration,
+        previous: Option<Self>,
+    ) -> Self {
+        let (upnp_after, natpmp_after) = previous.map_or((None, None), |previous| {
+            (previous.upnp.retire(), previous.natpmp.retire())
+        });
+        Self {
+            upnp: super::upnp::spawn(ports.clone(), lease, upnp_after),
+            natpmp: super::natpmp::spawn(ports.clone(), lease, natpmp_after),
+            ports,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -168,6 +193,7 @@ pub struct AddTorrentOptions {
     pub p2p_proxy_is_task_override: bool,
     pub download_limit: u64,
     pub upload_limit: u64,
+    pub verified_files: Vec<super::create::FileStamp>,
 }
 
 impl Default for AddTorrentOptions {
@@ -183,6 +209,7 @@ impl Default for AddTorrentOptions {
             p2p_proxy_is_task_override: false,
             download_limit: 0,
             upload_limit: 0,
+            verified_files: Vec::new(),
         }
     }
 }
@@ -229,7 +256,7 @@ pub struct Session {
     accept6_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     utp_accept_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     utp6_accept_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    upnp_handle: Mutex<Option<super::upnp::UpnpHandle>>,
+    port_forwarding: Mutex<Option<PortForwarding>>,
     lsd: Mutex<Option<Arc<super::lsd::LocalServiceDiscovery>>>,
     lsd_router_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     dht: Mutex<Option<Arc<super::dht::Dht>>>,
@@ -268,7 +295,7 @@ impl Drop for Session {
         if let Some(utp) = self.utp.take() {
             utp.shutdown();
         }
-        let _ = self.upnp_handle.lock().take();
+        let _ = self.port_forwarding.lock().take();
         let _ = self.lsd.lock().take();
         let _ = self.dht.lock().take();
         super::core::peer_id::clear_session_peer_id(self.listen_port, self.peer_id);
@@ -356,7 +383,7 @@ impl Session {
             dht
         };
 
-        let upnp_handle = if opts
+        let port_forwarding = if opts
             .listen
             .as_ref()
             .map(|l| l.enable_upnp_port_forwarding)
@@ -367,7 +394,7 @@ impl Session {
                 utp4_port,
                 dht.as_ref().and_then(|dht| dht.local_port_for(false)),
             );
-            Some(super::upnp::UpnpPortForwarder::new(mappings, upnp_lease(&opts)).spawn())
+            Some(PortForwarding::spawn(mappings, upnp_lease(&opts), None))
         } else {
             None
         };
@@ -407,7 +434,7 @@ impl Session {
             accept6_handle: Mutex::new(None),
             utp_accept_handle: Mutex::new(None),
             utp6_accept_handle: Mutex::new(None),
-            upnp_handle: Mutex::new(upnp_handle),
+            port_forwarding: Mutex::new(port_forwarding),
             lsd: Mutex::new(None),
             lsd_router_handle: Mutex::new(None),
             dht: Mutex::new(dht),
@@ -634,14 +661,16 @@ impl Session {
     }
 
     pub fn upnp_status(&self) -> UpnpStatus {
-        let guard = self.upnp_handle.lock();
-        let enabled = guard.is_some();
-        let mapping_count = guard.as_ref().map(|h| h.mapping_count()).unwrap_or(0);
-        let discovery_attempts = guard.as_ref().map(|h| h.discovery_attempts()).unwrap_or(0);
+        let guard = self.port_forwarding.lock();
+        let Some(forwarding) = guard.as_ref() else {
+            return UpnpStatus::default();
+        };
         UpnpStatus {
-            enabled,
-            mapping_count,
-            discovery_attempts,
+            enabled: true,
+            mapping_count: forwarding.upnp.mapping_count(),
+            discovery_attempts: forwarding.upnp.attempts(),
+            natpmp_mapping_count: forwarding.natpmp.mapping_count(),
+            natpmp_attempts: forwarding.natpmp.attempts(),
         }
     }
 
@@ -758,6 +787,7 @@ impl Session {
             lengths,
             root_dir,
             only_files: opts.only_files,
+            verified_files: opts.verified_files,
             max_outstanding_per_peer: self.opts.max_outstanding_requests_per_peer,
             max_peers: self.opts.max_peers_per_torrent,
             hash_fail_ban_strikes: self.opts.hash_fail_ban_strikes,
@@ -873,7 +903,7 @@ impl Session {
             utp.reconfigure_proxy(proxy.clone()).await;
         }
         *self.dht.lock() = dht.clone();
-        self.refresh_upnp_mappings(dht.as_ref());
+        self.refresh_port_forwarding(dht.as_ref());
         if let Some(next) = dht.as_ref() {
             next.set_announce_v6(self.accept6_handle.lock().is_some());
         }
@@ -955,13 +985,13 @@ impl Session {
             utp.reconfigure_proxy(proxy.clone()).await;
         }
         *self.p2p_proxy.write().await = proxy;
-        self.refresh_upnp_mappings(dht.as_ref());
+        self.refresh_port_forwarding(dht.as_ref());
         *self.dht.lock() = dht;
     }
 
-    fn refresh_upnp_mappings(&self, dht: Option<&Arc<super::dht::Dht>>) {
-        let mut upnp = self.upnp_handle.lock();
-        let Some(current) = upnp.as_ref() else {
+    fn refresh_port_forwarding(&self, dht: Option<&Arc<super::dht::Dht>>) {
+        let mut forwarding = self.port_forwarding.lock();
+        let Some(current) = forwarding.as_ref() else {
             return;
         };
         let utp4_port = self
@@ -975,9 +1005,13 @@ impl Session {
             utp4_port,
             dht.and_then(|dht| dht.local_port_for(false)),
         );
-        if current.ports() != mappings.as_slice() {
-            *upnp =
-                Some(super::upnp::UpnpPortForwarder::new(mappings, upnp_lease(&self.opts)).spawn());
+        if current.ports != mappings {
+            let previous = forwarding.take();
+            *forwarding = Some(PortForwarding::spawn(
+                mappings,
+                upnp_lease(&self.opts),
+                previous,
+            ));
         }
     }
 

@@ -135,6 +135,7 @@ pub struct TorrentInit {
     pub lengths: Lengths,
     pub root_dir: PathBuf,
     pub only_files: Option<Vec<usize>>,
+    pub verified_files: Vec<super::create::FileStamp>,
     pub max_outstanding_per_peer: Option<usize>,
     pub max_peers: Option<usize>,
     pub hash_fail_ban_strikes: Option<u8>,
@@ -1523,8 +1524,12 @@ async fn torrent_loop(
     let mut scan_task = Some({
         let verifier = verifier.clone();
         let storage = Arc::clone(&storage);
+        let info = Arc::clone(&info);
+        let stamps = init.verified_files;
         tokio::spawn(async move {
-            if storage.has_existing_payload_files().await {
+            if stamped_files_unchanged(&storage, &info, stamps).await {
+                mark_all_pieces_found(&lengths, scan_tx).await;
+            } else if storage.has_existing_payload_files().await {
                 scan_existing_pieces(&verifier, &storage, &lengths, scan_tx).await;
             }
         })
@@ -6720,6 +6725,53 @@ async fn scan_existing_pieces(
     }
     if !batch.is_empty() {
         let _ = found.send(batch).await;
+    }
+}
+
+async fn stamped_files_unchanged(
+    storage: &FilesystemStorage,
+    info: &super::core::metainfo::ValidatedTorrentMetaV1Info,
+    stamps: Vec<super::create::FileStamp>,
+) -> bool {
+    if stamps.is_empty() {
+        return false;
+    }
+    let by_path: HashMap<&[String], &super::create::FileStamp> =
+        stamps.iter().map(|s| (s.path.as_slice(), s)).collect();
+    let Some(expected) = storage
+        .layout()
+        .files()
+        .iter()
+        .zip(&info.files)
+        .filter(|(file, _)| !file.padding && file.length > 0)
+        .map(|(file, meta)| {
+            by_path
+                .get(meta.path.as_slice())
+                .filter(|stamp| stamp.length == file.length)
+                .map(|stamp| (file.path.clone(), stamp.length, stamp.modified))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        expected.iter().all(|(path, length, modified)| {
+            std::fs::metadata(path)
+                .is_ok_and(|m| m.len() == *length && m.modified().ok() == Some(*modified))
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn mark_all_pieces_found(lengths: &Lengths, found: mpsc::Sender<Vec<u32>>) {
+    const BATCH: u32 = 4096;
+    let total = lengths.total_pieces();
+    for start in (0..total).step_by(BATCH as usize) {
+        let batch = (start..total.min(start.saturating_add(BATCH))).collect();
+        if found.send(batch).await.is_err() {
+            return;
+        }
     }
 }
 

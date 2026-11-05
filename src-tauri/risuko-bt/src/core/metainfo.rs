@@ -28,7 +28,8 @@ pub enum MetaError {
     UnsupportedMetaVersion(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MetaVersion {
     V1,
     V2,
@@ -46,6 +47,10 @@ impl MetaVersion {
 
     pub fn has_v1(&self) -> bool {
         matches!(self, Self::V1 | Self::Hybrid)
+    }
+
+    pub fn has_v2(&self) -> bool {
+        matches!(self, Self::V2 | Self::Hybrid)
     }
 }
 
@@ -807,13 +812,6 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
         && v2.files[0].path.len() == 1
         && v2.files[0].path[0] == v2.name;
 
-    let strip_name = |path: &[String]| {
-        if !single_file_mode && path.len() > 1 && path[0] == v2.name {
-            path[1..].to_vec()
-        } else {
-            path.to_vec()
-        }
-    };
     let mut files = Vec::with_capacity(v2.files.len());
     let mut offset = 0u64;
     for f in &v2.files {
@@ -828,7 +826,7 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
             offset += pad;
         }
         files.push(TorrentMetaInfo {
-            path: strip_name(&f.path),
+            path: f.path.clone(),
             length: f.length,
             padding: false,
             executable: f.executable,
@@ -837,7 +835,7 @@ fn synthesize_v1_facade_from_v2(v2: &ValidatedTorrentMetaV2Info) -> ValidatedTor
     }
     for path in &v2.empty_files {
         files.push(TorrentMetaInfo {
-            path: strip_name(path),
+            path: path.clone(),
             length: 0,
             padding: false,
             executable: false,
@@ -2044,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_v2_tree_that_repeats_the_torrent_name_is_not_nested_twice() {
+    fn pure_v2_tree_keeps_a_top_folder_named_like_the_torrent() {
         let dir = Value::Dict(vec![
             (b"a".to_vec(), v2_leaf(10)),
             (b"b".to_vec(), v2_leaf(10)),
@@ -2057,7 +2055,7 @@ mod tests {
             .filter(|d| !d.padding)
             .map(|d| d.filename)
             .collect();
-        assert_eq!(shown, ["a", "b"]);
+        assert_eq!(shown, ["root/a", "root/b"]);
     }
 
     #[test]
