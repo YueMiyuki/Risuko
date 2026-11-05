@@ -3,12 +3,7 @@ use super::hash::{sha256, Id32};
 pub const BLOCK_SIZE: u32 = 16 * 1024;
 
 pub fn hash_block(block: &[u8]) -> Id32 {
-    if block.len() == BLOCK_SIZE as usize {
-        return sha256(block);
-    }
-    let mut padded = vec![0u8; BLOCK_SIZE as usize];
-    padded[..block.len()].copy_from_slice(block);
-    sha256(&padded)
+    sha256(block)
 }
 
 pub fn hash_pair(left: &Id32, right: &Id32) -> Id32 {
@@ -109,6 +104,18 @@ pub fn compute_root_with_pad(leaves: &[Id32], padded_len: usize, pad: Id32) -> I
 
 pub fn compute_root_padded(leaves: &[Id32], padded_len: usize) -> Id32 {
     compute_root_with_pad(leaves, padded_len, Id32([0u8; 32]))
+}
+
+fn block_hashes(bytes: &[u8]) -> Vec<Id32> {
+    bytes.chunks(BLOCK_SIZE as usize).map(hash_block).collect()
+}
+
+pub fn blocks_root(bytes: &[u8]) -> Id32 {
+    compute_root(&block_hashes(bytes))
+}
+
+pub fn piece_root(piece_bytes: &[u8], blocks_per_piece: u32) -> Id32 {
+    compute_root_padded(&block_hashes(piece_bytes), blocks_per_piece as usize)
 }
 
 pub fn piece_layer_root(piece_hashes: &[Id32], blocks_per_piece: u32) -> Id32 {
@@ -233,18 +240,7 @@ impl MerkleProofTable {
     }
 
     pub fn expected_piece_root(&self, piece_bytes: &[u8]) -> Id32 {
-        let mut block_hashes: Vec<Id32> = piece_bytes
-            .chunks(BLOCK_SIZE as usize)
-            .map(hash_block)
-            .collect();
-        let target = self.blocks_per_piece as usize;
-        if block_hashes.len() < target {
-            block_hashes.resize(target, Id32([0u8; 32]));
-        }
-        if target == 1 {
-            return block_hashes[0];
-        }
-        compute_root_padded(&block_hashes, target.next_power_of_two())
+        piece_root(piece_bytes, self.blocks_per_piece)
     }
 
     pub fn piece_layer_padded_len(&self) -> u32 {
@@ -494,11 +490,7 @@ impl MerkleProofTable {
             });
         }
         let computed = if self.piece_root_hashes.is_empty() {
-            let block_hashes: Vec<Id32> = piece_bytes
-                .chunks(BLOCK_SIZE as usize)
-                .map(hash_block)
-                .collect();
-            compute_root(&block_hashes)
+            blocks_root(piece_bytes)
         } else {
             self.expected_piece_root(piece_bytes)
         };

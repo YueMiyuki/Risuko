@@ -35,6 +35,7 @@
       </button>
     </nav>
     <add-task-dialog :visible="addTaskVisible" :type="addTaskType" />
+    <create-torrent-dialog :visible="createTorrentVisible" />
     <missed-schedule-dialog />
     <about-panel :visible="aboutPanelVisible" />
     <drop-zone />
@@ -51,6 +52,7 @@ import Dragger from "@/components/Dragger/Index.vue";
 import TitleBar from "@/components/Native/TitleBar.vue";
 import Sidebar from "@/components/Sidebar/Index.vue";
 import AddTask from "@/components/Task/AddTask.vue";
+import CreateTorrentDialog from "@/components/Task/CreateTorrentDialog.vue";
 import MissedScheduleDialog from "@/components/Task/MissedScheduleDialog.vue";
 import is from "@/shims/platform";
 import { useAppStore } from "@/store/app";
@@ -63,6 +65,7 @@ export default {
 		[Sidebar.name]: Sidebar,
 		[TitleBar.name]: TitleBar,
 		[AddTask.name]: AddTask,
+		[CreateTorrentDialog.name]: CreateTorrentDialog,
 		[MissedScheduleDialog.name]: MissedScheduleDialog,
 		[Dragger.name]: Dragger,
 		ListTodo,
@@ -95,6 +98,9 @@ export default {
 		},
 		addTaskVisible() {
 			return useAppStore().addTaskVisible;
+		},
+		createTorrentVisible() {
+			return useAppStore().createTorrentVisible;
 		},
 		addTaskType() {
 			return useAppStore().addTaskType;
@@ -181,6 +187,10 @@ export default {
 			}
 			if (appStore.addTaskVisible) {
 				appStore.hideAddTaskDialog();
+				return;
+			}
+			if (appStore.createTorrentVisible) {
+				appStore.hideCreateTorrentDialog();
 				return;
 			}
 			if (appStore.aboutPanelVisible) {

@@ -26,7 +26,7 @@ pub enum MapProto {
 }
 
 impl MapProto {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             MapProto::Tcp => "TCP",
             MapProto::Udp => "UDP",
@@ -37,73 +37,66 @@ impl MapProto {
 const DISCOVER_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAPPING_DESCRIPTION: &str = "risuko";
+const RETIRE_WAIT: Duration = Duration::from_secs(10);
 
-pub struct UpnpPortForwarder {
-    ports: Vec<(u16, MapProto)>,
-    lease: Duration,
+pub struct ForwarderHandle<M> {
+    shutdown: Option<mpsc::Sender<()>>,
+    join: Option<JoinHandle<()>>,
+    active: Arc<Mutex<Vec<M>>>,
+    attempts: Arc<AtomicUsize>,
 }
 
-impl UpnpPortForwarder {
-    pub fn new(ports: Vec<(u16, MapProto)>, lease: Duration) -> Self {
-        Self { ports, lease }
-    }
-
-    pub fn spawn(self) -> UpnpHandle {
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let active = Arc::new(Mutex::new(Vec::<ActiveMapping>::new()));
+impl<M> ForwarderHandle<M> {
+    pub(crate) fn spawn<F>(
+        active: Arc<Mutex<Vec<M>>>,
+        after: Option<JoinHandle<()>>,
+        run: impl FnOnce(Arc<AtomicUsize>, mpsc::Receiver<()>) -> F + Send + 'static,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (shutdown, mut shutdown_rx) = mpsc::channel(1);
         let attempts = Arc::new(AtomicUsize::new(0));
-        let active_for_task = active.clone();
-        let attempts_for_task = attempts.clone();
-        let ports = self.ports.clone();
-        let lease = self.lease;
+        let task_attempts = attempts.clone();
         let join = tokio::spawn(async move {
-            run_forever(
-                ports,
-                lease,
-                active_for_task,
-                attempts_for_task,
-                shutdown_rx,
-            )
-            .await;
+            if let Some(previous) = after {
+                let _ = tokio::time::timeout(RETIRE_WAIT, previous).await;
+            }
+            if shutdown_rx.try_recv().is_err() {
+                run(task_attempts, shutdown_rx).await;
+            }
         });
-        UpnpHandle {
-            ports: self.ports,
-            shutdown: Some(shutdown_tx),
+        Self {
+            shutdown: Some(shutdown),
             join: Some(join),
             active,
             attempts,
         }
-    }
-}
-
-pub struct UpnpHandle {
-    ports: Vec<(u16, MapProto)>,
-    shutdown: Option<mpsc::Sender<()>>,
-    join: Option<JoinHandle<()>>,
-    active: Arc<Mutex<Vec<ActiveMapping>>>,
-    attempts: Arc<AtomicUsize>,
-}
-
-impl UpnpHandle {
-    pub(crate) fn ports(&self) -> &[(u16, MapProto)] {
-        &self.ports
     }
 
     pub fn mapping_count(&self) -> usize {
         self.active.lock().len()
     }
 
-    pub fn discovery_attempts(&self) -> usize {
+    pub fn attempts(&self) -> usize {
         self.attempts.load(Ordering::Relaxed)
     }
-}
 
-impl Drop for UpnpHandle {
-    fn drop(&mut self) {
+    pub(crate) fn retire(mut self) -> Option<JoinHandle<()>> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Option<JoinHandle<()>> {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.try_send(());
         }
-        if let Some(h) = self.join.take() {
+        self.join.take()
+    }
+}
+
+impl<M> Drop for ForwarderHandle<M> {
+    fn drop(&mut self) {
+        if let Some(h) = self.stop() {
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
             });
@@ -111,8 +104,22 @@ impl Drop for UpnpHandle {
     }
 }
 
+pub(crate) type UpnpHandle = ForwarderHandle<ActiveMapping>;
+
+pub(crate) fn spawn(
+    ports: Vec<(u16, MapProto)>,
+    lease: Duration,
+    after: Option<JoinHandle<()>>,
+) -> UpnpHandle {
+    let active = Arc::new(Mutex::new(Vec::new()));
+    let task_active = active.clone();
+    ForwarderHandle::spawn(active, after, move |attempts, shutdown| {
+        run_forever(ports, lease, task_active, attempts, shutdown)
+    })
+}
+
 #[derive(Debug, Clone)]
-struct ActiveMapping {
+pub(crate) struct ActiveMapping {
     control_url: Url,
     service_type: String,
     port: u16,
@@ -161,7 +168,7 @@ async fn run_forever(
     }
 }
 
-fn next_pass_delay(failures: u32, renewal: Duration) -> Duration {
+pub(crate) fn next_pass_delay(failures: u32, renewal: Duration) -> Duration {
     match failures {
         0 => renewal,
         1 => DISCOVER_INTERVAL,
@@ -244,10 +251,14 @@ async fn discover_and_map(
     Ok(mapped)
 }
 
-fn report_external_address(external: &ExternalIp, gateway: Ipv4Addr, reported: Ipv4Addr) {
+pub(crate) fn report_external_address(
+    external: &ExternalIp,
+    gateway: Ipv4Addr,
+    reported: Ipv4Addr,
+) {
     external.vote(
         IpAddr::V4(reported),
-        Source::Upnp,
+        Source::Gateway,
         IpAddr::V4(gateway),
         Route::Direct,
     );

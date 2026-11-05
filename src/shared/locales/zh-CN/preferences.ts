@@ -198,12 +198,12 @@ export default {
 	"bt-ban-corrupt-strikes": "封禁前允许的失败分片数",
 	"bt-ban-corrupt-strikes-tips":
 		"一个 IP 参与的分片校验失败多少次后被封禁。值越大越能容忍偶发的数据损坏（需重启引擎生效）",
-	"bt-enable-upnp": "UPnP 端口转发",
+	"bt-enable-upnp": "UPnP / NAT-PMP 端口转发",
 	"bt-enable-upnp-tips":
-		"通过 UPnP IGD 自动在路由器开放 BT 监听端口（需重启引擎生效）",
-	"bt-upnp-lease": "UPnP 租期（秒）",
+		"通过 UPnP IGD、NAT-PMP 或 PCP 自动在路由器开放 BT 监听端口（需重启引擎生效）",
+	"bt-upnp-lease": "端口映射租期（秒）",
 	"bt-upnp-lease-tips":
-		"UPnP 端口映射的有效期，较短的租期可更快恢复失效映射（需重启引擎生效）",
+		"UPnP 与 NAT-PMP 端口映射的有效期，较短的租期可更快恢复失效映射（需重启引擎生效）",
 	"bt-enable-lsd": "本地服务发现",
 	"bt-enable-lsd-tips": "通过 BEP-14 多播在局域网内发现 peer（需重启引擎生效）",
 	"bt-encryption-policy": "协议加密",

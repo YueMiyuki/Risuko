@@ -23,8 +23,8 @@ tempfile = "3"
 regex = "1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
-base64 = { version = "0.22", features = ["std"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+base64 = { version = "0.23", features = ["std"] }
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
 cipher = { version = "0.5", features = ["alloc", "block-padding"] }

@@ -252,6 +252,7 @@ fn build_task_submenu(
                 .accelerator("CmdOrCtrl+O")
                 .build(handle)?,
         )
+        .item(&mi("create-torrent", "Create Torrent...").build(handle)?)
         .separator()
         .item(
             &mi("task-list", "Task List")
@@ -338,6 +339,7 @@ fn setup_menu_event_handler(app: &App) {
             "new-task" => show_and_emit(app, "application:new-task"),
             "new-bt-task" => show_and_emit(app, "application:new-bt-task"),
             "open-file" => show_and_emit(app, "application:open-file"),
+            "create-torrent" => show_and_emit(app, "application:create-torrent"),
             "task-list" => emit_command(app, "application:task-list"),
             "pause-task" => emit_command(app, "application:pause-task"),
             "resume-task" => emit_command(app, "application:resume-task"),

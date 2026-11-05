@@ -57,6 +57,77 @@ pub enum Command {
 
     /// Request engine shutdown via RPC
     Shutdown(RpcArgs),
+
+    /// Create a .torrent file from a file or folder
+    CreateTorrent(CreateTorrentArgs),
+}
+
+#[derive(clap::Args)]
+pub struct CreateTorrentArgs {
+    /// File or folder to share
+    pub path: std::path::PathBuf,
+
+    /// Where to write the .torrent file (default: <name>.torrent in the current directory)
+    #[arg(short, long)]
+    pub output: Option<std::path::PathBuf>,
+
+    /// Torrent format
+    #[arg(long, value_enum, default_value_t = TorrentFormat::Hybrid)]
+    pub format: TorrentFormat,
+
+    /// Piece size such as 256K or 4M (chosen from the total size when omitted)
+    #[arg(long)]
+    pub piece_size: Option<String>,
+
+    /// Tracker URL; each flag starts a new tier, comma-separate trackers that share a tier
+    #[arg(short = 'a', long = "tracker")]
+    pub trackers: Vec<String>,
+
+    /// Web seed URL (repeatable)
+    #[arg(short = 'w', long = "web-seed")]
+    pub web_seeds: Vec<String>,
+
+    /// Comment stored in the torrent
+    #[arg(short, long)]
+    pub comment: Option<String>,
+
+    /// Source tag stored in the info dictionary, as some private trackers require
+    #[arg(short, long)]
+    pub source: Option<String>,
+
+    /// Mark the torrent private (no DHT, PEX or local peer discovery)
+    #[arg(short, long)]
+    pub private: bool,
+
+    /// Leave out the creation date
+    #[arg(long)]
+    pub no_date: bool,
+
+    /// Overwrite the output file if it already exists
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Seed it from where the files are now, using the running engine or a headless one on this machine
+    #[arg(long)]
+    pub seed: bool,
+
+    #[arg(long, default_value_t = 16800)]
+    pub rpc_port: u16,
+
+    /// RPC secret for authentication
+    #[arg(long)]
+    pub rpc_secret: Option<String>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum TorrentFormat {
+    V1,
+    V2,
+    Hybrid,
 }
 
 #[derive(clap::Args)]
@@ -356,5 +427,6 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Rss(cmd) => commands::rss(cmd).await,
         Command::Serve(args) => commands::serve(args).await,
         Command::Shutdown(args) => commands::shutdown(args).await,
+        Command::CreateTorrent(args) => commands::create_torrent(args).await,
     }
 }

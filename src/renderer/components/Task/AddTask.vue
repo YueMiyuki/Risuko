@@ -12,6 +12,16 @@
         <button
           type="button"
           class="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+          :aria-label="$t('task.create-torrent')"
+          :title="$t('task.create-torrent')"
+          :disabled="submitting"
+          @click="openCreateTorrent"
+        >
+          <FilePlus2 :size="14" />
+        </button>
+        <button
+          type="button"
+          class="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
           :aria-label="$t('window.close')"
           :title="$t('window.close')"
           :disabled="submitting"
@@ -330,6 +340,7 @@ import {
 	Download,
 	ExternalLink,
 	FileArchive,
+	FilePlus2,
 	SlidersHorizontal,
 	TriangleAlert,
 	X,
@@ -408,6 +419,7 @@ export default {
 		Motion,
 		Download,
 		FileArchive,
+		FilePlus2,
 		SlidersHorizontal,
 		TriangleAlert,
 		ChevronDown,
@@ -707,6 +719,10 @@ export default {
 				return;
 			}
 			this.handleClose();
+		},
+		openCreateTorrent() {
+			this.handleClose();
+			useAppStore().showCreateTorrentDialog();
 		},
 		handleClose() {
 			if (this.submitting) {

@@ -14,7 +14,7 @@ const MAX_TRACKER_ID_LEN: usize = 256;
 const MAX_WARNING_LEN: usize = 512;
 const MAX_RESPONSE_PEERS: usize = 1000;
 
-const QUERY_SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+pub(crate) const QUERY_SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')

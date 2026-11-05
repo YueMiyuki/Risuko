@@ -146,8 +146,15 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config
 
       - name: Build risuko-cli
+        if: runner.os != 'Linux'
         working-directory: src-tauri
         run: cargo build --release --target ${{ matrix.target }} -p risuko-cli
+
+      - name: Build risuko-cli (glibc 2.17)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/build-cli-glibc
+        with:
+          target: ${{ matrix.target }}
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

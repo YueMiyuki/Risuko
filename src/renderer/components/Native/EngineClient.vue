@@ -5,6 +5,7 @@
 <script lang="ts">
 import type { DownloadTask } from "@shared/types/task";
 import {
+	checkTaskIsBT,
 	formatUsenetRepairFailure,
 	getTaskName,
 	parseBooleanConfig,
@@ -581,8 +582,11 @@ export default {
 				return;
 			}
 
-			this.fetchTaskItem({ gid }).then((task) => {
-				if (!task) {
+			this.fetchTaskItem({ gid }).then(async (task) => {
+				if (
+					!task ||
+					(checkTaskIsBT(task) && (await this.isSeedingInPlace(gid)))
+				) {
 					return;
 				}
 				const { dir } = task;
@@ -740,6 +744,13 @@ export default {
 				}
 				this.handleDownloadComplete(task, true);
 			});
+		},
+		async isSeedingInPlace(gid: string) {
+			const opts = (await api.getOption({ gid }).catch(() => undefined)) as
+				| Record<string, unknown>
+				| undefined;
+			const flag = opts?.risukoSeedInPlace;
+			return flag === true || flag === "true";
 		},
 		async readCompletionScriptOverrides(gid: string) {
 			try {

@@ -41,7 +41,7 @@ function joinPath(...parts: string[]): string {
 	return joined.replace(/[/\\]+/g, "/");
 }
 
-function dirname(path = ""): string {
+export function dirname(path = ""): string {
 	const value = `${path || ""}`.replace(/[/\\]+$/g, "");
 	const index = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
 	if (index < 0) {

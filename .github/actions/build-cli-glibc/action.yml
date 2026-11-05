@@ -1,0 +1,41 @@
+name: Build risuko-cli for glibc 2.17
+description: Build risuko-cli with cargo-zigbuild against glibc 2.17 and check the floor
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Zig
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+      with:
+        version: 0.16.0
+        use-cache: false
+
+    - name: Build risuko-cli (glibc 2.17)
+      working-directory: src-tauri
+      shell: bash
+      env:
+        MATRIX_TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        case "$MATRIX_TARGET" in
+          x86_64-*)  zigbuild_sha256=3ca25ee4348f9abd0932ed4debe826d246e20fb616d0201de5bd05e7f965e9d9 ;;
+          aarch64-*) zigbuild_sha256=de42626985f428033078dfc12ac8a59ee713f8e5627235ec883b1c899bee895c ;;
+          *) echo "::error::No cargo-zigbuild build for $MATRIX_TARGET"; exit 1 ;;
+        esac
+        zigbuild_dir="cargo-zigbuild-${MATRIX_TARGET%%-*}-unknown-linux-gnu"
+        curl -fsSL -o "$RUNNER_TEMP/zigbuild.tar.xz" \
+          "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.0/$zigbuild_dir.tar.xz"
+        echo "$zigbuild_sha256  $RUNNER_TEMP/zigbuild.tar.xz" | sha256sum -c -
+        tar -xJf "$RUNNER_TEMP/zigbuild.tar.xz" -C "$RUNNER_TEMP"
+        export PATH="$RUNNER_TEMP/$zigbuild_dir:$PATH"
+        cargo zigbuild --release --target "$MATRIX_TARGET.2.17" -p risuko-cli
+        glibc=$(objdump -T "target/$MATRIX_TARGET/release/risuko" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n1)
+        if [[ "$(printf '%s\n' GLIBC_2.17 "$glibc" | sort -V | tail -n1)" != GLIBC_2.17 ]]; then
+          echo "::error::risuko-cli requires $glibc, above the glibc 2.17 floor"
+          exit 1
+        fi

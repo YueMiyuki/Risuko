@@ -33,6 +33,7 @@ const MAGNET_METADATA_ATTEMPT_TIMEOUT_SECS: u64 = 60;
 const MAGNET_METADATA_RETRY_DELAY_SECS: u64 = 15;
 const MAGNET_METADATA_RETRY_MAX_DELAY_SECS: u64 = 600;
 const P2P_RELOAD_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+const SEED_IN_PLACE_KEY: &str = "risuko-seed-in-place";
 const WORKER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WORKER_WAIT: Duration = Duration::from_secs(3);
 
@@ -1023,6 +1024,10 @@ fn header_contains_cookie(value: &Value) -> bool {
     })
 }
 
+fn seeds_in_place(options: &Map<String, Value>) -> bool {
+    options.get(SEED_IN_PLACE_KEY).and_then(Value::as_bool) == Some(true)
+}
+
 fn task_requests_pause(options: &Map<String, Value>) -> bool {
     options
         .get("pause")
@@ -1169,6 +1174,9 @@ impl TaskManager {
             .and_then(|v| v.as_str())
             .unwrap_or(".")
             .to_string();
+        if seeds_in_place(options) {
+            return (raw_dir, None);
+        }
         let rules = opts_guard.task_routing_rules();
         let file_category_dirs = opts_guard.file_category_dirs();
         drop(opts_guard);
@@ -1307,14 +1315,50 @@ impl TaskManager {
         .await
     }
 
+    pub fn seed_in_place_options(dir: &str) -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("dir".into(), Value::String(dir.to_string()));
+        options.insert("bt-create-subfolder".into(), Value::Bool(true));
+        options.insert("keep-seeding".into(), Value::Bool(true));
+        options.insert(
+            "risuko-completion-script-enabled".into(),
+            Value::Bool(false),
+        );
+        options.insert(SEED_IN_PLACE_KEY.into(), Value::Bool(true));
+        options
+    }
+
     pub async fn add_torrent_task(
         &self,
         torrent_data: Vec<u8>,
         options: Map<String, Value>,
     ) -> Result<String, String> {
+        self.add_torrent_task_with(torrent_data, options, Vec::new())
+            .await
+    }
+
+    pub async fn seed_created_torrent(
+        &self,
+        torrent_data: Vec<u8>,
+        dir: &str,
+        verified_files: Vec<risuko_bt::create::FileStamp>,
+    ) -> Result<String, String> {
+        self.add_torrent_task_with(
+            torrent_data,
+            Self::seed_in_place_options(dir),
+            verified_files,
+        )
+        .await
+    }
+
+    async fn add_torrent_task_with(
+        &self,
+        torrent_data: Vec<u8>,
+        mut options: Map<String, Value>,
+        verified_files: Vec<risuko_bt::create::FileStamp>,
+    ) -> Result<String, String> {
         let _p2p_reload_guard = self.p2p_reload_lock.lock().await;
         let gid = generate_gid();
-        let merged = self.options.read().await.merge_task_options(&options);
         let out = options
             .get("out")
             .and_then(|v| v.as_str())
@@ -1330,6 +1374,8 @@ impl TaskManager {
         let (dir, tag) = self
             .resolve_routing_for_task(&options, &filename_hint)
             .await;
+        options.insert("dir".into(), Value::String(dir.clone()));
+        let merged = self.options.read().await.merge_task_options(&options);
 
         let mut task = DownloadTask::new_torrent(gid.clone(), dir.clone(), tag, options.clone());
 
@@ -1337,7 +1383,10 @@ impl TaskManager {
         let add_result = {
             let te_guard = self.torrent_engine.read().await;
             if let Some(ref te) = *te_guard {
-                Some(te.add_torrent_bytes(&torrent_data, &merged).await)
+                Some(
+                    te.add_verified_torrent_bytes(&torrent_data, &merged, verified_files)
+                        .await,
+                )
             } else {
                 None
             }
@@ -1633,11 +1682,10 @@ impl TaskManager {
     pub async fn add_magnet_task(
         &self,
         magnet_uri: &str,
-        options: Map<String, Value>,
+        mut options: Map<String, Value>,
     ) -> Result<String, String> {
         let _p2p_reload_guard = self.p2p_reload_lock.lock().await;
         let gid = generate_gid();
-        let merged = self.options.read().await.merge_task_options(&options);
         let out = options
             .get("out")
             .and_then(|v| v.as_str())
@@ -1653,6 +1701,8 @@ impl TaskManager {
         let (dir, tag) = self
             .resolve_routing_for_task(&options, &filename_hint)
             .await;
+        options.insert("dir".into(), Value::String(dir.clone()));
+        let merged = self.options.read().await.merge_task_options(&options);
 
         let mut task = DownloadTask::new_torrent(gid.clone(), dir.clone(), tag, options.clone());
         task.uris = vec![magnet_uri.to_string()];
@@ -3691,6 +3741,7 @@ impl TaskManager {
 
                         let (keep, seed_time_minutes, seed_ratio) =
                             resolve_seed_goal(&task.options, g_manual, g_seed_time, g_seed_ratio);
+                        let downloaded = !seeds_in_place(&task.options);
 
                         if stats.is_finished && !task.seeder {
                             if keep {
@@ -3701,20 +3752,24 @@ impl TaskManager {
                                     .as_millis()
                                     as u64;
                                 task.download_speed = 0;
-                                self.events.send(EngineEvent::BtDownloadComplete {
-                                    gid: task.gid.clone(),
-                                });
+                                if downloaded {
+                                    self.events.send(EngineEvent::BtDownloadComplete {
+                                        gid: task.gid.clone(),
+                                    });
+                                }
                             } else {
                                 task.status = TaskStatus::Complete;
                                 task.download_speed = 0;
                                 task.upload_speed = 0;
                                 halted.push(task.gid.clone());
-                                self.events.send(EngineEvent::BtDownloadComplete {
-                                    gid: task.gid.clone(),
-                                });
-                                self.events.send(EngineEvent::DownloadComplete {
-                                    gid: task.gid.clone(),
-                                });
+                                if downloaded {
+                                    self.events.send(EngineEvent::BtDownloadComplete {
+                                        gid: task.gid.clone(),
+                                    });
+                                    self.events.send(EngineEvent::DownloadComplete {
+                                        gid: task.gid.clone(),
+                                    });
+                                }
                             }
                         }
 
@@ -3748,9 +3803,11 @@ impl TaskManager {
                                 task.status = TaskStatus::Complete;
                                 task.upload_speed = 0;
                                 halted.push(task.gid.clone());
-                                self.events.send(EngineEvent::DownloadComplete {
-                                    gid: task.gid.clone(),
-                                });
+                                if downloaded {
+                                    self.events.send(EngineEvent::DownloadComplete {
+                                        gid: task.gid.clone(),
+                                    });
+                                }
                             }
                         }
                     } else {
@@ -3906,6 +3963,15 @@ impl TaskManager {
             let Some(engine) = self.torrent_engine.read().await.clone() else {
                 return;
             };
+            let moved = tokio::task::spawn_blocking({
+                let (data, merged) = (data.clone(), merged.clone());
+                move || torrent::adopt_stripped_v2_layout(&data, &merged)
+            })
+            .await
+            .unwrap_or(0);
+            if moved > 0 {
+                tracing::info!("[task:{gid}] moved {moved} file(s) out of the v1.1.0 layout");
+            }
             match engine.add_torrent_bytes(&data, &merged).await {
                 Ok(handle) => {
                     tracing::info!("[task:{gid}] re-added saved torrent as id={}", handle.id);
@@ -7862,6 +7928,101 @@ mod tests {
             ),
             (b"info".to_vec(), Bencode::Dict(info)),
         ]))
+    }
+
+    #[tokio::test]
+    async fn seeding_in_place_ignores_routing_rules() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        mgr.options.write().await.global.insert(
+            "task-routing-rules".into(),
+            serde_json::json!([{
+                "id": "all",
+                "label": "Everything",
+                "pattern": "*",
+                "dir": dir.path().join("routed").to_string_lossy(),
+            }]),
+        );
+        let source = dir.path().join("source");
+        let mut seed = TaskManager::seed_in_place_options(&source.to_string_lossy());
+        seed.insert("pause".into(), Value::Bool(true));
+        let mut routed = Map::new();
+        routed.insert("pause".into(), Value::Bool(true));
+        let seed_gid = mgr
+            .add_torrent_task(torrent_file_bytes("seeded", false), seed)
+            .await
+            .unwrap();
+        let routed_gid = mgr
+            .add_torrent_task(torrent_file_bytes("routed", false), routed)
+            .await
+            .unwrap();
+        let tasks = mgr.tasks.read().await;
+        let find = |gid: &str| tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(find(&seed_gid).dir, source.to_string_lossy());
+        assert_eq!(find(&seed_gid).tag, None);
+        assert_eq!(
+            find(&seed_gid).options.get("keep-seeding"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            find(&seed_gid)
+                .options
+                .get("risuko-completion-script-enabled"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(find(&routed_gid).tag.as_deref(), Some("Everything"));
+        let routed_dir = dir.path().join("routed").to_string_lossy().into_owned();
+        assert_eq!(find(&routed_gid).dir, routed_dir);
+        assert_eq!(
+            find(&routed_gid).options.get("dir"),
+            Some(&Value::String(routed_dir))
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_in_place_starts_seeding_without_a_completion_event() {
+        use risuko_bt::create::{create_torrent, CreateOptions};
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let mut events = mgr.events.subscribe();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut gids = Vec::new();
+        for (name, seed) in [("seeded.bin", true), ("fetched.bin", false)] {
+            std::fs::write(source.join(name), name.repeat(5000)).unwrap();
+            let created = create_torrent(
+                &source.join(name),
+                &CreateOptions::default(),
+                |_, _| {},
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+            let dir = source.to_string_lossy();
+            gids.push(if seed {
+                mgr.seed_created_torrent(created.bytes, &dir, created.stamps)
+                    .await
+                    .unwrap()
+            } else {
+                let mut options = TaskManager::seed_in_place_options(&dir);
+                options.remove(SEED_IN_PLACE_KEY);
+                mgr.add_torrent_task(created.bytes, options).await.unwrap()
+            });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while mgr.tasks.read().await.iter().any(|t| !t.seeder) {
+            assert!(std::time::Instant::now() < deadline, "tasks never seeded");
+            mgr.update_progress().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut completed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::BtDownloadComplete { gid } | EngineEvent::DownloadComplete { gid } =
+                event
+            {
+                completed.push(gid);
+            }
+        }
+        assert_eq!(completed, [gids[1].clone()]);
     }
 
     async fn paused_torrent_task(mgr: &TaskManager, name: &str, private: bool) -> String {

@@ -185,12 +185,12 @@ export default {
 	"bt-ban-corrupt-strikes": "封鎖前允許的失敗分片數",
 	"bt-ban-corrupt-strikes-tips":
 		"一個 IP 參與的分片校驗失敗多少次後被封鎖。值越大越能容忍偶發的資料損壞（需重啟引擎生效）",
-	"bt-enable-upnp": "UPnP 連接埠轉發",
+	"bt-enable-upnp": "UPnP / NAT-PMP 連接埠轉發",
 	"bt-enable-upnp-tips":
-		"透過 UPnP IGD 自動在路由器開放 BT 監聽連接埠（需重啟引擎生效）",
-	"bt-upnp-lease": "UPnP 租期（秒）",
+		"透過 UPnP IGD、NAT-PMP 或 PCP 自動在路由器開放 BT 監聽連接埠（需重啟引擎生效）",
+	"bt-upnp-lease": "連接埠映射租期（秒）",
 	"bt-upnp-lease-tips":
-		"UPnP 連接埠對應的有效期，較短的租期可更快復原失效對應（需重啟引擎生效）",
+		"UPnP 與 NAT-PMP 連接埠對應的有效期，較短的租期可更快復原失效對應（需重啟引擎生效）",
 	"bt-enable-lsd": "本地服務探索",
 	"bt-enable-lsd-tips":
 		"透過 BEP-14 多播在區域網路內探索 peer（需重啟引擎生效）",

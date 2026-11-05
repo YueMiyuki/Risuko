@@ -61,15 +61,11 @@ macro_rules! ftp_transfer {
             tracing::info!("FTP .part already complete ({existing_size} bytes), skipping transfer");
             let _ = $ftp.quit().await;
         } else {
-            let resume_offset =
+            let mut resume_offset =
                 if existing_size > 0 && (effective_size == 0 || existing_size < effective_size) {
                     match usize::try_from(existing_size) {
                         Ok(off) => match $ftp.resume_transfer(off).await {
-                            Ok(()) => {
-                                $completed.store(existing_size, Ordering::Relaxed);
-                                tracing::info!("Resuming FTP download from byte {existing_size}");
-                                existing_size
-                            }
+                            Ok(()) => existing_size,
                             Err(e) => {
                                 tracing::warn!("FTP resume not supported: {e}");
                                 0
@@ -87,6 +83,24 @@ macro_rules! ftp_transfer {
                     0
                 };
 
+            let mut data_stream = match $ftp.retr_as_stream(remote_path).await {
+                Ok(stream) => stream,
+                Err(e) if resume_offset > 0 && non_transient_refusal(&e) => {
+                    tracing::warn!(
+                        "FTP server refused resuming at byte {resume_offset}, restarting from 0: {e}"
+                    );
+                    resume_offset = 0;
+                    $ftp.retr_as_stream(remote_path)
+                        .await
+                        .map_err(|e| format!("FTP RETR failed: {e}"))?
+                }
+                Err(e) => return Err(format!("FTP RETR failed: {e}")),
+            };
+            if resume_offset > 0 {
+                $completed.store(resume_offset, Ordering::Relaxed);
+                tracing::info!("Resuming FTP download from byte {resume_offset}");
+            }
+
             let mut file = if resume_offset > 0 {
                 tokio::fs::OpenOptions::new()
                     .write(true)
@@ -99,11 +113,6 @@ macro_rules! ftp_transfer {
                     .await
                     .map_err(|e| format!("Failed to create part file: {e}"))?
             };
-
-            let mut data_stream = $ftp
-                .retr_as_stream(remote_path)
-                .await
-                .map_err(|e| format!("FTP RETR failed: {e}"))?;
 
             let mut bytes_downloaded = resume_offset;
             let mut buf = vec![0u8; BUF_SIZE];
@@ -156,7 +165,7 @@ macro_rules! ftp_transfer {
             drop(file);
 
             // Idle control connection can fail the closing 226 although every byte arrived
-            if let Err(e) = $ftp.finalize_retr_stream(data_stream).await {
+            if let Err(e) = data_stream.finish().await {
                 if remote_size > 0 && bytes_downloaded == remote_size {
                     tracing::warn!("FTP finalize failed after a complete transfer: {e}");
                 } else {
@@ -173,6 +182,13 @@ macro_rules! ftp_transfer {
         }
         Ok::<(), String>(())
     }};
+}
+
+fn non_transient_refusal(error: &suppaftp::FtpError) -> bool {
+    let suppaftp::FtpError::UnexpectedResponse(response) = error else {
+        return false;
+    };
+    response.body.first() != Some(&b'4')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -762,6 +778,43 @@ mod tests {
         assert!(is_transient_error("FTP read error: reset"));
         assert!(!is_transient_error("FTP login failed: 530"));
         assert!(!is_transient_error("Download cancelled"));
+    }
+
+    #[test]
+    fn only_non_transient_refusals_restart_a_resumed_retr() {
+        use suppaftp::types::Response;
+        use suppaftp::{FtpError, Status};
+        let reply = |status: Status, line: &str| {
+            FtpError::UnexpectedResponse(Response::new(status, line.as_bytes().to_vec()))
+        };
+        assert!(non_transient_refusal(&reply(
+            Status::NotImplemented,
+            "502 REST not implemented\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::Unknown,
+            "554 Invalid REST parameter\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::FileUnavailable,
+            "550 Restart not allowed\r\n"
+        )));
+        assert!(non_transient_refusal(&reply(
+            Status::CommandOk,
+            "200 REST ignored\r\n"
+        )));
+        assert!(!non_transient_refusal(&reply(
+            Status::CannotOpenDataConnection,
+            "425 Can't open data connection\r\n"
+        )));
+        assert!(!non_transient_refusal(&reply(
+            Status::NotAvailable,
+            "421 Timeout\r\n"
+        )));
+        assert!(!non_transient_refusal(&FtpError::ConnectionError(
+            io::Error::from(io::ErrorKind::ConnectionReset)
+        )));
+        assert!(!non_transient_refusal(&FtpError::BadResponse));
     }
 
     #[tokio::test]

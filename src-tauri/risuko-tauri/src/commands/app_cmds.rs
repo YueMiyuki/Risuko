@@ -178,7 +178,7 @@ pub async fn show_linux_notification(
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        if ashpd::is_sandboxed().await {
+        if ashpd::is_sandboxed() {
             return show_portal_notification(&app.config().identifier, &title, &body).await;
         }
         // The notification plugin's blocking show() nests a tokio runtime here and aborts the app

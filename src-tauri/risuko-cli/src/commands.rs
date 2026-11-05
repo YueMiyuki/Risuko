@@ -9,8 +9,8 @@ use risuko_engine::standalone::{
 };
 
 use crate::{
-    ConfigAction, ConfigCommand, DownloadArgs, GidArgs, PauseArgs, RemoveArgs, ResumeArgs, RpcArgs,
-    RssAction, RssCommand, ServeArgs, StatusArgs,
+    ConfigAction, ConfigCommand, CreateTorrentArgs, DownloadArgs, GidArgs, PauseArgs, RemoveArgs,
+    ResumeArgs, RpcArgs, RssAction, RssCommand, ServeArgs, StatusArgs, TorrentFormat,
 };
 use risuko_cli::progress::{self, extract_filename, format_size, format_size_speed, parse_num};
 use risuko_cli::rpc_client::RpcClient;
@@ -47,22 +47,8 @@ fn read_options_from_config() -> EngineOptions {
 }
 
 pub async fn download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let secret = resolve_rpc_secret(args.rpc_secret.clone());
-    let mut client = rpc_client(args.rpc_port, secret.clone());
-    let mut headless_engine = None;
-
-    let status = client.engine_status().await;
-    if let Some(problem) = status.problem() {
-        return Err(problem.into());
-    }
-    if !status.is_present() {
-        eprintln!("No running Risuko instance found. Starting headless engine...");
-        let engine = start_headless_engine(args.rpc_port).await?;
-        if secret.is_none() {
-            client = rpc_client(args.rpc_port, engine.rpc_secret.clone());
-        }
-        headless_engine = Some(engine);
-    }
+    let (client, headless_engine) =
+        connect_or_start_engine(args.rpc_port, args.rpc_secret.clone()).await?;
 
     // Ctrl+C must still reach the shutdown below so an embedded engine saves its session
     let result = tokio::select! {
@@ -163,15 +149,7 @@ async fn do_download(
     }
 
     let gid = if is_torrent {
-        let torrent_data = std::fs::read(primary)?;
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &torrent_data);
-        let result = client
-            .call(
-                "risuko.addTorrent",
-                vec![json!(b64), json!([]), json!(options)],
-            )
-            .await?;
-        result.as_str().unwrap_or("").to_string()
+        add_torrent(client, &std::fs::read(primary)?, &options).await?
     } else if is_media || args.force_ytdlp {
         let result = client
             .call("risuko.addMedia", vec![json!(primary), json!(options)])
@@ -545,6 +523,261 @@ pub async fn shutdown(args: RpcArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub async fn create_torrent(args: CreateTorrentArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use risuko_bt::core::MetaVersion;
+    use risuko_bt::create::{plan, throttled, CreateOptions};
+    use risuko_bt::torrent::split_tracker_list;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let source =
+        std::fs::canonicalize(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("cannot make a torrent of a filesystem root")?;
+    let output = std::path::absolute(
+        args.output
+            .unwrap_or_else(|| PathBuf::from(format!("{name}.torrent"))),
+    )?;
+    if output.exists() && !args.force {
+        return Err(format!(
+            "{} already exists; pass --force to overwrite it",
+            output.display()
+        )
+        .into());
+    }
+    let defaults = CreateOptions::default();
+    let opts = CreateOptions {
+        version: match args.format {
+            TorrentFormat::V1 => MetaVersion::V1,
+            TorrentFormat::V2 => MetaVersion::V2,
+            TorrentFormat::Hybrid => MetaVersion::Hybrid,
+        },
+        piece_length: args
+            .piece_size
+            .as_deref()
+            .map(parse_piece_size)
+            .transpose()?,
+        trackers: args
+            .trackers
+            .iter()
+            .map(|tier| split_tracker_list(tier).map(str::to_string).collect())
+            .collect(),
+        web_seeds: args.web_seeds,
+        comment: args.comment,
+        source: args.source,
+        private: args.private,
+        creation_date: if args.no_date {
+            None
+        } else {
+            defaults.creation_date
+        },
+        exclude: vec![output.clone()],
+        ..defaults
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
+    let show_progress = !args.json;
+    let mut hashing = tokio::task::spawn_blocking({
+        let cancel = cancel.clone();
+        move || {
+            let planned = plan(&source, &opts)?;
+            let padding = planned.hybrid_padding();
+            if opts.version == MetaVersion::Hybrid && padding > planned.total_length {
+                eprintln!(
+                    "Warning: hybrid pads these files with {} of zeros for {} of data; --format v2 needs no padding",
+                    format_size(padding),
+                    format_size(planned.total_length)
+                );
+            }
+            planned.create(
+                &opts,
+                throttled(std::time::Duration::from_millis(200), |done, total| {
+                    if show_progress {
+                        eprint!(
+                            "\rHashing {:5.1}%  {} / {}   ",
+                            done as f64 * 100.0 / total.max(1) as f64,
+                            format_size(done),
+                            format_size(total)
+                        );
+                    }
+                }),
+                &cancel,
+            )
+        }
+    });
+    let created = tokio::select! {
+        result = &mut hashing => result?,
+        _ = &mut interrupted => {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = hashing.await;
+            if show_progress {
+                eprintln!();
+            }
+            return Err("Interrupted".into());
+        }
+    };
+    if show_progress {
+        eprintln!();
+    }
+    let created = created?;
+    std::fs::write(&output, &created.bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+
+    let (gid, headless_engine) = if args.seed {
+        let (gid, engine) = seed_created_torrent(
+            args.rpc_port,
+            args.rpc_secret,
+            &created.bytes,
+            &created.seed_dir,
+        )
+        .await?;
+        (Some(gid), engine)
+    } else {
+        (None, None)
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "torrent": output.to_string_lossy(),
+                "name": created.name,
+                "infoHash": created.info_hash_v1.map(|h| h.to_hex()),
+                "infoHashV2": created.info_hash_v2.map(|h| h.to_hex()),
+                "pieceLength": created.piece_length,
+                "totalLength": created.total_length,
+                "files": created.file_count,
+                "magnet": created.magnet,
+                "gid": gid,
+            }))?
+        );
+    } else {
+        println!("Created {}", output.display());
+        println!(
+            "  {} file(s), {}, {} pieces",
+            created.file_count,
+            format_size(created.total_length),
+            format_size(created.piece_length.into())
+        );
+        if let Some(v1) = created.info_hash_v1 {
+            println!("  Info hash v1: {}", v1.to_hex());
+        }
+        if let Some(v2) = created.info_hash_v2 {
+            println!("  Info hash v2: {}", v2.to_hex());
+        }
+        println!("  {}", created.magnet);
+        if let Some(gid) = &gid {
+            println!("Seeding (GID: {gid})");
+        }
+    }
+
+    if let Some(engine) = headless_engine {
+        eprintln!("Seeding from a headless engine, press Ctrl+C to stop");
+        let signal = engine.shutdown_signal();
+        tokio::select! {
+            _ = &mut interrupted => {}
+            _ = signal.notified() => {}
+        }
+        engine.stop().await;
+    }
+    Ok(())
+}
+
+async fn seed_created_torrent(
+    rpc_port: u16,
+    rpc_secret: Option<String>,
+    torrent: &[u8],
+    dir: &std::path::Path,
+) -> Result<(String, Option<StandaloneEngine>), Box<dyn std::error::Error>> {
+    let (client, headless_engine) = connect_or_start_engine(rpc_port, rpc_secret).await?;
+    let options =
+        risuko_engine::engine::manager::TaskManager::seed_in_place_options(&dir.to_string_lossy());
+    let added = match add_torrent(&client, torrent, &options).await {
+        Ok(gid) if gid.is_empty() => Err("Failed to get task GID from engine".into()),
+        Ok(gid) => ensure_task_ok(&client, &gid).await.map(|()| gid),
+        Err(e) => Err(e),
+    };
+    match added {
+        Ok(gid) => Ok((gid, headless_engine)),
+        Err(e) => {
+            if let Some(engine) = headless_engine {
+                engine.stop().await;
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn ensure_task_ok(client: &RpcClient, gid: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = client
+        .call(
+            "risuko.tellStatus",
+            vec![json!(gid), json!(["status", "errorMessage"])],
+        )
+        .await?;
+    match status["status"].as_str() {
+        Some("error") => Err(status["errorMessage"].as_str().unwrap_or("error").into()),
+        _ => Ok(()),
+    }
+}
+
+async fn add_torrent(
+    client: &RpcClient,
+    torrent: &[u8],
+    options: &Map<String, Value>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, torrent);
+    let result = client
+        .call(
+            "risuko.addTorrent",
+            vec![json!(b64), json!([]), json!(options)],
+        )
+        .await?;
+    Ok(result.as_str().unwrap_or("").to_string())
+}
+
+async fn connect_or_start_engine(
+    rpc_port: u16,
+    rpc_secret: Option<String>,
+) -> Result<(RpcClient, Option<StandaloneEngine>), Box<dyn std::error::Error>> {
+    let secret = resolve_rpc_secret(rpc_secret);
+    let client = rpc_client(rpc_port, secret.clone());
+    let status = client.engine_status().await;
+    if let Some(problem) = status.problem() {
+        return Err(problem.into());
+    }
+    if status.is_present() {
+        return Ok((client, None));
+    }
+    eprintln!("No running Risuko instance found. Starting headless engine...");
+    let engine = start_headless_engine(rpc_port).await?;
+    let client = match secret {
+        Some(_) => client,
+        None => rpc_client(rpc_port, engine.rpc_secret.clone()),
+    };
+    Ok((client, Some(engine)))
+}
+
+fn parse_piece_size(text: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let lower = text.trim().to_ascii_lowercase();
+    let lower = lower.trim_end_matches("ib").trim_end_matches('b');
+    let (digits, unit) = match lower.char_indices().last() {
+        Some((i, 'k')) => (&lower[..i], 1024u64),
+        Some((i, 'm')) => (&lower[..i], 1024 * 1024),
+        _ => (lower, 1),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| format!("invalid piece size: {text}").into())
+}
+
 async fn start_headless_engine(
     rpc_port: u16,
 ) -> Result<StandaloneEngine, Box<dyn std::error::Error>> {
@@ -692,5 +925,18 @@ mod tests {
         write_atomically(&path, b"{\"a\":1}").unwrap();
         assert_eq!(load_user_config_for_edit(&path).unwrap()["a"], 1);
         assert!(!dir.path().join("user.json.tmp").exists());
+    }
+
+    #[test]
+    fn piece_sizes_accept_binary_suffixes() {
+        assert_eq!(parse_piece_size("16384").unwrap(), 16_384);
+        assert_eq!(parse_piece_size("256K").unwrap(), 256 * 1024);
+        assert_eq!(parse_piece_size("256kib").unwrap(), 256 * 1024);
+        assert_eq!(parse_piece_size("4M").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_piece_size(" 4 MiB ").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_piece_size("1mb").unwrap(), 1024 * 1024);
+        for bad in ["", "K", "abc", "-1M", "99999999M"] {
+            assert!(parse_piece_size(bad).is_err(), "{bad}");
+        }
     }
 }

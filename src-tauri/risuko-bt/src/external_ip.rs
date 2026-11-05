@@ -10,15 +10,15 @@ const MAX_CANDIDATES: usize = 32;
 const MAX_VOTER_NETWORKS: usize = 64;
 const AGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_AGE_STEPS: u32 = 8;
-const MAX_UPNP_GATEWAYS: usize = 8;
-const UPNP_TTL: Duration = Duration::from_secs(3 * 60 * 60);
+const MAX_GATEWAYS: usize = 8;
+const GATEWAY_TTL: Duration = Duration::from_secs(3 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Peer,
     Tracker,
     Dht,
-    Upnp,
+    Gateway,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,14 +211,14 @@ impl Family {
         }
     }
 
-    fn report_upnp(&mut self, addr: IpAddr, id: Voter, now: Instant) {
+    fn report_gateway(&mut self, addr: IpAddr, id: Voter, now: Instant) {
         let previous = match self.gateways.iter_mut().find(|gateway| gateway.id == id) {
             Some(gateway) => {
                 gateway.backed = Some(now);
                 Some(std::mem::replace(&mut gateway.addr, addr))
             }
             None => {
-                if self.gateways.len() >= MAX_UPNP_GATEWAYS {
+                if self.gateways.len() >= MAX_GATEWAYS {
                     self.gateways.remove(0);
                 }
                 self.gateways.push(Gateway {
@@ -279,7 +279,7 @@ impl Family {
         for gateway in &mut self.gateways {
             if gateway
                 .backed
-                .is_some_and(|at| now.saturating_duration_since(at) >= UPNP_TTL)
+                .is_some_and(|at| now.saturating_duration_since(at) >= GATEWAY_TTL)
             {
                 gateway.backed = None;
             }
@@ -387,7 +387,7 @@ impl ExternalIp {
         if !is_public_address(observed) {
             return;
         }
-        let network = if source == Source::Upnp {
+        let network = if source == Source::Gateway {
             None
         } else if route == Route::Proxied {
             return;
@@ -402,7 +402,7 @@ impl ExternalIp {
         let changed = match network {
             Some(network) => family.cast(observed, network),
             None => {
-                family.report_upnp(observed, voter, now);
+                family.report_gateway(observed, voter, now);
                 true
             }
         };
@@ -567,7 +567,7 @@ mod tests {
             "::ffff:10.0.0.1",
             "::ffff:192.168.1.1",
         ] {
-            for source in [Source::Peer, Source::Tracker, Source::Dht, Source::Upnp] {
+            for source in [Source::Peer, Source::Tracker, Source::Dht, Source::Gateway] {
                 peer_votes(&ext, ip(text), (1..=6).map(voter));
                 ext.vote(ip(text), source, voter(9), Route::Direct);
             }
@@ -602,11 +602,11 @@ mod tests {
     fn a_single_upnp_vote_elects_a_public_address() {
         let ext = ExternalIp::new();
         let gateway = ip("192.168.1.1");
-        ext.vote(ip("10.9.8.7"), Source::Upnp, gateway, Route::Direct);
-        ext.vote(ip("100.70.1.1"), Source::Upnp, gateway, Route::Direct);
-        ext.vote(ip("0.0.0.0"), Source::Upnp, gateway, Route::Direct);
+        ext.vote(ip("10.9.8.7"), Source::Gateway, gateway, Route::Direct);
+        ext.vote(ip("100.70.1.1"), Source::Gateway, gateway, Route::Direct);
+        ext.vote(ip("0.0.0.0"), Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), None);
-        ext.vote(ip("93.184.216.34"), Source::Upnp, gateway, Route::Direct);
+        ext.vote(ip("93.184.216.34"), Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
     }
 
@@ -614,8 +614,8 @@ mod tests {
     fn a_non_public_upnp_report_leaves_the_election_alone() {
         let ext = ExternalIp::new();
         let gateway = ip("192.168.1.1");
-        ext.vote(ip("93.184.216.34"), Source::Upnp, gateway, Route::Direct);
-        ext.vote(ip("100.70.1.1"), Source::Upnp, gateway, Route::Direct);
+        ext.vote(ip("93.184.216.34"), Source::Gateway, gateway, Route::Direct);
+        ext.vote(ip("100.70.1.1"), Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
     }
 
@@ -623,11 +623,11 @@ mod tests {
     fn a_gateway_address_change_switches_the_election_and_drops_the_old_tally() {
         let ext = ExternalIp::new();
         let (gateway, old, new) = (ip("192.168.1.1"), ip("93.184.216.34"), ip("8.8.4.4"));
-        ext.vote(old, Source::Upnp, gateway, Route::Direct);
+        ext.vote(old, Source::Gateway, gateway, Route::Direct);
         peer_votes(&ext, old, (1..=6).map(voter));
-        ext.vote(ip("198.18.0.1"), Source::Upnp, gateway, Route::Direct);
+        ext.vote(ip("198.18.0.1"), Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
-        ext.vote(new, Source::Upnp, gateway, Route::Direct);
+        ext.vote(new, Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), Some("8.8.4.4".parse().unwrap()));
         peer_votes(&ext, old, (1..=3).map(voter));
         assert_eq!(ext.external_v4(), Some("8.8.4.4".parse().unwrap()));
@@ -642,7 +642,7 @@ mod tests {
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
         ext.vote(
             ip("8.8.4.4"),
-            Source::Upnp,
+            Source::Gateway,
             ip("192.168.1.1"),
             Route::Direct,
         );
@@ -655,7 +655,7 @@ mod tests {
         peer_votes(&ext, ip("93.184.216.34"), (1..=5).map(voter));
         ext.vote(
             ip("8.8.4.4"),
-            Source::Upnp,
+            Source::Gateway,
             ip("192.168.1.1"),
             Route::Direct,
         );
@@ -666,7 +666,7 @@ mod tests {
     fn peers_overturn_a_contradicted_upnp_address() {
         let ext = ExternalIp::new();
         let (gateway, upnp, real) = (ip("192.168.1.1"), ip("8.8.4.4"), ip("93.184.216.34"));
-        ext.vote(upnp, Source::Upnp, gateway, Route::Direct);
+        ext.vote(upnp, Source::Gateway, gateway, Route::Direct);
         assert_eq!(ext.external_v4(), Some("8.8.4.4".parse().unwrap()));
         peer_votes(&ext, real, (1..=3).map(voter));
         assert_eq!(ext.external_v4(), Some("8.8.4.4".parse().unwrap()));
@@ -678,11 +678,11 @@ mod tests {
     fn an_unchanged_upnp_renewal_does_not_reclaim_an_overturned_election() {
         let ext = ExternalIp::new();
         let (gateway, upnp, real) = (ip("192.168.1.1"), ip("8.8.4.4"), ip("93.184.216.34"));
-        ext.vote(upnp, Source::Upnp, gateway, Route::Direct);
+        ext.vote(upnp, Source::Gateway, gateway, Route::Direct);
         peer_votes(&ext, real, (1..=6).map(voter));
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
         for _ in 0..5 {
-            ext.vote(upnp, Source::Upnp, gateway, Route::Direct);
+            ext.vote(upnp, Source::Gateway, gateway, Route::Direct);
         }
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
     }
@@ -692,13 +692,13 @@ mod tests {
         let ext = ExternalIp::new();
         let (first, second) = (ip("192.168.1.1"), ip("192.168.1.2"));
         let (a, b) = (ip("8.8.4.4"), ip("151.101.1.69"));
-        ext.vote(a, Source::Upnp, first, Route::Direct);
-        ext.vote(b, Source::Upnp, second, Route::Direct);
+        ext.vote(a, Source::Gateway, first, Route::Direct);
+        ext.vote(b, Source::Gateway, second, Route::Direct);
         assert_eq!(ext.external_v4(), Some("151.101.1.69".parse().unwrap()));
         for _ in 0..5 {
-            ext.vote(a, Source::Upnp, first, Route::Direct);
+            ext.vote(a, Source::Gateway, first, Route::Direct);
             assert_eq!(ext.external_v4(), Some("151.101.1.69".parse().unwrap()));
-            ext.vote(b, Source::Upnp, second, Route::Direct);
+            ext.vote(b, Source::Gateway, second, Route::Direct);
             assert_eq!(ext.external_v4(), Some("151.101.1.69".parse().unwrap()));
         }
     }
@@ -708,8 +708,8 @@ mod tests {
         let t0 = Instant::now();
         let ext = ExternalIp::starting_at(t0);
         let (gateway, upnp, real) = (ip("192.168.1.1"), ip("8.8.4.4"), ip("93.184.216.34"));
-        ext.vote_at(t0, upnp, Source::Upnp, gateway.into(), Route::Direct);
-        let later = t0 + UPNP_TTL + AGE_INTERVAL;
+        ext.vote_at(t0, upnp, Source::Gateway, gateway.into(), Route::Direct);
+        let later = t0 + GATEWAY_TTL + AGE_INTERVAL;
         for index in 10..=12u8 {
             ext.vote_at(
                 later,
@@ -720,7 +720,7 @@ mod tests {
             );
         }
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
-        ext.vote_at(later, upnp, Source::Upnp, gateway.into(), Route::Direct);
+        ext.vote_at(later, upnp, Source::Gateway, gateway.into(), Route::Direct);
         assert_eq!(ext.external_v4(), Some("93.184.216.34".parse().unwrap()));
     }
 
@@ -909,11 +909,11 @@ mod tests {
         ext.vote_at(
             t0,
             ip("93.184.216.34"),
-            Source::Upnp,
+            Source::Gateway,
             gateway.into(),
             Route::Direct,
         );
-        let later = t0 + UPNP_TTL + AGE_INTERVAL;
+        let later = t0 + GATEWAY_TTL + AGE_INTERVAL;
         for index in 10..=12u8 {
             ext.vote_at(
                 later,
@@ -955,7 +955,7 @@ mod tests {
         let ext = ExternalIp::new();
         ext.vote(
             ip("93.184.216.34"),
-            Source::Upnp,
+            Source::Gateway,
             ip("192.168.1.1"),
             Route::Proxied,
         );

@@ -11,7 +11,7 @@ name = "risuko_bt"
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "net", "macros", "io-util", "fs"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 thiserror = "2"
 percent-encoding = "2"
 bytes = "1"
@@ -26,11 +26,13 @@ risuko-http = { workspace = true }
 risuko-util = { workspace = true }
 socket2 = "0.6"
 url = "2"
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 httparse = "1"
 network-interface = "2"
+netdev = { version = "0.47", default-features = false, features = ["gateway"] }
+dunce = "1"
 serde = { version = "1", features = ["derive"] }
-num-bigint = "0.4"
+num-bigint = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

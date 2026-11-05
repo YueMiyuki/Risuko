@@ -18,6 +18,9 @@ export default {
 	mounted() {
 		this.preventDefault = (ev) => ev.preventDefault();
 		this.injectTorrentPaths = async (paths: string[] = []) => {
+			if (useAppStore().createTorrentVisible) {
+				return;
+			}
 			const items = paths
 				.map((path) => {
 					const segs = `${path}`.split(/[/\\]/);
@@ -33,6 +36,9 @@ export default {
 			useAppStore().enqueueBatchItems(items);
 		};
 		this.handleFileList = (files) => {
+			if (useAppStore().createTorrentVisible) {
+				return;
+			}
 			const items = (files || [])
 				.map((item) => batchItemForFilePath(item.path ?? item.name, item.name))
 				.filter(Boolean);
@@ -45,9 +51,10 @@ export default {
 		};
 		let count = 0;
 		this.onDragEnter = (_ev) => {
-			if (count === 0) {
-				this.dragPreviewOpened = !useAppStore().addTaskVisible;
-				useAppStore().showAddTaskDialog(ADD_TASK_TYPE.TORRENT);
+			const appStore = useAppStore();
+			if (count === 0 && !appStore.createTorrentVisible) {
+				this.dragPreviewOpened = !appStore.addTaskVisible;
+				appStore.showAddTaskDialog(ADD_TASK_TYPE.TORRENT);
 			}
 			count++;
 		};

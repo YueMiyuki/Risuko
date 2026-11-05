@@ -14,9 +14,11 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DEV_BRANCH: next-dev
 
 concurrency:
   group: prepare-release-${{ github.repository }}
@@ -57,6 +59,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
 
       - name: Collect release notes
         env:
@@ -74,10 +77,11 @@ jobs:
       - name: Bump version and metainfo
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          DATE: ${{ steps.version.outputs.date }}
         run: |
           set -euo pipefail
           node scripts/set-version.mjs "$VERSION"
-          node scripts/add-metainfo-release.mjs "$VERSION" "$(date -u +%F)" "$RUNNER_TEMP/notes.md"
+          node scripts/add-metainfo-release.mjs "$VERSION" "$DATE" "$RUNNER_TEMP/notes.md"
 
       - name: Commit and push
         env:
@@ -101,3 +105,33 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$BRANCH" \
             --title "Risuko $TAG" --generate-notes
           echo "::notice::Draft $TAG is ready. Edit the notes and publish it to start the release."
+
+      - name: Bump the dev branch
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DATE: ${{ steps.version.outputs.date }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEV_BRANCH" == "$BRANCH" ]] || ! git ls-remote --exit-code --heads origin "$DEV_BRANCH" >/dev/null; then
+            echo "::notice::No separate $DEV_BRANCH branch to bump"
+            exit 0
+          fi
+          git fetch --depth=1 origin "$DEV_BRANCH"
+          git switch --detach FETCH_HEAD
+          node scripts/set-version.mjs "$VERSION"
+          node scripts/add-metainfo-release.mjs "$VERSION" "$DATE" "$RUNNER_TEMP/notes.md"
+          if git diff --quiet; then
+            echo "$DEV_BRANCH is already at $VERSION"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(release): v$VERSION"
+          if git push origin "HEAD:$DEV_BRANCH"; then
+            exit 0
+          fi
+          pr_branch="release/v$VERSION-$DEV_BRANCH"
+          git push --force origin "HEAD:refs/heads/$pr_branch"
+          gh pr create --base "$DEV_BRANCH" --head "$pr_branch" \
+            --title "chore(release): v$VERSION" \
+            --body "Version bump for v$VERSION on $DEV_BRANCH, opened because the direct push was rejected."
