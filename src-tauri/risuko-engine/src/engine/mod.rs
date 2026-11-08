@@ -348,16 +348,7 @@ pub async fn start_engine(
                             ("engine:bt-download-complete", gid.as_str())
                         }
                     };
-                    let payload = match &event {
-                        EngineEvent::DownloadComplete { seeded, .. } => {
-                            serde_json::json!({ "gid": gid, "seeded": seeded })
-                        }
-                        EngineEvent::BtDownloadComplete { seeding, .. } => {
-                            serde_json::json!({ "gid": gid, "seeding": seeding })
-                        }
-                        _ => serde_json::json!({ "gid": gid }),
-                    };
-                    sink.emit(name, payload);
+                    sink.emit(name, event.params());
 
                     if matches!(event, EngineEvent::DownloadComplete { .. }) {
                         if let Some(uploads) = upload_mgr.clone() {

@@ -501,6 +501,88 @@ async fn withdrawing_a_share_revokes_the_slot_but_keeps_the_connection() {
     up.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_second_connection_from_the_same_user_takes_over_the_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let up = uploader(4).await;
+    let data = fixture(5000);
+    let (handle, hash) = share_complete(&up, dir.path(), &data);
+    let slot_request = build_slot_request(&hash).encode();
+    let mut first = raw_client(&up, [3; 16]).await;
+    let mut first_buf = bytes::BytesMut::new();
+    expect_op(&mut first, &mut first_buf, OP_HELLO_ANSWER).await;
+    first.write_all(&slot_request).await.unwrap();
+    expect_op(&mut first, &mut first_buf, OP_SLOT_GIVEN).await;
+
+    let mut second = raw_client(&up, [3; 16]).await;
+    let mut second_buf = bytes::BytesMut::new();
+    expect_op(&mut second, &mut second_buf, OP_HELLO_ANSWER).await;
+    second.write_all(&slot_request).await.unwrap();
+    expect_op(&mut second, &mut second_buf, OP_SLOT_GIVEN).await;
+
+    let request = build_request_parts(&hash, &[(0, 1000)], false)
+        .unwrap()
+        .encode();
+    first.write_all(&request).await.unwrap();
+    loop {
+        let packet = next_packet(&mut first, &mut first_buf).await.unwrap();
+        assert_ne!(packet.opcode, OP_SENDING_PART);
+        if packet.opcode == OP_SLOT_TAKEN {
+            break;
+        }
+    }
+    second.write_all(&request).await.unwrap();
+    let part = expect_op(&mut second, &mut second_buf, OP_SENDING_PART).await;
+    assert_eq!(&part.payload[24..], &data[..1000]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(handle.file().stats().uploaded(), 1000);
+    assert_eq!(up.shared.queue.lock().slots(), 1);
+    up.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_undialable_waiter_does_not_hold_up_connected_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let up = uploader(1).await;
+    let (_handle, hash) = share_complete(&up, dir.path(), &fixture(5000));
+    let slot_request = build_slot_request(&hash).encode();
+    let mut holder = raw_client(&up, [3; 16]).await;
+    let mut holder_buf = bytes::BytesMut::new();
+    expect_op(&mut holder, &mut holder_buf, OP_HELLO_ANSWER).await;
+    holder.write_all(&slot_request).await.unwrap();
+    expect_op(&mut holder, &mut holder_buf, OP_SLOT_GIVEN).await;
+
+    let busy = Ipv4Addr::new(127, 0, 0, 2);
+    let offline = queue::Waiter {
+        user: [5; 16],
+        file: hash,
+        dial: Some(SocketAddrV4::new(busy, 4662)),
+        session: None,
+        seen: tokio::time::Instant::now(),
+    };
+    assert_eq!(
+        up.shared.queue.lock().request(offline),
+        queue::Admission::Queued(1)
+    );
+    let _guards: Vec<_> = (0..MAX_SESSIONS_PER_IP)
+        .map(|_| up.shared.admit(busy).unwrap())
+        .collect();
+
+    let mut waiting = raw_client(&up, [4; 16]).await;
+    let mut waiting_buf = bytes::BytesMut::new();
+    expect_op(&mut waiting, &mut waiting_buf, OP_HELLO_ANSWER).await;
+    waiting.write_all(&slot_request).await.unwrap();
+    expect_op(&mut waiting, &mut waiting_buf, OP_EMULE_QUEUE_RANKING).await;
+
+    holder
+        .write_all(&Ed2kPacket::new(PROTO_EDONKEY, OP_CANCEL_TRANSFER, Vec::new()).encode())
+        .await
+        .unwrap();
+    expect_op(&mut waiting, &mut waiting_buf, OP_SLOT_GIVEN).await;
+    assert_eq!(up.shared.queue.lock().rank(&[5; 16]), Some(1));
+    up.shutdown().await;
+}
+
 async fn accept_dial(
     listener: &tokio::net::TcpListener,
 ) -> (tokio::net::TcpStream, bytes::BytesMut, HelloInfo) {

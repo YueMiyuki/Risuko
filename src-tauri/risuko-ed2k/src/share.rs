@@ -367,8 +367,14 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> i
 }
 
 pub struct ShareRegistry {
-    files: RwLock<HashMap<[u8; 16], Arc<SharedFile>>>,
+    files: RwLock<HashMap<[u8; 16], Vec<Arc<SharedFile>>>>,
     changed: watch::Sender<u64>,
+}
+
+fn preferred(shares: &[Arc<SharedFile>]) -> Option<&Arc<SharedFile>> {
+    shares
+        .iter()
+        .max_by_key(|file| (file.is_offerable(), file.is_complete()))
 }
 
 impl ShareRegistry {
@@ -381,7 +387,11 @@ impl ShareRegistry {
 
     pub fn insert(self: &Arc<Self>, file: SharedFile) -> ShareHandle {
         let file = Arc::new(file);
-        self.files.write().insert(file.hash, file.clone());
+        self.files
+            .write()
+            .entry(file.hash)
+            .or_default()
+            .push(file.clone());
         self.bump();
         ShareHandle {
             registry: Arc::downgrade(self),
@@ -390,21 +400,34 @@ impl ShareRegistry {
     }
 
     pub fn get(&self, hash: &[u8; 16]) -> Option<Arc<SharedFile>> {
-        self.files.read().get(hash).cloned()
+        self.files
+            .read()
+            .get(hash)
+            .and_then(|shares| preferred(shares))
+            .cloned()
     }
 
     pub fn files(&self) -> Vec<Arc<SharedFile>> {
-        self.files.read().values().cloned().collect()
+        self.files
+            .read()
+            .values()
+            .filter_map(|shares| preferred(shares))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn sample_stats(&self) {
-        for file in self.files.read().values() {
+        for file in self.files.read().values().flatten() {
             file.stats.sample();
         }
     }
 
     pub fn has_offerable(&self) -> bool {
-        self.files.read().values().any(|f| f.is_offerable())
+        self.files
+            .read()
+            .values()
+            .flatten()
+            .any(|f| f.is_offerable())
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -414,8 +437,16 @@ impl ShareRegistry {
     fn remove(&self, file: &Arc<SharedFile>) {
         let removed = {
             let mut files = self.files.write();
-            let current = files.get(&file.hash).is_some_and(|f| Arc::ptr_eq(f, file));
-            current && files.remove(&file.hash).is_some()
+            let Some(shares) = files.get_mut(&file.hash) else {
+                return;
+            };
+            let before = shares.len();
+            shares.retain(|f| !Arc::ptr_eq(f, file));
+            let removed = shares.len() != before;
+            if shares.is_empty() {
+                files.remove(&file.hash);
+            }
+            removed
         };
         if removed {
             self.bump();
@@ -737,24 +768,47 @@ mod tests {
     #[test]
     fn registry_handles_only_remove_their_own_entry() {
         let registry = ShareRegistry::new();
-        let first = registry.insert(SharedFile::complete(
-            [7; 16],
-            "a",
-            1,
-            PathBuf::new(),
-            Vec::new(),
-        ));
-        let second = registry.insert(SharedFile::complete(
-            [7; 16],
-            "b",
-            1,
-            PathBuf::new(),
-            Vec::new(),
-        ));
+        let complete = |name| SharedFile::complete([7; 16], name, 1, PathBuf::new(), Vec::new());
+        let first = registry.insert(complete("a"));
+        let second = registry.insert(complete("b"));
+        assert_eq!(registry.get(&[7; 16]).unwrap().name(), "b");
+        assert_eq!(registry.files().len(), 1);
         drop(first);
         assert_eq!(registry.get(&[7; 16]).unwrap().name(), "b");
         drop(second);
         assert!(registry.get(&[7; 16]).is_none());
+
+        let older = registry.insert(complete("a"));
+        let newer = registry.insert(complete("b"));
+        drop(newer);
+        assert_eq!(registry.get(&[7; 16]).unwrap().name(), "a");
+        assert!(registry.has_offerable());
+        drop(older);
+        assert!(registry.files().is_empty());
+    }
+
+    #[test]
+    fn a_complete_share_wins_over_a_newer_partial_of_the_same_file() {
+        let registry = ShareRegistry::new();
+        let size = ED2K_CHUNK_SIZE * 2;
+        let _complete = registry.insert(SharedFile::complete(
+            [7; 16],
+            "done",
+            size,
+            PathBuf::new(),
+            Vec::new(),
+        ));
+        let parts = PartMap::new(size);
+        let _partial = registry.insert(SharedFile::partial(
+            [7; 16],
+            "part",
+            size,
+            PathBuf::new(),
+            parts.clone(),
+        ));
+        assert_eq!(registry.get(&[7; 16]).unwrap().name(), "done");
+        parts.mark_verified(0);
+        assert_eq!(registry.get(&[7; 16]).unwrap().name(), "done");
     }
 
     #[tokio::test]

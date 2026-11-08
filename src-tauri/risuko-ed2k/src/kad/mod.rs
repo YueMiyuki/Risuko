@@ -411,6 +411,7 @@ struct KadRuntime {
     config_dir: PathBuf,
     shutdown: CancellationToken,
     health: RwLock<KadHealthSnapshot>,
+    published_at_ms: AtomicU64,
     seeds: Vec<SocketAddrV4>,
     seed_cursor: AtomicUsize,
     liveness: Mutex<HashSet<NodeId>>,
@@ -644,6 +645,7 @@ impl KadService {
             config,
             shutdown,
             health: RwLock::new(health),
+            published_at_ms: AtomicU64::new(0),
             seeds,
             seed_cursor: AtomicUsize::new(0),
             liveness: Mutex::new(HashSet::new()),
@@ -797,6 +799,11 @@ impl KadService {
                 Err(_) => {}
             }
         }
+        if stored > 0 {
+            self.runtime
+                .published_at_ms
+                .store(now_ms(), Ordering::Relaxed);
+        }
         Ok(stored)
     }
 
@@ -941,8 +948,13 @@ impl KadService {
             let health = self.runtime.health.read().await;
             (health.last_lookup_at_ms, health.last_lookup_success)
         };
-        let recent = last_at.is_some_and(|at| now_ms().saturating_sub(at) < WARM_ROUTING_WINDOW_MS);
-        recent && success == Some(true) && self.runtime.routing.lock().await.len() >= routing::K
+        let recent = |at: u64| now_ms().saturating_sub(at) < WARM_ROUTING_WINDOW_MS;
+        let looked_up = success == Some(true) && last_at.is_some_and(recent);
+        let published = match self.runtime.published_at_ms.load(Ordering::Relaxed) {
+            0 => false,
+            at => recent(at),
+        };
+        (looked_up || published) && self.runtime.routing.lock().await.len() >= routing::K
     }
 
     fn lookup_is_cancelled(&self, cancel: &CancellationToken) -> bool {

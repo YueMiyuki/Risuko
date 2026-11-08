@@ -120,6 +120,7 @@ export interface AppConfig {
 	dohFallback?: boolean;
 	dohProvider?: string;
 	ed2KEnableKad?: boolean | string;
+	ed2KEnableUpload?: boolean | string;
 	ed2KKadPort?: number | string;
 	cloudSyncEnabled?: boolean;
 	cloudSyncAuto?: boolean;

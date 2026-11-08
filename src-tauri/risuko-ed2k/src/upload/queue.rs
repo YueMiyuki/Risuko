@@ -111,11 +111,14 @@ impl UploadQueue {
         self.waiting.iter().any(Self::eligible)
     }
 
-    pub fn next_grant(&mut self, now: Instant) -> Option<Waiter> {
+    pub fn next_grant(&mut self, now: Instant, can_dial: bool) -> Option<Waiter> {
         if self.slots.len() >= self.max_slots {
             return None;
         }
-        let index = self.waiting.iter().position(Self::eligible)?;
+        let index = self
+            .waiting
+            .iter()
+            .position(|w| w.session.is_some() || (can_dial && w.dial.is_some()))?;
         let waiter = self.waiting.remove(index);
         self.slots.insert(
             waiter.user,
@@ -159,6 +162,12 @@ impl UploadQueue {
         }
         self.slots.remove(user);
         true
+    }
+
+    pub fn defer_grant(&mut self, waiter: Waiter) {
+        if self.abandon_grant(&waiter.user) && !self.waiting.iter().any(|w| w.user == waiter.user) {
+            self.waiting.insert(0, waiter);
+        }
     }
 
     pub fn session_closed(&mut self, user: &[u8; 16], session: SessionId) -> bool {
@@ -237,9 +246,9 @@ mod tests {
         assert_eq!(q.request(waiter(2, Some(2), now)), Admission::Queued(1));
         assert!(q.release(&[1; 16]));
         assert_eq!(q.request(waiter(3, Some(3), now)), Admission::Queued(2));
-        let grant = q.next_grant(now).unwrap();
+        let grant = q.next_grant(now, true).unwrap();
         assert_eq!((grant.user, grant.session), ([2; 16], Some(2)));
-        assert!(q.next_grant(now).is_none());
+        assert!(q.next_grant(now, true).is_none());
     }
 
     #[test]
@@ -254,7 +263,7 @@ mod tests {
         assert!(!q.session_closed(&[2; 16], 2));
         assert!(!q.session_closed(&[3; 16], 3));
         assert!(q.session_closed(&[1; 16], 1));
-        let grant = q.next_grant(now).unwrap();
+        let grant = q.next_grant(now, true).unwrap();
         assert_eq!((grant.user, grant.session), ([3; 16], None));
         assert_eq!(q.rank(&[2; 16]), Some(1));
         assert!(q.attach(&[3; 16], 7));
@@ -270,7 +279,7 @@ mod tests {
         q.request(waiter(2, Some(2), now));
         assert!(q.record_sent(&[1; 16], 1, now));
         assert_eq!(q.requeue(waiter(1, Some(1), now)), Some(2));
-        assert_eq!(q.next_grant(now).map(|g| g.user), Some([2; 16]));
+        assert_eq!(q.next_grant(now, true).map(|g| g.user), Some([2; 16]));
     }
 
     #[test]
@@ -285,6 +294,28 @@ mod tests {
         q.detach(&[1; 16]);
         assert!(q.abandon_grant(&[1; 16]));
         assert_eq!(q.slots(), 0);
+    }
+
+    #[test]
+    fn a_deferred_grant_keeps_its_place_unless_the_user_came_back() {
+        let now = Instant::now();
+        let mut q = UploadQueue::new(1, 10);
+        let mut dialable = waiter(1, None, now);
+        dialable.dial = Some(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662));
+        q.request(waiter(2, Some(2), now));
+        q.request(dialable);
+        q.request(waiter(3, Some(3), now));
+        assert!(q.release(&[2; 16]));
+        let grant = q.next_grant(now, true).unwrap();
+        assert_eq!(grant.user, [1; 16]);
+        q.defer_grant(grant);
+        assert_eq!((q.slots(), q.rank(&[1; 16])), (0, Some(1)));
+
+        let grant = q.next_grant(now, true).unwrap();
+        assert_eq!(q.request(waiter(1, Some(9), now)), Admission::Granted);
+        q.defer_grant(grant);
+        assert!(q.holds_slot(&[1; 16], 9));
+        assert_eq!(q.rank(&[1; 16]), None);
     }
 
     #[test]

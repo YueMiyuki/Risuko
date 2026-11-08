@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -6,6 +7,7 @@ use tokio::time::{interval_at, sleep, Duration, Instant};
 
 use super::session::Mode;
 use super::{Identity, Shared};
+use crate::kad::routing::is_public_ipv4;
 use crate::kad::KadService;
 use crate::protocol::{build_offer_files, OfferEntry};
 use crate::server::{ServerConnection, ServerEvent};
@@ -19,6 +21,8 @@ const MAX_OFFERS_PER_PACKET: usize = 200;
 const KAD_PUBLISH_TICK: Duration = Duration::from_secs(30);
 const KAD_REPUBLISH: Duration = Duration::from_secs(5 * 60 * 60);
 const KAD_RETRY: Duration = Duration::from_secs(30 * 60);
+const CALLBACK_WINDOW: Duration = Duration::from_secs(60);
+const MAX_CALLBACKS_PER_WINDOW: u32 = 30;
 
 const FILE_COMPLETE_ID: u32 = 0xfbfb_fbfb;
 const FILE_COMPLETE_PORT: u16 = 0xfbfb;
@@ -57,7 +61,7 @@ pub(super) async fn run_server_announcer(shared: Arc<Shared>, kad_udp_port: Opti
 
 async fn announce_to(
     shared: &Arc<Shared>,
-    addr: std::net::SocketAddrV4,
+    addr: SocketAddrV4,
     kad_udp_port: Option<u16>,
     changes: &mut watch::Receiver<u64>,
 ) -> Result<(), String> {
@@ -74,6 +78,7 @@ async fn announce_to(
     };
     let mut offered: HashMap<[u8; 16], bool> = HashMap::new();
     let mut login: Option<(u32, u32)> = None;
+    let mut callbacks = CallbackBudget::new(Instant::now());
     let mut offer_tick = interval_at(Instant::now() + OFFER_INTERVAL, OFFER_INTERVAL);
     let mut keepalive = interval_at(Instant::now() + KEEPALIVE_INTERVAL, KEEPALIVE_INTERVAL);
     loop {
@@ -90,7 +95,11 @@ async fn announce_to(
                     offer(&conn, shared, &mut offered, client_id, flags).await?;
                 }
                 Some(ServerEvent::CallbackRequested(target)) => {
-                    if login.is_some() && shared.registry.has_offerable() {
+                    if login.is_some()
+                        && shared.registry.has_offerable()
+                        && callback_target_allowed(addr, target)
+                        && callbacks.take(Instant::now())
+                    {
                         shared.spawn_dial(target, Mode::Callback);
                     }
                 }
@@ -122,6 +131,37 @@ async fn announce_to(
                 }
             }
         }
+    }
+}
+
+fn callback_target_allowed(server: SocketAddrV4, target: SocketAddrV4) -> bool {
+    let ip = *target.ip();
+    target.port() != 0 && (is_public_ipv4(ip) || (ip.is_private() && !is_public_ipv4(*server.ip())))
+}
+
+struct CallbackBudget {
+    window: Instant,
+    used: u32,
+}
+
+impl CallbackBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            window: now,
+            used: 0,
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.window) >= CALLBACK_WINDOW {
+            self.window = now;
+            self.used = 0;
+        }
+        if self.used >= MAX_CALLBACKS_PER_WINDOW {
+            return false;
+        }
+        self.used += 1;
+        true
     }
 }
 
@@ -271,6 +311,37 @@ mod tests {
             (0x0100_0000, 4662)
         );
         assert_eq!(offer_endpoint(&done, 5, 4662, 0), (0, 0));
+    }
+
+    #[test]
+    fn callbacks_go_only_to_public_peers_unless_the_server_is_local() {
+        let at = |a, b, c, d, port| SocketAddrV4::new(std::net::Ipv4Addr::new(a, b, c, d), port);
+        let public = at(8, 8, 8, 8, 4662);
+        let lan = at(192, 168, 1, 5, 4661);
+        assert!(callback_target_allowed(public, at(1, 2, 3, 4, 4662)));
+        assert!(!callback_target_allowed(public, at(1, 2, 3, 4, 0)));
+        assert!(!callback_target_allowed(public, at(192, 168, 1, 9, 4662)));
+        assert!(!callback_target_allowed(public, at(127, 0, 0, 1, 4662)));
+        assert!(callback_target_allowed(lan, at(192, 168, 1, 9, 4662)));
+        assert!(callback_target_allowed(lan, at(1, 2, 3, 4, 4662)));
+        for target in [
+            at(127, 0, 0, 1, 4662),
+            at(169, 254, 0, 1, 4662),
+            at(0, 0, 0, 0, 1),
+        ] {
+            assert!(!callback_target_allowed(lan, target));
+        }
+    }
+
+    #[test]
+    fn callbacks_are_rate_limited_per_server_connection() {
+        let start = Instant::now();
+        let mut budget = CallbackBudget::new(start);
+        for _ in 0..MAX_CALLBACKS_PER_WINDOW {
+            assert!(budget.take(start));
+        }
+        assert!(!budget.take(start + CALLBACK_WINDOW / 2));
+        assert!(budget.take(start + CALLBACK_WINDOW));
     }
 
     #[test]

@@ -107,11 +107,11 @@ impl Shared {
     fn admit(self: &Arc<Self>, ip: Ipv4Addr) -> Option<ConnectionGuard> {
         let mut connections = self.connections.lock();
         let total: usize = connections.values().sum();
-        let count = connections.entry(ip).or_insert(0);
-        if total >= MAX_SESSIONS || *count >= MAX_SESSIONS_PER_IP {
+        let count = connections.get(&ip).copied().unwrap_or(0);
+        if total >= MAX_SESSIONS || count >= MAX_SESSIONS_PER_IP {
             return None;
         }
-        *count += 1;
+        connections.insert(ip, count + 1);
         Some(ConnectionGuard {
             shared: self.clone(),
             ip,
@@ -123,23 +123,27 @@ impl Shared {
     }
 
     fn dispatch(self: &Arc<Self>) {
+        let mut can_dial = true;
         loop {
-            let Some(grant) = self.queue.lock().next_grant(Instant::now()) else {
+            let Some(mut grant) = self.queue.lock().next_grant(Instant::now(), can_dial) else {
                 return;
             };
             if self.deliver(&grant) {
                 continue;
             }
+            let Some(addr) = grant.dial else {
+                self.queue.lock().release(&grant.user);
+                continue;
+            };
+            self.queue.lock().detach(&grant.user);
             let mode = Mode::Grant {
                 user: grant.user,
                 file: grant.file,
             };
-            let dialed = grant.dial.is_some_and(|addr| {
-                self.queue.lock().detach(&grant.user);
-                self.spawn_dial(addr, mode)
-            });
-            if !dialed {
-                self.queue.lock().release(&grant.user);
+            if !can_dial || !self.spawn_dial(addr, mode) {
+                grant.session = None;
+                self.queue.lock().defer_grant(grant);
+                can_dial = false;
             }
         }
     }
@@ -170,10 +174,12 @@ impl Shared {
                     session::run(stream, *addr.ip(), shared.clone(), mode, guard).await;
                 }
                 Ok(Err(e)) => {
+                    drop(guard);
                     tracing::debug!("[ed2k] Upload dial to {addr} failed: {e}");
                     shared.dial_failed(mode);
                 }
                 Err(_) => {
+                    drop(guard);
                     tracing::debug!("[ed2k] Upload dial to {addr} timed out");
                     shared.dial_failed(mode);
                 }

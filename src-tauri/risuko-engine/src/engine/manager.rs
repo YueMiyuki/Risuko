@@ -3326,6 +3326,7 @@ impl TaskManager {
             };
 
             let c = counters.clone();
+            let mut announced_seeding = false;
             let result = match file_link {
                 Ok(link) if seeding => {
                     let path = super::ed2k::partial::final_path(&dir, &link.file_name);
@@ -3393,6 +3394,7 @@ impl TaskManager {
                                     )
                                     .await =>
                             {
+                                announced_seeding = true;
                                 counters.speed.store(0, Ordering::Relaxed);
                                 let verified = remember_complete_file(
                                     config_dir,
@@ -3427,6 +3429,12 @@ impl TaskManager {
                     if ok && task.seeder && task.status == TaskStatus::Active {
                         task.status = TaskStatus::Complete;
                         clear_seeding(task);
+                        if announced_seeding {
+                            events.send(EngineEvent::DownloadComplete {
+                                gid: task.gid.clone(),
+                                seeded: true,
+                            });
+                        }
                     }
                 },
                 |task, _| task.total_length,

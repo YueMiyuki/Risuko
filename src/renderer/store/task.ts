@@ -568,6 +568,7 @@ export const useTaskStore = defineStore("task", {
 						"uploadSpeed",
 						"seeder",
 						"bittorrent",
+						"ed2kLink",
 					],
 				})) as DownloadTask[];
 				if (sampleSpeedsFromTasks(tasks) && !document.hidden) {

@@ -260,7 +260,7 @@ impl MetaTag {
                 buf.push(0x02);
                 buf.extend_from_slice(&1u16.to_le_bytes());
                 buf.push(*name_id);
-                let bytes = value.as_bytes();
+                let bytes = clip_utf8(value, usize::from(u16::MAX)).as_bytes();
                 buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
@@ -393,13 +393,16 @@ pub fn build_request_parts(
     })
 }
 
+fn clip_utf8(s: &str, max: usize) -> &str {
+    &s[..s.floor_char_boundary(max)]
+}
+
 pub fn build_file_name_answer(file_hash: &[u8; 16], name: &str) -> Ed2kPacket {
-    let bytes = name.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize);
-    let mut payload = Vec::with_capacity(18 + len);
+    let bytes = clip_utf8(name, usize::from(u16::MAX)).as_bytes();
+    let mut payload = Vec::with_capacity(18 + bytes.len());
     payload.extend_from_slice(file_hash);
-    payload.extend_from_slice(&(len as u16).to_le_bytes());
-    payload.extend_from_slice(&bytes[..len]);
+    payload.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(bytes);
     Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_NAME_ANSWER, payload)
 }
 
@@ -770,6 +773,27 @@ mod tests {
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&[0xff, 0x01]);
         assert_eq!(parse_hello_answer_caps(&bad), PeerCaps::default());
+    }
+
+    #[test]
+    fn oversized_names_are_cut_at_a_char_boundary_within_the_length_prefix() {
+        let name = format!("{}é", "a".repeat(usize::from(u16::MAX) - 1));
+        let mut tag = Vec::new();
+        MetaTag::string(FT_FILENAME, &name).encode(&mut tag);
+        let len = usize::from(u16::from_le_bytes([tag[4], tag[5]]));
+        assert_eq!((len, tag.len()), (usize::from(u16::MAX) - 1, 6 + len));
+        let answer = build_file_name_answer(&[0; 16], &name);
+        assert_eq!(&answer.payload[16..18], &(len as u16).to_le_bytes());
+        assert!(std::str::from_utf8(&answer.payload[18..]).is_ok());
+        let entry = OfferEntry {
+            file_hash: [0; 16],
+            client_id: 0,
+            client_port: 0,
+            name: &name,
+            size: 1,
+        };
+        let offer = build_offer_files(&[entry]);
+        assert_eq!(offer.payload.len(), 4 + 16 + 6 + 4 + tag.len() + 8);
     }
 
     #[test]

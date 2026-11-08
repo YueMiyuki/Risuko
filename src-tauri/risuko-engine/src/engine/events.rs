@@ -34,11 +34,23 @@ impl EngineEvent {
         }
     }
 
+    pub fn params(&self) -> Value {
+        match self {
+            Self::DownloadComplete { gid, seeded } => {
+                serde_json::json!({ "gid": gid, "seeded": seeded })
+            }
+            Self::BtDownloadComplete { gid, seeding } => {
+                serde_json::json!({ "gid": gid, "seeding": seeding })
+            }
+            _ => serde_json::json!({ "gid": self.gid() }),
+        }
+    }
+
     pub fn to_notification(&self) -> Value {
         serde_json::json!({
             "jsonrpc": "2.0",
             "method": self.method_name(),
-            "params": [{"gid": self.gid()}]
+            "params": [self.params()]
         })
     }
 }
@@ -66,5 +78,33 @@ impl EventBroadcaster {
 impl Default for EventBroadcaster {
     fn default() -> Self {
         Self::new(256)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_carry_the_completion_flags() {
+        let params = |event: EngineEvent| event.to_notification()["params"][0].clone();
+        assert_eq!(
+            params(EngineEvent::DownloadComplete {
+                gid: "a".into(),
+                seeded: true
+            }),
+            serde_json::json!({ "gid": "a", "seeded": true })
+        );
+        assert_eq!(
+            params(EngineEvent::BtDownloadComplete {
+                gid: "b".into(),
+                seeding: false
+            }),
+            serde_json::json!({ "gid": "b", "seeding": false })
+        );
+        assert_eq!(
+            params(EngineEvent::DownloadStart { gid: "c".into() }),
+            serde_json::json!({ "gid": "c" })
+        );
     }
 }

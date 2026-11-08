@@ -109,7 +109,7 @@ pub(super) async fn run<S>(
     ip: Ipv4Addr,
     shared: Arc<Shared>,
     mode: Mode,
-    _guard: ConnectionGuard,
+    guard: ConnectionGuard,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -152,6 +152,7 @@ pub(super) async fn run<S>(
     }
 
     shared.sessions.lock().remove(&id);
+    drop(guard);
     session.slot = None;
     let mut released = false;
     if let Some(peer) = &session.peer {
@@ -428,13 +429,14 @@ impl Session {
             return true;
         };
         let id = slot.id;
-        if slot.file.is_withdrawn() || slot.blocks.stalled(now) {
+        let (held, expired) = {
+            let mut queue = self.shared.queue.lock();
+            let held = queue.holds_slot(&peer.user, self.id);
+            (held, held && queue.record_sent(&peer.user, 0, now))
+        };
+        if !held || slot.file.is_withdrawn() || slot.blocks.stalled(now) {
             return self.revoke(id).await;
         }
-        let expired = {
-            let mut queue = self.shared.queue.lock();
-            queue.holds_slot(&peer.user, self.id) && queue.record_sent(&peer.user, 0, now)
-        };
         if expired {
             return self.rotate(id).await;
         }
@@ -502,6 +504,7 @@ impl Session {
         let task = tokio::spawn(upload_loop(
             self.shared.clone(),
             id,
+            self.id,
             file.clone(),
             peer.user,
             blocks.clone(),
@@ -584,16 +587,18 @@ pub(super) fn packet_spans(start: u64, end: u64) -> Vec<(u64, u64)> {
     spans
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_loop(
     shared: Arc<Shared>,
     id: SlotId,
+    session: SessionId,
     file: Arc<SharedFile>,
     user: [u8; 16],
     blocks: Arc<BlockQueue>,
     out: mpsc::Sender<Ed2kPacket>,
     cmd_tx: mpsc::Sender<SessionCmd>,
 ) {
-    let cmd = serve_blocks(&shared, id, &file, &user, &blocks, &out).await;
+    let cmd = serve_blocks(&shared, id, session, &file, &user, &blocks, &out).await;
     blocks.busy.store(false, Ordering::Relaxed);
     if let Some(cmd) = cmd {
         let _ = cmd_tx.send(cmd).await;
@@ -603,6 +608,7 @@ async fn upload_loop(
 async fn serve_blocks(
     shared: &Shared,
     id: SlotId,
+    session: SessionId,
     file: &Arc<SharedFile>,
     user: &[u8; 16],
     blocks: &BlockQueue,
@@ -621,7 +627,7 @@ async fn serve_blocks(
             blocks.ready.notified().await;
             continue;
         };
-        if file.is_withdrawn() {
+        if file.is_withdrawn() || !shared.queue.lock().holds_slot(user, session) {
             return Some(SessionCmd::Revoke(id));
         }
         blocks.busy.store(true, Ordering::Relaxed);
@@ -650,11 +656,14 @@ async fn serve_blocks(
                 state.served.pop_front();
             }
         }
-        if shared
-            .queue
-            .lock()
-            .record_sent(user, end - start, Instant::now())
-        {
+        let rotate = {
+            let mut queue = shared.queue.lock();
+            if !queue.holds_slot(user, session) {
+                return Some(SessionCmd::Revoke(id));
+            }
+            queue.record_sent(user, end - start, Instant::now())
+        };
+        if rotate {
             return Some(SessionCmd::Rotate(id));
         }
     }
