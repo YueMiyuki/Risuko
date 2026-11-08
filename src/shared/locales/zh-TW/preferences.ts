@@ -257,6 +257,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"用於 Kad 探索的 UDP 連接埠，有效值為 1-65535（需重啟引擎）",
 	"ed2k-kad-port-invalid": "Kad UDP 連接埠必須是 1 到 65535 之間的整數",
+	"ed2k-enable-upload": "透過 ED2K 分享檔案",
+	"ed2k-enable-upload-tips":
+		"向其他節點上傳已完成的檔案與下載中 ED2K 任務已驗證的區塊。停止分享後，Kad 仍可能在最多 5 小時內列出該檔案（需重啟引擎）",
 	"engine-overrides-reserved-keys": "已忽略的保留引擎覆寫鍵：{{keys}}",
 	"engine-overrides-too-large":
 		"引擎覆寫設定過大：最多 64 個鍵、每個鍵 64 個字元、每個值 2048 個字元。",

@@ -9,6 +9,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::cookie_store::CookieStore;
 use super::ed2k::kad::{KadConfig, KadHealthSnapshot, KadLookupStatus, KadService, KadState};
+use super::ed2k::share::{
+    load_or_create_user_hash, remember_complete_file, verify_complete_file, ShareContext,
+    ShareRegistry, SharedFile, UploadStats, VerifiedFile,
+};
+use super::ed2k::upload::{Ed2kUploader, UploadConfig};
 use super::error_code::classify_error;
 use super::events::{EngineEvent, EventBroadcaster};
 use super::http;
@@ -439,6 +444,7 @@ struct ActiveDownload {
     adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
     metalink_files: Vec<(usize, Counters)>,
     kad_status: Arc<parking_lot::Mutex<Option<KadLookupStatus>>>,
+    ed2k_upload: Option<Arc<UploadStats>>,
 }
 
 #[derive(Clone)]
@@ -478,6 +484,7 @@ impl Counters {
             adopted_filename,
             metalink_files: Vec::new(),
             kad_status: Arc::new(parking_lot::Mutex::new(None)),
+            ed2k_upload: None,
         }
     }
 }
@@ -568,6 +575,7 @@ async fn finish_task_boxed(
         task.total_length = counters.total.load(Ordering::Relaxed);
         task.completed_length = counters.completed.load(Ordering::Relaxed);
         task.download_speed = 0;
+        task.upload_speed = 0;
         if let Some(status) = final_kad_status
             .as_ref()
             .filter(|_| task.kind == TaskKind::Ed2k)
@@ -595,24 +603,11 @@ async fn finish_task_boxed(
                     );
                     task.status = TaskStatus::Complete;
                     if task.kind != TaskKind::Usenet {
-                        task.files = vec![DownloadFile {
-                            index: "1".to_string(),
-                            path: path.to_string_lossy().to_string(),
-                            length: task.total_length.to_string(),
-                            completed_length: file_completed.to_string(),
-                            selected: "true".to_string(),
-                            uris: task
-                                .uris
-                                .iter()
-                                .map(|u| FileUri {
-                                    uri: u.clone(),
-                                    status: "used".to_string(),
-                                })
-                                .collect(),
-                        }];
+                        task.files = single_file(task, &path, file_completed);
                     }
                     events.send(EngineEvent::DownloadComplete {
                         gid: gid.to_string(),
+                        seeded: false,
                     });
                 }
             }
@@ -647,6 +642,102 @@ async fn finish_task_boxed(
     if active_guard.get(gid).map(|ad| ad.epoch) == Some(worker_epoch) {
         active_guard.remove(gid);
     }
+}
+
+fn single_file(task: &DownloadTask, path: &Path, completed: u64) -> Vec<DownloadFile> {
+    vec![DownloadFile {
+        index: "1".to_string(),
+        path: path.to_string_lossy().to_string(),
+        length: task.total_length.to_string(),
+        completed_length: completed.to_string(),
+        selected: "true".to_string(),
+        uris: task
+            .uris
+            .iter()
+            .map(|u| FileUri {
+                uri: u.clone(),
+                status: "used".to_string(),
+            })
+            .collect(),
+    }]
+}
+
+async fn seed_ed2k(
+    verified: Result<VerifiedFile, String>,
+    share: &ShareContext,
+    link: &super::ed2k::types::Ed2kFileLink,
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<PathBuf, String> {
+    let verified = match verified {
+        Ok(verified) => verified,
+        Err(error) if cancel.is_cancelled() => return Err(error),
+        Err(error) => {
+            tracing::warn!("[ed2k] Not sharing {}: {error}", path.display());
+            return Ok(path.to_path_buf());
+        }
+    };
+    let _handle = share.share(
+        SharedFile::complete(
+            link.file_hash_bytes,
+            link.file_name.clone(),
+            link.file_size,
+            path.to_path_buf(),
+            verified.hashset,
+        )
+        .with_stamp(verified.stamp),
+    );
+    cancel.cancelled().await;
+    Err("cancelled".to_string())
+}
+
+async fn begin_ed2k_seeding(
+    tasks: &Arc<RevLock>,
+    active: &Arc<RwLock<HashMap<String, ActiveDownload>>>,
+    options: &Arc<RwLock<EngineOptions>>,
+    events: &EventBroadcaster,
+    gid: &str,
+    worker_epoch: u64,
+    path: &Path,
+) -> bool {
+    let is_current = active
+        .read()
+        .await
+        .get(gid)
+        .is_some_and(|ad| ad.epoch == worker_epoch);
+    if !is_current {
+        return false;
+    }
+    let (g_manual, g_seed_time, g_seed_ratio) = {
+        let options = options.read().await;
+        (
+            options.keep_seeding(),
+            options.seed_time(),
+            options.seed_ratio(),
+        )
+    };
+    let mut tasks = tasks.write().await;
+    let Some(task) = tasks
+        .iter_mut()
+        .find(|t| t.gid == gid && t.status == TaskStatus::Active)
+    else {
+        return false;
+    };
+    if !resolve_seed_goal(&task.options, g_manual, g_seed_time, g_seed_ratio).0 {
+        return false;
+    }
+    start_seeding(task);
+    task.completed_length = task.total_length;
+    task.files = single_file(task, path, task.total_length);
+    tracing::info!(
+        "[task:{gid}] ed2k download complete, sharing {}",
+        path.display()
+    );
+    events.send(EngineEvent::BtDownloadComplete {
+        gid: gid.to_string(),
+        seeding: true,
+    });
+    true
 }
 
 fn finish_usenet_failure(
@@ -751,6 +842,7 @@ async fn metalink_finish(
                 task.status = TaskStatus::Complete;
                 events.send(EngineEvent::DownloadComplete {
                     gid: gid.to_string(),
+                    seeded: false,
                 });
             } else if failures.is_empty() {
                 task.status = TaskStatus::Paused;
@@ -938,6 +1030,81 @@ pub struct TaskManager {
     cookie_store: Arc<CookieStore>,
     usenet_connection_capacity: Arc<ProviderConnectionCapacityRegistry>,
     kad_runtime: Arc<parking_lot::RwLock<KadRuntime>>,
+    ed2k_shares: Arc<ShareRegistry>,
+    ed2k_user_hash: [u8; 16],
+    ed2k_upload: parking_lot::RwLock<UploadRuntime>,
+    ed2k_port_mapper: parking_lot::Mutex<Option<risuko_bt::session::PortMapper>>,
+    task_upload_limiters: Arc<parking_lot::Mutex<HashMap<String, Arc<SpeedLimiter>>>>,
+}
+
+#[derive(Clone)]
+enum UploadRuntime {
+    Disabled,
+    Running(Arc<Ed2kUploader>),
+    Failed(String),
+}
+
+impl UploadRuntime {
+    fn uploader(&self) -> Option<Arc<Ed2kUploader>> {
+        match self {
+            Self::Running(uploader) => Some(uploader.clone()),
+            Self::Disabled | Self::Failed(_) => None,
+        }
+    }
+
+    async fn build(
+        user_hash: [u8; 16],
+        options: &EngineOptions,
+        kad: Option<Arc<KadService>>,
+        registry: Arc<ShareRegistry>,
+        upload_limit: Arc<SpeedLimiter>,
+    ) -> Self {
+        if !options.ed2k_enable_upload() {
+            return Self::Disabled;
+        }
+        let proxy = match options.p2p_proxy_connector() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                tracing::warn!("[ed2k] Uploads disabled, invalid P2P proxy: {error}");
+                return Self::Failed(format!("invalid P2P proxy: {error}"));
+            }
+        };
+        let mut config = UploadConfig::new(user_hash, options.ed2k_port());
+        config.servers = super::ed2k::server_list::server_list(&options.ed2k_servers());
+        config.kad = kad;
+        config.proxy = proxy;
+        config.upload_limit = upload_limit;
+        config.registry = registry;
+        match Ed2kUploader::bind(config).await {
+            Ok(uploader) => Self::Running(uploader),
+            Err(error) => {
+                let reason = format!("cannot listen on TCP port {}: {error}", options.ed2k_port());
+                tracing::warn!("[ed2k] Uploads disabled, {reason}");
+                Self::Failed(reason)
+            }
+        }
+    }
+
+    fn port_mapper(
+        &self,
+        options: &EngineOptions,
+        kad: &KadRuntime,
+        previous: Option<risuko_bt::session::PortMapper>,
+    ) -> Option<risuko_bt::session::PortMapper> {
+        let uploader = self.uploader()?;
+        if !options.bt_enable_upnp() {
+            return None;
+        }
+        let mut ports = vec![(uploader.port(), risuko_bt::upnp::MapProto::Tcp)];
+        if let Some(port) = kad.udp_port() {
+            ports.push((port, risuko_bt::upnp::MapProto::Udp));
+        }
+        Some(risuko_bt::session::PortMapper::spawn(
+            ports,
+            options.bt_upnp_lease(),
+            previous,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -1133,6 +1300,28 @@ impl TaskManager {
             },
         };
 
+        let ed2k_shares = ShareRegistry::new();
+        let ed2k_user_hash = {
+            let dir = config_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || load_or_create_user_hash(&dir))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|loaded| loaded)
+                .unwrap_or_else(|error| {
+                    tracing::warn!("[ed2k] Cannot persist the user hash: {error}");
+                    super::ed2k::protocol::new_user_hash()
+                })
+        };
+        let ed2k_upload = UploadRuntime::build(
+            ed2k_user_hash,
+            &options,
+            kad_runtime.service(),
+            ed2k_shares.clone(),
+            global_upload_limiter.clone(),
+        )
+        .await;
+        let ed2k_port_mapper = ed2k_upload.port_mapper(&options, &kad_runtime, None);
+
         let manager = Self {
             tasks: Arc::new(RevLock::new(saved_tasks)),
             saved_rev: AtomicU64::new(u64::MAX),
@@ -1157,6 +1346,11 @@ impl TaskManager {
             p2p_route_generation: Arc::new(AtomicU64::new(0)),
             torrent_resume_seq: AtomicU64::new(0),
             kad_runtime: Arc::new(parking_lot::RwLock::new(kad_runtime)),
+            ed2k_shares,
+            ed2k_user_hash,
+            ed2k_upload: parking_lot::RwLock::new(ed2k_upload),
+            ed2k_port_mapper: parking_lot::Mutex::new(ed2k_port_mapper),
+            task_upload_limiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
 
         Ok(manager)
@@ -2528,38 +2722,42 @@ impl TaskManager {
             return;
         }
         let max_concurrent = self.options.read().await.max_concurrent_downloads();
-        let (active_count, busy_gids) = {
+        let busy_gids = {
             let active = self.active_downloads.read().await;
             let mut busy_gids = active.keys().cloned().collect::<HashSet<_>>();
             busy_gids.extend(self.starting_workers.lock().keys().cloned());
-            (busy_gids.len(), busy_gids)
+            busy_gids
         };
 
-        if active_count >= max_concurrent {
-            return;
-        }
-
-        let has_startable = {
+        let (active_count, has_startable) = {
             let tasks = self.tasks.read().await;
             let updating = self.updating_tasks.lock();
-            tasks.iter().any(|t| {
+            let busy_seeders = tasks
+                .iter()
+                .filter(|t| busy_gids.contains(&t.gid) && !t.holds_download_slot())
+                .count();
+            let active_count = busy_gids.len() - busy_seeders;
+            let has_startable = tasks.iter().any(|t| {
                 t.status == TaskStatus::Waiting
                     && !busy_gids.contains(&t.gid)
                     && !updating.contains(&t.gid)
-            })
+                    && (active_count < max_concurrent || !t.holds_download_slot())
+            });
+            (active_count, has_startable)
         };
         if !has_startable {
             return;
         }
         let options_snapshot = self.options.read().await.clone();
 
-        let slots = max_concurrent - active_count;
+        let slots = max_concurrent.saturating_sub(active_count);
         let mut tasks = self.tasks.write().await;
         let mut started = 0;
 
         for task in tasks.iter_mut() {
-            if started >= slots {
-                break;
+            let holds_slot = task.holds_download_slot();
+            if started >= slots && holds_slot {
+                continue;
             }
             if task.status != TaskStatus::Waiting {
                 continue;
@@ -2573,45 +2771,38 @@ impl TaskManager {
                 self.apply_stored_cookies(&task.uris, &mut merged);
                 self.spawn_http_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::Media && !task.uris.is_empty() {
                 task.status = TaskStatus::Active;
                 let mut merged = options_snapshot.merge_task_options(&task.options);
                 self.apply_stored_cookies(&task.uris, &mut merged);
                 self.spawn_media_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::M3u8 && !task.uris.is_empty() {
                 task.status = TaskStatus::Active;
                 let merged = options_snapshot.merge_task_options(&task.options);
                 self.spawn_m3u8_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::Ed2k && !task.uris.is_empty() {
                 task.status = TaskStatus::Active;
                 self.spawn_ed2k_download(task);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::Ftp && !task.uris.is_empty() {
                 task.status = TaskStatus::Active;
                 let merged = options_snapshot.merge_task_options(&task.options);
                 self.spawn_ftp_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::Metalink && !task.files.is_empty() {
                 task.status = TaskStatus::Active;
                 let merged = options_snapshot.merge_task_options(&task.options);
                 apply_select_file(&mut task.files, &task.options);
                 self.spawn_metalink_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if task.kind == TaskKind::Usenet && task.usenet.is_some() {
                 task.status = TaskStatus::Active;
                 task.usenet_stage = Some("connecting".to_string());
                 let merged = options_snapshot.merge_task_options(&task.options);
                 self.spawn_usenet_download(task, merged);
                 self.send_download_start(&task.gid);
-                started += 1;
             } else if matches!(
                 task.kind,
                 TaskKind::Adc | TaskKind::Gnutella | TaskKind::G2 | TaskKind::Gift
@@ -2620,6 +2811,8 @@ impl TaskManager {
                 task.status = TaskStatus::Active;
                 self.spawn_legacy_p2p_download(task);
                 self.send_download_start(&task.gid);
+            }
+            if holds_slot && task.status == TaskStatus::Active {
                 started += 1;
             }
         }
@@ -2632,7 +2825,7 @@ impl TaskManager {
             let mut rank = 0usize;
             let mut preempt = Vec::new();
             for task in tasks.iter() {
-                if task.kind == TaskKind::Torrent {
+                if !task.holds_download_slot() {
                     continue;
                 }
                 match task.status {
@@ -3046,6 +3239,7 @@ impl TaskManager {
         let uri = task.uris.first().cloned().unwrap_or_default();
         let dir = task.dir.clone();
         let task_options = task.options.clone();
+        let seeding = task.seeder;
         let events = self.events.clone();
         let tasks = self.tasks.clone();
         let active = self.active_downloads.clone();
@@ -3054,11 +3248,23 @@ impl TaskManager {
         let kad_udp_port = self.kad_udp_port();
         let global_limiter = self.global_speed_limiter.clone();
         let task_limiters = self.task_limiters.clone();
+        let task_upload_limiters = self.task_upload_limiters.clone();
+        let shares = self.ed2k_shares.clone();
+        let user_hash = self.ed2k_user_hash;
+        let upload_runtime = self.ed2k_upload.read().clone();
+        let uploads_enabled = upload_runtime.uploader().is_some();
+        let config_dir = self.config_dir.clone();
+        let upload_stats = Arc::new(UploadStats::with_uploaded(task.upload_length));
         let kad_status = Arc::new(parking_lot::Mutex::new(Some(
             self.kad_initial_task_status(),
         )));
 
         let counters = Counters::new(task.total_length, 0);
+        if seeding {
+            counters
+                .completed
+                .store(task.total_length, Ordering::Relaxed);
+        }
         let worker_epoch = next_worker_epoch();
         publish_starting_worker(
             &self.starting_workers,
@@ -3074,6 +3280,7 @@ impl TaskManager {
                 Arc::new(parking_lot::Mutex::new(None)),
             );
             active_download.kad_status = kad_status.clone();
+            active_download.ed2k_upload = Some(upload_stats.clone());
             register_active_download(&active, &starting, gid.clone(), active_download).await;
 
             let still_active = tasks
@@ -3107,42 +3314,105 @@ impl TaskManager {
                     global: options.merge_task_options(&task_options),
                 }
             };
-            let ed2k_servers = effective_options.ed2k_servers();
-            let ed2k_port = effective_options.ed2k_port();
-            let p2p_proxy = effective_options.p2p_proxy_connector();
-            let throttle = risuko_bt::limiter::Throttle::new(
-                global_limiter,
-                register_task_limiter(
-                    &task_limiters,
+            let share = ShareContext {
+                registry: shares,
+                user_hash,
+                stats: upload_stats,
+                limiter: register_task_limiter(
+                    &task_upload_limiters,
                     &gid,
-                    super::torrent::task_limit(&effective_options.global, "max-download-limit"),
+                    super::torrent::task_limit(&effective_options.global, "max-upload-limit"),
                 ),
-            );
+            };
 
             let c = counters.clone();
-            let download_result = match (file_link, p2p_proxy) {
-                (Ok(link), Ok(p2p_proxy)) => {
-                    super::ed2k::run_ed2k_download_with_proxy(
-                        &link,
-                        &dir,
-                        ed2k_servers,
-                        ed2k_port,
-                        kad_udp_port,
-                        kad_service,
-                        kad_status,
-                        c.total,
-                        c.completed,
-                        c.speed,
-                        c.connections,
-                        c.cancel_token,
-                        p2p_proxy,
-                        throttle,
-                    )
+            let result = match file_link {
+                Ok(link) if seeding => {
+                    let path = super::ed2k::partial::final_path(&dir, &link.file_name);
+                    match upload_runtime {
+                        UploadRuntime::Running(_) => {
+                            let verified = verify_complete_file(
+                                config_dir,
+                                path.clone(),
+                                link.file_hash_bytes,
+                                link.file_size,
+                                c.cancel_token.clone(),
+                            )
+                            .await;
+                            seed_ed2k(verified, &share, &link, &path, &c.cancel_token).await
+                        }
+                        UploadRuntime::Disabled => Ok(path),
+                        UploadRuntime::Failed(reason) => {
+                            Err(format!("eD2K sharing is unavailable: {reason}"))
+                        }
+                    }
+                }
+                Ok(link) => {
+                    async {
+                        let p2p_proxy = effective_options.p2p_proxy_connector()?;
+                        let throttle = risuko_bt::limiter::Throttle::new(
+                            global_limiter,
+                            register_task_limiter(
+                                &task_limiters,
+                                &gid,
+                                super::torrent::task_limit(
+                                    &effective_options.global,
+                                    "max-download-limit",
+                                ),
+                            ),
+                        );
+                        let downloaded = super::ed2k::run_ed2k_download_with_proxy(
+                            &link,
+                            &dir,
+                            effective_options.ed2k_servers(),
+                            effective_options.ed2k_port(),
+                            kad_udp_port,
+                            kad_service,
+                            kad_status,
+                            c.total,
+                            c.completed,
+                            c.speed,
+                            c.connections,
+                            c.cancel_token.clone(),
+                            p2p_proxy,
+                            throttle,
+                            uploads_enabled.then(|| share.clone()),
+                        )
+                        .await;
+                        match downloaded {
+                            Ok(done)
+                                if uploads_enabled
+                                    && begin_ed2k_seeding(
+                                        &tasks,
+                                        &active,
+                                        &options,
+                                        &events,
+                                        &gid,
+                                        worker_epoch,
+                                        &done.path,
+                                    )
+                                    .await =>
+                            {
+                                counters.speed.store(0, Ordering::Relaxed);
+                                let verified = remember_complete_file(
+                                    config_dir,
+                                    done.path.clone(),
+                                    link.file_hash_bytes,
+                                    done.hashset,
+                                )
+                                .await;
+                                seed_ed2k(verified, &share, &link, &done.path, &c.cancel_token)
+                                    .await
+                            }
+                            Ok(done) => Ok(done.path),
+                            Err(e) => Err(e),
+                        }
+                    }
                     .await
                 }
-                (Err(e), _) => Err(e),
-                (_, Err(e)) => Err(e),
+                Err(e) => Err(e),
             };
+            let ok = result.is_ok();
 
             finish_task(
                 &tasks,
@@ -3152,8 +3422,13 @@ impl TaskManager {
                 worker_epoch,
                 "ed2k",
                 &counters,
-                download_result,
-                |_| {},
+                result,
+                |task| {
+                    if ok && task.seeder && task.status == TaskStatus::Active {
+                        task.status = TaskStatus::Complete;
+                        clear_seeding(task);
+                    }
+                },
                 |task, _| task.total_length,
                 |_, e| classify_error(e, "ed2k"),
             )
@@ -3525,6 +3800,28 @@ impl TaskManager {
                         task.connections = ad.connections.load(Ordering::Relaxed);
                         if task.kind == TaskKind::Ed2k {
                             task.ed2k_kad = ad.kad_status.lock().as_ref().map(ed2k_kad_task_status);
+                            if let Some(upload) = &ad.ed2k_upload {
+                                task.upload_length = upload.uploaded();
+                                task.upload_speed = upload.speed();
+                                if task.seeder {
+                                    task.connections = upload.peers();
+                                    if ed2k_seed_goal_reached(
+                                        task,
+                                        g_manual,
+                                        g_seed_time,
+                                        g_seed_ratio,
+                                    ) {
+                                        task.status = TaskStatus::Complete;
+                                        clear_seeding(task);
+                                        ad.cancel_token.cancel();
+                                        self.events.send(EngineEvent::DownloadComplete {
+                                            gid: task.gid.clone(),
+                                            seeded: true,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
                         }
 
                         if let Some(name) = ad.adopted_filename.lock().clone() {
@@ -3745,16 +4042,11 @@ impl TaskManager {
 
                         if stats.is_finished && !task.seeder {
                             if keep {
-                                task.seeder = true;
-                                task.seeding_since = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                                    as u64;
-                                task.download_speed = 0;
+                                start_seeding(task);
                                 if downloaded {
                                     self.events.send(EngineEvent::BtDownloadComplete {
                                         gid: task.gid.clone(),
+                                        seeding: true,
                                     });
                                 }
                             } else {
@@ -3765,49 +4057,28 @@ impl TaskManager {
                                 if downloaded {
                                     self.events.send(EngineEvent::BtDownloadComplete {
                                         gid: task.gid.clone(),
+                                        seeding: false,
                                     });
                                     self.events.send(EngineEvent::DownloadComplete {
                                         gid: task.gid.clone(),
+                                        seeded: false,
                                     });
                                 }
                             }
                         }
 
-                        if task.seeder && task.seeding_since > 0 {
-                            let mut should_stop = false;
-
-                            let seed_time_ms = seed_time_minutes * 60 * 1000;
-                            if seed_time_ms > 0 {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64;
-                                if now >= task.seeding_since
-                                    && now - task.seeding_since >= seed_time_ms
-                                {
-                                    should_stop = true;
-                                }
-                            }
-
-                            if !should_stop && seed_ratio > 0.0 && task.total_length > 0 {
-                                let current_ratio =
-                                    task.upload_length as f64 / task.total_length as f64;
-                                if current_ratio >= seed_ratio {
-                                    should_stop = true;
-                                }
-                            }
-
-                            if should_stop {
-                                task.seeder = false;
-                                task.seeding_since = 0;
-                                task.status = TaskStatus::Complete;
-                                task.upload_speed = 0;
-                                halted.push(task.gid.clone());
-                                if downloaded {
-                                    self.events.send(EngineEvent::DownloadComplete {
-                                        gid: task.gid.clone(),
-                                    });
-                                }
+                        if task.seeder
+                            && task.seeding_since > 0
+                            && seed_goal_met(task, seed_time_minutes, seed_ratio)
+                        {
+                            task.status = TaskStatus::Complete;
+                            clear_seeding(task);
+                            halted.push(task.gid.clone());
+                            if downloaded {
+                                self.events.send(EngineEvent::DownloadComplete {
+                                    gid: task.gid.clone(),
+                                    seeded: true,
+                                });
                             }
                         }
                     } else {
@@ -5014,12 +5285,11 @@ impl TaskManager {
                     if effective_ratio.is_none_or(|r| r <= 0.0) {
                         // The engine torrent is paused after tasks.write() is released to avoid nesting torrent-engine locks
                         stop_seeding = true;
-                        task.upload_speed = 0;
-                        task.seeder = false;
-                        task.seeding_since = 0;
+                        clear_seeding(task);
                         task.status = TaskStatus::Complete;
                         self.events.send(EngineEvent::DownloadComplete {
                             gid: task.gid.clone(),
+                            seeded: !seeds_in_place(&task.options),
                         });
                     }
                 }
@@ -5036,10 +5306,11 @@ impl TaskManager {
                 self.apply_task_limits(gid, &task_options).await;
             }
             if stop_seeding {
-                let tid = self.torrent_ids.read().await.get(gid).copied();
-                let engine = self.torrent_engine.read().await.clone();
-                if let (Some(tid), Some(engine)) = (tid, engine) {
-                    engine.pause(tid).await.ok();
+                if let Some((_, token)) = self.worker_epoch_and_cancel(gid).await {
+                    token.cancel();
+                }
+                if let Some((te, tid)) = self.torrent_target(gid).await {
+                    te.pause(tid).await.ok();
                 }
             }
             if let (true, Some(selection)) = (is_torrent, reselect) {
@@ -5056,6 +5327,9 @@ impl TaskManager {
         let upload = super::torrent::task_limit(&merged, "max-upload-limit");
         if let Some(limiter) = self.task_limiters.lock().get(gid) {
             limiter.set_limit(download);
+        }
+        if let Some(limiter) = self.task_upload_limiters.lock().get(gid) {
+            limiter.set_limit(upload);
         }
         let Some(tid) = self.torrent_ids.read().await.get(gid).copied() else {
             return;
@@ -5406,8 +5680,33 @@ impl TaskManager {
         if let KadRuntime::Running(service) = old_kad {
             service.shutdown().await;
         }
+        self.rebuild_upload_runtime(&new_options).await;
         self.try_start_next_unlocked().await;
         Ok(())
+    }
+
+    async fn stop_uploader(&self) -> Option<risuko_bt::session::PortMapper> {
+        let mapper = self.ed2k_port_mapper.lock().take();
+        let old = std::mem::replace(&mut *self.ed2k_upload.write(), UploadRuntime::Disabled);
+        if let UploadRuntime::Running(uploader) = old {
+            uploader.shutdown().await;
+        }
+        mapper
+    }
+
+    async fn rebuild_upload_runtime(&self, options: &EngineOptions) {
+        let previous_mapper = self.stop_uploader().await;
+        let kad = self.kad_runtime.read().clone();
+        let next = UploadRuntime::build(
+            self.ed2k_user_hash,
+            options,
+            kad.service(),
+            self.ed2k_shares.clone(),
+            self.global_upload_limiter.clone(),
+        )
+        .await;
+        *self.ed2k_port_mapper.lock() = next.port_mapper(options, &kad, previous_mapper);
+        *self.ed2k_upload.write() = next;
     }
 
     async fn initialize_torrent_engine(
@@ -5583,6 +5882,7 @@ impl TaskManager {
         let touches_doh = opts.keys().any(|k| k.starts_with("doh-"));
 
         let touches_conns = opts.contains_key("bt-max-connections");
+        let touches_ed2k_servers = opts.contains_key("ed2k-server");
         let mut max_connections = None;
         {
             let mut options = self.options.write().await;
@@ -5591,6 +5891,13 @@ impl TaskManager {
             }
             if touches_conns {
                 max_connections = Some(options.bt_max_connections());
+            }
+            if touches_ed2k_servers {
+                if let Some(uploader) = self.ed2k_upload.read().uploader() {
+                    uploader.set_servers(super::ed2k::server_list::server_list(
+                        &options.ed2k_servers(),
+                    ));
+                }
             }
             if touches_doh {
                 super::dns::apply_from_options(&options.global);
@@ -5901,7 +6208,11 @@ impl TaskManager {
                 .and_then(|t| Some((t.dir.clone(), t.uris.first()?.clone())))
         };
         if let Some((dir, uri)) = target {
+            let config_dir = self.config_dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(link) = super::ed2k::parse_ed2k_link(&uri) {
+                    super::ed2k::share::remove_known(&config_dir, &link.file_hash_bytes);
+                }
                 super::ed2k::partial::remove_partial(&dir, &uri)
             })
             .await;
@@ -6055,11 +6366,9 @@ impl TaskManager {
         let mut tasks = tasks.write().await;
         for task in tasks.iter_mut() {
             if dropped.iter().any(|g| g == &task.gid) && task.status == TaskStatus::Active {
-                task.seeder = false;
-                task.seeding_since = 0;
+                clear_seeding(task);
                 task.status = TaskStatus::Complete;
                 task.download_speed = 0;
-                task.upload_speed = 0;
             }
         }
     }
@@ -6214,6 +6523,8 @@ impl TaskManager {
             te.shutdown().await;
         }
 
+        drop(self.stop_uploader().await);
+
         let runtime = self.kad_runtime.read().clone();
         if let KadRuntime::Running(service) = &runtime {
             service.shutdown().await;
@@ -6252,6 +6563,42 @@ fn is_retryable_magnet_resolution_error(err: &str) -> bool {
         || lower.contains("timeout")
         || lower.contains("no peers")
         || lower.contains("no seeds")
+}
+
+fn start_seeding(task: &mut DownloadTask) {
+    task.seeder = true;
+    task.seeding_since = crate::engine::util::now_ms();
+    task.download_speed = 0;
+}
+
+fn clear_seeding(task: &mut DownloadTask) {
+    task.seeder = false;
+    task.seeding_since = 0;
+    task.upload_speed = 0;
+}
+
+fn seed_goal_met(task: &DownloadTask, seed_time_minutes: u64, seed_ratio: f64) -> bool {
+    let seed_time_ms = seed_time_minutes.saturating_mul(60_000);
+    if seed_time_ms > 0
+        && task.seeding_since > 0
+        && crate::engine::util::now_ms().saturating_sub(task.seeding_since) >= seed_time_ms
+    {
+        return true;
+    }
+    seed_ratio > 0.0
+        && task.total_length > 0
+        && task.upload_length as f64 / task.total_length as f64 >= seed_ratio
+}
+
+fn ed2k_seed_goal_reached(
+    task: &DownloadTask,
+    g_manual: bool,
+    g_seed_time: u64,
+    g_seed_ratio: f64,
+) -> bool {
+    let (keep, seed_time_minutes, seed_ratio) =
+        resolve_seed_goal(&task.options, g_manual, g_seed_time, g_seed_ratio);
+    !keep || seed_goal_met(task, seed_time_minutes, seed_ratio)
 }
 
 fn resolve_seed_goal(
@@ -6675,6 +7022,11 @@ mod tests {
             kad_runtime: Arc::new(parking_lot::RwLock::new(KadRuntime::Disabled {
                 port: 4672,
             })),
+            ed2k_shares: ShareRegistry::new(),
+            ed2k_user_hash: [7; 16],
+            ed2k_upload: parking_lot::RwLock::new(UploadRuntime::Disabled),
+            ed2k_port_mapper: parking_lot::Mutex::new(None),
+            task_upload_limiters: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -6756,6 +7108,232 @@ mod tests {
         assert_eq!(status.queried_nodes, 9);
         assert_eq!(status.discovered_sources, 4);
         assert!(manager.active_downloads.read().await.is_empty());
+    }
+
+    #[test]
+    fn ed2k_seeding_stops_at_its_goal_or_when_keep_seeding_is_off() {
+        let mut task = DownloadTask::new_ed2k(
+            "seed".into(),
+            "ed2k://|file|f.bin|1000|0123456789abcdef0123456789abcdef|/".into(),
+            "f.bin".into(),
+            1000,
+            "/dl".into(),
+            None,
+            Map::new(),
+        );
+        task.total_length = 1000;
+        task.seeding_since = crate::engine::util::now_ms();
+        assert!(ed2k_seed_goal_reached(&task, false, 0, 0.0));
+        assert!(!ed2k_seed_goal_reached(&task, true, 0, 0.0));
+        assert!(!ed2k_seed_goal_reached(&task, false, 60, 0.0));
+        task.seeding_since -= 61 * 60 * 1000;
+        assert!(ed2k_seed_goal_reached(&task, false, 60, 0.0));
+        assert!(!ed2k_seed_goal_reached(&task, false, 0, 1.5));
+        task.upload_length = 1500;
+        assert!(ed2k_seed_goal_reached(&task, false, 0, 1.5));
+        task.options
+            .insert("keep-seeding".into(), Value::Bool(true));
+        assert!(!ed2k_seed_goal_reached(&task, false, 0, 1.5));
+    }
+
+    async fn install_uploader(mgr: &TaskManager) {
+        let mut config = UploadConfig::new(mgr.ed2k_user_hash, 0);
+        config.bind_addr = std::net::Ipv4Addr::LOCALHOST;
+        config.registry = mgr.ed2k_shares.clone();
+        *mgr.ed2k_upload.write() =
+            UploadRuntime::Running(Ed2kUploader::bind(config).await.unwrap());
+    }
+
+    async fn wait_for(what: &str, mut check: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !check().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_ed2k_download_seeds_until_its_goal() {
+        use super::super::ed2k::share::{hash_file, SharedFile};
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..9_729_000u32).map(|i| (i % 251) as u8).collect();
+        let source_path = dir.path().join("source.bin");
+        std::fs::write(&source_path, &data).unwrap();
+        let (hash, hashset) = hash_file(&source_path, &CancellationToken::new()).unwrap();
+
+        let mut source_config = UploadConfig::new(super::super::ed2k::protocol::new_user_hash(), 0);
+        source_config.bind_addr = std::net::Ipv4Addr::LOCALHOST;
+        let source = Ed2kUploader::bind(source_config).await.unwrap();
+        let _offer = source.share(SharedFile::complete(
+            hash,
+            "source.bin",
+            data.len() as u64,
+            source_path,
+            hashset,
+        ));
+
+        let mgr = make_test_manager(Vec::new());
+        install_uploader(&mgr).await;
+        {
+            let mut options = mgr.options.write().await;
+            options.set("ed2k-server".into(), Value::from("127.0.0.1:1"));
+            options.set("keep-seeding".into(), Value::Bool(true));
+            let out = dir.path().join("out");
+            options.set("dir".into(), Value::from(out.to_str().unwrap()));
+        }
+        let uri = format!(
+            "ed2k://|file|got.bin|{}|{}|/|sources,127.0.0.1:{}|/",
+            data.len(),
+            hex::encode(hash),
+            source.port()
+        );
+        let mut events = mgr.events.subscribe();
+        let gid = mgr.add_ed2k_task(&uri, Map::new()).await.unwrap();
+
+        wait_for("the task to start seeding", async || {
+            mgr.tasks
+                .read()
+                .await
+                .iter()
+                .any(|t| t.gid == gid && t.seeder && t.status == TaskStatus::Active)
+        })
+        .await;
+        wait_for("the complete share", async || {
+            mgr.ed2k_shares
+                .get(&hash)
+                .is_some_and(|file| file.is_complete())
+        })
+        .await;
+        let path = dir.path().join("out").join("got.bin");
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.files[0].path, path.to_string_lossy());
+            assert_eq!(task.completed_length, data.len() as u64);
+        }
+
+        mgr.pause(&gid).await.unwrap();
+        wait_for("the share to be withdrawn", async || {
+            mgr.ed2k_shares.get(&hash).is_none()
+        })
+        .await;
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.status, TaskStatus::Paused);
+            assert!(task.seeder);
+        }
+
+        mgr.unpause(&gid).await.unwrap();
+        wait_for("the share to return", async || {
+            mgr.ed2k_shares
+                .get(&hash)
+                .is_some_and(|file| file.is_complete())
+        })
+        .await;
+        mgr.update_progress().await;
+        let full = data.len().to_string();
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!((task.status, task.seeder), (TaskStatus::Active, true));
+            assert_eq!(task.completed_length, data.len() as u64);
+            assert_eq!(task.files[0].completed_length, full);
+        }
+        mgr.options
+            .write()
+            .await
+            .set("keep-seeding".into(), Value::Bool(false));
+        mgr.update_progress().await;
+        wait_for("the share to be withdrawn at the goal", async || {
+            mgr.ed2k_shares.get(&hash).is_none() && mgr.active_downloads.read().await.is_empty()
+        })
+        .await;
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!((task.status, task.seeder), (TaskStatus::Complete, false));
+            assert_eq!(task.completed_length, data.len() as u64);
+        }
+        let mut completions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                EngineEvent::BtDownloadComplete { seeding, .. } => {
+                    completions.push(("bt", seeding))
+                }
+                EngineEvent::DownloadComplete { seeded, .. } => completions.push(("done", seeded)),
+                _ => {}
+            }
+        }
+        assert_eq!(completions, [("bt", true), ("done", true)]);
+    }
+
+    #[tokio::test]
+    async fn resumed_ed2k_seeders_that_cannot_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let paused_seeder = |gid: &str| {
+            let mut task = DownloadTask::new_ed2k(
+                gid.into(),
+                "ed2k://|file|gone.bin|1000|0123456789abcdef0123456789abcdef|/".into(),
+                "gone.bin".into(),
+                1000,
+                dir.path().to_string_lossy().into(),
+                None,
+                Map::new(),
+            );
+            task.total_length = 1000;
+            task.completed_length = 1000;
+            task.seeder = true;
+            task.seeding_since = 1;
+            task.status = TaskStatus::Paused;
+            task
+        };
+        let mgr = make_test_manager(vec![
+            paused_seeder("off"),
+            paused_seeder("failed"),
+            paused_seeder("missing"),
+        ]);
+        let mut events = mgr.events.subscribe();
+        let settled = async |gid: &str, status: TaskStatus| {
+            mgr.unpause(gid).await.unwrap();
+            wait_for(gid, async || {
+                mgr.tasks
+                    .read()
+                    .await
+                    .iter()
+                    .any(|t| t.gid == gid && t.status == status)
+                    && mgr.active_downloads.read().await.is_empty()
+            })
+            .await;
+            mgr.tasks
+                .read()
+                .await
+                .iter()
+                .find(|t| t.gid == gid)
+                .cloned()
+                .unwrap()
+        };
+
+        let off = settled("off", TaskStatus::Complete).await;
+        assert!(!off.seeder);
+        assert_eq!(off.completed_length, 1000);
+
+        *mgr.ed2k_upload.write() = UploadRuntime::Failed("port busy".into());
+        let failed = settled("failed", TaskStatus::Error).await;
+        assert!(failed.seeder);
+        assert!(failed.error_message.unwrap().contains("port busy"));
+
+        install_uploader(&mgr).await;
+        let missing = settled("missing", TaskStatus::Complete).await;
+        assert!(!missing.seeder);
+
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, EngineEvent::DownloadComplete { .. }));
+        }
     }
 
     #[test]
@@ -7269,6 +7847,7 @@ mod tests {
                 adopted_filename: Arc::new(parking_lot::Mutex::new(None)),
                 metalink_files: Vec::new(),
                 kad_status: Arc::new(parking_lot::Mutex::new(None)),
+                ed2k_upload: None,
             },
         );
         let starting_token = CancellationToken::new();
@@ -8016,8 +8595,8 @@ mod tests {
 
         let mut completed = Vec::new();
         while let Ok(event) = events.try_recv() {
-            if let EngineEvent::BtDownloadComplete { gid } | EngineEvent::DownloadComplete { gid } =
-                event
+            if let EngineEvent::BtDownloadComplete { gid, .. }
+            | EngineEvent::DownloadComplete { gid, .. } = event
             {
                 completed.push(gid);
             }

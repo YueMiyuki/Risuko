@@ -121,6 +121,9 @@ export default {
 		"Port UDP yang digunakan untuk penemuan melalui Kad. Nilai yang valid adalah 1-65535 (memerlukan mulai ulang mesin)",
 	"ed2k-kad-port-invalid":
 		"Port UDP Kad harus berupa bilangan bulat dari 1 hingga 65535",
+	"ed2k-enable-upload": "Bagikan berkas melalui ED2K",
+	"ed2k-enable-upload-tips":
+		"Unggah berkas yang selesai dan bagian terverifikasi dari unduhan ED2K yang berjalan ke peer lain. Kad dapat tetap mencantumkan berkas yang sudah tidak Anda bagikan hingga 5 jam (memerlukan mulai ulang mesin)",
 	"engine-overrides-reserved-keys":
 		"Kunci override mesin yang dicadangkan diabaikan: {{keys}}",
 	"engine-overrides-too-large":

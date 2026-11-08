@@ -710,13 +710,17 @@ export default {
 				});
 			});
 		},
-		onDownloadComplete(payload: { gid: string }) {
+		onDownloadComplete(payload: { gid: string; seeded?: boolean }) {
 			const taskStore = useTaskStore();
 			requestListRefresh();
 			this.ensurePolling();
-			const { gid } = payload;
+			const { gid, seeded } = payload;
 			this.clearAutoRetryState(gid);
 			taskStore.removeFromSeedingList(gid);
+			if (seeded) {
+				taskStore.saveSession();
+				return;
+			}
 
 			this.fetchTaskItem({ gid }).then((task) => {
 				if (!task) {
@@ -725,14 +729,14 @@ export default {
 				this.handleDownloadComplete(task, false);
 			});
 		},
-		onBtDownloadComplete(payload: { gid: string }) {
+		onBtDownloadComplete(payload: { gid: string; seeding?: boolean }) {
 			const taskStore = useTaskStore();
 			requestListRefresh();
 			this.ensurePolling();
-			const { gid } = payload;
+			const { gid, seeding } = payload;
 			this.clearAutoRetryState(gid);
 			const { seedingList } = this;
-			if (seedingList.includes(gid)) {
+			if (!seeding || seedingList.includes(gid)) {
 				return;
 			}
 
@@ -821,9 +825,10 @@ export default {
 				return;
 			}
 
-			const notifyMessage = isBT
-				? this.$t("task.bt-download-complete-notify")
-				: this.$t("task.download-complete-notify");
+			const notifyMessage =
+				isBT && checkTaskIsBT(task)
+					? this.$t("task.bt-download-complete-notify")
+					: this.$t("task.download-complete-notify");
 
 			if (is.linux()) {
 				invoke("show_linux_notification", {

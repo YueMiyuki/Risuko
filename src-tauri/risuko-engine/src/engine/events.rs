@@ -6,9 +6,9 @@ pub enum EngineEvent {
     DownloadStart { gid: String },
     DownloadPause { gid: String },
     DownloadStop { gid: String },
-    DownloadComplete { gid: String },
+    DownloadComplete { gid: String, seeded: bool },
     DownloadError { gid: String },
-    BtDownloadComplete { gid: String },
+    BtDownloadComplete { gid: String, seeding: bool },
 }
 
 impl EngineEvent {
@@ -28,9 +28,9 @@ impl EngineEvent {
             Self::DownloadStart { gid }
             | Self::DownloadPause { gid }
             | Self::DownloadStop { gid }
-            | Self::DownloadComplete { gid }
+            | Self::DownloadComplete { gid, .. }
             | Self::DownloadError { gid }
-            | Self::BtDownloadComplete { gid } => gid,
+            | Self::BtDownloadComplete { gid, .. } => gid,
         }
     }
 

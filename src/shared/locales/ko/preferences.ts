@@ -113,6 +113,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"Kad 검색에 사용하는 UDP 포트입니다. 유효한 값은 1-65535입니다(엔진 재시작 필요)",
 	"ed2k-kad-port-invalid": "Kad UDP 포트는 1부터 65535까지의 정수여야 합니다",
+	"ed2k-enable-upload": "ED2K로 파일 공유",
+	"ed2k-enable-upload-tips":
+		"완료된 파일과 다운로드 중인 ED2K 작업의 검증된 파트를 다른 피어에게 업로드합니다. 공유를 중단한 파일도 Kad에는 최대 5시간 동안 남아 있을 수 있습니다(엔진 재시작 필요)",
 	"engine-overrides-reserved-keys":
 		"예약된 엔진 오버라이드 키는 무시되었습니다: {{keys}}",
 	"engine-overrides-too-large":

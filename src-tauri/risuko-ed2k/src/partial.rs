@@ -32,11 +32,7 @@ impl Met {
     }
 
     pub fn decoded_hashset(&self) -> Option<Vec<[u8; 16]>> {
-        self.hashset
-            .as_ref()?
-            .iter()
-            .map(|h| hex::decode(h).ok()?.try_into().ok())
-            .collect()
+        decode_hashset(self.hashset.as_ref()?)
     }
 
     fn matches(&self, link: &Ed2kFileLink) -> bool {
@@ -51,6 +47,13 @@ impl Met {
 pub fn final_path(dir: &str, file_name: &str) -> PathBuf {
     let safe = risuko_util::safe_filename(file_name, "ed2k-download");
     PathBuf::from(dir).join(safe)
+}
+
+pub(crate) fn decode_hashset(hashes: &[String]) -> Option<Vec<[u8; 16]>> {
+    hashes
+        .iter()
+        .map(|h| hex::decode(h).ok()?.try_into().ok())
+        .collect()
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -74,15 +77,21 @@ pub fn load_met(path: &Path, link: &Ed2kFileLink) -> Option<Met> {
 }
 
 pub fn save_met(path: &Path, met: &Met) -> std::io::Result<()> {
+    write_atomic(
+        path,
+        &serde_json::to_vec(met).map_err(std::io::Error::other)?,
+    )
+}
+
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = with_suffix(path, ".tmp");
-    let data = serde_json::to_vec(met).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
 
-fn remove_quiet(path: &Path) {
+pub(crate) fn remove_quiet(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!("could not delete {}: {e}", path.display());

@@ -120,6 +120,9 @@ export default {
 		"Kad keşfi için kullanılan UDP bağlantı noktası. Geçerli değerler 1-65535 aralığındadır (motorun yeniden başlatılması gerekir)",
 	"ed2k-kad-port-invalid":
 		"Kad UDP bağlantı noktası 1 ile 65535 arasında bir tam sayı olmalıdır",
+	"ed2k-enable-upload": "Dosyaları ED2K üzerinden paylaş",
+	"ed2k-enable-upload-tips":
+		"Tamamlanan dosyaları ve süren ED2K indirmelerinin doğrulanmış parçalarını diğer eşlere yükler. Paylaşmayı bıraktığınız bir dosya Kad'da 5 saate kadar listelenmeye devam edebilir (motorun yeniden başlatılması gerekir)",
 	"engine-overrides-reserved-keys":
 		"Yok sayılan ayrılmış motor geçersiz kılma anahtarları: {{keys}}",
 	"engine-overrides-too-large":

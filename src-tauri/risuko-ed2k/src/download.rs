@@ -16,6 +16,7 @@ use super::peer::{PeerConnection, PeerEvent};
 use super::protocol::{new_user_hash, PeerCaps};
 use super::server::{ServerConnection, ServerEvent};
 use super::server_list::server_list;
+use super::share::{PartMap, ShareContext, SharedFile};
 use super::types::*;
 
 const MAX_ACTIVE_PEER_DIALS: usize = 64;
@@ -34,11 +35,11 @@ const FILE_REASK_JITTER_SECS: u64 = 120;
 const REASK_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
-struct PeerTimeouts {
-    handshake: Duration,
-    request: Duration,
-    queue: Duration,
-    transfer: Duration,
+pub(crate) struct PeerTimeouts {
+    pub(crate) handshake: Duration,
+    pub(crate) request: Duration,
+    pub(crate) queue: Duration,
+    pub(crate) transfer: Duration,
 }
 
 impl Default for PeerTimeouts {
@@ -413,6 +414,16 @@ fn usable_source_addr(addr: SocketAddrV4) -> bool {
     addr.port() != 0 && is_public_ipv4(*addr.ip())
 }
 
+fn is_foreign_high_id_source(ip: u32, port: u16, own_id: u32, own_port: u16) -> bool {
+    is_high_id(ip) && (ip, port) != (own_id, own_port)
+}
+
+#[derive(Debug, Clone)]
+pub struct Ed2kCompleted {
+    pub path: PathBuf,
+    pub hashset: Vec<[u8; 16]>,
+}
+
 pub async fn run_ed2k_download_with_proxy(
     file_link: &Ed2kFileLink,
     dir: &str,
@@ -428,8 +439,10 @@ pub async fn run_ed2k_download_with_proxy(
     cancel_token: CancellationToken,
     proxy: risuko_http::ProxyConnector,
     throttle: Throttle,
-) -> Result<PathBuf, String> {
+    share: Option<ShareContext>,
+) -> Result<Ed2kCompleted, String> {
     let final_path = partial::final_path(dir, &file_link.file_name);
+    let part_map = PartMap::new(file_link.file_size);
     run_download(
         file_link,
         dir,
@@ -445,13 +458,19 @@ pub async fn run_ed2k_download_with_proxy(
         cancel_token,
         proxy,
         throttle,
+        share,
+        part_map.clone(),
     )
     .await?;
+    let hashset = part_map.hashset().unwrap_or_default();
     let target = final_path.clone();
     tokio::task::spawn_blocking(move || partial::finalize(&target))
         .await
         .map_err(|e| format!("Finalize task failed: {e}"))??;
-    Ok(final_path)
+    Ok(Ed2kCompleted {
+        path: final_path,
+        hashset,
+    })
 }
 
 async fn run_download(
@@ -469,6 +488,8 @@ async fn run_download(
     cancel_token: CancellationToken,
     proxy: risuko_http::ProxyConnector,
     throttle: Throttle,
+    share: Option<ShareContext>,
+    part_map: PartMap,
 ) -> Result<PathBuf, String> {
     let worker_cancel = cancel_token.child_token();
     let _worker_guard = DownloadWorkerGuard(worker_cancel.clone());
@@ -494,7 +515,8 @@ async fn run_download(
 
     let mut chunks = ChunkManager::new(file_path.clone(), file_link.file_size)
         .with_file_hash(file_hash)
-        .with_met(met_path, worker_cancel.clone());
+        .with_met(met_path, worker_cancel.clone())
+        .with_part_map(part_map.clone());
     chunks.init_file().await?;
     if let Some(met) = &met {
         restore_verified_parts(&mut chunks, met, &worker_cancel).await;
@@ -505,7 +527,19 @@ async fn run_download(
     let chunks = Arc::new(Mutex::new(chunks));
     let peer_count = Arc::new(AtomicU32::new(0));
 
-    let client_hash = new_user_hash();
+    let client_hash = share
+        .as_ref()
+        .map_or_else(new_user_hash, |share| share.user_hash);
+    let login_hash = new_user_hash();
+    let _partial_share = share.as_ref().map(|share| {
+        share.share(SharedFile::partial(
+            file_hash,
+            file_link.file_name.clone(),
+            file_link.file_size,
+            file_path.clone(),
+            part_map,
+        ))
+    });
     let scheduler = SourceScheduler::new(
         client_hash,
         client_port,
@@ -605,7 +639,7 @@ async fn run_download(
         tracing::info!("[ed2k] Trying server {} ({})", entry.name, addr);
         let mut conn = ServerConnection::new_with_proxy(
             addr,
-            client_hash,
+            login_hash,
             client_port,
             kad_udp_port,
             proxy.clone(),
@@ -636,6 +670,7 @@ async fn run_download(
             event_rx,
             server_ip,
             server_port_val,
+            client_port,
             file_hash,
             &file_path,
             &chunks,
@@ -722,6 +757,7 @@ async fn run_server_session(
     mut event_rx: tokio::sync::mpsc::Receiver<ServerEvent>,
     server_ip: u32,
     server_port_val: u16,
+    client_port: u16,
     file_hash: [u8; 16],
     file_path: &Path,
     chunks: &Arc<Mutex<ChunkManager>>,
@@ -758,7 +794,7 @@ async fn run_server_session(
             }
             event = event_rx.recv() => {
                 match event {
-                    Some(ServerEvent::Connected { client_id: cid }) => {
+                    Some(ServerEvent::Connected { client_id: cid, .. }) => {
                         tracing::info!("[ed2k] Got client ID: {} ({})",
                             cid,
                             if is_high_id(cid) { "High" } else { "Low" }
@@ -772,7 +808,7 @@ async fn run_server_session(
                         if fh == file_hash {
                             tracing::info!("[ed2k] Found {} sources", sources.len());
                             for &(ip, port) in &sources {
-                                if !is_high_id(ip) {
+                                if !is_foreign_high_id_source(ip, port, client_id, client_port) {
                                     continue;
                                 }
                                 let peer_addr = SocketAddrV4::new(client_id_to_ip(ip), port);
@@ -792,7 +828,7 @@ async fn run_server_session(
                     Some(ServerEvent::ServerStatus { users, files }) => {
                         tracing::info!("[ed2k] Server: {} users, {} files", users, files);
                     }
-                    Some(ServerEvent::ServerList) => {}
+                    Some(ServerEvent::ServerList | ServerEvent::CallbackRequested(_)) => {}
                     Some(ServerEvent::Disconnected(reason)) => {
                         tracing::warn!("[ed2k] Server disconnected: {:?}", reason);
                         return Err(format!("Server disconnected: {:?}", reason));
@@ -952,7 +988,7 @@ fn spawn_peer_task_with_permit(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerOutcome {
+pub(crate) enum PeerOutcome {
     Finished,
     Queued(u16),
 }
@@ -993,17 +1029,11 @@ async fn run_peer_download(
     result
 }
 
-const OLD_MAX_EMULE_FILE_SIZE: u64 = 4_290_048_000;
-
-fn is_large_file(file_size: u64) -> bool {
-    file_size > OLD_MAX_EMULE_FILE_SIZE
-}
-
 fn can_serve(file_size: u64, caps: &PeerCaps) -> bool {
     !is_large_file(file_size) || caps.large_files()
 }
 
-async fn peer_session(
+pub(crate) async fn peer_session(
     timeouts: PeerTimeouts,
     peer_id: u64,
     addr: SocketAddrV4,
@@ -1385,6 +1415,15 @@ mod tests {
     }
 
     #[test]
+    fn server_sources_skip_low_ids_and_our_own_listener() {
+        let own = u32::from_le_bytes([8, 8, 8, 8]);
+        assert!(!is_foreign_high_id_source(own, 4662, own, 4662));
+        assert!(is_foreign_high_id_source(own, 4663, own, 4662));
+        assert!(is_foreign_high_id_source(own, 4662, 1234, 4662));
+        assert!(!is_foreign_high_id_source(1234, 4662, own, 4662));
+    }
+
+    #[test]
     fn fallback_wait_does_not_extend_after_kad_lookup_finishes() {
         assert_eq!(fallback_wait(false), SERVER_FALLBACK_WAIT);
     }
@@ -1473,6 +1512,7 @@ mod tests {
             CancellationToken::new(),
             risuko_http::ProxyConnector::direct(),
             Throttle::unlimited(),
+            None,
         )
         .await;
 
@@ -1783,8 +1823,8 @@ mod tests {
             ..PeerCaps::default()
         };
         let big = u64::from(u32::MAX) + 1;
-        assert!(can_serve(OLD_MAX_EMULE_FILE_SIZE, &plain));
-        assert!(!can_serve(OLD_MAX_EMULE_FILE_SIZE + 1, &plain));
+        assert!(can_serve(OLD_MAX_FILE_SIZE, &plain));
+        assert!(!can_serve(OLD_MAX_FILE_SIZE + 1, &plain));
         assert!(!can_serve(big, &plain));
         assert!(can_serve(big, &capable));
         assert!(can_serve(1000, &capable));

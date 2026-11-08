@@ -11,6 +11,7 @@ const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum ServerEvent {
     Connected {
         client_id: u32,
+        flags: u32,
     },
     ServerMessage(String),
     ServerStatus {
@@ -22,6 +23,7 @@ pub enum ServerEvent {
         sources: Vec<(u32, u16)>,
     },
     ServerList,
+    CallbackRequested(SocketAddrV4),
     Disconnected(Option<String>),
 }
 
@@ -31,7 +33,16 @@ pub struct ServerConnection {
     client_port: u16,
     kad_udp_port: Option<u16>,
     tx: Option<mpsc::Sender<Ed2kPacket>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     proxy: risuko_http::ProxyConnector,
+}
+
+impl Drop for ServerConnection {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 enum ServerPacketError {
@@ -59,6 +70,7 @@ impl ServerConnection {
             client_port,
             kad_udp_port,
             tx: None,
+            tasks: Vec::new(),
             proxy,
         }
     }
@@ -83,7 +95,7 @@ impl ServerConnection {
             .await
             .map_err(|e| format!("Failed to send hello: {}", e))?;
 
-        let offer = build_offer_files_empty();
+        let offer = build_offer_files(&[]);
         write_half
             .write_all(&offer.encode())
             .await
@@ -93,7 +105,7 @@ impl ServerConnection {
         let (packet_tx, mut packet_rx) = mpsc::channel::<Ed2kPacket>(32);
         self.tx = Some(packet_tx.clone());
 
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(packet) = packet_rx.recv().await {
                 if write_half.write_all(&packet.encode()).await.is_err() {
                     break;
@@ -102,7 +114,7 @@ impl ServerConnection {
         });
 
         let event_tx_clone = event_tx.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut reader = read_half;
             let mut buf = bytes::BytesMut::with_capacity(8192);
             'outer: loop {
@@ -142,6 +154,8 @@ impl ServerConnection {
                 }
             }
         });
+        self.tasks.push(writer);
+        self.tasks.push(reader);
 
         Ok((event_rx, packet_tx))
     }
@@ -152,9 +166,9 @@ impl ServerConnection {
     ) -> Result<(), ServerPacketError> {
         let event = match packet.opcode {
             OP_ID_CHANGE => {
-                let client_id = parse_id_change(&packet.payload)
+                let (client_id, flags) = parse_id_change(&packet.payload)
                     .map_err(|e| Self::parse_packet_error(packet.opcode, e))?;
-                ServerEvent::Connected { client_id }
+                ServerEvent::Connected { client_id, flags }
             }
             OP_SERVER_MESSAGE => {
                 let msg = parse_server_message(&packet.payload)
@@ -175,6 +189,10 @@ impl ServerConnection {
                 }
             }
             OP_SERVER_LIST => ServerEvent::ServerList,
+            OP_CALLBACK_REQUESTED => match parse_callback_requested(&packet.payload) {
+                Some(addr) => ServerEvent::CallbackRequested(addr),
+                None => return Ok(()),
+            },
             _ => return Ok(()),
         };
 
@@ -183,11 +201,14 @@ impl ServerConnection {
             .map_err(|_| ServerPacketError::ChannelClosed)
     }
 
-    pub async fn request_sources(&self, file_hash: &[u8; 16]) -> Result<(), String> {
+    pub async fn send(&self, packet: Ed2kPacket) -> Result<(), String> {
         let tx = self.tx.as_ref().ok_or("Not connected")?;
-        let packet = build_get_sources(file_hash);
         tx.send(packet)
             .await
             .map_err(|_| "Send channel closed".to_string())
+    }
+
+    pub async fn request_sources(&self, file_hash: &[u8; 16]) -> Result<(), String> {
+        self.send(build_get_sources(file_hash)).await
     }
 }

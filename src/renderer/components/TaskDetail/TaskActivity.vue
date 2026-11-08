@@ -4,14 +4,14 @@
       <div class="activity-speed-trend-header">
         <span class="activity-speed-trend-title">
           {{ $t('task.task-download-speed') }}
-          <template v-if="isBT"> / {{ $t('task.task-upload-speed') }}</template>
+          <template v-if="uploads"> / {{ $t('task.task-upload-speed') }}</template>
         </span>
         <div class="activity-speed-trend-legend">
           <span class="activity-speed-legend-item">
             <i class="speed-dot speed-dot-download"></i>
             {{ formatBytes(displayDownloadSpeed) }}/s
           </span>
-          <span class="activity-speed-legend-item" v-if="isBT">
+          <span class="activity-speed-legend-item" v-if="uploads">
             <i class="speed-dot speed-dot-upload"></i>
             {{ formatBytes(displayUploadSpeed) }}/s
           </span>
@@ -44,7 +44,7 @@
               :d="downloadSpeedPath"
             />
             <path
-              v-if="isBT && uploadSpeedPath"
+              v-if="uploads && uploadSpeedPath"
               class="activity-speed-line upload"
               :d="uploadSpeedPath"
             />
@@ -109,7 +109,7 @@
         <span class="activity-stat-label">{{ $t('task.task-download-speed') }}</span>
         <span class="activity-stat-value">{{ formatBytes(displayDownloadSpeed) }}/s</span>
       </div>
-      <div class="activity-stat-item" v-if="isBT">
+      <div class="activity-stat-item" v-if="uploads">
         <span class="activity-stat-label">{{ $t('task.task-upload-speed') }}</span>
         <span class="activity-stat-value">{{ formatBytes(displayUploadSpeed) }}/s</span>
       </div>
@@ -121,11 +121,11 @@
         <span class="activity-stat-label">{{ $t('task.task-num-seeders') }}</span>
         <span class="activity-stat-value">{{ task.numSeeders }}</span>
       </div>
-      <div class="activity-stat-item" v-if="isBT">
+      <div class="activity-stat-item" v-if="uploads">
         <span class="activity-stat-label">{{ $t('task.task-upload-length') }}</span>
         <span class="activity-stat-value">{{ formatBytes(task.uploadLength) }}</span>
       </div>
-      <div class="activity-stat-item" v-if="isBT">
+      <div class="activity-stat-item" v-if="uploads">
         <span class="activity-stat-label">{{ $t('task.task-ratio') }}</span>
         <span class="activity-stat-value">{{ ratio }}</span>
       </div>
@@ -141,6 +141,7 @@ import {
 	calcRatio,
 	checkTaskIsBT,
 	checkTaskIsSeeder,
+	checkTaskUploads,
 	getDisplayDownloadSpeed,
 	getDisplayTaskStatus,
 	timeFormat,
@@ -190,6 +191,9 @@ export default {
 		isBT() {
 			return checkTaskIsBT(this.task);
 		},
+		uploads() {
+			return checkTaskUploads(this.task);
+		},
 		isSeeder() {
 			return checkTaskIsSeeder(this.task);
 		},
@@ -230,7 +234,7 @@ export default {
 			});
 		},
 		ratio() {
-			if (!this.isBT) {
+			if (!this.uploads) {
 				return 0;
 			}
 
@@ -339,7 +343,7 @@ export default {
 		speedHistoryMax() {
 			const maxSpeed = this.speedHistory.reduce((max, sample) => {
 				const downloadSpeed = Number(sample.download || 0);
-				const uploadSpeed = this.isBT ? Number(sample.upload || 0) : 0;
+				const uploadSpeed = this.uploads ? Number(sample.upload || 0) : 0;
 				return Math.max(max, downloadSpeed, uploadSpeed);
 			}, 0);
 			return Math.max(1, maxSpeed);

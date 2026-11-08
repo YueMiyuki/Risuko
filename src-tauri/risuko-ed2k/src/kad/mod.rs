@@ -25,12 +25,15 @@ use self::routing::{
     is_public_ipv4, KadId, LookupConfig, LookupTracker, NodeId, RoutingTable, SourceSet,
 };
 use self::wire::{
-    build_bootstrap_request, build_hello_request, build_routing_request,
-    build_source_search_request, parse_bootstrap_response, parse_hello, parse_pong,
-    parse_routing_request, parse_routing_response_with_limit, parse_source_search_request,
-    parse_source_search_response, KadPacket, KadSourceRecord, KadWireContact, WireError,
-    OP_BOOTSTRAP_REQ, OP_BOOTSTRAP_RES, OP_HELLO_REQ, OP_HELLO_RES, OP_PING, OP_PONG,
-    OP_ROUTING_REQ, OP_ROUTING_RES, OP_SEARCH_RES, OP_SEARCH_SOURCE_REQ, TAG_SOURCE_UDP_PORT,
+    build_bootstrap_request, build_hello_request, build_publish_source_request,
+    build_routing_request, build_source_search_request, parse_bootstrap_response, parse_hello,
+    parse_pong, parse_publish_response, parse_publish_source_request, parse_routing_request,
+    parse_routing_response_with_limit, parse_source_search_request, parse_source_search_response,
+    KadPacket, KadSourceRecord, KadTag, KadWireContact, WireError, OP_BOOTSTRAP_REQ,
+    OP_BOOTSTRAP_RES, OP_HELLO_REQ, OP_HELLO_RES, OP_PING, OP_PONG, OP_PUBLISH_RES,
+    OP_PUBLISH_SOURCE_REQ, OP_ROUTING_REQ, OP_ROUTING_RES, OP_SEARCH_RES, OP_SEARCH_SOURCE_REQ,
+    TAGTYPE_UINT16, TAG_ENCRYPTION, TAG_FILESIZE, TAG_SOURCE_PORT, TAG_SOURCE_TYPE,
+    TAG_SOURCE_UDP_PORT,
 };
 
 const KAD_VERSION: u8 = 0x08;
@@ -44,6 +47,18 @@ const SOURCE_RESPONSE_IDLE: Duration = Duration::from_millis(250);
 const MAX_LIVENESS_PROBES: usize = routing::ALPHA;
 const STATE_CHECKPOINT_DEBOUNCE: Duration = Duration::from_secs(2);
 const WARM_ROUTING_WINDOW_MS: u64 = 10 * 60 * 1000;
+const SOURCE_ROUTING_KIND: u8 = 2;
+const STORE_ROUTING_KIND: u8 = 4;
+const MAX_PUBLISH_NODES: usize = 10;
+const PUBLISH_STORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn routing_contact_limit(kind: u8) -> usize {
+    if kind == SOURCE_ROUTING_KIND {
+        2
+    } else {
+        32
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum KadError {
@@ -282,6 +297,16 @@ impl Shortlist {
             .any(|entry| entry.state == NodeState::Unqueried)
     }
 
+    fn closest_responded(&mut self) -> Vec<routing::Contact> {
+        self.window()
+            .filter(|entry| {
+                entry.state == NodeState::Responded
+                    && entry.contact.version >= MIN_SOURCE_SEARCH_KAD_VERSION
+            })
+            .map(|entry| entry.contact.clone())
+            .collect()
+    }
+
     fn next_source_candidate(&mut self) -> Option<routing::Contact> {
         self.window()
             .find(|entry| {
@@ -313,6 +338,7 @@ enum RequestExpectation {
     Hello,
     Routing { target: KadId, max_contacts: usize },
     Source(KadId),
+    Publish(KadId),
     Pong,
 }
 
@@ -324,7 +350,7 @@ impl RequestExpectation {
             OP_ROUTING_REQ => {
                 let (kind, target, _) =
                     parse_routing_request(&packet.payload).map_err(KadError::Wire)?;
-                let max_contacts = if kind == 2 { 2 } else { 32 };
+                let max_contacts = routing_contact_limit(kind);
                 Ok(Self::Routing {
                     target,
                     max_contacts,
@@ -334,6 +360,11 @@ impl RequestExpectation {
                 let (target, _, _) =
                     parse_source_search_request(&packet.payload).map_err(KadError::Wire)?;
                 Ok(Self::Source(target))
+            }
+            OP_PUBLISH_SOURCE_REQ => {
+                let (target, _, _) =
+                    parse_publish_source_request(&packet.payload).map_err(KadError::Wire)?;
+                Ok(Self::Publish(target))
             }
             OP_PING => Ok(Self::Pong),
             _ => Err(KadError::Io(std::io::Error::new(
@@ -360,6 +391,10 @@ impl RequestExpectation {
                 packet.opcode == OP_SEARCH_RES
                     && parse_source_search_response(&packet.payload)
                         .is_ok_and(|response| response.target == target)
+            }
+            Self::Publish(target) => {
+                packet.opcode == OP_PUBLISH_RES
+                    && parse_publish_response(&packet.payload).is_ok_and(|id| id == target)
             }
         }
     }
@@ -722,6 +757,163 @@ impl KadService {
         }
     }
 
+    pub async fn publish_source(
+        self: &Arc<Self>,
+        file_hash: KadId,
+        file_size: u64,
+        tcp_port: u16,
+        client_hash: KadId,
+        cancel: CancellationToken,
+    ) -> Result<usize, KadError> {
+        let Some(_task_guard) = self.runtime.active_tasks.try_start() else {
+            return Err(KadError::Cancelled);
+        };
+        let deadline = Instant::now() + self.runtime.config.lookup.clone().bounded().deadline;
+        if !self.routing_is_warm().await {
+            let mut status = KadLookupStatus::default();
+            let (status_tx, _status_rx) = watch::channel(status.clone());
+            self.bootstrap_if_needed(&cancel, deadline, &mut status, &status_tx)
+                .await?;
+        }
+        let closest = self
+            .converge_on(file_hash, STORE_ROUTING_KIND, &cancel, deadline)
+            .await?;
+        let tags = self.publish_tags(file_size, tcp_port);
+        let store_deadline = Instant::now() + PUBLISH_STORE_TIMEOUT;
+        let mut stores = FuturesUnordered::new();
+        for contact in closest.into_iter().take(MAX_PUBLISH_NODES) {
+            let request = build_publish_source_request(&file_hash, &client_hash, &tags);
+            let cancel = &cancel;
+            stores.push(async move {
+                self.request(contact.udp_addr(), request, cancel, store_deadline)
+                    .await
+            });
+        }
+        let mut stored = 0;
+        while let Some(result) = stores.next().await {
+            match result {
+                Ok(_) => stored += 1,
+                Err(KadError::Cancelled) => return Err(KadError::Cancelled),
+                Err(_) => {}
+            }
+        }
+        Ok(stored)
+    }
+
+    fn publish_tags(&self, file_size: u64, tcp_port: u16) -> Vec<KadTag> {
+        let source_type = if crate::types::is_large_file(file_size) {
+            4
+        } else {
+            1
+        };
+        let mut tags = vec![
+            KadTag::uint(TAG_SOURCE_TYPE, source_type),
+            KadTag::uint(TAG_SOURCE_PORT, u64::from(tcp_port)),
+        ];
+        if let Some(port) = self.advertised_udp_port() {
+            tags.push(KadTag {
+                wire_type: Some(TAGTYPE_UINT16),
+                ..KadTag::uint(TAG_SOURCE_UDP_PORT, u64::from(port))
+            });
+        }
+        tags.push(KadTag::uint(TAG_FILESIZE, file_size));
+        tags.push(KadTag::uint(TAG_ENCRYPTION, 0));
+        tags
+    }
+
+    async fn converge_on(
+        self: &Arc<Self>,
+        target_hash: KadId,
+        kind: u8,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<Vec<routing::Contact>, KadError> {
+        let mut shortlist = self.lookup_shortlist(target_hash).await?;
+        let lookup = self.runtime.config.lookup.clone().bounded();
+        let mut tracker = LookupTracker::new(&lookup);
+        let mut inflight: FuturesUnordered<BoxFuture<'_, (NodeId, Result<KadPacket, KadError>)>> =
+            FuturesUnordered::new();
+        loop {
+            if self.lookup_is_cancelled(cancel) {
+                return Err(KadError::Cancelled);
+            }
+            while Instant::now() < deadline && inflight.len() < lookup.alpha {
+                let Some(contact) = shortlist.next_unqueried() else {
+                    break;
+                };
+                if !tracker.mark_queried(contact.id) {
+                    shortlist.set_state(contact.id, NodeState::Unqueried);
+                    break;
+                }
+                let request = build_routing_request(kind, &target_hash, &contact.id.0);
+                let addr = contact.udp_addr();
+                inflight.push(
+                    async move {
+                        let result = self.request(addr, request, cancel, deadline).await;
+                        (contact.id, result)
+                    }
+                    .boxed(),
+                );
+            }
+            let Some((id, result)) = inflight.next().await else {
+                break;
+            };
+            self.absorb_routing_reply(&mut shortlist, id, result, kind)
+                .await?;
+        }
+        Ok(shortlist.closest_responded())
+    }
+
+    async fn lookup_shortlist(&self, target_hash: KadId) -> Result<Shortlist, KadError> {
+        let initial = self
+            .runtime
+            .routing
+            .lock()
+            .await
+            .closest_with_replacements(NodeId(target_hash), routing::MAX_LOOKUP_QUERIES);
+        if initial.is_empty() {
+            return Err(KadError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Kad routing table is empty",
+            )));
+        }
+        Ok(Shortlist::new(target_hash, initial))
+    }
+
+    async fn absorb_routing_reply(
+        self: &Arc<Self>,
+        shortlist: &mut Shortlist,
+        id: NodeId,
+        result: Result<KadPacket, KadError>,
+        kind: u8,
+    ) -> Result<(), KadError> {
+        match result {
+            Ok(packet) => {
+                shortlist.set_state(id, NodeState::Responded);
+                let Ok(response) =
+                    parse_routing_response_with_limit(&packet.payload, routing_contact_limit(kind))
+                else {
+                    return Ok(());
+                };
+                for wire_contact in response.contacts {
+                    if !self.is_valid_wire_contact(&wire_contact) {
+                        continue;
+                    }
+                    let candidate = wire_contact.to_contact();
+                    self.insert_wire_contact(wire_contact).await;
+                    shortlist.add(candidate);
+                }
+                Ok(())
+            }
+            Err(KadError::Cancelled) => Err(KadError::Cancelled),
+            Err(_) => {
+                shortlist.set_state(id, NodeState::Failed);
+                self.runtime.routing.lock().await.mark_failed(id);
+                Ok(())
+            }
+        }
+    }
+
     pub async fn health_snapshot(&self) -> KadHealthSnapshot {
         self.runtime.health.read().await.clone()
     }
@@ -1020,24 +1212,10 @@ impl KadService {
         status_tx: &watch::Sender<KadLookupStatus>,
         source_tx: &mpsc::Sender<KadSource>,
     ) -> Result<(), KadError> {
-        let target = NodeId(file_hash);
-        let initial = self
-            .runtime
-            .routing
-            .lock()
-            .await
-            .closest_with_replacements(target, routing::MAX_LOOKUP_QUERIES);
-        if initial.is_empty() {
-            return Err(KadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Kad routing table is empty",
-            )));
-        }
-
+        let mut shortlist = self.lookup_shortlist(file_hash).await?;
         let lookup = self.runtime.config.lookup.clone().bounded();
         let alpha = lookup.alpha;
         let source_limit = lookup.max_sources.min(MAX_SOURCE_QUERIES);
-        let mut shortlist = Shortlist::new(file_hash, initial);
         let mut tracker = LookupTracker::new(&lookup);
         let mut sink = SourceSink::default();
         let mut source_queries = 0usize;
@@ -1067,7 +1245,8 @@ impl KadService {
                     routing_inflight += 1;
                     status.queried_nodes = tracker.queried_count();
                     let _ = status_tx.send(status.clone());
-                    let request = build_routing_request(2, &file_hash, &contact.id.0);
+                    let request =
+                        build_routing_request(SOURCE_ROUTING_KIND, &file_hash, &contact.id.0);
                     let addr = contact.udp_addr();
                     inflight.push(
                         async move {
@@ -1100,31 +1279,11 @@ impl KadService {
             match reply {
                 LookupReply::Routing(id, result) => {
                     routing_inflight -= 1;
-                    match result {
-                        Ok(packet) => {
-                            shortlist.set_state(id, NodeState::Responded);
-                            if packet.opcode != OP_ROUTING_RES {
-                                continue;
-                            }
-                            let Ok(response) =
-                                parse_routing_response_with_limit(&packet.payload, 2)
-                            else {
-                                continue;
-                            };
-                            for wire_contact in response.contacts {
-                                if !self.is_valid_wire_contact(&wire_contact) {
-                                    continue;
-                                }
-                                let candidate = wire_contact.to_contact();
-                                self.insert_wire_contact(wire_contact).await;
-                                shortlist.add(candidate);
-                            }
-                        }
-                        Err(KadError::Cancelled) => abort = Some(KadError::Cancelled),
-                        Err(_) => {
-                            shortlist.set_state(id, NodeState::Failed);
-                            self.runtime.routing.lock().await.mark_failed(id);
-                        }
+                    if let Err(error) = self
+                        .absorb_routing_reply(&mut shortlist, id, result, SOURCE_ROUTING_KIND)
+                        .await
+                    {
+                        abort = Some(error);
                     }
                 }
                 LookupReply::Source(result) => {

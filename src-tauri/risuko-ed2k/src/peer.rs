@@ -79,7 +79,8 @@ impl PeerConnection {
 
         let (read_half, mut write_half) = tokio::io::split(stream);
 
-        let hello = build_hello_client(
+        let hello = build_hello(
+            false,
             &self.client_hash,
             self.client_id,
             self.client_port,

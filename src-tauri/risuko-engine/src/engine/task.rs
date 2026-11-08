@@ -276,6 +276,10 @@ pub struct UpdateTaskOutcome {
 }
 
 impl DownloadTask {
+    pub(crate) fn holds_download_slot(&self) -> bool {
+        self.kind != TaskKind::Torrent && !self.seeder
+    }
+
     pub fn new_http(
         gid: String,
         uris: Vec<String>,
@@ -725,6 +729,12 @@ impl DownloadTask {
             m.insert("scheduleMissed".into(), Value::Bool(true));
         }
 
+        if matches!(self.kind, TaskKind::Torrent | TaskKind::Ed2k) {
+            m.insert(
+                "seeder".into(),
+                Value::String(if self.seeder { "true" } else { "false" }.into()),
+            );
+        }
         if self.kind == TaskKind::Torrent {
             let mut bt = Map::new();
             if let Some(ref hash) = self.info_hash {
@@ -765,10 +775,6 @@ impl DownloadTask {
                 bt.insert("announceList".into(), Value::Array(tiers));
             }
             m.insert("bittorrent".into(), Value::Object(bt));
-            m.insert(
-                "seeder".into(),
-                Value::String(if self.seeder { "true" } else { "false" }.into()),
-            );
             m.insert(
                 "numSeeders".into(),
                 Value::String(self.num_seeders.to_string()),
@@ -1370,6 +1376,8 @@ mod tests {
         let status = task.to_rpc_status(&[]);
         let obj = status.as_object().unwrap();
         assert!(obj.contains_key("ed2kLink"));
+        assert_eq!(obj["seeder"], "false");
+        assert!(!obj.contains_key("bittorrent"));
     }
 
     #[test]

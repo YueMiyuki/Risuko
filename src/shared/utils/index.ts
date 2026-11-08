@@ -397,10 +397,8 @@ export const detectUriProtocol = (uri: string): string | null => {
 	return null;
 };
 
-export const checkTaskIsSeeder = (task) => {
-	const { bittorrent, seeder } = task;
-	return !!bittorrent && seeder === "true";
-};
+export const checkTaskIsSeeder = (task) =>
+	task.seeder === "true" && task.status === TASK_STATUS.ACTIVE;
 
 export const getDisplayTaskStatus = (task) => {
 	return checkTaskIsSeeder(task) ? TASK_STATUS.SEEDING : task.status;
@@ -432,6 +430,9 @@ export const getTaskUri = (task, withTracker = false) => {
 
 export const checkTaskIsBT = (task?: Partial<DownloadTask> | null) =>
 	!!task?.bittorrent;
+
+export const checkTaskUploads = (task?: Partial<DownloadTask> | null) =>
+	!!task?.bittorrent || !!task?.ed2kLink;
 
 const LOW_SPEED_RECOVERABLE_KINDS = new Set(["http", "ftp", "media", "m3u8"]);
 
