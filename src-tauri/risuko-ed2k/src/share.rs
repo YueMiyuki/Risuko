@@ -147,6 +147,7 @@ pub struct SharedFile {
     limiter: Arc<RateLimiter>,
     handle: Mutex<Option<Arc<std::fs::File>>>,
     withdrawn: AtomicBool,
+    registry: Weak<ShareRegistry>,
 }
 
 impl SharedFile {
@@ -194,6 +195,7 @@ impl SharedFile {
             limiter: Arc::new(RateLimiter::unlimited()),
             handle: Mutex::new(None),
             withdrawn: AtomicBool::new(false),
+            registry: Weak::new(),
         }
     }
 
@@ -336,7 +338,11 @@ impl SharedFile {
     }
 
     fn withdraw(&self) {
-        self.withdrawn.store(true, Ordering::Relaxed);
+        if !self.withdrawn.swap(true, Ordering::Relaxed) {
+            if let Some(registry) = self.registry.upgrade() {
+                registry.bump();
+            }
+        }
     }
 }
 
@@ -399,7 +405,8 @@ impl ShareRegistry {
         })
     }
 
-    pub fn insert(self: &Arc<Self>, file: SharedFile) -> ShareHandle {
+    pub fn insert(self: &Arc<Self>, mut file: SharedFile) -> ShareHandle {
+        file.registry = Arc::downgrade(self);
         let file = Arc::new(file);
         self.files
             .write()
@@ -407,10 +414,7 @@ impl ShareRegistry {
             .or_default()
             .push(file.clone());
         self.bump();
-        ShareHandle {
-            registry: Arc::downgrade(self),
-            file,
-        }
+        ShareHandle { file }
     }
 
     pub fn get(&self, hash: &[u8; 16]) -> Option<Arc<SharedFile>> {
@@ -476,7 +480,6 @@ impl ShareRegistry {
 }
 
 pub struct ShareHandle {
-    registry: Weak<ShareRegistry>,
     file: Arc<SharedFile>,
 }
 
@@ -489,7 +492,7 @@ impl ShareHandle {
 impl Drop for ShareHandle {
     fn drop(&mut self) {
         self.file.withdrawn.store(true, Ordering::Relaxed);
-        if let Some(registry) = self.registry.upgrade() {
+        if let Some(registry) = self.file.registry.upgrade() {
             registry.remove(&self.file);
         }
     }
@@ -804,9 +807,15 @@ mod tests {
         ));
         let preferred = registry.get(&[7; 16]).unwrap();
         assert_eq!(preferred.name(), "done");
+        let mut changes = registry.subscribe();
+        changes.mark_unchanged();
         std::fs::write(&path, b"replaced").unwrap();
         assert!(preferred.read_range(0, 10).is_err());
+        assert!(changes.has_changed().unwrap());
         assert_eq!(registry.get(&[7; 16]).unwrap().name(), "part");
+        changes.mark_unchanged();
+        assert!(preferred.read_range(0, 10).is_err());
+        assert!(!changes.has_changed().unwrap());
     }
 
     #[test]
