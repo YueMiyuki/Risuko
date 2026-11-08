@@ -152,7 +152,6 @@ pub(super) async fn run<S>(
     }
 
     shared.sessions.lock().remove(&id);
-    drop(guard);
     session.slot = None;
     let mut released = false;
     if let Some(peer) = &session.peer {
@@ -167,7 +166,10 @@ pub(super) async fn run<S>(
     drop(session);
     if timeout(WRITE_TIMEOUT, &mut writer_task).await.is_err() {
         writer_task.abort();
+        let _ = writer_task.await;
     }
+    drop(reader);
+    drop(guard);
 }
 
 impl Session {

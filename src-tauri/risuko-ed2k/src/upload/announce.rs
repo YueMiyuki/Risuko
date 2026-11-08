@@ -100,7 +100,7 @@ async fn announce_to(
                         && callback_target_allowed(addr, target)
                         && callbacks.take(Instant::now())
                     {
-                        shared.spawn_dial(target, Mode::Callback);
+                        let _ = shared.spawn_dial(target, Mode::Callback);
                     }
                 }
                 Some(ServerEvent::Disconnected(reason)) => {

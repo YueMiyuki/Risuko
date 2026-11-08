@@ -78,6 +78,12 @@ struct Shared {
     next_session: AtomicU64,
 }
 
+#[derive(Debug)]
+enum Refusal {
+    Full,
+    Host,
+}
+
 struct ConnectionGuard {
     shared: Arc<Shared>,
     ip: Ipv4Addr,
@@ -104,15 +110,17 @@ impl Shared {
         *self.identity.lock() = identity;
     }
 
-    fn admit(self: &Arc<Self>, ip: Ipv4Addr) -> Option<ConnectionGuard> {
+    fn admit(self: &Arc<Self>, ip: Ipv4Addr) -> Result<ConnectionGuard, Refusal> {
         let mut connections = self.connections.lock();
-        let total: usize = connections.values().sum();
+        if connections.values().sum::<usize>() >= MAX_SESSIONS {
+            return Err(Refusal::Full);
+        }
         let count = connections.get(&ip).copied().unwrap_or(0);
-        if total >= MAX_SESSIONS || count >= MAX_SESSIONS_PER_IP {
-            return None;
+        if count >= MAX_SESSIONS_PER_IP {
+            return Err(Refusal::Host);
         }
         connections.insert(ip, count + 1);
-        Some(ConnectionGuard {
+        Ok(ConnectionGuard {
             shared: self.clone(),
             ip,
         })
@@ -123,9 +131,11 @@ impl Shared {
     }
 
     fn dispatch(self: &Arc<Self>) {
-        let mut can_dial = true;
+        let mut full = false;
+        let mut busy_hosts = Vec::new();
         loop {
-            let Some(mut grant) = self.queue.lock().next_grant(Instant::now(), can_dial) else {
+            let dialable = |addr: &SocketAddrV4| !full && !busy_hosts.contains(addr.ip());
+            let Some(mut grant) = self.queue.lock().next_grant(Instant::now(), dialable) else {
                 return;
             };
             if self.deliver(&grant) {
@@ -140,10 +150,21 @@ impl Shared {
                 user: grant.user,
                 file: grant.file,
             };
-            if !can_dial || !self.spawn_dial(addr, mode) {
+            let refused = !dialable(&addr)
+                || match self.spawn_dial(addr, mode) {
+                    Ok(()) => false,
+                    Err(Refusal::Full) => {
+                        full = true;
+                        true
+                    }
+                    Err(Refusal::Host) => {
+                        busy_hosts.push(*addr.ip());
+                        true
+                    }
+                };
+            if refused {
                 grant.session = None;
                 self.queue.lock().defer_grant(grant);
-                can_dial = false;
             }
         }
     }
@@ -158,10 +179,8 @@ impl Shared {
         tx.try_send(SessionCmd::Grant(grant.file)).is_ok()
     }
 
-    fn spawn_dial(self: &Arc<Self>, addr: SocketAddrV4, mode: Mode) -> bool {
-        let Some(guard) = self.admit(*addr.ip()) else {
-            return false;
-        };
+    fn spawn_dial(self: &Arc<Self>, addr: SocketAddrV4, mode: Mode) -> Result<(), Refusal> {
+        let guard = self.admit(*addr.ip())?;
         let shared = self.clone();
         tokio::spawn(async move {
             let host = addr.ip().to_string();
@@ -185,7 +204,7 @@ impl Shared {
                 }
             }
         });
-        true
+        Ok(())
     }
 
     fn dial_failed(self: &Arc<Self>, mode: Mode) {
@@ -289,7 +308,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         let std::net::SocketAddr::V4(addr) = addr else {
             continue;
         };
-        let Some(guard) = shared.admit(*addr.ip()) else {
+        let Ok(guard) = shared.admit(*addr.ip()) else {
             continue;
         };
         let _ = stream.set_nodelay(true);
@@ -316,8 +335,8 @@ async fn housekeeping(shared: Arc<Shared>) {
         ticks += 1;
         if ticks.is_multiple_of(PURGE_EVERY_TICKS) {
             shared.queue.lock().purge(Instant::now());
-            shared.dispatch();
         }
+        shared.dispatch();
     }
 }
 

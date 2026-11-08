@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -301,6 +301,7 @@ impl SharedFile {
         let file = self.open()?;
         if let Some(stamp) = self.stamp {
             if FileStamp::from_metadata(&file.metadata()?)? != stamp {
+                self.withdraw();
                 return Err(io::Error::other("shared file changed on disk"));
             }
         }
@@ -314,8 +315,17 @@ impl SharedFile {
         if let Some(file) = handle.as_ref() {
             return Ok(file.clone());
         }
-        let file = Arc::new(std::fs::File::open(&self.path)?);
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => Arc::new(file),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::NotFound {
+                    self.withdraw();
+                }
+                return Err(e);
+            }
+        };
         if file.metadata()?.len() < self.size {
+            self.withdraw();
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "shared file is shorter than expected",
@@ -323,6 +333,10 @@ impl SharedFile {
         }
         *handle = Some(file.clone());
         Ok(file)
+    }
+
+    fn withdraw(&self) {
+        self.withdrawn.store(true, Ordering::Relaxed);
     }
 }
 
@@ -417,8 +431,11 @@ impl ShareRegistry {
     }
 
     pub(crate) fn sample_stats(&self) {
+        let mut sampled = HashSet::new();
         for file in self.files.read().values().flatten() {
-            file.stats.sample();
+            if sampled.insert(Arc::as_ptr(&file.stats)) {
+                file.stats.sample();
+            }
         }
     }
 
@@ -763,6 +780,50 @@ mod tests {
             .set_modified(later)
             .unwrap();
         assert!(file.read_range(10, 20).is_err());
+        assert!(!file.is_offerable());
+    }
+
+    #[test]
+    fn a_partial_takes_over_once_the_complete_copy_changes_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = ED2K_CHUNK_SIZE * 2;
+        let path = write(dir.path(), "done", &vec![0; size as usize]);
+        let registry = ShareRegistry::new();
+        let _complete = registry.insert(
+            SharedFile::complete([7; 16], "done", size, path.clone(), Vec::new())
+                .with_stamp(FileStamp::of(&path).unwrap()),
+        );
+        let parts = PartMap::new(size);
+        parts.mark_verified(0);
+        let _partial = registry.insert(SharedFile::partial(
+            [7; 16],
+            "part",
+            size,
+            PathBuf::new(),
+            parts,
+        ));
+        let preferred = registry.get(&[7; 16]).unwrap();
+        assert_eq!(preferred.name(), "done");
+        std::fs::write(&path, b"replaced").unwrap();
+        assert!(preferred.read_range(0, 10).is_err());
+        assert_eq!(registry.get(&[7; 16]).unwrap().name(), "part");
+    }
+
+    #[test]
+    fn shared_stats_are_sampled_once_per_tick() {
+        let registry = ShareRegistry::new();
+        let share = ShareContext {
+            registry: registry.clone(),
+            user_hash: [0; 16],
+            stats: Arc::new(UploadStats::default()),
+            limiter: Arc::new(RateLimiter::unlimited()),
+        };
+        let complete = |hash| SharedFile::complete([hash; 16], "f", 1, PathBuf::new(), Vec::new());
+        let _a = share.share(complete(1));
+        let _b = share.share(complete(2));
+        share.stats.add(500);
+        registry.sample_stats();
+        assert_eq!(share.stats.speed(), 500);
     }
 
     #[test]

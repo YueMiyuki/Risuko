@@ -583,6 +583,52 @@ async fn an_undialable_waiter_does_not_hold_up_connected_ones() {
     up.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_busy_host_does_not_hold_up_dials_to_other_waiters() {
+    let dir = tempfile::tempdir().unwrap();
+    let up = uploader(1).await;
+    let (_handle, hash) = share_complete(&up, dir.path(), &fixture(5000));
+    let mut holder = raw_client(&up, [3; 16]).await;
+    let mut holder_buf = bytes::BytesMut::new();
+    expect_op(&mut holder, &mut holder_buf, OP_HELLO_ANSWER).await;
+    holder
+        .write_all(&build_slot_request(&hash).encode())
+        .await
+        .unwrap();
+    expect_op(&mut holder, &mut holder_buf, OP_SLOT_GIVEN).await;
+
+    let busy = Ipv4Addr::new(127, 0, 0, 2);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for (user, addr) in [
+        ([5; 16], SocketAddrV4::new(busy, 4662)),
+        ([6; 16], local_addr(&listener)),
+    ] {
+        up.shared.queue.lock().request(queue::Waiter {
+            user,
+            file: hash,
+            dial: Some(addr),
+            session: None,
+            seen: tokio::time::Instant::now(),
+        });
+    }
+    let _guards: Vec<_> = (0..MAX_SESSIONS_PER_IP)
+        .map(|_| up.shared.admit(busy).unwrap())
+        .collect();
+
+    holder
+        .write_all(&Ed2kPacket::new(PROTO_EDONKEY, OP_CANCEL_TRANSFER, Vec::new()).encode())
+        .await
+        .unwrap();
+    let (mut stream, mut buf, _) = accept_dial(&listener).await;
+    stream
+        .write_all(&build_hello(true, &[6; 16], 0, 4662, 0, 0).encode())
+        .await
+        .unwrap();
+    expect_op(&mut stream, &mut buf, OP_SLOT_GIVEN).await;
+    assert_eq!(up.shared.queue.lock().rank(&[5; 16]), Some(1));
+    up.shutdown().await;
+}
+
 async fn accept_dial(
     listener: &tokio::net::TcpListener,
 ) -> (tokio::net::TcpStream, bytes::BytesMut, HelloInfo) {
@@ -609,7 +655,10 @@ async fn server_callbacks_dial_out_and_serve_the_requester() {
     let up = uploader(4).await;
     let (_handle, hash) = share_complete(&up, dir.path(), &fixture(5000));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    assert!(up.shared.spawn_dial(local_addr(&listener), Mode::Callback));
+    assert!(up
+        .shared
+        .spawn_dial(local_addr(&listener), Mode::Callback)
+        .is_ok());
     let (mut stream, mut buf, info) = accept_dial(&listener).await;
     assert_eq!(
         (info.user_hash, info.port),
@@ -650,13 +699,16 @@ async fn dial_back_grants_the_slot_only_to_the_queued_user() {
     let addr = local_addr(&listener);
 
     reserve_dial_slot(&up, [6; 16], hash, addr);
-    assert!(up.shared.spawn_dial(
-        addr,
-        Mode::Grant {
-            user: [6; 16],
-            file: hash
-        }
-    ));
+    assert!(up
+        .shared
+        .spawn_dial(
+            addr,
+            Mode::Grant {
+                user: [6; 16],
+                file: hash
+            }
+        )
+        .is_ok());
     let (mut stream, mut buf, _) = accept_dial(&listener).await;
     stream
         .write_all(&build_hello(true, &[6; 16], 0, 4662, 0, 0).encode())
@@ -668,13 +720,16 @@ async fn dial_back_grants_the_slot_only_to_the_queued_user() {
     wait_for_free_slots(&up, "slot released after the peer left").await;
 
     reserve_dial_slot(&up, [6; 16], hash, addr);
-    assert!(up.shared.spawn_dial(
-        addr,
-        Mode::Grant {
-            user: [6; 16],
-            file: hash
-        }
-    ));
+    assert!(up
+        .shared
+        .spawn_dial(
+            addr,
+            Mode::Grant {
+                user: [6; 16],
+                file: hash
+            }
+        )
+        .is_ok());
     let (mut stream, _, _) = accept_dial(&listener).await;
     stream
         .write_all(&build_hello(true, &[7; 16], 0, 4662, 0, 0).encode())

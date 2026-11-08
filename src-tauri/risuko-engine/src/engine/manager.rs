@@ -3326,7 +3326,6 @@ impl TaskManager {
             };
 
             let c = counters.clone();
-            let mut announced_seeding = false;
             let result = match file_link {
                 Ok(link) if seeding => {
                     let path = super::ed2k::partial::final_path(&dir, &link.file_name);
@@ -3380,35 +3379,42 @@ impl TaskManager {
                             uploads_enabled.then(|| share.clone()),
                         )
                         .await;
-                        match downloaded {
-                            Ok(done)
-                                if uploads_enabled
-                                    && begin_ed2k_seeding(
-                                        &tasks,
-                                        &active,
-                                        &options,
-                                        &events,
-                                        &gid,
-                                        worker_epoch,
-                                        &done.path,
-                                    )
-                                    .await =>
-                            {
-                                announced_seeding = true;
-                                counters.speed.store(0, Ordering::Relaxed);
-                                let verified = remember_complete_file(
-                                    config_dir,
-                                    done.path.clone(),
-                                    link.file_hash_bytes,
-                                    done.hashset,
-                                )
-                                .await;
-                                seed_ed2k(verified, &share, &link, &done.path, &c.cancel_token)
-                                    .await
+                        let done = match downloaded {
+                            Ok(done) if uploads_enabled => done,
+                            other => return other.map(|done| done.path),
+                        };
+                        let verified = match remember_complete_file(
+                            config_dir,
+                            done.path.clone(),
+                            link.file_hash_bytes,
+                            done.hashset,
+                        )
+                        .await
+                        {
+                            Ok(verified) => verified,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "[ed2k] Not sharing {}: {error}",
+                                    done.path.display()
+                                );
+                                return Ok(done.path);
                             }
-                            Ok(done) => Ok(done.path),
-                            Err(e) => Err(e),
+                        };
+                        if !begin_ed2k_seeding(
+                            &tasks,
+                            &active,
+                            &options,
+                            &events,
+                            &gid,
+                            worker_epoch,
+                            &done.path,
+                        )
+                        .await
+                        {
+                            return Ok(done.path);
                         }
+                        counters.speed.store(0, Ordering::Relaxed);
+                        seed_ed2k(Ok(verified), &share, &link, &done.path, &c.cancel_token).await
                     }
                     .await
                 }
@@ -3429,12 +3435,6 @@ impl TaskManager {
                     if ok && task.seeder && task.status == TaskStatus::Active {
                         task.status = TaskStatus::Complete;
                         clear_seeding(task);
-                        if announced_seeding {
-                            events.send(EngineEvent::DownloadComplete {
-                                gid: task.gid.clone(),
-                                seeded: true,
-                            });
-                        }
                     }
                 },
                 |task, _| task.total_length,
