@@ -5,7 +5,7 @@
         <span class="activity-stat-label">{{ $t('task.task-download-speed') }}</span>
         <span class="activity-stat-value">{{ formatBytes(displayDownloadSpeed) }}/s</span>
       </div>
-      <div class="activity-stat-item" v-if="isBT">
+      <div class="activity-stat-item" v-if="uploads">
         <span class="activity-stat-label">{{ $t('task.task-upload-speed') }}</span>
         <span class="activity-stat-value">{{ formatBytes(Number(task.uploadSpeed || 0)) }}/s</span>
       </div>
@@ -160,6 +160,7 @@ import {
 	bytesToSize,
 	checkTaskIsBT,
 	checkTaskIsSeeder,
+	checkTaskUploads,
 	formatUsenetRepairFailure,
 	getTaskName,
 	getTaskUri,
@@ -229,6 +230,9 @@ export default {
 		},
 		isBT() {
 			return checkTaskIsBT(this.task);
+		},
+		uploads() {
+			return checkTaskUploads(this.task);
 		},
 		ed2kKadStatusLabel() {
 			const state = this.task?.ed2kKad?.state;

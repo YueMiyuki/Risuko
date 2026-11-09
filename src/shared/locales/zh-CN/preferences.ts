@@ -269,6 +269,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"用于 Kad 发现的 UDP 端口，有效值为 1-65535（需要重启引擎）",
 	"ed2k-kad-port-invalid": "Kad UDP 端口必须是 1 到 65535 之间的整数",
+	"ed2k-enable-upload": "通过 ED2K 共享文件",
+	"ed2k-enable-upload-tips":
+		"向其他节点上传已完成的文件和正在下载的 ED2K 任务中已校验的分块。停止共享后，Kad 仍可能在最多 5 小时内列出该文件（需要重启引擎）",
 	"engine-overrides-reserved-keys": "已忽略的保留引擎覆盖键：{{keys}}",
 	"engine-overrides-too-large":
 		"引擎覆盖配置过大：最多 64 个键，每个键 64 个字符，每个值 2048 个字符。",

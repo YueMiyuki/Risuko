@@ -118,6 +118,9 @@ export default {
 		"UDP-poort voor Kad-brondetectie. Geldige waarden zijn 1-65535 (vereist herstart van de engine)",
 	"ed2k-kad-port-invalid":
 		"De Kad-UDP-poort moet een geheel getal van 1 tot en met 65535 zijn",
+	"ed2k-enable-upload": "Bestanden delen via ED2K",
+	"ed2k-enable-upload-tips":
+		"Voltooide bestanden en geverifieerde delen van lopende ED2K-downloads uploaden naar andere peers. Kad kan een bestand dat je niet meer deelt nog tot 5 uur vermelden (vereist herstart van de engine)",
 	"engine-overrides-reserved-keys":
 		"Genegeerde gereserveerde sleutels voor engine-overrides: {{keys}}",
 	"engine-overrides-too-large":

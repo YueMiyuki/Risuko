@@ -5,8 +5,9 @@ use tokio::fs::OpenOptions;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use super::md4::{md4, Md4};
+use super::md4::Md4;
 use super::partial::Met;
+use super::share::{hashset_matches, PartMap};
 use super::types::*;
 
 pub const ED2K_BLOCK_SIZE: u64 = 184_320;
@@ -105,6 +106,7 @@ pub struct ChunkManager {
     met_path: Option<PathBuf>,
     met_dirty: bool,
     cancel: Option<CancellationToken>,
+    part_map: Option<PartMap>,
 }
 
 pub async fn write_block(
@@ -199,7 +201,13 @@ impl ChunkManager {
             met_path: None,
             met_dirty: false,
             cancel: None,
+            part_map: None,
         }
+    }
+
+    pub fn with_part_map(mut self, part_map: PartMap) -> Self {
+        self.part_map = Some(part_map);
+        self
     }
 
     pub fn with_met(mut self, met_path: PathBuf, cancel: CancellationToken) -> Self {
@@ -231,13 +239,11 @@ impl ChunkManager {
         if self.chunk_hashes.is_some() || self.file_size < ED2K_CHUNK_SIZE {
             return true;
         }
-        let expected_len = (self.file_size / ED2K_CHUNK_SIZE + 1) as usize;
-        if hashes.len() != expected_len {
+        if !hashset_matches(&self.file_hash, self.file_size, &hashes) {
             return false;
         }
-        let concat: Vec<u8> = hashes.iter().flatten().copied().collect();
-        if md4(&concat) != self.file_hash {
-            return false;
+        if let Some(map) = &self.part_map {
+            map.set_hashset(&hashes);
         }
         self.chunk_hashes = Some(hashes);
         self.met_dirty = true;
@@ -279,6 +285,9 @@ impl ChunkManager {
         self.part_bytes[part] = pe - ps;
         self.completed_length += pe - ps;
         self.chunk_status[part] = ChunkStatus::Downloaded;
+        if let Some(map) = &self.part_map {
+            map.mark_verified(part);
+        }
     }
 
     pub fn met_snapshot(&self) -> Met {
@@ -536,6 +545,9 @@ impl ChunkManager {
         if ok {
             self.chunk_status[part] = ChunkStatus::Downloaded;
             self.met_dirty = true;
+            if let Some(map) = &self.part_map {
+                map.mark_verified(part);
+            }
             return;
         }
         if let [peer] = sources.as_slice() {
@@ -558,6 +570,7 @@ impl ChunkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::md4::md4;
 
     fn manager(size: u64, hash: [u8; 16]) -> (ChunkManager, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

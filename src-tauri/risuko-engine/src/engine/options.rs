@@ -445,6 +445,10 @@ impl EngineOptions {
         self.get_bool("ed2k-enable-kad").unwrap_or(true)
     }
 
+    pub fn ed2k_enable_upload(&self) -> bool {
+        self.get_bool("ed2k-enable-upload").unwrap_or(true)
+    }
+
     pub fn ed2k_kad_port_checked(&self) -> Result<u16, String> {
         let Some(value) = self.global.get("ed2k-kad-port") else {
             return Ok(DEFAULT_ED2K_KAD_PORT);
@@ -926,6 +930,7 @@ mod tests {
         assert!(opts.ed2k_servers().is_empty());
         assert_eq!(opts.ed2k_port(), 4662);
         assert!(opts.ed2k_enable_kad());
+        assert!(opts.ed2k_enable_upload());
         assert_eq!(opts.ed2k_kad_port_checked().unwrap(), 4672);
         assert_eq!(opts.ed2k_kad_port(), 4672);
         assert_eq!(opts.pbh_listen_port_checked().unwrap(), 16801);
@@ -1058,9 +1063,11 @@ mod tests {
     fn kad_options_parse_and_validate_port() {
         let mut sys = Map::new();
         sys.insert("ed2k-enable-kad".into(), json!(false));
+        sys.insert("ed2k-enable-upload".into(), json!(false));
         sys.insert("ed2k-kad-port".into(), json!(5000));
         let opts = EngineOptions::from_config(&sys, &Map::new());
         assert!(!opts.ed2k_enable_kad());
+        assert!(!opts.ed2k_enable_upload());
         assert_eq!(opts.ed2k_kad_port_checked().unwrap(), 5000);
 
         for invalid in [json!(0), json!(65536), json!("not-a-port"), json!(-1)] {

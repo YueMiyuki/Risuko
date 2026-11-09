@@ -57,6 +57,7 @@ pub const STARTUP_ONLY_KEYS: &[&str] = &[
     "dht-listen-port",
     "ed2k-port",
     "ed2k-enable-kad",
+    "ed2k-enable-upload",
     "ed2k-kad-port",
     "bt-max-peers-per-torrent",
     "bt-max-outstanding-per-peer",
@@ -337,18 +338,17 @@ pub async fn start_engine(
                             ("engine:download-pause", gid.as_str())
                         }
                         EngineEvent::DownloadStop { gid } => ("engine:download-stop", gid.as_str()),
-                        EngineEvent::DownloadComplete { gid } => {
+                        EngineEvent::DownloadComplete { gid, .. } => {
                             ("engine:download-complete", gid.as_str())
                         }
                         EngineEvent::DownloadError { gid } => {
                             ("engine:download-error", gid.as_str())
                         }
-                        EngineEvent::BtDownloadComplete { gid } => {
+                        EngineEvent::BtDownloadComplete { gid, .. } => {
                             ("engine:bt-download-complete", gid.as_str())
                         }
                     };
-                    let payload = serde_json::json!({ "gid": gid });
-                    sink.emit(name, payload);
+                    sink.emit(name, event.params());
 
                     if matches!(event, EngineEvent::DownloadComplete { .. }) {
                         if let Some(uploads) = upload_mgr.clone() {

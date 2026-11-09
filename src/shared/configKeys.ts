@@ -100,6 +100,7 @@ const systemKeys = [
 	"doh-bootstrap",
 	"doh-fallback",
 	"ed2k-enable-kad",
+	"ed2k-enable-upload",
 	"ed2k-kad-port",
 	"ed2k-port",
 	"ed2k-server",
@@ -147,6 +148,7 @@ const systemKeys = [
 const startupOnlyKeys = [
 	"dht-listen-port",
 	"ed2k-enable-kad",
+	"ed2k-enable-upload",
 	"ed2k-kad-port",
 	"ed2k-port",
 	"listen-port",

@@ -846,6 +846,28 @@
             <div class="form-info" style="margin-top: 8px">
               {{ $t('preferences.ed2k-kad-port-tips') }}
             </div>
+            <div
+              class="settings-row"
+              style="margin-top: 16px"
+              data-preference-search-target="preferences.ed2k-enable-upload"
+            >
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.ed2k-enable-upload') }}
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.ed2k-enable-upload-tips') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <ui-checkbox
+                  :model-value="!!form.ed2kEnableUpload"
+                  :title="$t('preferences.ed2k-enable-upload')"
+                  :aria-label="$t('preferences.ed2k-enable-upload')"
+                  @change="(val) => setAdvancedBoolean('ed2kEnableUpload', val)"
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1801,8 +1823,10 @@ const initForm = (config) => {
 		noNetrc,
 		dhtListenPort,
 		ed2KEnableKad,
+		ed2KEnableUpload,
 		ed2KKadPort,
 		ed2kEnableKad,
+		ed2kEnableUpload,
 		ed2kKadPort,
 		dohEnable,
 		dohUrl,
@@ -1868,6 +1892,10 @@ const initForm = (config) => {
 		noNetrc: parseBooleanConfig(noNetrc, false),
 		dhtListenPort,
 		ed2kEnableKad: parseBooleanConfig(ed2KEnableKad ?? ed2kEnableKad, true),
+		ed2kEnableUpload: parseBooleanConfig(
+			ed2KEnableUpload ?? ed2kEnableUpload,
+			true,
+		),
 		ed2kKadPort: normalizePortValue(ed2KKadPort ?? ed2kKadPort, 4672),
 		dohEnable: parseBooleanConfig(dohEnable, false),
 		dohUrl: dohUrl || "",
@@ -1987,6 +2015,7 @@ const ADVANCED_BOOLEAN_KEYS = [
 	"externalEngineEnabled",
 	"completionScriptEnabled",
 	"ed2kEnableKad",
+	"ed2kEnableUpload",
 	"giftEnabled",
 	"pbhEnable",
 ];

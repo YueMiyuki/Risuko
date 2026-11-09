@@ -115,6 +115,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"Cổng UDP dùng để tìm nguồn qua Kad. Giá trị hợp lệ là 1-65535 (cần khởi động lại engine)",
 	"ed2k-kad-port-invalid": "Cổng UDP Kad phải là số nguyên từ 1 đến 65535",
+	"ed2k-enable-upload": "Chia sẻ tệp qua ED2K",
+	"ed2k-enable-upload-tips":
+		"Tải lên cho các peer khác các tệp đã hoàn tất và các phần đã xác minh của lượt tải ED2K đang chạy. Kad có thể vẫn liệt kê tệp bạn đã ngừng chia sẻ trong tối đa 5 giờ (cần khởi động lại engine)",
 	"engine-overrides-reserved-keys":
 		"Đã bỏ qua các khóa ghi đè engine dành riêng: {{keys}}",
 	"engine-overrides-too-large":

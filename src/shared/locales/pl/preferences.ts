@@ -122,6 +122,9 @@ export default {
 		"Port UDP używany do wyszukiwania przez Kad. Prawidłowe wartości to 1-65535 (wymaga ponownego uruchomienia silnika)",
 	"ed2k-kad-port-invalid":
 		"Port UDP Kad musi być liczbą całkowitą od 1 do 65535",
+	"ed2k-enable-upload": "Udostępniaj pliki przez ED2K",
+	"ed2k-enable-upload-tips":
+		"Wysyłaj innym peerom ukończone pliki i zweryfikowane części trwających pobrań ED2K. Kad może jeszcze do 5 godzin wyświetlać plik, którego już nie udostępniasz (wymaga ponownego uruchomienia silnika)",
 	"engine-overrides-reserved-keys":
 		"Zignorowane zastrzeżone klucze nadpisań silnika: {{keys}}",
 	"engine-overrides-too-large":

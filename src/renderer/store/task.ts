@@ -1,7 +1,13 @@
 import { TASK_STATUS } from "@shared/constants";
 import type { DownloadStatsMinuteInput } from "@shared/types/stats";
 import type { DownloadFile, DownloadTask, PeerInfo } from "@shared/types/task";
-import { calcProgress, checkTaskIsBT, getTaskName } from "@shared/utils";
+import {
+	calcProgress,
+	checkTaskIsBT,
+	checkTaskIsSeeder,
+	checkTaskUploads,
+	getTaskName,
+} from "@shared/utils";
 import logger from "@shared/utils/logger";
 import { defineStore } from "pinia";
 import api from "@/api";
@@ -138,12 +144,12 @@ function sampleSpeedsFromTasks(tasks: DownloadTask[]): boolean {
 		if (!isActive || !task.gid) {
 			continue;
 		}
-		const isBT = checkTaskIsBT(task);
-		const isSeeder = isBT && task.seeder === "true";
+		const uploads = checkTaskUploads(task);
+		const isSeeder = checkTaskIsSeeder(task);
 		const download = isSeeder
 			? 0
 			: Math.max(0, Number(task.downloadSpeed || 0));
-		const upload = isBT ? Math.max(0, Number(task.uploadSpeed || 0)) : 0;
+		const upload = uploads ? Math.max(0, Number(task.uploadSpeed || 0)) : 0;
 		collectStatsSample(task, download, upload);
 		const sample: SpeedSample = { download, upload };
 		const prev = speedHistoryCache.get(task.gid) || [];
@@ -562,6 +568,7 @@ export const useTaskStore = defineStore("task", {
 						"uploadSpeed",
 						"seeder",
 						"bittorrent",
+						"ed2kLink",
 					],
 				})) as DownloadTask[];
 				if (sampleSpeedsFromTasks(tasks) && !document.hidden) {

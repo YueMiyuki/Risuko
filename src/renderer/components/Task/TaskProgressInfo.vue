@@ -11,7 +11,7 @@
     </div>
     <div class="task-progress-info-right" v-show="isActive">
       <div class="task-speed-info">
-        <div class="task-speed-text" v-if="isBT">
+        <div class="task-speed-text" v-if="uploads">
           <i><ArrowUp :size="10" /></i>
           <span>{{ formatBytes(displayUploadSpeed) }}/s</span>
         </div>
@@ -42,6 +42,7 @@ import {
 	bytesToSize,
 	checkTaskIsBT,
 	checkTaskIsSeeder,
+	checkTaskUploads,
 	formatProgressPercent,
 	getDisplayDownloadSpeed,
 	timeFormat,
@@ -67,6 +68,9 @@ export default {
 		},
 		isBT() {
 			return checkTaskIsBT(this.task);
+		},
+		uploads() {
+			return checkTaskUploads(this.task);
 		},
 		isSeeder() {
 			return checkTaskIsSeeder(this.task);

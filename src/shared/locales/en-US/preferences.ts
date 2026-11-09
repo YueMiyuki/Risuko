@@ -364,6 +364,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"UDP port used for Kad discovery. Valid values are 1-65535 (requires engine restart)",
 	"ed2k-kad-port-invalid": "Kad UDP port must be an integer from 1 to 65535",
+	"ed2k-enable-upload": "Share files over ED2K",
+	"ed2k-enable-upload-tips":
+		"Upload finished files and verified parts of running ED2K downloads to other peers. Kad can keep listing a file you stopped sharing for up to 5 hours (requires engine restart)",
 	"ftp-sftp-settings": "FTP / SFTP",
 	"ftp-sftp-settings-tips":
 		"Default credentials for FTP, FTPS and SFTP downloads",

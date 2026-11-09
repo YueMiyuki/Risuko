@@ -119,6 +119,9 @@ export default {
 	"ed2k-kad-port-tips":
 		"UDP-port som brukes til Kad-søk. Gyldige verdier er 1-65535 (krever omstart av motoren)",
 	"ed2k-kad-port-invalid": "Kad UDP-port må være et heltall fra 1 til 65535",
+	"ed2k-enable-upload": "Del filer via ED2K",
+	"ed2k-enable-upload-tips":
+		"Last opp ferdige filer og verifiserte deler av pågående ED2K-nedlastinger til andre noder. Kad kan fortsatt liste en fil du har sluttet å dele i opptil 5 timer (krever omstart av motoren)",
 	"engine-overrides-reserved-keys":
 		"Ignorerte reserverte nøkler for motoroverstyring: {{keys}}",
 	"engine-overrides-too-large":

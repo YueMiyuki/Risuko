@@ -109,19 +109,14 @@ pub fn build_get_sources(file_hash: &[u8; 16]) -> Ed2kPacket {
     Ed2kPacket::new(PROTO_EDONKEY, OP_GET_SOURCES, file_hash.to_vec())
 }
 
-pub fn build_offer_files_empty() -> Ed2kPacket {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    Ed2kPacket::new(PROTO_EDONKEY, OP_OFFER_FILES, payload)
-}
-
-pub fn parse_id_change(payload: &[u8]) -> Result<u32, String> {
-    if payload.len() < 4 {
+pub fn parse_id_change(payload: &[u8]) -> Result<(u32, u32), String> {
+    let Some((id, rest)) = payload.split_first_chunk::<4>() else {
         return Err("ID Change packet too short".to_string());
-    }
-    Ok(u32::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-    ]))
+    };
+    let flags = rest
+        .first_chunk::<4>()
+        .map_or(0, |f| u32::from_le_bytes(*f));
+    Ok((u32::from_le_bytes(*id), flags))
 }
 
 pub fn parse_server_status(payload: &[u8]) -> Result<(u32, u32), String> {
@@ -265,7 +260,7 @@ impl MetaTag {
                 buf.push(0x02);
                 buf.extend_from_slice(&1u16.to_le_bytes());
                 buf.push(*name_id);
-                let bytes = value.as_bytes();
+                let bytes = clip_utf8(value, usize::from(u16::MAX)).as_bytes();
                 buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
@@ -279,20 +274,23 @@ impl MetaTag {
     }
 }
 
-pub fn build_hello_client(
+pub fn build_hello(
+    answer: bool,
     client_hash: &[u8; 16],
     client_id: u32,
     client_port: u16,
     server_ip: u32,
     server_port: u16,
 ) -> Ed2kPacket {
-    let mut payload = Vec::with_capacity(64);
-    payload.push(0x10);
+    let mut payload = Vec::with_capacity(96);
+    if !answer {
+        payload.push(0x10);
+    }
     payload.extend_from_slice(client_hash);
     payload.extend_from_slice(&client_id.to_le_bytes());
     payload.extend_from_slice(&client_port.to_le_bytes());
 
-    let tags = vec![
+    let tags = [
         MetaTag::string(TAG_NAME, "Risuko"),
         MetaTag::u32(TAG_VERSION, 0x3c),
         MetaTag::u32(TAG_PORT, client_port as u32),
@@ -301,16 +299,49 @@ pub fn build_hello_client(
         MetaTag::u32(CT_EMULE_MISCOPTIONS2, OUR_MISC_OPTIONS2),
     ];
 
-    let tag_count = tags.len() as u32;
-    payload.extend_from_slice(&tag_count.to_le_bytes());
+    payload.extend_from_slice(&(tags.len() as u32).to_le_bytes());
     for tag in &tags {
         tag.encode(&mut payload);
     }
 
     payload.extend_from_slice(&server_ip.to_le_bytes());
     payload.extend_from_slice(&server_port.to_le_bytes());
+    let opcode = if answer {
+        OP_HELLO_ANSWER
+    } else {
+        OP_HELLO_CLIENT
+    };
+    Ed2kPacket::new(PROTO_EDONKEY, opcode, payload)
+}
 
-    Ed2kPacket::new(PROTO_EDONKEY, OP_HELLO_CLIENT, payload)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloInfo {
+    pub user_hash: [u8; 16],
+    pub client_id: u32,
+    pub port: u16,
+    pub caps: PeerCaps,
+}
+
+pub fn parse_hello(payload: &[u8], answer: bool) -> Option<HelloInfo> {
+    let body = if answer {
+        payload
+    } else {
+        match payload.split_first() {
+            Some((16, rest)) => rest,
+            _ => return None,
+        }
+    };
+    if body.len() < 26 {
+        return None;
+    }
+    let mut user_hash = [0u8; 16];
+    user_hash.copy_from_slice(&body[..16]);
+    Some(HelloInfo {
+        user_hash,
+        client_id: u32::from_le_bytes([body[16], body[17], body[18], body[19]]),
+        port: u16::from_le_bytes([body[20], body[21]]),
+        caps: parse_hello_answer_caps(body),
+    })
 }
 
 pub fn build_file_request(file_hash: &[u8; 16]) -> Ed2kPacket {
@@ -362,6 +393,120 @@ pub fn build_request_parts(
     })
 }
 
+fn clip_utf8(s: &str, max: usize) -> &str {
+    &s[..s.floor_char_boundary(max)]
+}
+
+pub fn build_file_name_answer(file_hash: &[u8; 16], name: &str) -> Ed2kPacket {
+    let bytes = clip_utf8(name, usize::from(u16::MAX)).as_bytes();
+    let mut payload = Vec::with_capacity(18 + bytes.len());
+    payload.extend_from_slice(file_hash);
+    payload.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(bytes);
+    Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_NAME_ANSWER, payload)
+}
+
+pub fn build_no_file(file_hash: &[u8; 16]) -> Ed2kPacket {
+    Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_REQ_ANS_NOFILE, file_hash.to_vec())
+}
+
+pub fn build_hashset_answer(file_hash: &[u8; 16], hashes: &[[u8; 16]]) -> Ed2kPacket {
+    let count = hashes.len().min(u16::MAX as usize);
+    let mut payload = Vec::with_capacity(18 + count * 16);
+    payload.extend_from_slice(file_hash);
+    payload.extend_from_slice(&(count as u16).to_le_bytes());
+    for hash in &hashes[..count] {
+        payload.extend_from_slice(hash);
+    }
+    Ed2kPacket::new(PROTO_EDONKEY, OP_HASHSET_ANSWER, payload)
+}
+
+pub fn build_queue_ranking(rank: u16) -> Ed2kPacket {
+    let mut payload = rank.to_le_bytes().to_vec();
+    payload.extend_from_slice(&[0; 10]);
+    Ed2kPacket::new(PROTO_EMULE, OP_EMULE_QUEUE_RANKING, payload)
+}
+
+pub fn build_sending_part(file_hash: &[u8; 16], start: u64, data: &[u8]) -> Ed2kPacket {
+    let end = start + data.len() as u64;
+    let wide = end > u64::from(u32::MAX);
+    let mut payload = Vec::with_capacity(32 + data.len());
+    payload.extend_from_slice(file_hash);
+    if wide {
+        payload.extend_from_slice(&start.to_le_bytes());
+        payload.extend_from_slice(&end.to_le_bytes());
+        payload.extend_from_slice(data);
+        Ed2kPacket::new(PROTO_EMULE, OP_SENDING_PART_I64, payload)
+    } else {
+        payload.extend_from_slice(&(start as u32).to_le_bytes());
+        payload.extend_from_slice(&(end as u32).to_le_bytes());
+        payload.extend_from_slice(data);
+        Ed2kPacket::new(PROTO_EDONKEY, OP_SENDING_PART, payload)
+    }
+}
+
+pub fn parse_request_parts(payload: &[u8], wide: bool) -> Option<([u8; 16], [(u64, u64); 3])> {
+    let width = if wide { 8 } else { 4 };
+    if payload.len() < 16 + 6 * width {
+        return None;
+    }
+    let mut file_hash = [0u8; 16];
+    file_hash.copy_from_slice(&payload[..16]);
+    let word = |i: usize| -> u64 {
+        let at = 16 + i * width;
+        let mut w = [0u8; 8];
+        w[..width].copy_from_slice(&payload[at..at + width]);
+        u64::from_le_bytes(w)
+    };
+    let mut ranges = [(0, 0); 3];
+    for (i, range) in ranges.iter_mut().enumerate() {
+        *range = (word(i), word(i + 3));
+    }
+    Some((file_hash, ranges))
+}
+
+pub fn build_public_ip_answer(ip: std::net::Ipv4Addr) -> Ed2kPacket {
+    Ed2kPacket::new(PROTO_EMULE, OP_PUBLIC_IP_ANSWER, ip.octets().to_vec())
+}
+
+pub struct OfferEntry<'a> {
+    pub file_hash: [u8; 16],
+    pub client_id: u32,
+    pub client_port: u16,
+    pub name: &'a str,
+    pub size: u64,
+}
+
+pub fn build_offer_files(entries: &[OfferEntry<'_>]) -> Ed2kPacket {
+    let mut payload = Vec::with_capacity(4 + entries.len() * 64);
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        payload.extend_from_slice(&entry.file_hash);
+        payload.extend_from_slice(&entry.client_id.to_le_bytes());
+        payload.extend_from_slice(&entry.client_port.to_le_bytes());
+        let mut tags = vec![
+            MetaTag::string(FT_FILENAME, entry.name),
+            MetaTag::u32(FT_FILESIZE, entry.size as u32),
+        ];
+        if entry.size > u64::from(u32::MAX) {
+            tags.push(MetaTag::u32(FT_FILESIZE_HI, (entry.size >> 32) as u32));
+        }
+        payload.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for tag in &tags {
+            tag.encode(&mut payload);
+        }
+    }
+    Ed2kPacket::new(PROTO_EDONKEY, OP_OFFER_FILES, payload)
+}
+
+pub fn parse_callback_requested(payload: &[u8]) -> Option<std::net::SocketAddrV4> {
+    let [a, b, c, d, p0, p1, ..] = *payload else {
+        return None;
+    };
+    let port = u16::from_le_bytes([p0, p1]);
+    (port != 0).then(|| std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(a, b, c, d), port))
+}
+
 pub fn parse_sending_part_header_i64(payload: &[u8]) -> Result<([u8; 16], u64, u64), String> {
     if payload.len() < 32 {
         return Err("Sending Part I64 header too short".to_string());
@@ -381,10 +526,17 @@ pub const OUR_MISC_OPTIONS1: u32 = 0;
 pub const OUR_MISC_OPTIONS2: u32 = MISC2_LARGE_FILES;
 
 pub fn new_user_hash() -> [u8; 16] {
-    let mut hash: [u8; 16] = rand::random();
+    mark_user_hash(rand::random())
+}
+
+pub fn mark_user_hash(mut hash: [u8; 16]) -> [u8; 16] {
     hash[5] = 14;
     hash[14] = 111;
     hash
+}
+
+pub fn is_user_hash(hash: &[u8; 16]) -> bool {
+    hash[5] == 14 && hash[14] == 111
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -571,7 +723,7 @@ mod tests {
 
     #[test]
     fn hello_advertises_only_large_file_support() {
-        let hello = build_hello_client(&[0; 16], 0, 4662, 0, 0);
+        let hello = build_hello(false, &[0; 16], 0, 4662, 0, 0);
         let caps = parse_hello_answer_caps(&hello.payload[1..]);
         assert!(caps.large_files());
         assert_eq!(caps.misc_options1, 0);
@@ -621,6 +773,27 @@ mod tests {
         bad.extend_from_slice(&1u32.to_le_bytes());
         bad.extend_from_slice(&[0xff, 0x01]);
         assert_eq!(parse_hello_answer_caps(&bad), PeerCaps::default());
+    }
+
+    #[test]
+    fn oversized_names_are_cut_at_a_char_boundary_within_the_length_prefix() {
+        let name = format!("{}é", "a".repeat(usize::from(u16::MAX) - 1));
+        let mut tag = Vec::new();
+        MetaTag::string(FT_FILENAME, &name).encode(&mut tag);
+        let len = usize::from(u16::from_le_bytes([tag[4], tag[5]]));
+        assert_eq!((len, tag.len()), (usize::from(u16::MAX) - 1, 6 + len));
+        let answer = build_file_name_answer(&[0; 16], &name);
+        assert_eq!(&answer.payload[16..18], &(len as u16).to_le_bytes());
+        assert!(std::str::from_utf8(&answer.payload[18..]).is_ok());
+        let entry = OfferEntry {
+            file_hash: [0; 16],
+            client_id: 0,
+            client_port: 0,
+            name: &name,
+            size: 1,
+        };
+        let offer = build_offer_files(&[entry]);
+        assert_eq!(offer.payload.len(), 4 + 16 + 6 + 4 + tag.len() + 8);
     }
 
     #[test]

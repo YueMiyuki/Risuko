@@ -36,6 +36,7 @@ pub fn system_defaults() -> Map<String, Value> {
     m.insert("doh-bootstrap".into(), json!(""));
     m.insert("doh-fallback".into(), json!(true));
     m.insert("ed2k-enable-kad".into(), json!(true));
+    m.insert("ed2k-enable-upload".into(), json!(true));
     m.insert("ed2k-kad-port".into(), json!(4672));
     m.insert("ed2k-server".into(), json!("176.123.5.89:4725,45.82.80.155:5687,85.239.33.123:4232,91.208.162.87:4232,145.239.2.134:4661"));
     m.insert("file-allocation".into(), json!(file_allocation));
@@ -231,6 +232,7 @@ mod tests {
             "doh-bootstrap",
             "doh-fallback",
             "ed2k-enable-kad",
+            "ed2k-enable-upload",
             "ed2k-kad-port",
         ];
         for key in required {
@@ -281,6 +283,7 @@ mod tests {
         assert_eq!(sys.get("doh-bootstrap").unwrap(), "");
         assert_eq!(sys.get("doh-fallback").unwrap(), true);
         assert_eq!(sys.get("ed2k-enable-kad").unwrap(), true);
+        assert_eq!(sys.get("ed2k-enable-upload").unwrap(), true);
         assert_eq!(sys.get("ed2k-kad-port").unwrap(), 4672);
     }
 

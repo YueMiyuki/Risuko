@@ -121,6 +121,9 @@ export default {
 		"Portul UDP utilizat pentru descoperirea prin Kad. Valorile valide sunt 1-65535 (necesită repornirea motorului)",
 	"ed2k-kad-port-invalid":
 		"Portul UDP Kad trebuie să fie un număr întreg între 1 și 65535",
+	"ed2k-enable-upload": "Partajează fișiere prin ED2K",
+	"ed2k-enable-upload-tips":
+		"Încarcă către alți parteneri fișierele finalizate și părțile verificate ale descărcărilor ED2K în curs. Kad poate lista în continuare un fișier pe care nu îl mai partajezi timp de până la 5 ore (necesită repornirea motorului)",
 	"engine-overrides-reserved-keys":
 		"Chei rezervate ignorate în suprascrierile motorului: {{keys}}",
 	"engine-overrides-too-large":

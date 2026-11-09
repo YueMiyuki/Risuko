@@ -32,10 +32,12 @@ pub const OP_SERVER_MESSAGE: u8 = 0x38;
 pub const OP_SERVER_STATUS: u8 = 0x34;
 pub const OP_FOUND_SOURCES: u8 = 0x42;
 pub const OP_SERVER_LIST: u8 = 0x32;
+pub const OP_CALLBACK_REQUESTED: u8 = 0x35;
 
 pub const OP_HELLO_CLIENT: u8 = 0x01;
 pub const OP_HELLO_ANSWER: u8 = 0x4c;
 pub const OP_FILE_REQUEST: u8 = 0x58;
+pub const OP_FILE_NAME_ANSWER: u8 = 0x59;
 pub const OP_FILE_STATUS_REQUEST: u8 = 0x4f;
 pub const OP_FILE_STATUS: u8 = 0x50;
 pub const OP_HASHSET_REQUEST: u8 = 0x51;
@@ -45,12 +47,24 @@ pub const OP_SLOT_GIVEN: u8 = 0x55;
 pub const OP_SLOT_TAKEN: u8 = 0x57;
 pub const OP_FILE_REQ_ANS_NOFILE: u8 = 0x48;
 pub const OP_CANCEL_TRANSFER: u8 = 0x56;
+pub const OP_END_OF_DOWNLOAD: u8 = 0x49;
 pub const OP_REQUEST_PARTS: u8 = 0x47;
 pub const OP_SENDING_PART: u8 = 0x46;
 pub const OP_REQUEST_PARTS_I64: u8 = 0xa3;
 pub const OP_SENDING_PART_I64: u8 = 0xa2;
 
 pub const OP_EMULE_QUEUE_RANKING: u8 = 0x60;
+pub const OP_PUBLIC_IP_REQ: u8 = 0x97;
+pub const OP_PUBLIC_IP_ANSWER: u8 = 0x98;
+
+pub const FT_FILENAME: u8 = 0x01;
+pub const FT_FILESIZE: u8 = 0x02;
+pub const FT_FILESIZE_HI: u8 = 0x3a;
+
+pub const SRV_TCPFLG_COMPRESSION: u32 = 0x01;
+pub const SRV_TCPFLG_LARGEFILES: u32 = 0x100;
+
+pub const OLD_MAX_FILE_SIZE: u64 = 4_290_048_000;
 
 pub const TAG_NAME: u8 = 0x01;
 pub const TAG_PORT: u8 = 0x0f;
@@ -80,6 +94,14 @@ pub enum ChunkStatus {
     Missing,
     Verifying,
     Downloaded,
+}
+
+pub fn part_hash_count(file_size: u64) -> u64 {
+    file_size / ED2K_CHUNK_SIZE + 1
+}
+
+pub fn is_large_file(file_size: u64) -> bool {
+    file_size > OLD_MAX_FILE_SIZE
 }
 
 pub fn chunk_count(file_size: u64) -> u64 {

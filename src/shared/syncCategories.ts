@@ -202,7 +202,13 @@ const namedCategories: SyncCategory[] = [
 	},
 	{
 		id: "ports",
-		keys: ["listen-port", "ed2k-port", "ed2k-enable-kad", "ed2k-kad-port"],
+		keys: [
+			"listen-port",
+			"ed2k-port",
+			"ed2k-enable-kad",
+			"ed2k-kad-port",
+			"ed2k-enable-upload",
+		],
 	},
 	{
 		id: "ftp",

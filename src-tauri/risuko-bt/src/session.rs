@@ -157,6 +157,26 @@ impl PortForwarding {
     }
 }
 
+pub struct PortMapper {
+    forwarding: PortForwarding,
+}
+
+impl PortMapper {
+    pub fn spawn(
+        ports: Vec<(u16, super::upnp::MapProto)>,
+        lease: Option<std::time::Duration>,
+        previous: Option<Self>,
+    ) -> Self {
+        Self {
+            forwarding: PortForwarding::spawn(
+                ports,
+                lease.unwrap_or(DEFAULT_UPNP_LEASE),
+                previous.map(|p| p.forwarding),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ListenerOptions {
     pub listen_addr: Option<SocketAddr>,
@@ -1312,11 +1332,13 @@ async fn managed_needs_rescan(handle: &ManagedTorrent) -> bool {
     }
 }
 
+const DEFAULT_UPNP_LEASE: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn upnp_lease(opts: &SessionOptions) -> std::time::Duration {
     opts.listen
         .as_ref()
         .and_then(|l| l.upnp_lease)
-        .unwrap_or(std::time::Duration::from_secs(300))
+        .unwrap_or(DEFAULT_UPNP_LEASE)
 }
 
 fn upnp_mapping_specs(

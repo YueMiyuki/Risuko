@@ -121,6 +121,9 @@ export default {
 		"A Kad-felderítéshez használt UDP-port. Az érvényes értékek 1 és 65535 között vannak (a motor újraindítása szükséges)",
 	"ed2k-kad-port-invalid":
 		"A Kad UDP-portjának 1 és 65535 közötti egész számnak kell lennie",
+	"ed2k-enable-upload": "Fájlok megosztása ED2K-n",
+	"ed2k-enable-upload-tips":
+		"A kész fájlok és a folyamatban lévő ED2K-letöltések ellenőrzött részeinek feltöltése más peereknek. A Kad még legfeljebb 5 óráig listázhatja a már nem megosztott fájlt (a motor újraindítása szükséges)",
 	"engine-overrides-reserved-keys":
 		"Figyelmen kívül hagyott fenntartott motorfelülbírálási kulcsok: {{keys}}",
 	"engine-overrides-too-large":

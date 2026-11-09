@@ -124,6 +124,9 @@ export default {
 		"Porta UDP usada para descoberta via Kad. Os valores válidos são 1-65535 (requer reinicialização do motor)",
 	"ed2k-kad-port-invalid":
 		"A porta UDP do Kad deve ser um número inteiro de 1 a 65535",
+	"ed2k-enable-upload": "Compartilhar arquivos via ED2K",
+	"ed2k-enable-upload-tips":
+		"Envia a outros pares os arquivos concluídos e as partes verificadas dos downloads ED2K em andamento. O Kad pode continuar listando um arquivo que você parou de compartilhar por até 5 horas (requer reinicialização do motor)",
 	"engine-overrides-reserved-keys":
 		"Chaves reservadas ignoradas nas substituições do motor: {{keys}}",
 	"engine-overrides-too-large":

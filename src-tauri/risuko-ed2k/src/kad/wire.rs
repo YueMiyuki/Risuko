@@ -17,6 +17,8 @@ pub const OP_ROUTING_REQ: u8 = 0x21;
 pub const OP_ROUTING_RES: u8 = 0x29;
 pub const OP_SEARCH_SOURCE_REQ: u8 = 0x34;
 pub const OP_SEARCH_RES: u8 = 0x3b;
+pub const OP_PUBLISH_SOURCE_REQ: u8 = 0x44;
+pub const OP_PUBLISH_RES: u8 = 0x4b;
 pub const OP_PING: u8 = 0x60;
 pub const OP_PONG: u8 = 0x61;
 
@@ -24,6 +26,8 @@ pub const TAG_SOURCE_IP: u8 = 0xfe;
 pub const TAG_SOURCE_PORT: u8 = 0xfd;
 pub const TAG_SOURCE_UDP_PORT: u8 = 0xfc;
 pub const TAG_SOURCE_TYPE: u8 = 0xff;
+pub const TAG_FILESIZE: u8 = 0x02;
+pub const TAG_ENCRYPTION: u8 = 0xf3;
 
 fn id_to_wire(id: &KadId) -> KadId {
     let mut wire = *id;
@@ -694,6 +698,34 @@ pub fn parse_source_search_response(payload: &[u8]) -> Result<SourceSearchRespon
     Ok(SourceSearchResponse { target, sources })
 }
 
+pub fn build_publish_source_request(
+    file_hash: &KadId,
+    source_id: &KadId,
+    tags: &[KadTag],
+) -> KadPacket {
+    let mut payload = Vec::with_capacity(64);
+    payload.extend_from_slice(&id_to_wire(file_hash));
+    payload.extend_from_slice(&id_to_wire(source_id));
+    encode_tags(&mut payload, tags);
+    KadPacket::new(OP_PUBLISH_SOURCE_REQ, payload)
+}
+
+pub fn parse_publish_source_request(
+    payload: &[u8],
+) -> Result<(KadId, KadId, Vec<KadTag>), WireError> {
+    let mut cursor = Cursor::new(payload);
+    let file_hash = cursor.id("publish target")?;
+    let source_id = cursor.id("publish source")?;
+    let tags = decode_tags(&mut cursor)?;
+    cursor.finish("publish request trailing bytes")?;
+    Ok((file_hash, source_id, tags))
+}
+
+pub fn parse_publish_response(payload: &[u8]) -> Result<KadId, WireError> {
+    let mut cursor = Cursor::new(payload);
+    cursor.id("publish response target")
+}
+
 pub fn build_ping() -> KadPacket {
     KadPacket::new(OP_PING, Vec::new())
 }
@@ -1145,5 +1177,32 @@ mod tests {
         assert!(parse_pong(&[]).is_err());
         assert!(parse_pong(&[1]).is_err());
         assert!(parse_pong(&[0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn publish_source_request_roundtrips_target_source_and_tags() {
+        let file: KadId = std::array::from_fn(|i| i as u8);
+        let source: KadId = std::array::from_fn(|i| 100 + i as u8);
+        let tags = vec![
+            KadTag::uint(TAG_SOURCE_TYPE, 1),
+            KadTag::uint(TAG_SOURCE_PORT, 4662),
+            KadTag {
+                wire_type: Some(TAGTYPE_UINT16),
+                ..KadTag::uint(TAG_SOURCE_UDP_PORT, 4672)
+            },
+            KadTag::uint(TAG_FILESIZE, 5_000_000_000),
+        ];
+        let packet = build_publish_source_request(&file, &source, &tags);
+        assert_eq!(packet.opcode, OP_PUBLISH_SOURCE_REQ);
+        assert_eq!(&packet.payload[..4], &[3, 2, 1, 0]);
+        let (target, id, decoded) = parse_publish_source_request(&packet.payload).unwrap();
+        assert_eq!((target, id), (file, source));
+        let value = |name| decoded.iter().find_map(|t| t.id_value(name)).cloned();
+        assert_eq!(value(TAG_SOURCE_PORT), Some(KadTagValue::UInt(4662)));
+        assert_eq!(value(TAG_SOURCE_UDP_PORT), Some(KadTagValue::UInt(4672)));
+        assert_eq!(value(TAG_FILESIZE), Some(KadTagValue::UInt(5_000_000_000)));
+        let mut response = packet.payload[..16].to_vec();
+        response.push(0);
+        assert_eq!(parse_publish_response(&response).unwrap(), file);
     }
 }

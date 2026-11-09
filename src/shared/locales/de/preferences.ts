@@ -124,6 +124,9 @@ export default {
 		"UDP-Port für die Suche über Kad. Gültige Werte liegen zwischen 1 und 65535 (Engine-Neustart erforderlich)",
 	"ed2k-kad-port-invalid":
 		"Der Kad-UDP-Port muss eine Ganzzahl zwischen 1 und 65535 sein",
+	"ed2k-enable-upload": "Dateien über ED2K teilen",
+	"ed2k-enable-upload-tips":
+		"Fertige Dateien und geprüfte Teile laufender ED2K-Downloads an andere Peers hochladen. Kad kann eine nicht mehr geteilte Datei noch bis zu 5 Stunden auflisten (Engine-Neustart erforderlich)",
 	"engine-overrides-reserved-keys":
 		"Reservierte Schlüssel für Engine-Überschreibungen wurden ignoriert: {{keys}}",
 	"engine-overrides-too-large":

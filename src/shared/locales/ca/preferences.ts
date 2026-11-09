@@ -126,6 +126,9 @@ export default {
 		"Port UDP utilitzat per a la descoberta mitjançant Kad. Els valors vàlids són de l'1 al 65535 (cal reiniciar el motor)",
 	"ed2k-kad-port-invalid":
 		"El port UDP de Kad ha de ser un enter entre 1 i 65535",
+	"ed2k-enable-upload": "Comparteix fitxers per ED2K",
+	"ed2k-enable-upload-tips":
+		"Puja a altres parells els fitxers acabats i les parts verificades de les baixades ED2K en curs. Kad pot continuar llistant un fitxer que ja no comparteixes fins a 5 hores (cal reiniciar el motor)",
 	"engine-overrides-reserved-keys":
 		"S'han ignorat les claus reservades de les sobreescriptures del motor: {{keys}}",
 	"engine-overrides-too-large":

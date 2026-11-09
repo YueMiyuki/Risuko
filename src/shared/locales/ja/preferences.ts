@@ -117,6 +117,9 @@ export default {
 		"Kad のソース検出に使用する UDP ポート。有効な値は 1-65535 です（エンジンの再起動が必要です）",
 	"ed2k-kad-port-invalid":
 		"Kad UDP ポートは 1 から 65535 までの整数である必要があります",
+	"ed2k-enable-upload": "ED2K でファイルを共有",
+	"ed2k-enable-upload-tips":
+		"完了したファイルと、ダウンロード中の ED2K タスクの検証済みパートを他のピアにアップロードします。共有をやめたファイルも、Kad 上には最大 5 時間掲載されたままになることがあります（エンジンの再起動が必要です）",
 	"engine-overrides-reserved-keys":
 		"次の予約済みエンジン上書きキーは無視されました: {{keys}}",
 	"engine-overrides-too-large":
