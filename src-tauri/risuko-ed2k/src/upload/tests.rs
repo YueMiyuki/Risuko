@@ -392,7 +392,8 @@ async fn a_download_shares_its_partial_and_returns_the_hashset() {
     let out = dir.path().join("out");
     let done = crate::run_ed2k_download_with_proxy(
         &link,
-        out.to_str().unwrap(),
+        crate::partial::reserve(out.to_str().unwrap(), &link.file_name, &link, true).unwrap(),
+        true,
         vec!["127.0.0.1:1".into()],
         0,
         None,

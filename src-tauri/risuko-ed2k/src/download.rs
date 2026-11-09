@@ -418,15 +418,17 @@ fn is_foreign_high_id_source(ip: u32, port: u16, own_id: u32, own_port: u16) -> 
     is_high_id(ip) && (ip, port) != (own_id, own_port)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Ed2kCompleted {
     pub path: PathBuf,
     pub hashset: Vec<[u8; 16]>,
+    pub claim: partial::PathClaim,
 }
 
 pub async fn run_ed2k_download_with_proxy(
     file_link: &Ed2kFileLink,
-    dir: &str,
+    target: partial::PathClaim,
+    auto_rename: bool,
     ed2k_servers: Vec<String>,
     client_port: u16,
     kad_udp_port: Option<u16>,
@@ -441,12 +443,10 @@ pub async fn run_ed2k_download_with_proxy(
     throttle: Throttle,
     share: Option<ShareContext>,
 ) -> Result<Ed2kCompleted, String> {
-    let final_path = partial::final_path(dir, &file_link.file_name);
-    let _claim = partial::PathClaim::acquire(&final_path)?;
     let part_map = PartMap::new(file_link.file_size);
     run_download(
         file_link,
-        dir,
+        target.path(),
         ed2k_servers,
         client_port,
         kad_udp_port,
@@ -464,19 +464,19 @@ pub async fn run_ed2k_download_with_proxy(
     )
     .await?;
     let hashset = part_map.hashset().unwrap_or_default();
-    let target = final_path.clone();
-    tokio::task::spawn_blocking(move || partial::finalize(&target))
+    let claim = tokio::task::spawn_blocking(move || partial::finalize(target, auto_rename))
         .await
         .map_err(|e| format!("Finalize task failed: {e}"))??;
     Ok(Ed2kCompleted {
-        path: final_path,
+        path: claim.path().to_path_buf(),
         hashset,
+        claim,
     })
 }
 
 async fn run_download(
     file_link: &Ed2kFileLink,
-    dir: &str,
+    final_path: &Path,
     ed2k_servers: Vec<String>,
     client_port: u16,
     kad_udp_port: Option<u16>,
@@ -495,9 +495,8 @@ async fn run_download(
     let worker_cancel = cancel_token.child_token();
     let _worker_guard = DownloadWorkerGuard(worker_cancel.clone());
     let file_hash = file_link.file_hash_bytes;
-    let final_path = partial::final_path(dir, &file_link.file_name);
-    let file_path = partial::part_path(&final_path);
-    let met_path = partial::met_path(&final_path);
+    let file_path = partial::part_path(final_path);
+    let met_path = partial::met_path(final_path);
 
     total.store(file_link.file_size, Ordering::Relaxed);
 
@@ -508,10 +507,15 @@ async fn run_download(
             .map_err(|e| format!("Sidecar load failed: {e}"))?
     };
     if met.is_none() {
-        let target = final_path.clone();
-        tokio::task::spawn_blocking(move || partial::remove_partial_files(&target))
-            .await
-            .map_err(|e| format!("Cleanup task failed: {e}"))?;
+        let (target, sidecar) = (final_path.to_path_buf(), met_path.clone());
+        let owner = partial::Met::new(file_hash, file_link.file_size, None, Vec::new());
+        tokio::task::spawn_blocking(move || {
+            partial::remove_partial_files(&target);
+            partial::save_met(&sidecar, &owner)
+        })
+        .await
+        .map_err(|e| format!("Cleanup task failed: {e}"))?
+        .map_err(|e| format!("Failed to write {}: {e}", met_path.display()))?;
     }
 
     let mut chunks = ChunkManager::new(file_path.clone(), file_link.file_size)
@@ -1483,6 +1487,46 @@ mod tests {
         assert!(!parent.is_cancelled());
     }
 
+    async fn run_unreachable(
+        link: &Ed2kFileLink,
+        target: &Path,
+        kad_status: Arc<parking_lot::Mutex<Option<KadLookupStatus>>>,
+    ) -> Result<Ed2kCompleted, String> {
+        run_ed2k_download_with_proxy(
+            link,
+            partial::PathClaim::acquire(target).unwrap(),
+            true,
+            vec!["127.0.0.1:1".into()],
+            4662,
+            None,
+            None,
+            kad_status,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            CancellationToken::new(),
+            risuko_http::ProxyConnector::direct(),
+            Throttle::unlimited(),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_new_partial_records_its_owner_before_any_part_verifies() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = super::super::parse_ed2k_link(
+            "ed2k://|file|test.bin|1|0123456789abcdef0123456789abcdef|/",
+        )
+        .unwrap();
+        let fin = directory.path().join("test.bin");
+        let kad_status = Arc::new(parking_lot::Mutex::new(None));
+        assert!(run_unreachable(&link, &fin, kad_status).await.is_err());
+        assert!(partial::part_path(&fin).exists());
+        assert!(partial::load_met(&partial::met_path(&fin), &link).is_some());
+    }
+
     #[tokio::test]
     async fn unavailable_kad_preserves_the_initial_failure_diagnostic() {
         let directory = tempfile::tempdir().unwrap();
@@ -1498,22 +1542,10 @@ mod tests {
             error: Some("UDP port is already in use".into()),
         })));
 
-        let result = run_ed2k_download_with_proxy(
+        let result = run_unreachable(
             &link,
-            directory.path().to_str().unwrap(),
-            vec!["127.0.0.1:1".into()],
-            4662,
-            None,
-            None,
+            &directory.path().join("test.bin"),
             kad_status.clone(),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU32::new(0)),
-            CancellationToken::new(),
-            risuko_http::ProxyConnector::direct(),
-            Throttle::unlimited(),
-            None,
         )
         .await;
 

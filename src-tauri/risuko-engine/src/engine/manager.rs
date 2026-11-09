@@ -415,22 +415,88 @@ fn apply_task_patch(
     }
 }
 
-fn ed2k_final_path(task: &DownloadTask) -> Option<PathBuf> {
-    let link = super::ed2k::parse_ed2k_link(task.uris.first()?).ok()?;
-    Some(super::ed2k::partial::final_path(&task.dir, &link.file_name))
+fn ed2k_file_name<'a>(out: &'a str, link: &'a super::ed2k::types::Ed2kFileLink) -> &'a str {
+    if out.is_empty() {
+        &link.file_name
+    } else {
+        out
+    }
 }
 
-fn ed2k_paths_in_use(tasks: &[DownloadTask], except: &[String]) -> HashSet<PathBuf> {
-    tasks
+fn ed2k_target(task: &DownloadTask) -> Option<(PathBuf, super::ed2k::types::Ed2kFileLink)> {
+    let link = super::ed2k::parse_ed2k_link(task.uris.first()?).ok()?;
+    let path = super::ed2k::partial::final_path(&task.dir, ed2k_file_name(&task.out, &link));
+    Some((path, link))
+}
+
+async fn record_ed2k_target(tasks: &Arc<RevLock>, gid: &str, path: &Path) {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let mut tasks = tasks.write().await;
+    if let Some(task) = tasks.iter_mut().find(|t| t.gid == gid && t.out != name) {
+        task.out = name;
+        refresh_persisted_file_paths(task);
+    }
+}
+
+fn ed2k_partial_users(
+    tasks: &[DownloadTask],
+    except: &[String],
+    live: &HashSet<String>,
+) -> HashMap<PathBuf, HashSet<[u8; 16]>> {
+    let mut users: HashMap<PathBuf, HashSet<[u8; 16]>> = HashMap::new();
+    for (path, link) in tasks
         .iter()
         .filter(|t| {
             t.kind == TaskKind::Ed2k
                 && !t.seeder
-                && !matches!(t.status, TaskStatus::Complete | TaskStatus::Removed)
-                && !except.contains(&t.gid)
+                && (live.contains(&t.gid)
+                    || (!matches!(t.status, TaskStatus::Complete | TaskStatus::Removed)
+                        && !except.contains(&t.gid)))
         })
-        .filter_map(ed2k_final_path)
-        .collect()
+        .filter_map(ed2k_target)
+    {
+        users.entry(path).or_default().insert(link.file_hash_bytes);
+    }
+    users
+}
+
+fn ed2k_partial_is_ours(
+    path: &Path,
+    link: &super::ed2k::types::Ed2kFileLink,
+    users: Option<&HashSet<[u8; 16]>>,
+) -> bool {
+    let met = super::ed2k::partial::met_path(path);
+    if super::ed2k::partial::load_met(&met, link).is_some() {
+        users.is_none_or(|hashes| !hashes.contains(&link.file_hash_bytes))
+    } else {
+        !met.exists() && users.is_none()
+    }
+}
+
+fn relocate_ed2k_partial(from: &Path, to: &Path) -> Result<bool, String> {
+    use super::ed2k::partial::{met_path, part_path};
+    let (old_part, new_part) = (part_path(from), part_path(to));
+    let (old_met, new_met) = (met_path(from), met_path(to));
+    if !old_part.exists() {
+        return Ok(false);
+    }
+    if from == to {
+        return Ok(true);
+    }
+    if new_part.exists() || new_met.exists() {
+        return Err(format!(
+            "Cannot relocate partial: destination already exists ({})",
+            new_part.display()
+        ));
+    }
+    if let Some(parent) = new_part.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create destination dir {}: {e}", parent.display()))?;
+    }
+    http::relocate_file_pair(&old_part, &new_part, &old_met, &new_met)?;
+    Ok(true)
 }
 
 fn ed2k_kad_task_status(status: &KadLookupStatus) -> Ed2kKadTaskStatus {
@@ -3256,6 +3322,7 @@ impl TaskManager {
         let gid = task.gid.clone();
         let uri = task.uris.first().cloned().unwrap_or_default();
         let dir = task.dir.clone();
+        let out = task.out.clone();
         let task_options = task.options.clone();
         let seeding = task.seeder;
         let events = self.events.clone();
@@ -3346,18 +3413,24 @@ impl TaskManager {
             let c = counters.clone();
             let result = match file_link {
                 Ok(link) if seeding => {
-                    let path = super::ed2k::partial::final_path(&dir, &link.file_name);
+                    let path = super::ed2k::partial::final_path(&dir, ed2k_file_name(&out, &link));
                     match upload_runtime {
                         UploadRuntime::Running(_) => {
-                            let verified = verify_complete_file(
-                                config_dir,
-                                path.clone(),
-                                link.file_hash_bytes,
-                                link.file_size,
-                                c.cancel_token.clone(),
-                            )
-                            .await;
-                            seed_ed2k(verified, &share, &link, &path, &c.cancel_token).await
+                            async {
+                                let _claim =
+                                    super::ed2k::partial::PathClaim::acquire_async(path.clone())
+                                        .await?;
+                                let verified = verify_complete_file(
+                                    config_dir,
+                                    path.clone(),
+                                    link.file_hash_bytes,
+                                    link.file_size,
+                                    c.cancel_token.clone(),
+                                )
+                                .await;
+                                seed_ed2k(verified, &share, &link, &path, &c.cancel_token).await
+                            }
+                            .await
                         }
                         UploadRuntime::Disabled => Ok(path),
                         UploadRuntime::Failed(reason) => {
@@ -3379,9 +3452,26 @@ impl TaskManager {
                                 ),
                             ),
                         );
+                        let auto_rename = effective_options
+                            .get_bool("auto-file-renaming")
+                            .unwrap_or(true);
+                        let target = {
+                            let (dir, name, link) = (
+                                dir.clone(),
+                                ed2k_file_name(&out, &link).to_string(),
+                                link.clone(),
+                            );
+                            tokio::task::spawn_blocking(move || {
+                                super::ed2k::partial::reserve(&dir, &name, &link, auto_rename)
+                            })
+                            .await
+                            .map_err(|e| format!("Reserve task failed: {e}"))??
+                        };
+                        record_ed2k_target(&tasks, &gid, target.path()).await;
                         let downloaded = super::ed2k::run_ed2k_download_with_proxy(
                             &link,
-                            &dir,
+                            target,
+                            auto_rename,
                             effective_options.ed2k_servers(),
                             effective_options.ed2k_port(),
                             kad_udp_port,
@@ -3397,25 +3487,29 @@ impl TaskManager {
                             uploads_enabled.then(|| share.clone()),
                         )
                         .await;
-                        let done = match downloaded {
+                        if let Ok(done) = &downloaded {
+                            record_ed2k_target(&tasks, &gid, &done.path).await;
+                        }
+                        let super::ed2k::download::Ed2kCompleted {
+                            path,
+                            hashset,
+                            claim: _claim,
+                        } = match downloaded {
                             Ok(done) if uploads_enabled => done,
                             other => return other.map(|done| done.path),
                         };
                         let verified = match remember_complete_file(
                             config_dir,
-                            done.path.clone(),
+                            path.clone(),
                             link.file_hash_bytes,
-                            done.hashset,
+                            hashset,
                         )
                         .await
                         {
                             Ok(verified) => verified,
                             Err(error) => {
-                                tracing::warn!(
-                                    "[ed2k] Not sharing {}: {error}",
-                                    done.path.display()
-                                );
-                                return Ok(done.path);
+                                tracing::warn!("[ed2k] Not sharing {}: {error}", path.display());
+                                return Ok(path);
                             }
                         };
                         if !begin_ed2k_seeding(
@@ -3425,14 +3519,14 @@ impl TaskManager {
                             &events,
                             &gid,
                             worker_epoch,
-                            &done.path,
+                            &path,
                         )
                         .await
                         {
-                            return Ok(done.path);
+                            return Ok(path);
                         }
                         counters.speed.store(0, Ordering::Relaxed);
-                        seed_ed2k(Ok(verified), &share, &link, &done.path, &c.cancel_token).await
+                        seed_ed2k(Ok(verified), &share, &link, &path, &c.cancel_token).await
                     }
                     .await
                 }
@@ -4607,20 +4701,21 @@ impl TaskManager {
 
     pub async fn remove(&self, gid: &str) -> Result<(), String> {
         tracing::info!("[task:{}] Removing", gid);
-        if let Some((_, token)) = self.worker_epoch_and_cancel(gid).await {
+        let worker = self.worker_epoch_and_cancel(gid).await;
+        if let Some((_, token)) = &worker {
             token.cancel();
         }
 
-        let found = {
+        let (found, is_ed2k) = {
             let mut tasks = self.tasks.write().await;
             match tasks.iter_mut().find(|t| t.gid == gid) {
                 Some(task) => {
                     task.status = TaskStatus::Removed;
                     task.download_speed = 0;
                     task.upload_speed = 0;
-                    true
+                    (true, task.kind == TaskKind::Ed2k)
                 }
-                None => false,
+                None => (false, false),
             }
         };
 
@@ -4632,6 +4727,11 @@ impl TaskManager {
         self.pending_magnets.write().await.remove(gid);
         self.cleanup_m3u8_temp(gid).await;
         self.cleanup_p2p_partial(gid).await;
+        if let Some((epoch, _)) = worker.filter(|_| is_ed2k) {
+            if !self.wait_for_worker_epoch_exit(gid, epoch).await {
+                tracing::warn!("[task:{gid}] eD2K worker still running; keeping its partial file");
+            }
+        }
         self.cleanup_ed2k_partials(&[gid.to_string()]).await;
 
         if found {
@@ -5219,13 +5319,17 @@ impl TaskManager {
         drop(updating_guard.take());
 
         let mut progress_preserved = true;
-        let ed2k_partial_shared = kind == TaskKind::Ed2k && {
+        let mut ed2k_move = None;
+        if kind == TaskKind::Ed2k {
+            let live = self.live_worker_gids().await;
             let tasks = self.tasks.read().await;
-            super::ed2k::parse_ed2k_link(&old_primary_uri).is_ok_and(|link| {
-                ed2k_paths_in_use(&tasks, &[gid.to_string()])
-                    .contains(&super::ed2k::partial::final_path(&old_dir, &link.file_name))
-            })
-        };
+            if let Ok(link) = super::ed2k::parse_ed2k_link(&old_primary_uri) {
+                let from =
+                    super::ed2k::partial::final_path(&old_dir, ed2k_file_name(&old_out, &link));
+                let users = ed2k_partial_users(&tasks, &[gid.to_string()], &live).remove(&from);
+                ed2k_move = Some((link, from, users));
+            }
+        }
         if path_changed && kind != TaskKind::Torrent {
             let relocate_old_out = if old_out.is_empty() {
                 http::sanitize_filename(&http::infer_filename_from_uri(&old_primary_uri))
@@ -5237,13 +5341,20 @@ impl TaskManager {
             } else {
                 new_out.clone()
             };
-            if relocate_old_out.is_empty() || relocate_new_out.is_empty() || ed2k_partial_shared {
+            if relocate_old_out.is_empty() || relocate_new_out.is_empty() {
                 progress_preserved = false;
             } else {
                 let (from_dir, to_dir) = (old_dir.clone(), new_dir.clone());
                 let (from_out, to_out) = (relocate_old_out.clone(), relocate_new_out.clone());
-                let moved = tokio::task::spawn_blocking(move || {
-                    http::relocate_partial(&from_dir, &from_out, &to_dir, &to_out)
+                let moved = tokio::task::spawn_blocking(move || match ed2k_move {
+                    Some((link, from, users)) => {
+                        if !ed2k_partial_is_ours(&from, &link, users.as_ref()) {
+                            return Ok(false);
+                        }
+                        let to = super::ed2k::partial::final_path(&to_dir, &to_out);
+                        relocate_ed2k_partial(&from, &to)
+                    }
+                    None => http::relocate_partial(&from_dir, &from_out, &to_dir, &to_out),
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("relocate task failed: {e}")));
@@ -6232,16 +6343,25 @@ impl TaskManager {
         }
     }
 
+    async fn live_worker_gids(&self) -> HashSet<String> {
+        let mut live: HashSet<String> =
+            self.active_downloads.read().await.keys().cloned().collect();
+        live.extend(self.starting_workers.lock().keys().cloned());
+        live
+    }
+
     async fn cleanup_ed2k_partials(&self, gids: &[String]) {
-        let targets: Vec<(String, String, bool)> = {
+        let live = self.live_worker_gids().await;
+        let targets: Vec<_> = {
             let tasks = self.tasks.read().await;
-            let in_use = ed2k_paths_in_use(&tasks, gids);
+            let users = ed2k_partial_users(&tasks, gids, &live);
             tasks
                 .iter()
                 .filter(|t| t.kind == TaskKind::Ed2k && gids.contains(&t.gid))
-                .filter_map(|t| {
-                    let shared = ed2k_final_path(t).is_some_and(|path| in_use.contains(&path));
-                    Some((t.dir.clone(), t.uris.first()?.clone(), shared))
+                .filter_map(ed2k_target)
+                .map(|(path, link)| {
+                    let users = users.get(&path).cloned();
+                    (path, link, users)
                 })
                 .collect()
         };
@@ -6250,12 +6370,10 @@ impl TaskManager {
         }
         let config_dir = self.config_dir.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            for (dir, uri, shared) in targets {
-                if let Ok(link) = super::ed2k::parse_ed2k_link(&uri) {
-                    super::ed2k::share::remove_known(&config_dir, &link.file_hash_bytes);
-                }
-                if !shared {
-                    super::ed2k::partial::remove_partial(&dir, &uri);
+            for (path, link, users) in targets {
+                super::ed2k::share::remove_known(&config_dir, &link.file_hash_bytes);
+                if ed2k_partial_is_ours(&path, &link, users.as_ref()) {
+                    super::ed2k::partial::remove_partial_files(&path);
                 }
             }
         })
@@ -7225,6 +7343,9 @@ mod tests {
             let out = dir.path().join("out");
             options.set("dir".into(), Value::from(out.to_str().unwrap()));
         }
+        let taken = dir.path().join("out").join("got.bin");
+        std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+        std::fs::write(&taken, b"someone else's file").unwrap();
         let uri = format!(
             "ed2k://|file|got.bin|{}|{}|/|sources,127.0.0.1:{}|/",
             data.len(),
@@ -7248,20 +7369,25 @@ mod tests {
                 .is_some_and(|file| file.is_complete())
         })
         .await;
-        let path = dir.path().join("out").join("got.bin");
+        let path = dir.path().join("out").join("got.1.bin");
+        let claimed = || super::super::ed2k::partial::PathClaim::acquire(&path).is_err();
         assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's file");
+        assert!(claimed());
         {
             let tasks = mgr.tasks.read().await;
             let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.out, "got.1.bin");
             assert_eq!(task.files[0].path, path.to_string_lossy());
             assert_eq!(task.completed_length, data.len() as u64);
         }
 
         mgr.pause(&gid).await.unwrap();
         wait_for("the share to be withdrawn", async || {
-            mgr.ed2k_shares.get(&hash).is_none()
+            mgr.ed2k_shares.get(&hash).is_none() && mgr.active_downloads.read().await.is_empty()
         })
         .await;
+        assert!(!claimed());
         {
             let tasks = mgr.tasks.read().await;
             let task = tasks.iter().find(|t| t.gid == gid).unwrap();
@@ -7277,6 +7403,7 @@ mod tests {
         })
         .await;
         mgr.update_progress().await;
+        assert!(claimed());
         let full = data.len().to_string();
         {
             let tasks = mgr.tasks.read().await;
@@ -7300,6 +7427,7 @@ mod tests {
             assert_eq!((task.status, task.seeder), (TaskStatus::Complete, false));
             assert_eq!(task.completed_length, data.len() as u64);
         }
+        assert!(!claimed());
         let mut completions = Vec::new();
         while let Ok(event) = events.try_recv() {
             match event {
@@ -9067,21 +9195,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let part = dir.path().join("f.bin.part");
         let met = dir.path().join("f.bin.part.met");
-        std::fs::write(&part, b"partial").unwrap();
-        std::fs::write(&met, b"{}").unwrap();
-        let task = |gid: &str, status: TaskStatus| {
-            let mut t = DownloadTask::new_ed2k(
-                gid.into(),
-                "ed2k://|file|f.bin|1000|0123456789abcdef0123456789abcdef|/".into(),
-                "f.bin".into(),
-                1000,
-                dir.path().to_string_lossy().into(),
-                None,
-                Map::new(),
-            );
-            t.status = status;
-            t
-        };
+        write_ed2k_partial(&dir.path().join("f.bin"), ED2K_HASH);
+        let task = |gid: &str, status: TaskStatus| ed2k_task_in(dir.path(), gid, status);
         let mgr = make_test_manager(vec![
             task("a", TaskStatus::Paused),
             task("b", TaskStatus::Paused),
@@ -9098,6 +9213,153 @@ mod tests {
         assert!(!part.exists() && !met.exists());
     }
 
+    const ED2K_HASH: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_ED2K_HASH: &str = "fedcba9876543210fedcba9876543210";
+
+    fn ed2k_uri(hash: &str) -> String {
+        format!("ed2k://|file|f.bin|1000|{hash}|/")
+    }
+
+    fn write_ed2k_partial(final_path: &Path, hash: &str) {
+        use super::super::ed2k::partial::{met_path, part_path, save_met, Met};
+        let link = super::super::ed2k::parse_ed2k_link(&ed2k_uri(hash)).unwrap();
+        std::fs::write(part_path(final_path), b"partial").unwrap();
+        let met = Met::new(link.file_hash_bytes, link.file_size, None, Vec::new());
+        save_met(&met_path(final_path), &met).unwrap();
+    }
+
+    fn ed2k_task_in(dir: &Path, gid: &str, status: TaskStatus) -> DownloadTask {
+        ed2k_task_for(dir, gid, ED2K_HASH, status)
+    }
+
+    fn ed2k_task_for(dir: &Path, gid: &str, hash: &str, status: TaskStatus) -> DownloadTask {
+        let mut t = DownloadTask::new_ed2k(
+            gid.into(),
+            ed2k_uri(hash),
+            "f.bin".into(),
+            1000,
+            dir.to_string_lossy().into(),
+            None,
+            Map::new(),
+        );
+        t.status = status;
+        t
+    }
+
+    fn fake_worker(epoch: u64) -> ActiveDownload {
+        Counters::new(0, 0).to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn removing_a_renamed_ed2k_task_cleans_its_own_partial_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ed2k_partial(&dir.path().join("f.bin"), ED2K_HASH);
+        write_ed2k_partial(&dir.path().join("f.1.bin"), ED2K_HASH);
+        let mut renamed = ed2k_task_in(dir.path(), "a", TaskStatus::Paused);
+        renamed.out = "f.1.bin".into();
+        let mgr = make_test_manager(vec![renamed]);
+
+        mgr.remove("a").await.unwrap();
+        assert!(!dir.path().join("f.1.bin.part").exists());
+        assert!(!dir.path().join("f.1.bin.part.met").exists());
+        assert!(dir.path().join("f.bin.part").exists());
+        assert!(dir.path().join("f.bin.part.met").exists());
+    }
+
+    #[tokio::test]
+    async fn removing_an_ed2k_task_deletes_only_partials_its_link_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin = dir.path().join("f.bin");
+        let part = dir.path().join("f.bin.part");
+
+        write_ed2k_partial(&fin, ED2K_HASH);
+        let mgr = make_test_manager(vec![
+            ed2k_task_for(dir.path(), "owner", ED2K_HASH, TaskStatus::Paused),
+            ed2k_task_for(dir.path(), "queued", OTHER_ED2K_HASH, TaskStatus::Waiting),
+        ]);
+        mgr.remove("owner").await.unwrap();
+        assert!(!part.exists());
+
+        write_ed2k_partial(&fin, OTHER_ED2K_HASH);
+        let mgr = make_test_manager(vec![
+            ed2k_task_for(dir.path(), "queued", ED2K_HASH, TaskStatus::Waiting),
+            ed2k_task_for(dir.path(), "owner", OTHER_ED2K_HASH, TaskStatus::Paused),
+        ]);
+        mgr.remove("queued").await.unwrap();
+        mgr.remove_download_result("queued").await.unwrap();
+        assert!(part.exists());
+    }
+
+    #[tokio::test]
+    async fn moving_an_ed2k_task_carries_its_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        let (old_dir, new_dir) = (root.path().join("old"), root.path().join("new"));
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_ed2k_partial(&old_dir.join("f.bin"), ED2K_HASH);
+        let mgr = make_test_manager(vec![ed2k_task_in(&old_dir, "a", TaskStatus::Paused)]);
+
+        let outcome = mgr
+            .update_task(
+                "a",
+                TaskPatch {
+                    dir: Some(new_dir.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.progress_preserved);
+        assert!(new_dir.join("f.bin.part").exists());
+        assert!(new_dir.join("f.bin.part.met").exists());
+        assert!(!old_dir.join("f.bin.part.met").exists());
+    }
+
+    #[tokio::test]
+    async fn ed2k_partials_are_kept_while_a_removed_worker_unwinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f.bin.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let mgr = make_test_manager(vec![
+            ed2k_task_in(dir.path(), "a", TaskStatus::Removed),
+            ed2k_task_in(dir.path(), "b", TaskStatus::Paused),
+        ]);
+        mgr.active_downloads
+            .write()
+            .await
+            .insert("a".into(), fake_worker(next_worker_epoch()));
+
+        mgr.remove("b").await.unwrap();
+        assert!(part.exists());
+
+        mgr.active_downloads.write().await.remove("a");
+        mgr.purge_download_result().await;
+        assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_an_ed2k_task_waits_for_its_worker_before_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f.bin.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let mgr = make_test_manager(vec![ed2k_task_in(dir.path(), "a", TaskStatus::Active)]);
+        let worker = fake_worker(next_worker_epoch());
+        let cancel = worker.cancel_token.clone();
+        mgr.active_downloads
+            .write()
+            .await
+            .insert("a".into(), worker);
+        let active = mgr.active_downloads.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            active.write().await.remove("a");
+        });
+
+        mgr.remove("a").await.unwrap();
+        assert!(!part.exists());
+    }
+
     #[tokio::test]
     async fn moving_an_ed2k_task_leaves_a_shared_partial_in_place() {
         let root = tempfile::tempdir().unwrap();
@@ -9105,19 +9367,7 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
         std::fs::write(old_dir.join("f.bin.part"), b"partial").unwrap();
-        let task = |gid: &str| {
-            let mut t = DownloadTask::new_ed2k(
-                gid.into(),
-                "ed2k://|file|f.bin|1000|0123456789abcdef0123456789abcdef|/".into(),
-                "f.bin".into(),
-                1000,
-                old_dir.to_string_lossy().into(),
-                None,
-                Map::new(),
-            );
-            t.status = TaskStatus::Paused;
-            t
-        };
+        let task = |gid: &str| ed2k_task_in(&old_dir, gid, TaskStatus::Paused);
         let mgr = make_test_manager(vec![task("a"), task("b")]);
 
         let outcome = mgr

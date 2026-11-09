@@ -192,7 +192,7 @@ fn copy_file_durable(src: &Path, dst: &Path, what: &str) -> Result<(), String> {
     sync_path(dst)
 }
 
-fn relocate_file_pair(
+pub(super) fn relocate_file_pair(
     old_part: &Path,
     new_part: &Path,
     old_meta: &Path,
