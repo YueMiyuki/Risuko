@@ -1,5 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::types::Ed2kFileLink;
@@ -47,6 +50,28 @@ impl Met {
 pub fn final_path(dir: &str, file_name: &str) -> PathBuf {
     let safe = risuko_util::safe_filename(file_name, "ed2k-download");
     PathBuf::from(dir).join(safe)
+}
+
+static CLAIMED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+pub struct PathClaim(PathBuf);
+
+impl PathClaim {
+    pub fn acquire(final_path: &Path) -> Result<Self, String> {
+        if !CLAIMED.lock().insert(final_path.to_path_buf()) {
+            return Err(format!(
+                "{} is already being downloaded by another eD2K task",
+                final_path.display()
+            ));
+        }
+        Ok(Self(final_path.to_path_buf()))
+    }
+}
+
+impl Drop for PathClaim {
+    fn drop(&mut self) {
+        CLAIMED.lock().remove(&self.0);
+    }
 }
 
 pub(crate) fn decode_hashset(hashes: &[String]) -> Option<Vec<[u8; 16]>> {
@@ -170,6 +195,17 @@ mod tests {
         save_met(&path, &met).unwrap();
         assert!(load_met(&path, &link(10, [1; 16])).is_none());
         assert!(load_met(&dir.path().join("missing"), &link(10, [1; 16])).is_none());
+    }
+
+    #[test]
+    fn a_claimed_path_cannot_be_claimed_again_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin = dir.path().join("f.bin");
+        let claim = PathClaim::acquire(&fin).unwrap();
+        assert!(PathClaim::acquire(&fin).is_err());
+        assert!(PathClaim::acquire(&dir.path().join("g.bin")).is_ok());
+        drop(claim);
+        assert!(PathClaim::acquire(&fin).is_ok());
     }
 
     #[test]

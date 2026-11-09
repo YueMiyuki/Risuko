@@ -442,6 +442,7 @@ pub async fn run_ed2k_download_with_proxy(
     share: Option<ShareContext>,
 ) -> Result<Ed2kCompleted, String> {
     let final_path = partial::final_path(dir, &file_link.file_name);
+    let _claim = partial::PathClaim::acquire(&final_path)?;
     let part_map = PartMap::new(file_link.file_size);
     run_download(
         file_link,
