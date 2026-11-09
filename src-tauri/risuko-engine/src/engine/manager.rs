@@ -475,8 +475,13 @@ fn ed2k_partial_is_ours(
     }
 }
 
-fn relocate_ed2k_partial(from: &Path, to: &Path) -> Result<bool, String> {
-    use super::ed2k::partial::{met_path, part_path};
+fn relocate_ed2k_partial(
+    from: &Path,
+    to: &Path,
+    link: &super::ed2k::types::Ed2kFileLink,
+    users: Option<&HashSet<[u8; 16]>>,
+) -> Result<bool, String> {
+    use super::ed2k::partial::{met_path, part_path, PathClaim};
     let (old_part, new_part) = (part_path(from), part_path(to));
     let (old_met, new_met) = (met_path(from), met_path(to));
     if !old_part.exists() {
@@ -484,6 +489,13 @@ fn relocate_ed2k_partial(from: &Path, to: &Path) -> Result<bool, String> {
     }
     if from == to {
         return Ok(true);
+    }
+    let Ok(_from_claim) = PathClaim::acquire(from) else {
+        return Ok(false);
+    };
+    let _to_claim = PathClaim::acquire(to)?;
+    if !old_part.exists() || !ed2k_partial_is_ours(from, link, users) {
+        return Ok(false);
     }
     if new_part.exists() || new_met.exists() {
         return Err(format!(
@@ -5316,8 +5328,6 @@ impl TaskManager {
                 }
             }
         }
-        drop(updating_guard.take());
-
         let mut progress_preserved = true;
         let mut ed2k_move = None;
         if kind == TaskKind::Ed2k {
@@ -5348,11 +5358,8 @@ impl TaskManager {
                 let (from_out, to_out) = (relocate_old_out.clone(), relocate_new_out.clone());
                 let moved = tokio::task::spawn_blocking(move || match ed2k_move {
                     Some((link, from, users)) => {
-                        if !ed2k_partial_is_ours(&from, &link, users.as_ref()) {
-                            return Ok(false);
-                        }
                         let to = super::ed2k::partial::final_path(&to_dir, &to_out);
-                        relocate_ed2k_partial(&from, &to)
+                        relocate_ed2k_partial(&from, &to, &link, users.as_ref())
                     }
                     None => http::relocate_partial(&from_dir, &from_out, &to_dir, &to_out),
                 })
@@ -5375,6 +5382,7 @@ impl TaskManager {
             progress_preserved = false;
         }
 
+        drop(updating_guard.take());
         if needs_restart {
             self.reconcile_active_set().await;
         }
@@ -9313,6 +9321,37 @@ mod tests {
         assert!(new_dir.join("f.bin.part").exists());
         assert!(new_dir.join("f.bin.part.met").exists());
         assert!(!old_dir.join("f.bin.part.met").exists());
+        use super::super::ed2k::partial::PathClaim;
+        PathClaim::acquire(&old_dir.join("f.bin")).unwrap();
+        PathClaim::acquire(&new_dir.join("f.bin")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moving_an_ed2k_task_onto_a_claimed_path_leaves_the_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let (old_dir, new_dir) = (root.path().join("old"), root.path().join("new"));
+        std::fs::create_dir_all(&old_dir).unwrap();
+        write_ed2k_partial(&old_dir.join("f.bin"), ED2K_HASH);
+        let _held =
+            super::super::ed2k::partial::PathClaim::acquire(&new_dir.join("f.bin")).unwrap();
+        let mgr = make_test_manager(vec![ed2k_task_in(&old_dir, "a", TaskStatus::Paused)]);
+
+        let outcome = mgr
+            .update_task(
+                "a",
+                TaskPatch {
+                    dir: Some(new_dir.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.progress_preserved);
+        assert!(old_dir.join("f.bin.part").exists());
+        assert!(old_dir.join("f.bin.part.met").exists());
+        assert!(!new_dir.join("f.bin.part").exists());
+        assert!(!new_dir.join("f.bin.part.met").exists());
     }
 
     #[tokio::test]
