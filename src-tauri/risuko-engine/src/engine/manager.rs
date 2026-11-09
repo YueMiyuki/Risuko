@@ -488,7 +488,7 @@ fn relocate_ed2k_partial(
         return Ok(false);
     }
     if from == to {
-        return Ok(true);
+        return Ok(ed2k_partial_is_ours(from, link, users));
     }
     let Ok(_from_claim) = PathClaim::acquire(from) else {
         return Ok(false);
@@ -9324,6 +9324,30 @@ mod tests {
         use super::super::ed2k::partial::PathClaim;
         PathClaim::acquire(&old_dir.join("f.bin")).unwrap();
         PathClaim::acquire(&new_dir.join("f.bin")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_path_ed2k_edit_does_not_adopt_another_links_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_ed2k_partial(&dir.join("f.bin"), OTHER_ED2K_HASH);
+        let mgr = make_test_manager(vec![ed2k_task_in(&dir, "a", TaskStatus::Paused)]);
+
+        let outcome = mgr
+            .update_task(
+                "a",
+                TaskPatch {
+                    dir: Some(format!("{}/", dir.to_string_lossy())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.progress_preserved);
+        assert!(dir.join("f.bin.part").exists());
+        assert!(dir.join("f.bin.part.met").exists());
     }
 
     #[tokio::test]
