@@ -20,5 +20,8 @@
 	},
 	"files": [
 		"risuko.win32-x64-msvc.node"
-	]
+	],
+	"engines": {
+		"node": ">= 22"
+	}
 }

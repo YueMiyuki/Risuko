@@ -20,5 +20,8 @@
 	},
 	"files": [
 		"risuko.darwin-x64.node"
-	]
+	],
+	"engines": {
+		"node": ">= 22"
+	}
 }
