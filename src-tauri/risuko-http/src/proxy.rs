@@ -86,7 +86,9 @@ impl NoProxy {
                 host: rule,
                 port: rule_port,
             } => {
-                rule_port_matches(*rule_port, port) && (host == *rule || is_subdomain(&host, rule))
+                rule_port_matches(*rule_port, port)
+                    && ip.is_none()
+                    && (host == *rule || is_subdomain(&host, rule))
             }
             NoProxyEntry::Ip {
                 addr,
@@ -208,10 +210,9 @@ fn parse_entry(raw: &str) -> Option<NoProxyEntry> {
         return Some(NoProxyEntry::Ip { addr, port });
     }
 
-    if host_part.contains('.')
-        && host_part
-            .split('.')
-            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+    if host_part
+        .split('.')
+        .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
     {
         return None;
     }
@@ -513,6 +514,15 @@ mod tests {
             "bad host,*.example.com,[example.com],example.com:0,example.com:nope,10.0.0.0/33,2001:db8::/129,001.002.003.004",
         );
         assert!(bypass.is_empty());
+    }
+
+    #[test]
+    fn host_rules_never_match_ip_literals() {
+        assert!(NoProxy::parse("1").is_empty());
+        let bypass = NoProxy::parse("1,example.com,internal");
+        assert!(!bypass.matches_host_port("10.0.0.1", None));
+        assert!(!bypass.matches_ip("10.0.0.1".parse().unwrap(), None));
+        assert!(bypass.matches_host_port("a.example.com", None));
     }
 
     #[test]

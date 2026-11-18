@@ -1,3 +1,4 @@
+use crate::engine::util::is_cross_device_error;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -110,8 +111,14 @@ impl UploadSinkManager {
     pub fn load(&self) -> Result<(), String> {
         if let Some(val) = self.storage.load(UPLOAD_STORE_KEY)? {
             if let Some(data_val) = val.get("data").cloned() {
-                let data: UploadStore = serde_json::from_value(data_val)
-                    .map_err(|e| format!("Failed to parse upload sinks: {e}"))?;
+                let data: UploadStore = serde_json::from_value(data_val).map_err(|e| {
+                    crate::traits::keep_unreadable_copy(
+                        self.storage.as_ref(),
+                        UPLOAD_STORE_KEY,
+                        &val,
+                    );
+                    format!("Failed to parse upload sinks: {e}")
+                })?;
                 let new_concurrency = data.max_concurrency.clamp(1, 16);
                 let mut s = self.store.blocking_write();
                 *s = data;
@@ -338,11 +345,21 @@ impl UploadSinkManager {
         gid: &str,
         local_path: PathBuf,
         remote_relative: String,
-        size: u64,
         category: Option<String>,
         task_kind: &str,
         override_sink_id: Option<String>,
     ) {
+        let size = match tokio::fs::metadata(&local_path).await {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => {
+                tracing::warn!("upload: skipping {}: not a file", local_path.display());
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("upload: skipping {}: {e}", local_path.display());
+                return;
+            }
+        };
         let chosen_sink = self
             .pick_sink(
                 &local_path,
@@ -551,9 +568,7 @@ impl UploadSinkManager {
             let res = sink_runtime.upload(&file, &ctl).await;
             match res {
                 Err(e)
-                    if attempt < MAX_UPLOAD_ATTEMPTS
-                        && !cancel.is_cancelled()
-                        && is_retryable_upload_error(&e) =>
+                    if attempt < MAX_UPLOAD_ATTEMPTS && !cancel.is_cancelled() && e.retryable =>
                 {
                     tracing::warn!("upload {job_id}: attempt {attempt} failed ({e}), retrying");
                     ctl.report(0, size);
@@ -588,7 +603,7 @@ impl UploadSinkManager {
                 if cancel.is_cancelled() {
                     self.cancel_job_state(&job_id).await;
                 } else {
-                    self.fail_job(&job_id, &e).await;
+                    self.fail_job(&job_id, &e.message).await;
                 }
             }
         }
@@ -734,24 +749,6 @@ async fn free_destination(path: PathBuf) -> PathBuf {
     path.with_file_name(format!("{stem}.{}", Uuid::new_v4().simple()))
 }
 
-fn is_retryable_upload_error(error: &str) -> bool {
-    let e = error.to_ascii_lowercase();
-    ![
-        "cancel",
-        "auth",
-        "login",
-        "denied",
-        "forbidden",
-        "401",
-        "403",
-        "traversal",
-        "no such file",
-        "open ",
-    ]
-    .iter()
-    .any(|marker| e.contains(marker))
-}
-
 fn upload_retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(2u64.saturating_mul(u64::from(attempt)).min(30))
 }
@@ -800,19 +797,6 @@ async fn run_post_action(
             }
             Ok(())
         }
-    }
-}
-
-fn is_cross_device_error(e: &std::io::Error) -> bool {
-    if e.kind() == std::io::ErrorKind::CrossesDevices {
-        return true;
-    }
-    match e.raw_os_error() {
-        #[cfg(unix)]
-        Some(18) => true,
-        #[cfg(windows)]
-        Some(17) => true,
-        _ => false,
     }
 }
 
@@ -1125,6 +1109,32 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_data_is_kept_when_load_fails() {
+        let dir = TempDir::new().unwrap();
+        let storage: Arc<dyn crate::traits::StorageBackend> =
+            Arc::new(FileStorage::new(dir.path().to_path_buf()));
+        let event_sink: Arc<dyn crate::traits::EventSink> = Arc::new(NoopEventSink);
+        let stored = serde_json::json!({"data": {"sinks": 5}});
+        storage.save(UPLOAD_STORE_KEY, &stored).unwrap();
+
+        assert!(UploadSinkManager::new(storage, event_sink).load().is_err());
+
+        let prefix = format!("{UPLOAD_STORE_KEY}.unreadable-");
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+        assert_eq!(kept, stored);
+    }
+
+    #[test]
     fn build_sink_runtime_webdav_ok() {
         let cfg = SinkConfig::Webdav(WebdavConfig {
             endpoint: "https://dav.example.com".into(),
@@ -1280,15 +1290,6 @@ mod tests {
             std::fs::read_to_string(target.join("CD1/readme (1).txt")).unwrap(),
             "B"
         );
-    }
-
-    #[test]
-    fn retry_skips_credential_and_cancel_errors() {
-        assert!(is_retryable_upload_error("PUT failed: connection reset"));
-        assert!(is_retryable_upload_error("PUT x returned 503: busy"));
-        assert!(!is_retryable_upload_error("cancelled"));
-        assert!(!is_retryable_upload_error("FTP login failed: 530"));
-        assert!(!is_retryable_upload_error("PUT x returned 403 Forbidden"));
     }
 
     #[tokio::test]

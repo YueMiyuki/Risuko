@@ -5,24 +5,54 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::events::EventBroadcaster;
 use super::manager::TaskManager;
+use super::options::EngineOptions;
+use super::rpc_paths;
 
 const ENGINE_VERSION: &str = concat!("risuko-engine/", env!("CARGO_PKG_VERSION"));
 const ARIA2NEXT_PRODUCT: &str = "aria2-next";
 const ARIA2NEXT_VERSION: &str = "1.37.0";
 
 const RPC_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const RPC_BLOCKED_OPTION_STEM: &str = "risukocompletionscript";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+
+const PBH_METHODS: &[&str] = &[
+    "risuko.getVersion",
+    "risuko.tellActive",
+    "risuko.tellWaiting",
+    "risuko.tellStopped",
+    "risuko.getPeers",
+    "risuko.setBtPeerBlocklist",
+    "risuko.getGlobalOption",
+    "risuko.changeGlobalOption",
+    "risuko.getGlobalStat",
+    "system.listMethods",
+];
+
+const PBH_READABLE_OPTIONS: &[&str] = &[
+    "max-download-limit",
+    "max-upload-limit",
+    "listen-port",
+    "max-overall-upload-limit",
+    "max-overall-download-limit",
+];
+
+const PBH_WRITABLE_OPTIONS: &[&str] = &[
+    "max-overall-upload-limit",
+    "max-overall-download-limit",
+    "listen-port",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RpcCompatMode {
@@ -291,6 +321,25 @@ fn host_hostname(host_header: &str) -> &str {
     h.rsplit_once(':').map(|(name, _)| name).unwrap_or(h)
 }
 
+async fn handle_rpc_value(state: &RpcState, parsed: Value) -> Option<Value> {
+    match parsed {
+        Value::Array(batch) if batch.is_empty() => {
+            Some(rpc_error(Value::Null, INVALID_REQUEST, "Invalid Request"))
+        }
+        Value::Array(batch) => {
+            let mut results = Vec::with_capacity(batch.len());
+            for item in batch {
+                if let Some(r) = process_single_request(state, item).await {
+                    results.push(r);
+                }
+            }
+            (!results.is_empty()).then_some(Value::Array(results))
+        }
+        Value::Object(_) => process_single_request(state, parsed).await,
+        _ => Some(rpc_error(Value::Null, INVALID_REQUEST, "Invalid Request")),
+    }
+}
+
 async fn handle_http_post(State(state): State<RpcState>, body: String) -> Response {
     let parsed = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
@@ -300,33 +349,9 @@ async fn handle_http_post(State(state): State<RpcState>, body: String) -> Respon
         }
     };
 
-    match parsed {
-        Value::Array(batch) => {
-            if batch.is_empty() {
-                return json_rpc_response(rpc_error(
-                    Value::Null,
-                    INVALID_REQUEST,
-                    "Invalid Request",
-                ));
-            }
-            let mut results = Vec::with_capacity(batch.len());
-            for item in batch {
-                let resp = process_single_request(&state, item).await;
-                if let Some(r) = resp {
-                    results.push(r);
-                }
-            }
-            if results.is_empty() {
-                (StatusCode::NO_CONTENT, "").into_response()
-            } else {
-                json_rpc_response(Value::Array(results))
-            }
-        }
-        Value::Object(_) => match process_single_request(&state, parsed).await {
-            Some(resp) => json_rpc_response(resp),
-            None => (StatusCode::NO_CONTENT, "").into_response(),
-        },
-        _ => json_rpc_response(rpc_error(Value::Null, INVALID_REQUEST, "Invalid Request")),
+    match handle_rpc_value(&state, parsed).await {
+        Some(resp) => json_rpc_response(resp),
+        None => (StatusCode::NO_CONTENT, "").into_response(),
     }
 }
 
@@ -469,48 +494,40 @@ fn maybe_jsonp(body: Value, callback: Option<String>) -> Response {
         .into_response()
 }
 
+fn uses_aria2_namespace(request: &Value) -> bool {
+    match request {
+        Value::Array(batch) => batch.iter().any(uses_aria2_namespace),
+        _ => request
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method.starts_with("aria2.")),
+    }
+}
+
+async fn ws_send_json(socket: &mut WebSocket, value: &Value) -> bool {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    socket.send(Message::Text(text.into())).await.is_ok()
+}
+
 async fn handle_ws_connection(state: RpcState, mut socket: WebSocket) {
     let mut event_rx = state.events.subscribe();
+    let mut aria2_namespace = matches!(state.compat, RpcCompatMode::Aria2Next);
 
     loop {
         tokio::select! {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        let parsed = match serde_json::from_str::<Value>(&text) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                let err = rpc_error(Value::Null, PARSE_ERROR, "Parse error");
-                                let text = serde_json::to_string(&err).unwrap_or_default();
-                                if socket.send(Message::Text(text.into())).await.is_err() {
-                                    break;
-                                }
-                                continue;
+                        let response = match serde_json::from_str::<Value>(&text) {
+                            Ok(parsed) => {
+                                aria2_namespace = aria2_namespace || uses_aria2_namespace(&parsed);
+                                handle_rpc_value(&state, parsed).await
                             }
+                            Err(_) => Some(rpc_error(Value::Null, PARSE_ERROR, "Parse error")),
                         };
-
-                        match parsed {
-                            Value::Array(batch) => {
-                                let mut results = Vec::with_capacity(batch.len());
-                                for item in batch {
-                                    if let Some(r) = process_single_request(&state, item).await {
-                                        results.push(r);
-                                    }
-                                }
-                                if !results.is_empty() {
-                                    let text = serde_json::to_string(&Value::Array(results)).unwrap_or_default();
-                                    if socket.send(Message::Text(text.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ => {
-                                if let Some(resp) = process_single_request(&state, parsed).await {
-                                    let text = serde_json::to_string(&resp).unwrap_or_default();
-                                    if socket.send(Message::Text(text.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
+                        if let Some(response) = response {
+                            if !ws_send_json(&mut socket, &response).await {
+                                break;
                             }
                         }
                     }
@@ -521,9 +538,8 @@ async fn handle_ws_connection(state: RpcState, mut socket: WebSocket) {
             event = event_rx.recv() => {
                 match event {
                     Ok(event) => {
-                        let notification = event.to_notification();
-                        let text = serde_json::to_string(&notification).unwrap_or_default();
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        let notification = event.to_notification(aria2_namespace);
+                        if !ws_send_json(&mut socket, &notification).await {
                             break;
                         }
                     }
@@ -667,6 +683,113 @@ impl From<String> for RpcError {
     }
 }
 
+fn task_options(params: &[Value], index: usize) -> Map<String, Value> {
+    let mut options = params
+        .get(index)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    strip_blocked_options(&mut options);
+    options
+}
+
+fn is_blocked_option(key: &str) -> bool {
+    if !key.is_ascii() {
+        return true;
+    }
+    let folded: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    folded.starts_with(RPC_BLOCKED_OPTION_STEM)
+}
+
+fn strip_blocked_options(options: &mut Map<String, Value>) {
+    options.retain(|key, _| !is_blocked_option(key));
+}
+
+fn invalid_params(message: String) -> RpcError {
+    RpcError {
+        code: INVALID_PARAMS,
+        message,
+    }
+}
+
+async fn current_options(state: &RpcState) -> EngineOptions {
+    let global = match state.manager.get_global_option().await {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    EngineOptions { global }
+}
+
+async fn check_save_options(
+    state: &RpcState,
+    options: &Map<String, Value>,
+) -> Result<(), RpcError> {
+    let names_a_path = ["dir", "out"]
+        .into_iter()
+        .chain(rpc_paths::FILE_OPTIONS)
+        .any(|key| options.contains_key(key));
+    if !names_a_path {
+        return Ok(());
+    }
+    let current = current_options(state).await;
+    if rpc_paths::allows_any_dir(&current) {
+        return Ok(());
+    }
+    rpc_paths::check_file_options(options).map_err(invalid_params)?;
+    rpc_paths::check_task_options(options, &rpc_paths::allowed_roots(&current))
+        .map_err(invalid_params)
+}
+
+async fn check_task_patch(
+    state: &RpcState,
+    patch: &crate::engine::task::TaskPatch,
+) -> Result<(), RpcError> {
+    let mut fields = Map::new();
+    if let Some(dir) = &patch.dir {
+        fields.insert("dir".into(), Value::String(dir.clone()));
+    }
+    if let Some(out) = &patch.out {
+        fields.insert("out".into(), Value::String(out.clone()));
+    }
+    check_save_options(state, &fields).await?;
+    match &patch.options {
+        Some(options) => check_save_options(state, options).await,
+        None => Ok(()),
+    }
+}
+
+async fn check_routing_rule(
+    state: &RpcState,
+    rule: &super::routing::TaskRoutingRule,
+) -> Result<(), RpcError> {
+    let current = current_options(state).await;
+    if rpc_paths::allows_any_dir(&current) {
+        return Ok(());
+    }
+    rpc_paths::check_save_dir(&rule.dir, &rpc_paths::download_roots(&current))
+        .map_err(invalid_params)
+}
+
+async fn keeps_stored_dir(state: &RpcState, rule: &super::routing::TaskRoutingRule) -> bool {
+    state
+        .manager
+        .list_routing_rules()
+        .await
+        .into_iter()
+        .find(|stored| stored.id == rule.id)
+        .is_some_and(|stored| stored.dir == rule.dir)
+}
+
+fn decode_base64(data: &str) -> Result<Vec<u8>, RpcError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| RpcError::from(format!("Invalid base64: {e}")))
+}
+
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -684,6 +807,13 @@ fn dispatch_method<'a>(
     params: Vec<Value>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RpcError>> + Send + 'a>> {
     Box::pin(async move {
+        if state.compat == RpcCompatMode::Aria2Next && !PBH_METHODS.contains(&method) {
+            return Err(RpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!("Method not available on this listener: {method}"),
+            });
+        }
+
         match method {
             "risuko.addUri" => {
                 let uris = params
@@ -700,17 +830,10 @@ fn dispatch_method<'a>(
                     return Err("URI required".to_string().into());
                 }
 
-                let options = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let options = task_options(&params, 1);
+                check_save_options(state, &options).await?;
 
-                let gid = state
-                    .manager
-                    .add_http_task(uris, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                let gid = state.manager.add_http_task(uris, options).await?;
                 Ok(Value::String(gid))
             }
 
@@ -725,21 +848,14 @@ fn dispatch_method<'a>(
                     return Err(RpcError::from("Media URL required".to_string()));
                 }
 
-                let options = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let options = task_options(&params, 1);
+                check_save_options(state, &options).await?;
 
                 if !super::media::is_media_uri(uri) && !super::media::is_force_ytdlp(&options) {
                     return Err(RpcError::from("Not a supported media URL".to_string()));
                 }
 
-                let gid = state
-                    .manager
-                    .add_media_task(uri, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                let gid = state.manager.add_media_task(uri, options).await?;
                 Ok(Value::String(gid))
             }
 
@@ -749,21 +865,15 @@ fn dispatch_method<'a>(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| RpcError::from("Torrent data required".to_string()))?;
 
-                let torrent_data = base64::engine::general_purpose::STANDARD
-                    .decode(torrent_b64)
-                    .map_err(|e| RpcError::from(format!("Invalid base64: {e}")))?;
+                let torrent_data = decode_base64(torrent_b64)?;
 
-                let options = params
-                    .get(2)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let options = task_options(&params, 2);
+                check_save_options(state, &options).await?;
 
                 let gid = state
                     .manager
                     .add_torrent_task(torrent_data, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                    .await?;
                 Ok(Value::String(gid))
             }
 
@@ -773,21 +883,15 @@ fn dispatch_method<'a>(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| RpcError::from("Metalink data required".to_string()))?;
 
-                let metalink_data = base64::engine::general_purpose::STANDARD
-                    .decode(metalink_b64)
-                    .map_err(|e| RpcError::from(format!("Invalid base64: {e}")))?;
+                let metalink_data = decode_base64(metalink_b64)?;
 
-                let options = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let options = task_options(&params, 1);
+                check_save_options(state, &options).await?;
 
                 let gid = state
                     .manager
                     .add_metalink_task(metalink_data, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                    .await?;
                 Ok(Value::String(gid))
             }
 
@@ -796,19 +900,10 @@ fn dispatch_method<'a>(
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| RpcError::from("NZB data required".to_string()))?;
-                let nzb_data = base64::engine::general_purpose::STANDARD
-                    .decode(nzb_b64)
-                    .map_err(|e| RpcError::from(format!("Invalid base64: {e}")))?;
-                let options = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                let gid = state
-                    .manager
-                    .add_nzb_task(nzb_data, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                let nzb_data = decode_base64(nzb_b64)?;
+                let options = task_options(&params, 1);
+                check_save_options(state, &options).await?;
+                let gid = state.manager.add_nzb_task(nzb_data, options).await?;
                 Ok(Value::String(gid))
             }
 
@@ -818,29 +913,22 @@ fn dispatch_method<'a>(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| RpcError::from("ed2k URI required".to_string()))?;
 
-                let options = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let options = task_options(&params, 1);
+                check_save_options(state, &options).await?;
 
-                let gid = state
-                    .manager
-                    .add_ed2k_task(uri, options)
-                    .await
-                    .map_err(RpcError::from)?;
+                let gid = state.manager.add_ed2k_task(uri, options).await?;
                 Ok(Value::String(gid))
             }
 
             "risuko.remove" | "risuko.forceRemove" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                state.manager.remove(&gid).await.map_err(RpcError::from)?;
+                state.manager.remove(&gid).await?;
                 Ok(Value::String(gid))
             }
 
             "risuko.pause" | "risuko.forcePause" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                state.manager.pause(&gid).await.map_err(RpcError::from)?;
+                state.manager.pause(&gid).await?;
                 Ok(Value::String(gid))
             }
 
@@ -851,7 +939,7 @@ fn dispatch_method<'a>(
 
             "risuko.unpause" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                state.manager.unpause(&gid).await.map_err(RpcError::from)?;
+                state.manager.unpause(&gid).await?;
                 Ok(Value::String(gid))
             }
 
@@ -901,41 +989,40 @@ fn dispatch_method<'a>(
 
             "risuko.changeOption" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                let opts = params
-                    .get(1)
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                state
-                    .manager
-                    .change_option(&gid, opts)
-                    .await
-                    .map_err(RpcError::from)?;
+                let opts = task_options(&params, 1);
+                check_save_options(state, &opts).await?;
+                state.manager.change_option(&gid, opts).await?;
                 Ok(Value::String("OK".into()))
             }
 
             "risuko.updateTask" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                let patch = params
-                    .get(1)
-                    .cloned()
-                    .unwrap_or(Value::Object(serde_json::Map::new()));
-                let patch: crate::engine::task::TaskPatch = serde_json::from_value(patch)
+                let patch = params.get(1).cloned().unwrap_or(Value::Object(Map::new()));
+                let mut patch: crate::engine::task::TaskPatch = serde_json::from_value(patch)
                     .map_err(|e| RpcError::from(format!("Invalid task patch: {e}")))?;
-                let outcome = state
-                    .manager
-                    .update_task(&gid, patch)
-                    .await
-                    .map_err(RpcError::from)?;
+                if let Some(options) = patch.options.as_mut() {
+                    strip_blocked_options(options);
+                }
+                check_task_patch(state, &patch).await?;
+                let outcome = state.manager.update_task(&gid, patch).await?;
                 serde_json::to_value(outcome).map_err(|e| RpcError::from(e.to_string()))
             }
 
             "risuko.changeGlobalOption" => {
-                let opts = params
-                    .first()
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
+                let opts = task_options(&params, 0);
+                if state.compat == RpcCompatMode::Aria2Next {
+                    if let Some(key) = opts
+                        .keys()
+                        .find(|key| !PBH_WRITABLE_OPTIONS.contains(&key.as_str()))
+                    {
+                        return Err(RpcError {
+                            code: INVALID_PARAMS,
+                            message: format!("Option not allowed on this listener: {key}"),
+                        });
+                    }
+                }
+                let allow_any_dir = rpc_paths::allows_any_dir(&current_options(state).await);
+                rpc_paths::check_global_options(&opts, allow_any_dir).map_err(invalid_params)?;
                 state.manager.change_global_option(opts).await;
                 Ok(Value::String("OK".into()))
             }
@@ -945,7 +1032,17 @@ fn dispatch_method<'a>(
                 state.manager.get_option(&gid).await.map_err(RpcError::from)
             }
 
-            "risuko.getGlobalOption" => Ok(state.manager.get_global_option().await),
+            "risuko.getGlobalOption" => {
+                let options = state.manager.get_global_option().await;
+                Ok(match (state.compat, options) {
+                    (RpcCompatMode::Standard, options) => options,
+                    (RpcCompatMode::Aria2Next, Value::Object(mut map)) => {
+                        map.retain(|key, _| PBH_READABLE_OPTIONS.contains(&key.as_str()));
+                        Value::Object(map)
+                    }
+                    (RpcCompatMode::Aria2Next, _) => Value::Object(Map::new()),
+                })
+            }
 
             "risuko.changePosition" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
@@ -981,11 +1078,7 @@ fn dispatch_method<'a>(
                         });
                     }
                 };
-                let result = state
-                    .manager
-                    .set_bt_peer_blocklist(entries)
-                    .await
-                    .map_err(RpcError::from)?;
+                let result = state.manager.set_bt_peer_blocklist(entries).await?;
                 Ok(json!({
                     "revision": result.revision,
                     "ruleCount": result.rule_count,
@@ -1037,7 +1130,7 @@ fn dispatch_method<'a>(
             }
 
             "risuko.saveSession" => {
-                state.manager.save_session().await.map_err(RpcError::from)?;
+                state.manager.save_session().await?;
                 Ok(Value::String("OK".into()))
             }
 
@@ -1048,11 +1141,7 @@ fn dispatch_method<'a>(
 
             "risuko.removeDownloadResult" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                state
-                    .manager
-                    .remove_download_result(&gid)
-                    .await
-                    .map_err(RpcError::from)?;
+                state.manager.remove_download_result(&gid).await?;
                 Ok(Value::String("OK".into()))
             }
 
@@ -1097,11 +1186,8 @@ fn dispatch_method<'a>(
                     .ok_or_else(|| RpcError::from("Invalid routing rule".to_string()))?;
                 let rule = serde_json::from_value::<super::routing::TaskRoutingRule>(rule_value)
                     .map_err(|e| RpcError::from(format!("Invalid routing rule: {e}")))?;
-                let added = state
-                    .manager
-                    .add_routing_rule(rule)
-                    .await
-                    .map_err(RpcError::from)?;
+                check_routing_rule(state, &rule).await?;
+                let added = state.manager.add_routing_rule(rule).await?;
                 Ok(serde_json::to_value(added).unwrap_or_default())
             }
 
@@ -1112,11 +1198,10 @@ fn dispatch_method<'a>(
                     .ok_or_else(|| RpcError::from("Invalid routing rule".to_string()))?;
                 let rule = serde_json::from_value::<super::routing::TaskRoutingRule>(rule_value)
                     .map_err(|e| RpcError::from(format!("Invalid routing rule: {e}")))?;
-                state
-                    .manager
-                    .update_routing_rule(rule)
-                    .await
-                    .map_err(RpcError::from)?;
+                if !keeps_stored_dir(state, &rule).await {
+                    check_routing_rule(state, &rule).await?;
+                }
+                state.manager.update_routing_rule(rule).await?;
                 Ok(Value::String("OK".into()))
             }
 
@@ -1125,11 +1210,7 @@ fn dispatch_method<'a>(
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| RpcError::from("Rule ID required".to_string()))?;
-                state
-                    .manager
-                    .remove_routing_rule(id)
-                    .await
-                    .map_err(RpcError::from)?;
+                state.manager.remove_routing_rule(id).await?;
                 Ok(Value::String("OK".into()))
             }
 
@@ -1179,7 +1260,10 @@ fn dispatch_method<'a>(
                 Ok(Value::Array(results))
             }
 
-            "system.listMethods" => Ok(list_methods()),
+            "system.listMethods" => Ok(match state.compat {
+                RpcCompatMode::Aria2Next => list_pbh_methods(),
+                RpcCompatMode::Standard => list_methods(),
+            }),
 
             "system.listNotifications" => Ok(list_notifications()),
 
@@ -1248,6 +1332,20 @@ fn list_methods() -> Value {
     Value::Array(all)
 }
 
+fn list_pbh_methods() -> Value {
+    let mut all: Vec<Value> = Vec::new();
+    for method in PBH_METHODS {
+        match method.strip_prefix("risuko.") {
+            Some(suffix) => {
+                all.push(Value::String(format!("aria2.{suffix}")));
+                all.push(Value::String((*method).into()));
+            }
+            None => all.push(Value::String((*method).into())),
+        }
+    }
+    Value::Array(all)
+}
+
 fn list_notifications() -> Value {
     let names = [
         "onDownloadStart",
@@ -1311,6 +1409,7 @@ fn stringify_aria2_peer_speeds(peers: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::rpc_paths::ALLOW_ANY_DIR_KEY;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1349,6 +1448,82 @@ mod tests {
             },
             config_dir,
         )
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_an_invalid_request() {
+        let (state, _dir) = make_rpc_state("").await;
+        let response = handle_rpc_value(&state, json!([])).await.unwrap();
+        assert_eq!(response["error"]["code"], INVALID_REQUEST);
+        let response = handle_rpc_value(&state, json!(7)).await.unwrap();
+        assert_eq!(response["error"]["code"], INVALID_REQUEST);
+    }
+
+    #[test]
+    fn aria2_namespace_is_detected_in_single_and_batch_requests() {
+        assert!(uses_aria2_namespace(&json!({"method": "aria2.tellActive"})));
+        assert!(uses_aria2_namespace(&json!([
+            {"method": "risuko.tellActive"},
+            {"method": "aria2.getGlobalStat"}
+        ])));
+        assert!(!uses_aria2_namespace(
+            &json!({"method": "risuko.tellActive"})
+        ));
+        assert!(!uses_aria2_namespace(
+            &json!({"method": "system.listMethods"})
+        ));
+    }
+
+    #[test]
+    fn rpc_options_drop_completion_script_overrides() {
+        let params = vec![
+            json!(["http://example.com/a"]),
+            json!({
+                "dir": "/tmp",
+                "risuko-completion-script-command": "sh",
+                "risuko-completion-script-args": "{path}",
+                "risuko-completion-script-enabled": true,
+            }),
+        ];
+        let options = task_options(&params, 1);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options.get("dir"), Some(&json!("/tmp")));
+        assert!(task_options(&params, 5).is_empty());
+    }
+
+    #[test]
+    fn rpc_options_drop_respelled_completion_script_keys() {
+        let params = vec![
+            json!(["http://example.com/a"]),
+            json!({
+                "dir": "/tmp",
+                "out": "a.bin",
+                "risuko-cookie-host": "example.com",
+                "risuko_completion_script_command": "sh",
+                "Risuko-Completion-Script-Args": "{path}",
+                "RISUKO-COMPLETION-SCRIPT-ENABLED": "true",
+                "risuko completion script timeout ms": "1000",
+                "risuko.completion.script.command": "sh",
+                "risukoCompletionScriptCommand": "sh",
+                "risuko-completion'script-command": "sh",
+                "r\u{00ed}suko-completion-script-command": "sh",
+                "risuko-completion-script-command\u{200b}": "sh",
+            }),
+        ];
+        let options = task_options(&params, 1);
+        let mut keys: Vec<&str> = options.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["dir", "out", "risuko-cookie-host"]);
+    }
+
+    #[test]
+    fn update_task_patches_drop_respelled_completion_script_keys() {
+        let mut options = Map::new();
+        options.insert("dir".into(), json!("/tmp"));
+        options.insert("risuko_completion_script_command".into(), json!("sh"));
+        strip_blocked_options(&mut options);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options.get("dir"), Some(&json!("/tmp")));
     }
 
     #[test]
@@ -1985,5 +2160,819 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.starts_with("cb("), "{body}");
         server.stop();
+    }
+
+    async fn pbh_state() -> (RpcState, TempDir) {
+        let (mut state, config_dir) = make_rpc_state("secret").await;
+        state.compat = RpcCompatMode::Aria2Next;
+        (state, config_dir)
+    }
+
+    fn authed_call(method: &str, params: Vec<Value>) -> Value {
+        let mut all = vec![json!("token:secret")];
+        all.extend(params);
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": method,
+            "params": all
+        })
+    }
+
+    async fn call(state: &RpcState, method: &str, params: Vec<Value>) -> Value {
+        process_single_request(state, authed_call(method, params))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_refuses_methods_outside_its_list() {
+        let (state, _config_dir) = pbh_state().await;
+        let gid = json!("0000000000000000");
+        let calls = [
+            ("aria2.addUri", vec![json!(["http://127.0.0.1:1/a"])]),
+            ("aria2.shutdown", vec![]),
+            (
+                "aria2.changeOption",
+                vec![gid.clone(), json!({"dir": "/tmp/x"})],
+            ),
+            ("risuko.remove", vec![gid.clone()]),
+            ("aria2.tellStatus", vec![gid.clone()]),
+            ("aria2.getOption", vec![gid]),
+            ("aria2.saveSession", vec![]),
+        ];
+        for (method, params) in calls {
+            let response = call(&state, method, params).await;
+            assert_eq!(
+                response["error"]["code"], METHOD_NOT_FOUND,
+                "{method}: {response}"
+            );
+        }
+        for method in ["aria2.tellActive", "aria2.tellWaiting"] {
+            let response = call(&state, method, vec![]).await;
+            assert_eq!(response["result"], json!([]), "{method}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_refuses_multicall() {
+        let (state, _config_dir) = pbh_state().await;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "system.multicall",
+            "params": [[{
+                "methodName": "aria2.addUri",
+                "params": ["token:secret", ["http://127.0.0.1:1/a"]]
+            }]]
+        });
+        let response = process_single_request(&state, request).await.unwrap();
+        assert_eq!(response["error"]["code"], METHOD_NOT_FOUND, "{response}");
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_checks_every_batch_item() {
+        let (state, _config_dir) = pbh_state().await;
+        let batch = json!([
+            authed_call("aria2.getVersion", vec![]),
+            authed_call("aria2.addUri", vec![json!(["http://127.0.0.1:1/a"])]),
+        ]);
+        let response = handle_rpc_value(&state, batch).await.unwrap();
+        let items = response.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].get("result").is_some(), "{response}");
+        assert_eq!(items[1]["error"]["code"], METHOD_NOT_FOUND, "{response}");
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_answers_what_peerbanhelper_calls() {
+        let (state, _config_dir) = pbh_state().await;
+        let fields = json!(["gid", "status"]);
+        let calls = [
+            ("aria2.getVersion", vec![]),
+            ("aria2.tellActive", vec![fields.clone()]),
+            ("aria2.tellWaiting", vec![fields.clone()]),
+            ("aria2.tellStopped", vec![fields]),
+            ("aria2.getGlobalOption", vec![]),
+            ("aria2.getGlobalStat", vec![]),
+            ("aria2.setBtPeerBlocklist", vec![json!(["192.0.2.1"])]),
+        ];
+        for (method, params) in calls {
+            let response = call(&state, method, params).await;
+            assert!(response.get("result").is_some(), "{method}: {response}");
+            assert!(response.get("error").is_none(), "{method}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_global_options_hide_everything_else() {
+        let (mut state, _config_dir) = make_rpc_state("secret").await;
+        let changed = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({
+                "rpc-secret": "topsecret",
+                "ftp-passwd": "pw",
+                "max-overall-download-limit": "1024"
+            })],
+        )
+        .await;
+        assert_eq!(changed["result"], "OK", "{changed}");
+
+        state.compat = RpcCompatMode::Aria2Next;
+        let response = call(&state, "aria2.getGlobalOption", vec![]).await;
+        let result = response["result"].as_object().unwrap();
+        for key in result.keys() {
+            assert!(PBH_READABLE_OPTIONS.contains(&key.as_str()), "{key}");
+        }
+        assert!(result.contains_key("max-overall-download-limit"));
+        let text = response["result"].to_string();
+        assert!(!text.contains("topsecret"), "{text}");
+        assert!(!text.contains("ftp-passwd"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_limits_writable_options() {
+        let (state, _config_dir) = pbh_state().await;
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({
+                "max-overall-upload-limit": "2048",
+                "max-overall-download-limit": "0"
+            })],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"listen-port": 23456})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"dir": "/tmp/x"})],
+        )
+        .await;
+        assert_eq!(response["error"]["code"], INVALID_PARAMS, "{response}");
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"max-overall-upload-limit": "1", "rpc-secret": "x"})],
+        )
+        .await;
+        assert!(response.get("error").is_some(), "{response}");
+
+        let global = state.manager.get_global_option().await;
+        assert_eq!(global["max-overall-upload-limit"], "2048");
+        assert_ne!(global.get("dir"), Some(&json!("/tmp/x")));
+        assert!(global.get("rpc-secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn pbh_listener_lists_only_its_methods() {
+        let (state, _config_dir) = pbh_state().await;
+        let response = call(&state, "system.listMethods", vec![]).await;
+        let methods: Vec<&str> = response["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(methods.contains(&"aria2.getPeers"));
+        assert!(methods.contains(&"risuko.setBtPeerBlocklist"));
+        assert!(!methods.contains(&"aria2.addUri"));
+        assert!(!methods.contains(&"system.multicall"));
+    }
+
+    fn text(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    fn refused(response: &Value) -> bool {
+        response["error"]["code"] == INVALID_PARAMS
+    }
+
+    fn error_message(response: &Value) -> String {
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    async fn task_count(state: &RpcState) -> usize {
+        [
+            state.manager.tell_active(&[]).await,
+            state.manager.tell_waiting(0, 100, &[]).await,
+            state.manager.tell_stopped(0, 100, &[]).await,
+        ]
+        .iter()
+        .map(|list| list.as_array().map_or(0, Vec::len))
+        .sum()
+    }
+
+    async fn allow_any_dir(state: &RpcState) {
+        let mut opts = Map::new();
+        opts.insert(ALLOW_ANY_DIR_KEY.into(), json!(true));
+        state.manager.change_global_option(opts).await;
+    }
+
+    async fn add_paused(state: &RpcState, mut options: Value) -> Value {
+        options["pause"] = json!("true");
+        call(
+            state,
+            "aria2.addUri",
+            vec![json!(["http://127.0.0.1:1/a.bin"]), options],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn adds_with_a_folder_outside_the_download_folders_are_refused() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+
+        let response = add_paused(&state, json!({"dir": outside})).await;
+        assert!(refused(&response), "{response}");
+        let message = error_message(&response);
+        assert!(message.contains(&outside), "{message}");
+        assert!(
+            message.contains("Let RPC clients use any local path"),
+            "{message}"
+        );
+        assert_eq!(task_count(&state).await, 0);
+
+        for out in ["../escape.bin", "/tmp/escape.bin"] {
+            let response = add_paused(&state, json!({"out": out})).await;
+            assert!(refused(&response), "{out}: {response}");
+        }
+
+        let options = json!({"dir": outside, "pause": "true"});
+        let calls = [
+            (
+                "aria2.addTorrent",
+                vec![json!("AAAA"), json!([]), options.clone()],
+            ),
+            ("aria2.addMetalink", vec![json!("AAAA"), options.clone()]),
+            ("risuko.addNzb", vec![json!("AAAA"), options.clone()]),
+            (
+                "risuko.addMedia",
+                vec![json!("https://www.youtube.com/watch?v=x"), options.clone()],
+            ),
+            (
+                "risuko.addEd2k",
+                vec![
+                    json!("ed2k://|file|a.bin|1|0123456789ABCDEF0123456789ABCDEF|/"),
+                    options,
+                ],
+            ),
+        ];
+        for (method, params) in calls {
+            let response = call(&state, method, params).await;
+            assert!(refused(&response), "{method}: {response}");
+        }
+        assert_eq!(task_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn adds_inside_the_download_folders_or_without_a_folder_are_accepted() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let inside = text(&config_dir.path().join("downloads").join("sub"));
+
+        let response = add_paused(&state, json!({"dir": inside, "out": "sub/name.bin"})).await;
+        assert!(response["result"].is_string(), "{response}");
+        let response = add_paused(&state, json!({})).await;
+        assert!(response["result"].is_string(), "{response}");
+
+        let videos = config_dir.path().join("videos");
+        let mut opts = Map::new();
+        opts.insert("file-category-dirs".into(), json!({"video": text(&videos)}));
+        state.manager.change_global_option(opts).await;
+        let response = add_paused(&state, json!({"dir": text(&videos.join("x"))})).await;
+        assert!(response["result"].is_string(), "{response}");
+        assert_eq!(task_count(&state).await, 3);
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_on_any_folder_is_accepted() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        allow_any_dir(&state).await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let response = add_paused(&state, json!({"dir": outside})).await;
+        assert!(response["result"].is_string(), "{response}");
+        assert_eq!(task_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn task_edits_refuse_folders_outside_the_download_folders() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let inside = text(&config_dir.path().join("downloads").join("sub"));
+        let added = add_paused(&state, json!({})).await;
+        let gid = added["result"].as_str().unwrap().to_string();
+
+        let response = call(
+            &state,
+            "aria2.changeOption",
+            vec![json!(gid), json!({"dir": outside})],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        let options = state.manager.get_option(&gid).await.unwrap();
+        assert_ne!(options.get("dir"), Some(&json!(outside)));
+
+        for patch in [
+            json!({"dir": outside}),
+            json!({"options": {"dir": outside}}),
+            json!({"out": "../x.bin"}),
+            json!({"options": {"out": "/tmp/x.bin"}}),
+        ] {
+            let response = call(&state, "risuko.updateTask", vec![json!(gid), patch.clone()]).await;
+            assert!(refused(&response), "{patch}: {response}");
+        }
+
+        let response = call(
+            &state,
+            "aria2.changeOption",
+            vec![json!(gid), json!({"dir": inside})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+    }
+
+    #[tokio::test]
+    async fn global_folder_settings_cannot_be_changed_while_restricted() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let changes = [
+            ("dir", json!(outside)),
+            ("file-category-dirs", json!({"video": outside})),
+            (
+                "task-routing-rules",
+                json!([{"id": "r", "label": "All", "pattern": "*", "dir": outside}]),
+            ),
+        ];
+        for (key, value) in &changes {
+            let response = call(
+                &state,
+                "aria2.changeGlobalOption",
+                vec![json!({ *key: value })],
+            )
+            .await;
+            assert!(refused(&response), "{key}: {response}");
+            assert!(error_message(&response).contains(key), "{response}");
+        }
+        let global = state.manager.get_global_option().await;
+        assert_ne!(global["dir"], json!(outside));
+        assert!(global.get("file-category-dirs").is_none());
+        assert!(global.get("task-routing-rules").is_none());
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"max-overall-download-limit": "1024"})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+
+        allow_any_dir(&state).await;
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"dir": outside})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+        assert_eq!(
+            state.manager.get_global_option().await["dir"],
+            json!(outside)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_switch_itself_cannot_be_changed_over_rpc() {
+        for allowed in [false, true] {
+            let (state, _config_dir) = make_rpc_state("secret").await;
+            if allowed {
+                allow_any_dir(&state).await;
+            }
+            for value in [json!(true), json!("true"), json!(false)] {
+                let response = call(
+                    &state,
+                    "aria2.changeGlobalOption",
+                    vec![json!({ ALLOW_ANY_DIR_KEY: value })],
+                )
+                .await;
+                assert!(refused(&response), "{allowed} {value}: {response}");
+                assert!(
+                    error_message(&response).contains(ALLOW_ANY_DIR_KEY),
+                    "{response}"
+                );
+            }
+            let response = call(
+                &state,
+                "aria2.changeGlobalOption",
+                vec![json!({"max-overall-download-limit": "2048", ALLOW_ANY_DIR_KEY: true})],
+            )
+            .await;
+            assert!(refused(&response), "{response}");
+
+            let global = state.manager.get_global_option().await;
+            assert_ne!(global["max-overall-download-limit"], "2048");
+            let options = crate::engine::options::EngineOptions {
+                global: global.as_object().cloned().unwrap(),
+            };
+            assert_eq!(
+                options.get_bool(ALLOW_ANY_DIR_KEY).unwrap_or(false),
+                allowed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_rules_must_stay_inside_the_download_folders() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let inside = text(&config_dir.path().join("downloads").join("iso"));
+        let rule =
+            |id: &str, dir: &str| json!({"id": id, "label": "ISO", "pattern": "*.iso", "dir": dir});
+
+        let response = call(&state, "aria2.addRoutingRule", vec![rule("a", &outside)]).await;
+        assert!(refused(&response), "{response}");
+        assert!(state.manager.list_routing_rules().await.is_empty());
+
+        let response = call(&state, "aria2.addRoutingRule", vec![rule("b", &inside)]).await;
+        assert_eq!(response["result"]["dir"], json!(inside), "{response}");
+        let response = call(&state, "aria2.updateRoutingRule", vec![rule("b", &outside)]).await;
+        assert!(refused(&response), "{response}");
+        assert_eq!(state.manager.list_routing_rules().await[0].dir, inside);
+
+        let trusted = config_dir.path().join("trusted");
+        state
+            .manager
+            .add_routing_rule(super::super::routing::TaskRoutingRule {
+                id: "t".into(),
+                label: "Trusted".into(),
+                pattern: "*.bin".into(),
+                dir: text(&trusted),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let response = call(
+            &state,
+            "aria2.addRoutingRule",
+            vec![rule("c", &text(&trusted.join("deeper")))],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        let response = add_paused(&state, json!({"dir": text(&trusted.join("x"))})).await;
+        assert!(response["result"].is_string(), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_rule_with_an_outside_folder_can_be_edited_while_its_folder_stays() {
+        fn rule(id: &str, label: &str, dir: &str) -> Value {
+            json!({"id": id, "label": label, "pattern": "*.img", "dir": dir})
+        }
+
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let mine = text(&config_dir.path().join("mine"));
+        let other = text(&config_dir.path().join("other"));
+        let inside = text(&config_dir.path().join("downloads").join("iso"));
+        let stored_rule = |id: &str, dir: &str| super::super::routing::TaskRoutingRule {
+            id: id.into(),
+            label: "Mine".into(),
+            pattern: "*.iso".into(),
+            dir: dir.into(),
+            enabled: true,
+        };
+        for (id, dir) in [("m", &mine), ("d", &inside), ("d", &mine)] {
+            state
+                .manager
+                .add_routing_rule(stored_rule(id, dir))
+                .await
+                .unwrap();
+        }
+
+        let response = call(
+            &state,
+            "aria2.updateRoutingRule",
+            vec![rule("m", "Images", &mine)],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+        let stored = state.manager.list_routing_rules().await;
+        assert_eq!(stored[0].label, "Images");
+        assert_eq!(stored[0].pattern, "*.img");
+        assert_eq!(stored[0].dir, mine);
+
+        for (id, dir) in [("m", &other), ("x", &mine), ("x", &other), ("d", &mine)] {
+            let response = call(
+                &state,
+                "aria2.updateRoutingRule",
+                vec![rule(id, "Moved", dir)],
+            )
+            .await;
+            assert!(refused(&response), "{id} {dir}: {response}");
+            assert_eq!(state.manager.list_routing_rules().await, stored);
+        }
+
+        let response = call(
+            &state,
+            "aria2.addRoutingRule",
+            vec![rule("m", "Images", &mine)],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        assert_eq!(state.manager.list_routing_rules().await, stored);
+    }
+
+    #[tokio::test]
+    async fn multicall_checks_every_entry() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let inside = text(&config_dir.path().join("downloads"));
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "system.multicall",
+            "params": [[
+                {
+                    "methodName": "aria2.addUri",
+                    "params": ["token:secret", ["http://127.0.0.1:1/a.bin"], {"dir": outside, "pause": "true"}]
+                },
+                {
+                    "methodName": "aria2.addUri",
+                    "params": ["token:secret", ["http://127.0.0.1:1/b.bin"], {"dir": inside, "pause": "true"}]
+                },
+                {
+                    "methodName": "aria2.changeGlobalOption",
+                    "params": ["token:secret", { ALLOW_ANY_DIR_KEY: true }]
+                }
+            ]]
+        });
+        let response = process_single_request(&state, request).await.unwrap();
+        let results = response["result"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "{response}");
+        assert_eq!(results[0]["code"], INVALID_PARAMS, "{response}");
+        assert!(results[1][0].is_string(), "{response}");
+        assert_eq!(results[2]["code"], INVALID_PARAMS, "{response}");
+        assert_eq!(task_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn adds_that_name_a_cookie_or_netrc_file_are_refused() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let file = text(&config_dir.path().join("secrets.txt"));
+        for key in ["load-cookies", "netrc-path"] {
+            let response = add_paused(&state, json!({ key: file })).await;
+            assert!(refused(&response), "{key}: {response}");
+            let message = error_message(&response);
+            assert!(message.contains(&file), "{message}");
+            assert!(message.contains(key), "{message}");
+            assert!(
+                message.contains("Let RPC clients use any local path"),
+                "{message}"
+            );
+        }
+        let response = add_paused(&state, json!({"load-cookies": 7})).await;
+        assert!(refused(&response), "{response}");
+        let response = call(
+            &state,
+            "risuko.addMedia",
+            vec![
+                json!("https://www.youtube.com/watch?v=x"),
+                json!({"cookies": file, "pause": "true"}),
+            ],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        assert!(
+            error_message(&response).contains("cookies names a file"),
+            "{response}"
+        );
+        assert_eq!(task_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn adds_with_an_empty_cookie_file_are_accepted() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let response = add_paused(&state, json!({"load-cookies": ""})).await;
+        assert!(response["result"].is_string(), "{response}");
+        assert_eq!(task_count(&state).await, 1);
+    }
+
+    const PASTED_KEY: &str =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
+
+    #[tokio::test]
+    async fn sftp_key_files_need_the_switch() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let key_file = text(&config_dir.path().join("id_ed25519"));
+        let options = json!({"sftp-private-key": key_file});
+
+        let response = add_paused(&state, options.clone()).await;
+        assert!(refused(&response), "{response}");
+        let message = error_message(&response);
+        assert!(message.contains(&key_file), "{message}");
+        assert!(
+            message.contains("sftp-private-key names a file"),
+            "{message}"
+        );
+        assert_eq!(task_count(&state).await, 0);
+
+        let added = add_paused(&state, json!({})).await;
+        let gid = added["result"].as_str().unwrap().to_string();
+        let edits = [
+            ("aria2.changeOption", vec![json!(gid), options.clone()]),
+            (
+                "risuko.updateTask",
+                vec![json!(gid), json!({ "options": options })],
+            ),
+            ("aria2.changeGlobalOption", vec![options.clone()]),
+        ];
+        for (method, params) in &edits {
+            let response = call(&state, method, params.clone()).await;
+            assert!(refused(&response), "{method}: {response}");
+        }
+        let task = state.manager.get_option(&gid).await.unwrap();
+        assert!(task.get("sftp-private-key").is_none(), "{task}");
+        let global = state.manager.get_global_option().await;
+        assert!(global.get("sftp-private-key").is_none(), "{global}");
+
+        allow_any_dir(&state).await;
+        let response = add_paused(&state, options.clone()).await;
+        assert!(response["result"].is_string(), "{response}");
+        for (method, params) in &edits {
+            let response = call(&state, method, params.clone()).await;
+            assert!(response.get("error").is_none(), "{method}: {response}");
+        }
+        assert_eq!(
+            state.manager.get_global_option().await["sftp-private-key"],
+            json!(key_file)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pasted_sftp_key_is_accepted_and_never_echoed() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let pasted = json!({"sftp-private-key": PASTED_KEY});
+
+        let added = add_paused(&state, pasted.clone()).await;
+        let gid = added["result"].as_str().expect("accepted").to_string();
+        let calls = [
+            ("aria2.changeOption", vec![json!(gid), pasted.clone()]),
+            (
+                "risuko.updateTask",
+                vec![json!(gid), json!({ "options": pasted })],
+            ),
+            ("aria2.changeGlobalOption", vec![pasted.clone()]),
+        ];
+        for (method, params) in calls {
+            let response = call(&state, method, params).await;
+            assert!(response.get("error").is_none(), "{method}: {response}");
+        }
+
+        let outside = text(&config_dir.path().join("elsewhere"));
+        let cookies = text(&config_dir.path().join("cookies.txt"));
+        for options in [
+            json!({"sftp-private-key": PASTED_KEY, "dir": outside}),
+            json!({"sftp-private-key": PASTED_KEY, "load-cookies": cookies}),
+            json!({"sftp-private-key": [PASTED_KEY]}),
+        ] {
+            let response = add_paused(&state, options.clone()).await;
+            assert!(refused(&response), "{options}: {response}");
+            let body = response.to_string();
+            assert!(!body.contains("PRIVATE KEY"), "{body}");
+            assert!(!body.contains("AAAA"), "{body}");
+        }
+        assert_eq!(task_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_on_cookie_and_netrc_files_are_accepted() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        allow_any_dir(&state).await;
+        let cookies = text(&config_dir.path().join("cookies.txt"));
+        let netrc = text(&config_dir.path().join("netrc"));
+        let response = add_paused(
+            &state,
+            json!({"load-cookies": cookies, "netrc-path": netrc}),
+        )
+        .await;
+        let gid = response["result"].as_str().expect("accepted").to_string();
+        let options = state.manager.get_option(&gid).await.unwrap();
+        assert_eq!(options["load-cookies"], json!(cookies));
+        assert_eq!(options["netrc-path"], json!(netrc));
+    }
+
+    #[tokio::test]
+    async fn task_edits_refuse_a_cookie_file() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let file = text(&config_dir.path().join("cookies.txt"));
+        let added = add_paused(&state, json!({})).await;
+        let gid = added["result"].as_str().unwrap().to_string();
+
+        let response = call(
+            &state,
+            "aria2.changeOption",
+            vec![json!(gid), json!({"load-cookies": file})],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        let response = call(
+            &state,
+            "risuko.updateTask",
+            vec![json!(gid), json!({"options": {"load-cookies": file}})],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        let options = state.manager.get_option(&gid).await.unwrap();
+        assert!(options.get("load-cookies").is_none(), "{options}");
+    }
+
+    #[tokio::test]
+    async fn the_global_netrc_file_needs_the_switch() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let file = text(&config_dir.path().join("netrc"));
+        let change = || {
+            call(
+                &state,
+                "aria2.changeGlobalOption",
+                vec![json!({"netrc-path": file})],
+            )
+        };
+
+        let response = change().await;
+        assert!(refused(&response), "{response}");
+        assert!(
+            error_message(&response).contains("netrc-path"),
+            "{response}"
+        );
+        let global = state.manager.get_global_option().await;
+        assert!(global.get("netrc-path").is_none(), "{global}");
+
+        allow_any_dir(&state).await;
+        let response = change().await;
+        assert_eq!(response["result"], "OK", "{response}");
+        assert_eq!(
+            state.manager.get_global_option().await["netrc-path"],
+            json!(file)
+        );
+    }
+
+    #[tokio::test]
+    async fn multicall_refuses_an_add_that_names_a_cookie_file() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let file = text(&config_dir.path().join("cookies.txt"));
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "system.multicall",
+            "params": [[
+                {
+                    "methodName": "aria2.addUri",
+                    "params": ["token:secret", ["http://127.0.0.1:1/a.bin"], {"load-cookies": file, "pause": "true"}]
+                },
+                {
+                    "methodName": "aria2.addUri",
+                    "params": ["token:secret", ["http://127.0.0.1:1/b.bin"], {"pause": "true"}]
+                }
+            ]]
+        });
+        let response = process_single_request(&state, request).await.unwrap();
+        let results = response["result"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{response}");
+        assert_eq!(results[0]["code"], INVALID_PARAMS, "{response}");
+        assert!(results[1][0].is_string(), "{response}");
+        assert_eq!(task_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn standard_listener_is_unchanged() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let response = call(&state, "aria2.getGlobalOption", vec![]).await;
+        let result = response["result"].as_object().unwrap();
+        assert!(result
+            .keys()
+            .any(|key| !PBH_READABLE_OPTIONS.contains(&key.as_str())));
+        assert!(result.contains_key("dir"));
+
+        let response = call(&state, "system.listMethods", vec![]).await;
+        let methods: Vec<&str> = response["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(methods.contains(&"aria2.addUri"));
     }
 }

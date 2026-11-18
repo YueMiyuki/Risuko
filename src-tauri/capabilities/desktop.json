@@ -3,10 +3,5 @@
 	"description": "Desktop-only capabilities for Risuko",
 	"windows": ["main"],
 	"platforms": ["macOS", "windows", "linux"],
-	"permissions": [
-		"autostart:default",
-		"notification:default",
-		"process:default",
-		"updater:default"
-	]
+	"permissions": ["notification:default", "updater:default"]
 }

@@ -33,7 +33,82 @@ impl UploadControl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl UploadError {
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn http(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: status == 408 || status == 429 || status >= 500,
+        }
+    }
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for UploadError {
+    fn from(message: String) -> Self {
+        Self::transient(message)
+    }
+}
+
+impl From<&str> for UploadError {
+    fn from(message: &str) -> Self {
+        Self::transient(message)
+    }
+}
+
 pub(super) const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(180);
+pub(super) const UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn stalled() -> String {
+    format!(
+        "upload stalled: no data moved for {}s",
+        UPLOAD_STALL_TIMEOUT.as_secs()
+    )
+}
+
+pub(super) async fn write_or_stall<W>(
+    writer: &mut W,
+    data: &[u8],
+    cancel: &CancellationToken,
+    label: &str,
+) -> Result<(), UploadError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    tokio::select! {
+        _ = cancel.cancelled() => Err(UploadError::fatal("cancelled")),
+        written = tokio::time::timeout(UPLOAD_STALL_TIMEOUT, writer.write_all(data)) => match written {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("{label} write: {e}").into()),
+            Err(_) => Err(stalled().into()),
+        },
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Heartbeat {
@@ -191,7 +266,7 @@ pub struct UploadSinkRecord {
 
 #[async_trait]
 pub trait UploadSink: Send + Sync {
-    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String>;
+    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, UploadError>;
 
     async fn test(&self) -> Result<(), String>;
 }
@@ -333,6 +408,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn write_or_stall_gives_up_on_a_stuck_peer_and_obeys_cancel() {
+        let (mut writer, _reader) = tokio::io::duplex(4);
+        let cancel = CancellationToken::new();
+        let stuck = write_or_stall(&mut writer, &[0u8; 64], &cancel, "TEST").await;
+        assert!(stuck.unwrap_err().message.contains("stalled"));
+        cancel.cancel();
+        let cancelled = write_or_stall(&mut writer, &[0u8; 64], &cancel, "TEST").await;
+        assert_eq!(cancelled.unwrap_err().message, "cancelled");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_with_stall_survives_while_progressing() {
         let hb = Heartbeat::new();
         let hb2 = hb.clone();
@@ -345,5 +431,33 @@ mod tests {
         };
         let r = run_with_stall(work, &hb, Duration::from_secs(10)).await;
         assert_eq!(r.unwrap(), 7);
+    }
+
+    #[test]
+    fn http_errors_retry_only_on_timeouts_throttling_and_server_faults() {
+        for status in [503, 429, 408] {
+            assert!(UploadError::http(status, "x").retryable, "{status}");
+        }
+        for status in [403, 401, 404, 400] {
+            assert!(!UploadError::http(status, "x").retryable, "{status}");
+        }
+    }
+
+    #[test]
+    fn string_errors_are_transient_and_fatal_is_not() {
+        assert!(UploadError::from("x".to_string()).retryable);
+        assert!(UploadError::from("x").retryable);
+        assert!(UploadError::transient("x").retryable);
+        assert!(!UploadError::fatal("x").retryable);
+        assert_eq!(UploadError::fatal("boom").to_string(), "boom");
+    }
+
+    #[test]
+    fn file_name_words_do_not_make_a_server_fault_permanent() {
+        let e = UploadError::http(
+            503,
+            "S3 PUT https://h/b/IMG_4031-oauth-login.jpg returned 503 Service Unavailable: busy",
+        );
+        assert!(e.retryable);
     }
 }

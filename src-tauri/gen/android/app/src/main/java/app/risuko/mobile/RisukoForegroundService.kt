@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class RisukoForegroundService : Service() {
@@ -26,11 +27,24 @@ class RisukoForegroundService : Service() {
       return START_NOT_STICKY
     }
 
-    startForeground(NOTIFICATION_ID, buildNotification(this, progress, activeCount, detail))
+    try {
+      startForeground(NOTIFICATION_ID, buildNotification(this, progress, activeCount, detail))
+    } catch (e: IllegalStateException) {
+      Log.w(TAG, "foreground service could not start", e)
+      stopSelf()
+      return START_NOT_STICKY
+    }
     return START_STICKY
   }
 
+  override fun onTimeout(startId: Int, fgsType: Int) {
+    Log.w(TAG, "foreground service time limit reached")
+    stopForeground(STOP_FOREGROUND_REMOVE)
+    stopSelf()
+  }
+
   companion object {
+    private const val TAG = "RisukoService"
     private const val CHANNEL_ID = "risuko_downloads"
     private const val CHANNEL_NAME = "Downloads"
     private const val NOTIFICATION_ID = 4737
@@ -44,10 +58,14 @@ class RisukoForegroundService : Service() {
         putExtra(EXTRA_ACTIVE_COUNT, activeCount.coerceAtLeast(0))
         putExtra(EXTRA_DETAIL, detail)
       }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        context.startForegroundService(intent)
-      } else {
-        context.startService(intent)
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+          context.startForegroundService(intent)
+        } else {
+          context.startService(intent)
+        }
+      } catch (e: IllegalStateException) {
+        Log.w(TAG, "foreground service could not start", e)
       }
     }
 

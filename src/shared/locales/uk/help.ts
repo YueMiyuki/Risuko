@@ -1,7 +1,7 @@
 export default {
 	"official-website": "Сайт Risuko",
 	manual: "Інструкція",
-	"release-notes": "Примітки до релизу...",
+	"release-notes": "Примітки до релізу...",
 	"report-problem": "Повідомити про проблему",
-	"toggle-dev-tools": "Переключити інстрменти розробника",
+	"toggle-dev-tools": "Переключити інструменти розробника",
 };

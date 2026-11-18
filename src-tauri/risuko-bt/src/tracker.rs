@@ -123,20 +123,38 @@ pub(crate) fn redacted_tracker_url(url: &str) -> String {
     }
 }
 
+pub(crate) fn is_announce_path(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|url| url.path().ends_with("/announce"))
+}
+
+fn tracker_host(url: &str) -> Option<url::Host> {
+    let parsed = url::Url::parse(url).ok()?;
+    match parsed.host()? {
+        url::Host::Domain(name) => url::Host::parse(name).ok(),
+        host => Some(host.to_owned()),
+    }
+}
+
+pub(crate) fn tracker_may_supply(tracker_url: &str, peer: SocketAddr) -> bool {
+    if !peer.ip().to_canonical().is_loopback() {
+        return true;
+    }
+    match tracker_host(tracker_url) {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).to_canonical().is_loopback(),
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn is_valid_endpoint(endpoint: SocketAddr) -> bool {
     !endpoint.ip().is_unspecified()
         && !endpoint.ip().is_multicast()
         && !matches!(endpoint, SocketAddr::V4(v4) if v4.ip().is_broadcast())
         && endpoint.port() != 0
-}
-
-pub async fn announce_with_proxy(
-    url: &str,
-    req: &AnnounceRequest,
-    timeout: Duration,
-    proxy: Option<&risuko_http::ProxyConnector>,
-) -> Result<AnnounceResponse, TrackerError> {
-    announce_with_proxy_and_source(url, req, timeout, proxy, None).await
 }
 
 const FAMILY_ANNOUNCE_GRACE: Duration = Duration::from_secs(5);
@@ -222,11 +240,7 @@ async fn announce_family(
 }
 
 fn tracker_voter(url: &str) -> Option<Voter> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = match parsed.host()? {
-        url::Host::Domain(name) => url::Host::parse(name).ok()?,
-        host => host.to_owned(),
-    };
+    let host = tracker_host(url)?;
     if !super::webseed::is_allowed_host(&host) {
         return None;
     }
@@ -734,5 +748,56 @@ mod tests {
     fn rejects_broadcast_peer_endpoints() {
         assert!(!is_valid_endpoint("255.255.255.255:6881".parse().unwrap()));
         assert!(is_valid_endpoint("192.0.2.1:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn announce_paths_are_recognised_by_their_last_segment() {
+        for url in [
+            "http://t.example/announce",
+            "http://t.example/a/b/announce",
+            "https://t.example:8443/announce?passkey=x",
+            "udp://t.example:6969/announce",
+        ] {
+            assert!(is_announce_path(url), "{url}");
+        }
+        for url in [
+            "http://t.example/announce.php",
+            "http://t.example/scrape",
+            "http://t.example/",
+            "http://t.example/admin?next=/announce",
+            "not a url",
+        ] {
+            assert!(!is_announce_path(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn only_loopback_trackers_may_supply_loopback_peers() {
+        let peer = |raw: &str| raw.parse::<SocketAddr>().unwrap();
+        let public = "http://tracker.example/announce";
+        assert!(tracker_may_supply(public, peer("203.0.113.5:6881")));
+        assert!(tracker_may_supply(public, peer("192.168.1.10:6881")));
+        for loopback in ["127.0.0.1:6379", "[::1]:6379", "[::ffff:127.0.0.1]:6379"] {
+            assert!(!tracker_may_supply(public, peer(loopback)), "{loopback}");
+        }
+        for url in [
+            "http://127.0.0.1:8000/announce",
+            "http://localhost:8000/announce",
+            "http://[::1]:8000/announce",
+            "udp://127.0.0.1:8000/announce",
+            "udp://LOCALHOST:8000/announce",
+            "http://tracker.localhost/announce",
+        ] {
+            assert!(tracker_may_supply(url, peer("127.0.0.1:6881")), "{url}");
+        }
+        for url in [
+            "http://192.168.1.2/announce",
+            "udp://203.0.113.9:6969/announce",
+            "http://localhost.evil.example/announce",
+            "not a url",
+        ] {
+            assert!(!tracker_may_supply(url, peer("127.0.0.1:6881")), "{url}");
+            assert!(tracker_may_supply(url, peer("203.0.113.5:6881")), "{url}");
+        }
     }
 }

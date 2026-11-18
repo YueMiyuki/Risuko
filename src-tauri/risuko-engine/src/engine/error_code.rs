@@ -204,25 +204,6 @@ pub fn classify_error(msg: &str, protocol: &str) -> ErrorCode {
             if lower.contains("auth") || lower.contains("credential") {
                 return ErrorCode::USENET_AUTH_FAILED;
             }
-            if lower.contains("archive safety:") {
-                if lower.contains("unsafepath") {
-                    return ErrorCode::USENET_ARCHIVE_UNSAFE;
-                }
-                if [
-                    "entrycount",
-                    "expandedbytes",
-                    "entrybytes",
-                    "nestingdepth",
-                    "compressionratio",
-                    "freespacereserve",
-                    "activetime",
-                ]
-                .iter()
-                .any(|variant| lower.contains(variant))
-                {
-                    return ErrorCode::USENET_ARCHIVE_LIMIT;
-                }
-            }
             if lower.contains("unsafe archive")
                 || lower.contains("unsafe path")
                 || lower.contains("unsafe par2")
@@ -476,24 +457,6 @@ mod tests {
         assert_eq!(
             classify_error("unsafe PAR2 filename: ../escape.bin", "usenet"),
             ErrorCode::USENET_ARCHIVE_UNSAFE
-        );
-    }
-
-    #[test]
-    fn classifies_formatted_archive_pipeline_safety_failures() {
-        use crate::engine::archive_pipeline::ArchivePipelineError;
-        use crate::engine::archive_safety::ArchiveSafetyError;
-
-        let unsafe_path = ArchivePipelineError::Safety(ArchiveSafetyError::UnsafePath).to_string();
-        assert_eq!(
-            classify_error(&unsafe_path, "usenet"),
-            ErrorCode::USENET_ARCHIVE_UNSAFE
-        );
-
-        let expanded = ArchivePipelineError::Safety(ArchiveSafetyError::ExpandedBytes).to_string();
-        assert_eq!(
-            classify_error(&expanded, "usenet"),
-            ErrorCode::USENET_ARCHIVE_LIMIT
         );
     }
 }

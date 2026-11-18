@@ -31,7 +31,7 @@ export default {
 			}
 
 			const { bittorrent } = this.task;
-			const data = (bittorrent.announceList || []).map((i: string[]) => i[0]);
+			const data = (bittorrent.announceList || []).flat();
 			return convertTrackerDataToLine(data);
 		},
 	},

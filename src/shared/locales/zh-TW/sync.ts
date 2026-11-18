@@ -77,4 +77,9 @@ export default {
 	"login-required": "請登入以啟用雲端同步",
 	"login-or": "或",
 	"login-github-fail": "GitHub 登入失敗",
+	"login-link-only":
+		"此信箱的登入請求過於頻繁，驗證碼已暫停發放。請開啟郵件中的連結登入。",
+	"login-link-fail": "無法完成登入，請在登入視窗中重新開始。",
+	"login-server-outdated":
+		"此同步伺服器版本過舊，不支援目前版本 Risuko 的登入連結。請重新取得郵件並直接輸入驗證碼（不要開啟連結），或更新伺服器。",
 };

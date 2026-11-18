@@ -168,6 +168,16 @@ pub trait StorageBackend: Send + Sync {
     fn save(&self, key: &str, value: &Value) -> Result<(), String>;
 }
 
+pub fn keep_unreadable_copy(storage: &dyn StorageBackend, key: &str, value: &Value) {
+    let backup_key = format!("{key}.unreadable-{}", crate::engine::util::now_secs());
+    match storage.save(&backup_key, value) {
+        Ok(()) => tracing::warn!("kept a copy of the unreadable {key} data under {backup_key}"),
+        Err(e) => tracing::warn!(
+            "could not keep a copy of the unreadable {key} data under {backup_key}: {e}"
+        ),
+    }
+}
+
 pub struct FileStorage {
     dir: PathBuf,
 }
@@ -297,6 +307,28 @@ mod tests {
         assert!(fresh.exists());
         assert!(live.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn unreadable_value_is_kept_under_a_backup_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path().to_path_buf());
+        let value = json!({"data": {"feeds": 5}});
+
+        keep_unreadable_copy(&storage, "rss", &value);
+
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("rss.unreadable-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+        assert_eq!(kept, value);
     }
 
     #[cfg(unix)]

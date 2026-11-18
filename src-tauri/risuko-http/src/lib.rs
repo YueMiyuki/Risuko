@@ -13,7 +13,7 @@ mod resolver;
 mod response;
 
 pub use body::ReqBody;
-pub use client::{Client, ClientBuilder};
+pub use client::{tls_roots, Client, ClientBuilder};
 pub use connector::{
     datagram_source_matches, BoxedIo, ProxyAssociation, ProxyConnector, ProxyDatagram,
     ProxyDatagramSource,

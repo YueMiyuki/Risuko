@@ -382,12 +382,10 @@ class MainActivity : TauriActivity() {
 	        activity.getExternalFilesDir(null),
 	        activity.cacheDir,
 	        activity.externalCacheDir,
+	        Environment.getExternalStorageDirectory(),
 	      ).map { it.canonicalFile }
-	      val allowed = allowedRoots.any { root ->
-	        file == root || file.relativeToOrNull(root) != null
-	      }
-	      if (!allowed) {
-	        throw SecurityException("open_path only allows app-owned files")
+	      if (allowedRoots.none { root -> file.startsWith(root) }) {
+	        throw SecurityException("open_path only allows downloads and app-owned files")
 	      }
 	      return FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
 	    }

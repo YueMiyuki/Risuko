@@ -78,6 +78,10 @@
         <span class="general-card-label">{{ $t('task.schedule-start-at') }}</span>
         <span class="general-card-value">{{ scheduledStartText }}</span>
       </div>
+      <div class="general-card-row" v-if="usenetWarningLabel">
+        <span class="general-card-label">{{ $t('task.task-warning') }}</span>
+        <span class="general-card-value">{{ usenetWarningLabel }}</span>
+      </div>
       <div
         class="general-card-row"
         v-if="(task.errorCode && task.errorCode !== '0') || taskErrorMessage"
@@ -242,6 +246,15 @@ export default {
 			const key = `task.ed2k-kad-state-${state}`;
 			const label = this.$t(key);
 			return label === key ? state : label;
+		},
+		usenetWarningLabel() {
+			const code = this.task?.usenetWarning;
+			if (!code) {
+				return "";
+			}
+			const key = `task.usenet-warning-${code}`;
+			const label = this.$t(key);
+			return label === key ? code : label;
 		},
 		usenetRepairFailureMessage() {
 			const failure = this.task?.usenetRepairFailure;

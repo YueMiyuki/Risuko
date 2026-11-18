@@ -444,7 +444,7 @@ pub fn decode_yenc_part(input: &[u8]) -> Result<DecodedYencPart, String> {
 }
 
 fn parse_yenc_header(line: &[u8], prefix: &str) -> Result<BTreeMap<String, String>, String> {
-    let text = std::str::from_utf8(line).map_err(|_| "yEnc header is not ASCII".to_string())?;
+    let text = String::from_utf8_lossy(line);
     let remainder = text
         .strip_prefix(prefix)
         .ok_or_else(|| "invalid yEnc header".to_string())?;
@@ -503,8 +503,20 @@ fn validate_crc32(data: &[u8], encoded: &str, field: &str) -> Result<(), String>
 }
 
 fn decode_yenc_line(line: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
-    crate::engine::archive_pipeline::decode_yenc_line(line, output)
-        .map_err(|error| error.to_string())
+    let mut index = 0;
+    while index < line.len() {
+        let mut value = line[index];
+        index += 1;
+        if value == b'=' {
+            if index >= line.len() {
+                return Err("truncated yEnc escape".to_string());
+            }
+            value = line[index].wrapping_sub(64);
+            index += 1;
+        }
+        output.push(value.wrapping_sub(42));
+    }
+    Ok(())
 }
 
 const fn build_crc32_tables() -> [[u32; 256]; 8] {
@@ -733,12 +745,36 @@ fn assembly_report(
     }
 }
 
+fn fits_free_space(current_len: u64, expected_size: u64, available: u64) -> bool {
+    expected_size.saturating_sub(current_len) <= available
+}
+
 async fn resize_assembled_part(
     file: &mut tokio::fs::File,
+    dir: &Path,
     expected_size: u64,
     limits: YencAssemblyLimits,
 ) -> Result<(), String> {
     limits.validate_file_size(expected_size)?;
+    let current_len = file
+        .metadata()
+        .await
+        .map_err(|error| format!("read assembled part metadata: {error}"))?
+        .len();
+    if expected_size > current_len {
+        let dir = dir.to_path_buf();
+        let available = tokio::task::spawn_blocking(move || fs4::available_space(&dir).ok())
+            .await
+            .ok()
+            .flatten();
+        if available
+            .is_some_and(|available| !fits_free_space(current_len, expected_size, available))
+        {
+            return Err(format!(
+                "not enough free space to assemble a {expected_size}-byte file"
+            ));
+        }
+    }
     file.set_len(expected_size)
         .await
         .map_err(|error| format!("size assembled part: {error}"))
@@ -912,8 +948,9 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
         .open(&part_path)
         .await
         .map_err(|error| format!("open assembled part: {error}"))?;
+    let part_dir = part_path.parent().unwrap_or_else(|| Path::new("."));
     if let Some(size) = sidecar.expected_size {
-        resize_assembled_part(&mut file, size, limits).await?;
+        resize_assembled_part(&mut file, part_dir, size, limits).await?;
     }
     let mut resized_expected_size = sidecar.expected_size;
     let mut bytes_since_checkpoint = 0u64;
@@ -1046,7 +1083,9 @@ pub(crate) async fn assemble_file_with_report_with_limits_at_offset<S: ArticleSo
                 return_after_checkpoint!("yEnc part overlaps a completed segment".into());
             }
             if resized_expected_size != Some(expected_size) {
-                if let Err(error) = resize_assembled_part(&mut file, expected_size, limits).await {
+                if let Err(error) =
+                    resize_assembled_part(&mut file, part_dir, expected_size, limits).await
+                {
                     return_after_checkpoint!(error);
                 }
                 resized_expected_size = Some(expected_size);
@@ -1181,6 +1220,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn yenc_header_tolerates_a_non_utf8_name() {
+        let mut line = b"=ybegin part=1 line=128 size=10 name=caf".to_vec();
+        line.extend_from_slice(&[0xe9, b'.', b'b', b'i', b'n']);
+        let fields = parse_yenc_header(&line, "=ybegin ").unwrap();
+        assert_eq!(fields.get("size").map(String::as_str), Some("10"));
+        assert_eq!(fields.get("part").map(String::as_str), Some("1"));
+    }
     use crate::traits::process_may_be_running;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1703,6 +1751,19 @@ mod tests {
             b"AB\0\0EF"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn free_space_check_covers_only_the_growth() {
+        assert!(fits_free_space(100, 100, 0));
+        assert!(fits_free_space(100, 50, 0));
+        assert!(fits_free_space(100, 150, 50));
+        assert!(!fits_free_space(100, 151, 50));
+        assert!(!fits_free_space(0, 1, 0));
+        assert!(!fits_free_space(0, u64::MAX, 0));
+        assert!(fits_free_space(0, u64::MAX, u64::MAX));
+        assert!(fits_free_space(u64::MAX, u64::MAX, 0));
+        assert!(!fits_free_space(1, u64::MAX, 0));
     }
 
     #[tokio::test]

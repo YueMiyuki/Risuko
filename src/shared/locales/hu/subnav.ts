@@ -1,4 +1,6 @@
 export default {
 	"task-list": "Feladat",
-	preferences: "Beallitás",
+	preferences: "Beállítás",
+	rss: "RSS",
+	sync: "Szinkronizálás",
 };

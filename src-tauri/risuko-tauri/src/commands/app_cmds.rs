@@ -23,30 +23,37 @@ pub fn hide_main_window(handle: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn quit_app(handle: AppHandle) -> Result<(), String> {
-    handle
-        .state::<crate::state::AppState>()
-        .is_quitting
-        .store(true, Ordering::SeqCst);
-    risuko_engine::engine::stop_engine()
-        .await
-        .map_err(|e| e.to_string())?;
+    let state = handle.state::<crate::state::AppState>();
+    state.is_quitting.store(true, Ordering::SeqCst);
+    if let Err(e) = risuko_engine::engine::stop_engine().await {
+        state.is_quitting.store(false, Ordering::SeqCst);
+        return Err(e.to_string());
+    }
     handle.exit(0);
     Ok(())
 }
 
-#[tauri::command]
-pub async fn relaunch_app(handle: AppHandle) -> Result<(), String> {
+async fn stop_engine_for_relaunch(handle: &AppHandle) -> Result<(), String> {
     let state = handle.state::<crate::state::AppState>();
     state.is_quitting.store(true, Ordering::SeqCst);
     let stop = risuko_engine::engine::stop_engine();
     match tokio::time::timeout(std::time::Duration::from_secs(15), stop).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             state.is_quitting.store(false, Ordering::SeqCst);
-            return Err(e.to_string());
+            Err(e.to_string())
         }
-        Err(_) => tracing::warn!("Timed out stopping engine before relaunch"),
+        Err(_) => {
+            tracing::warn!("Timed out stopping engine before relaunch");
+            Ok(())
+        }
     }
+}
+
+#[tauri::command]
+pub async fn relaunch_app(handle: AppHandle) -> Result<(), String> {
+    stop_engine_for_relaunch(&handle).await?;
+    std::env::set_var(RELAUNCHED_ENV, "1");
     handle.restart()
 }
 
@@ -66,15 +73,18 @@ pub fn log_frontend(level: String, message: String) {
     }
 }
 
-#[tauri::command(async)]
-pub fn factory_reset(
+#[tauri::command]
+pub async fn factory_reset(
     handle: AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config.reset()?;
-    drop(config);
-    handle.restart();
+    {
+        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+        config.reset()?;
+    }
+    stop_engine_for_relaunch(&handle).await?;
+    std::env::set_var(RELAUNCHED_ENV, "1");
+    handle.restart()
 }
 
 #[tauri::command]
@@ -114,6 +124,24 @@ pub fn toggle_app_menu(handle: AppHandle, hidden: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn is_opened_at_login() -> bool {
     std::env::args_os().any(|arg| arg == "--opened-at-login=1")
+}
+
+const RELAUNCHED_ENV: &str = "RISUKO_RELAUNCHED";
+
+pub fn file_argument<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> Option<String> {
+    args.into_iter()
+        .skip(1)
+        .map(|arg| arg.as_ref().to_string())
+        .find(|arg| !arg.starts_with('-') && std::path::Path::new(arg).exists())
+}
+
+#[tauri::command]
+pub fn take_startup_file() -> Option<String> {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TAKEN.swap(true, Ordering::SeqCst) || std::env::var_os(RELAUNCHED_ENV).is_some() {
+        return None;
+    }
+    file_argument(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -254,9 +282,14 @@ pub async fn shutdown_system(handle: AppHandle) -> Result<(), String> {
         state.is_quitting.store(true, Ordering::SeqCst);
 
         #[cfg(target_os = "windows")]
-        let args = ["/s", "/t", "0"];
-        #[cfg(not(target_os = "windows"))]
-        let args = ["-h", "now"];
+        let (program, args) = ("shutdown", ["/s", "/t", "0"].as_slice());
+        #[cfg(target_os = "macos")]
+        let (program, args) = (
+            "osascript",
+            ["-e", "tell application \"System Events\" to shut down"].as_slice(),
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let (program, args) = ("shutdown", ["-h", "now"].as_slice());
 
         if let Some(manager) = risuko_engine::engine::get_manager().await {
             if let Err(e) = manager.save_session().await {
@@ -266,7 +299,7 @@ pub async fn shutdown_system(handle: AppHandle) -> Result<(), String> {
 
         let rollback = || state.is_quitting.store(false, Ordering::SeqCst);
         let status = tauri::async_runtime::spawn_blocking(move || {
-            std::process::Command::new("shutdown").args(args).status()
+            std::process::Command::new(program).args(args).status()
         })
         .await
         .map_err(|e| {

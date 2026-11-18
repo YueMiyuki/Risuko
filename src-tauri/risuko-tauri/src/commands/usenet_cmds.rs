@@ -37,6 +37,10 @@ impl risuko_engine::engine::usenet::UsenetCredentialResolver for VaultCredential
         &self,
         profile_id: &str,
     ) -> Result<Option<risuko_engine::engine::usenet::UsenetCredentials>, String> {
+        let fallback = self.fallback.resolve(profile_id).await;
+        if let Ok(Some(credentials)) = fallback {
+            return Ok(Some(credentials));
+        }
         let lookup = {
             let vault = self.vault.clone();
             let key = credential_key(profile_id);
@@ -59,17 +63,15 @@ impl risuko_engine::engine::usenet::UsenetCredentialResolver for VaultCredential
             }
             Ok(Some(Ok(None))) | Ok(None) => {}
             Ok(Some(Err(error))) => {
-                tracing::warn!(
-                    "Failed to load Usenet credentials for {profile_id}: {error}; trying fallback"
-                );
+                tracing::warn!("Failed to load Usenet credentials for {profile_id}: {error}");
             }
             Err(error) => {
                 tracing::warn!(
-                    "Usenet credential lookup for {profile_id} did not complete: {error}; trying fallback"
+                    "Usenet credential lookup for {profile_id} did not complete: {error}"
                 );
             }
         }
-        self.fallback.resolve(profile_id).await
+        fallback
     }
 }
 
@@ -212,12 +214,12 @@ pub fn usenet_save_credentials(
     if state.vault.enabled() {
         match state.vault.put(&credential_key(&profile_id), &credentials) {
             Ok(()) => {
-                if let Err(error) = remove_fallback(&fallback_path, &profile_id) {
+                return remove_fallback(&fallback_path, &profile_id).or_else(|error| {
                     tracing::warn!(
-                        "Failed to clear stale Usenet credential fallback for {profile_id}: {error}"
+                        "Failed to clear stale Usenet credential fallback for {profile_id}: {error}; replacing it"
                     );
-                }
-                return Ok(());
+                    save_fallback(&fallback_path, &profile_id, &credentials)
+                });
             }
             Err(error) => tracing::warn!(
                 "Failed to store Usenet credentials in vault for {profile_id}: {error}; using fallback"

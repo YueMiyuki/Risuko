@@ -102,6 +102,8 @@ export default {
 		"No supported browsers detected on this machine.",
 	"task-cookie-import-success": "Imported {{count}} cookies from {{browser}}",
 	"task-cookie-import-failed": "Cookie import failed: {{error}}",
+	"task-cookie-app-bound":
+		"This browser protects its cookies on Windows (Chrome, Edge and Brave 127 or newer), so Risuko cannot read them. Use Firefox, or set a cookies.txt file under Preferences > Advanced.",
 	"task-cloudflare-title": "Cloudflare protection blocked the download",
 	"task-cloudflare-explain":
 		"This site uses Cloudflare to filter automated requests. Open the link in your browser, solve the challenge, then click Retry — Risuko will reuse your browser cookies for this download.",
@@ -168,6 +170,8 @@ export default {
 	"task-peer-client": "Client",
 	"navigate-to-downloading": "Navigate to Downloading",
 	"completion-script-override": "Override on-completion script for this task",
+	"completion-script-not-approved":
+		"The completion script for this task was not allowed.",
 	"show-advanced-options": "Advanced Options",
 	"loading-add-task": "Adding task...",
 	"loading-resolve-torrent": "Resolving torrent metadata...",
@@ -289,6 +293,13 @@ export default {
 	"download-pause-message": "Paused downloading {{taskName}}",
 	"download-stop-message": "Stopped downloading {{taskName}}",
 	"download-error-message": "Error occurred when downloading {{taskName}}",
+	"task-warning": "Warning",
+	"usenet-warning-archive-cleanup-unsupported":
+		"Archive volumes were kept because extraction is not verified. Only PAR2 files were cleaned up.",
+	"usenet-warning-cleanup-incomplete":
+		"The download is complete, but some PAR2 or archive files could not be removed during cleanup.",
+	"usenet-warning-par2-unverified":
+		"Downloaded, but the PAR2 check was skipped because some file names in this post are identical",
 	"usenet-repair-insufficient":
 		"PAR2 recovery is insufficient: {{neededBlocks}} blocks are needed, but only {{availableBlocks}} are available.",
 	"usenet-repair-partials-retained":

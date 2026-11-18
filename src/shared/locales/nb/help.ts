@@ -1,5 +1,5 @@
 export default {
-	"official-website": "Risuko' nettside",
+	"official-website": "Risukos nettside",
 	manual: "Brukerhåndbok",
 	"release-notes": "Utgivelsesnotater...",
 	"report-problem": "Rapporter problem",

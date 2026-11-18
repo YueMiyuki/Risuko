@@ -62,6 +62,26 @@ pub(crate) fn remove_connection_registration(
     }
 }
 
+struct AbandonedDial<'a> {
+    socket: &'a UtpSocket,
+    shared: &'a Arc<stream::Shared>,
+    key: ConnKey,
+    token: &'a ConnectionToken,
+    armed: bool,
+}
+
+impl Drop for AbandonedDial<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.shared.state.lock().force_close();
+        self.shared.nudge.notify_one();
+        remove_connection_registration(&self.socket.registry, self.key, self.token);
+        remove_proxy_connection_registration(&self.socket.proxy_registry, self.key.1, self.token);
+    }
+}
+
 pub(crate) fn remove_proxy_connection_registration(
     proxy_registry: &ProxyConnRegistry,
     connection_id: u16,
@@ -502,26 +522,27 @@ impl UtpSocket {
         tokio::spawn(stream::drive(driver_shared, cfg, Role::Initiator(done_tx)));
         drop(reconfigure_guard);
 
-        match tokio::time::timeout(timeout, done_rx).await {
+        let mut abandon = AbandonedDial {
+            socket: self,
+            shared: &shared,
+            key,
+            token: &token,
+            armed: true,
+        };
+        let outcome = tokio::time::timeout(timeout, done_rx).await;
+        abandon.armed = outcome.is_err();
+        drop(abandon);
+        match outcome {
             Ok(Ok(Ok(()))) => Ok(UtpStream::new(shared)),
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "utp driver exited before handshake",
             )),
-            Err(_) => {
-                {
-                    let mut st = shared.state.lock();
-                    st.force_close();
-                }
-                shared.nudge.notify_one();
-                remove_connection_registration(&self.registry, key, &token);
-                remove_proxy_connection_registration(&self.proxy_registry, recv_id, &token);
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "utp connect timed out",
-                ))
-            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "utp connect timed out",
+            )),
         }
     }
 
@@ -950,6 +971,27 @@ mod tests {
             .expect("no inbound connection")
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_dial_leaves_no_registered_connection() {
+        let socket = UtpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = silent.local_addr().unwrap();
+        let dialer = socket.clone();
+        let dial = tokio::spawn(async move { dialer.connect(target).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while socket.registry.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dial never registered");
+        dial.abort();
+        let _ = dial.await;
+        assert!(socket.registry.lock().is_empty());
     }
 
     #[tokio::test]

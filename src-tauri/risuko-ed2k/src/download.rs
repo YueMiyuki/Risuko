@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval, Duration, Instant};
@@ -33,6 +33,21 @@ const MAX_SLOT_RETRIES: u32 = 32;
 const FILE_REASK_INTERVAL: Duration = Duration::from_secs(29 * 60);
 const FILE_REASK_JITTER_SECS: u64 = 120;
 const REASK_BACKOFF: Duration = Duration::from_secs(30);
+const SOURCE_RETRY_BASE: Duration = Duration::from_secs(2 * 60);
+const SOURCE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+const MAX_SOURCE_ATTEMPTS: u32 = 5;
+const MAX_TRACKED_SOURCES: usize = 4096;
+const KAD_RELOOKUP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const KAD_IDLE_RELOOKUP_DELAY: Duration = Duration::from_secs(5 * 60);
+const KAD_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+const BAD_HASHSET_ERROR: &str = "peer sent a hashset that does not match the file hash";
+const UNREQUESTED_DATA_ERROR: &str = "peer keeps sending data that was not requested";
+const CORRUPT_DATA_ERROR: &str = "peer served corrupt data";
+const MISCONDUCT_ERRORS: [&str; 3] = [
+    BAD_HASHSET_ERROR,
+    UNREQUESTED_DATA_ERROR,
+    CORRUPT_DATA_ERROR,
+];
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerTimeouts {
@@ -144,13 +159,112 @@ impl QueuedSources {
     }
 }
 
+const VERIFY_RECHECK_DELAY: Duration = Duration::from_secs(30);
+const SERVER_LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn reask_delay() -> Duration {
     use rand::RngExt;
     FILE_REASK_INTERVAL + Duration::from_secs(rand::rng().random_range(0..=FILE_REASK_JITTER_SECS))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceState {
+    Live { failures: u32 },
+    Failed { failures: u32, retry_at: Instant },
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    Failed,
+    Done,
+    Requeued,
+}
+
+fn source_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(5);
+    (SOURCE_RETRY_BASE * (1 << doublings)).min(SOURCE_RETRY_MAX)
+}
+
+struct SourceBook {
+    states: HashMap<SocketAddrV4, SourceState>,
+    limit: usize,
+}
+
+impl SourceBook {
+    fn new(limit: usize) -> Self {
+        Self {
+            states: HashMap::new(),
+            limit,
+        }
+    }
+
+    fn admit(&mut self, addr: SocketAddrV4, now: Instant) -> bool {
+        let failures = match self.states.get(&addr).copied() {
+            None => {
+                if self.states.len() >= self.limit && !self.evict_one() {
+                    return false;
+                }
+                0
+            }
+            Some(SourceState::Failed { failures, retry_at })
+                if failures < MAX_SOURCE_ATTEMPTS && now >= retry_at =>
+            {
+                failures
+            }
+            Some(_) => return false,
+        };
+        self.states.insert(addr, SourceState::Live { failures });
+        true
+    }
+
+    fn record_end(&mut self, addr: SocketAddrV4, end: SessionEnd, now: Instant) {
+        let Some(state) = self.states.get_mut(&addr) else {
+            return;
+        };
+        *state = match end {
+            SessionEnd::Requeued => SourceState::Live { failures: 0 },
+            SessionEnd::Done => SourceState::Done,
+            SessionEnd::Failed => {
+                let failures = match *state {
+                    SourceState::Live { failures } | SourceState::Failed { failures, .. } => {
+                        failures.saturating_add(1)
+                    }
+                    SourceState::Done => 1,
+                };
+                SourceState::Failed {
+                    failures,
+                    retry_at: now + source_retry_delay(failures),
+                }
+            }
+        };
+    }
+
+    fn evict_one(&mut self) -> bool {
+        let victim = self
+            .states
+            .iter()
+            .filter_map(|(addr, state)| match *state {
+                SourceState::Live { .. } => None,
+                SourceState::Done => Some(((false, false, None), *addr)),
+                SourceState::Failed { failures, retry_at } => Some((
+                    (true, failures >= MAX_SOURCE_ATTEMPTS, Some(retry_at)),
+                    *addr,
+                )),
+            })
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, addr)| addr);
+        victim.is_some_and(|addr| self.states.remove(&addr).is_some())
+    }
+}
+
+fn kad_relookup_due(finished: Instant, idle_since: Option<Instant>, now: Instant) -> bool {
+    now >= finished + KAD_RELOOKUP_INTERVAL
+        || idle_since.is_some_and(|since| now >= since.max(finished) + KAD_IDLE_RELOOKUP_DELAY)
+}
+
 struct SourceScheduler {
-    seen: parking_lot::Mutex<HashSet<SocketAddrV4>>,
+    sources: Arc<parking_lot::Mutex<SourceBook>>,
     queued: Arc<QueuedSources>,
     candidates: mpsc::Sender<SourceCandidate>,
     cancel_token: CancellationToken,
@@ -224,6 +338,45 @@ async fn collect_kad_sources(
     *kad_status.lock() = Some(status.borrow().clone());
 }
 
+async fn repeat_kad_lookups<L, F>(
+    mut lookup: L,
+    is_idle: impl Fn() -> bool,
+    running: &AtomicBool,
+    cancel: &CancellationToken,
+) where
+    L: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    while !cancel.is_cancelled() {
+        running.store(true, Ordering::Relaxed);
+        lookup().await;
+        running.store(false, Ordering::Relaxed);
+        let finished = Instant::now();
+        let mut idle_since = None;
+        let mut check = interval(KAD_IDLE_CHECK_INTERVAL);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = check.tick() => {}
+            }
+            let now = Instant::now();
+            idle_since = if is_idle() {
+                idle_since.or(Some(now))
+            } else {
+                None
+            };
+            if kad_relookup_due(finished, idle_since, now) {
+                break;
+            }
+        }
+    }
+}
+
+fn kad_lookup_active(task: &Option<tokio::task::JoinHandle<()>>, running: &AtomicBool) -> bool {
+    task.as_ref().is_some_and(|task| !task.is_finished()) && running.load(Ordering::Relaxed)
+}
+
 impl SourceScheduler {
     fn new(
         client_hash: [u8; 16],
@@ -242,10 +395,15 @@ impl SourceScheduler {
         let peer_wake = wake.clone();
         let queued = QueuedSources::new(MAX_PENDING_PEER_SOURCES, wake.clone());
         let peer_queued = queued.clone();
+        let sources = Arc::new(parking_lot::Mutex::new(SourceBook::new(
+            MAX_TRACKED_SOURCES,
+        )));
+        let peer_sources = sources.clone();
         let dispatcher: CandidateDispatcher = Arc::new(move |candidate, permit| {
             spawn_peer_task_with_permit(
                 candidate,
                 peer_queued.clone(),
+                peer_sources.clone(),
                 candidate.addr,
                 client_hash,
                 candidate.client_id,
@@ -270,6 +428,7 @@ impl SourceScheduler {
             dispatcher,
             wake,
             queued,
+            sources,
         )
     }
 
@@ -289,6 +448,9 @@ impl SourceScheduler {
             dispatcher,
             wake,
             queued,
+            Arc::new(parking_lot::Mutex::new(SourceBook::new(
+                MAX_TRACKED_SOURCES,
+            ))),
         )
     }
 
@@ -299,6 +461,7 @@ impl SourceScheduler {
         dispatcher: CandidateDispatcher,
         wake: Arc<Notify>,
         queued: Arc<QueuedSources>,
+        sources: Arc<parking_lot::Mutex<SourceBook>>,
     ) -> Arc<Self> {
         let permits = Arc::new(Semaphore::new(max_active_dials));
         let (candidates, mut pending_candidates) = mpsc::channel::<SourceCandidate>(queue_capacity);
@@ -373,7 +536,7 @@ impl SourceScheduler {
         });
 
         Arc::new(Self {
-            seen: parking_lot::Mutex::new(HashSet::new()),
+            sources,
             queued,
             candidates,
             cancel_token,
@@ -383,6 +546,10 @@ impl SourceScheduler {
     }
 
     fn submit(&self, candidate: SourceCandidate) -> bool {
+        self.submit_at(candidate, Instant::now())
+    }
+
+    fn submit_at(&self, candidate: SourceCandidate, now: Instant) -> bool {
         let usable_addr = if candidate.origin == SourceOrigin::Kad {
             usable_source_addr(candidate.addr)
         } else {
@@ -391,18 +558,15 @@ impl SourceScheduler {
         if self.cancel_token.is_cancelled() || !usable_addr {
             return false;
         }
-        let mut seen = self.seen.lock();
-        if !seen.insert(candidate.addr) {
+        let Ok(slot) = self.candidates.try_reserve() else {
+            return false;
+        };
+        if !self.sources.lock().admit(candidate.addr, now) {
             return false;
         }
         self.pending.fetch_add(1, Ordering::Relaxed);
-        if self.candidates.try_send(candidate).is_ok() {
-            return true;
-        }
-
-        self.pending.fetch_sub(1, Ordering::Relaxed);
-        seen.remove(&candidate.addr);
-        false
+        slot.send(candidate);
+        true
     }
 
     fn is_idle(&self) -> bool {
@@ -510,7 +674,12 @@ async fn run_download(
         let (target, sidecar) = (final_path.to_path_buf(), met_path.clone());
         let owner = partial::Met::new(file_hash, file_link.file_size, None, Vec::new());
         tokio::task::spawn_blocking(move || {
-            partial::remove_partial_files(&target);
+            if partial::part_path(&target).exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "partial file belongs to another download",
+                ));
+            }
             partial::save_met(&sidecar, &owner)
         })
         .await
@@ -584,26 +753,30 @@ async fn run_download(
     }
 
     let kad_cancel = worker_cancel.child_token();
+    let kad_lookup_running = Arc::new(AtomicBool::new(kad.is_some()));
     let mut kad_task = kad.map(|service| {
-        let lookup = service.lookup_sources_for_client(
-            file_hash,
-            file_link.file_size,
-            client_hash,
-            kad_cancel.clone(),
-        );
+        let file_size = file_link.file_size;
         let scheduler = scheduler.clone();
         let kad_status = kad_status.clone();
+        let peer_count = peer_count.clone();
+        let running = kad_lookup_running.clone();
+        let cancel = kad_cancel.clone();
         tokio::spawn(async move {
-            let (sources, status, completion) = lookup.into_parts();
-            collect_kad_sources(
-                sources,
-                status,
-                completion,
-                scheduler,
-                kad_status,
-                client_hash,
-            )
-            .await;
+            let lookup = || {
+                let (sources, status, completion) = service
+                    .lookup_sources_for_client(file_hash, file_size, client_hash, cancel.clone())
+                    .into_parts();
+                collect_kad_sources(
+                    sources,
+                    status,
+                    completion,
+                    scheduler.clone(),
+                    kad_status.clone(),
+                    client_hash,
+                )
+            };
+            let is_idle = || peer_count.load(Ordering::Relaxed) == 0 && scheduler.is_idle();
+            repeat_kad_lookups(lookup, is_idle, &running, &cancel).await;
         })
     });
     if kad_task.is_none() {
@@ -706,7 +879,7 @@ async fn run_download(
     }
 
     tracing::info!("[ed2k] All servers tried, waiting for active peers to finish");
-    let fallback_wait = fallback_wait(kad_task.as_ref().is_some_and(|task| !task.is_finished()));
+    let fallback_wait = fallback_wait(kad_lookup_active(&kad_task, &kad_lookup_running));
     let deadline = tokio::time::Instant::now() + fallback_wait;
     let mut deadline_passed = false;
     loop {
@@ -721,7 +894,7 @@ async fn run_download(
                 return Ok(file_path);
             }
         }
-        let kad_finished = kad_task.as_ref().is_none_or(|task| task.is_finished());
+        let kad_finished = !kad_lookup_active(&kad_task, &kad_lookup_running);
         let no_work = peer_count.load(Ordering::Relaxed) == 0 && scheduler.is_idle();
         if no_work && (kad_finished || deadline_passed || tokio::time::Instant::now() >= deadline) {
             break;
@@ -780,6 +953,8 @@ async fn run_server_session(
     let mut client_id: u32 = 0;
     let mut source_check = interval(SERVER_REASK_INTERVAL);
     source_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let login_deadline = tokio::time::sleep(SERVER_LOGIN_TIMEOUT);
+    tokio::pin!(login_deadline);
 
     loop {
         if cancel_token.is_cancelled() {
@@ -848,6 +1023,9 @@ async fn run_server_session(
                     let _ = server.request_sources(&file_hash).await;
                 }
             }
+            _ = &mut login_deadline, if !got_id => {
+                return Err("Server login timed out".to_string());
+            }
             _ = progress_tick.tick() => {
                 publish_progress(chunks, completed, speed, connections, peer_count, 1, prev_completed).await;
             }
@@ -911,22 +1089,25 @@ async fn verify_ready_parts(
     chunks: &Arc<Mutex<ChunkManager>>,
     completed: &AtomicU64,
 ) -> Result<(), String> {
-    let jobs = chunks.lock().await.take_verify_jobs();
-    for job in jobs {
+    let mut jobs = chunks.lock().await.take_verify_jobs().into_iter();
+    while let Some(job) = jobs.next() {
         let index = job.index;
         let expected = job.expected;
         let hashed = tokio::task::spawn_blocking(move || hash_part_from_disk(&job)).await;
-        let ok = match hashed {
-            Ok(Ok(hash)) => hash == expected,
-            Ok(Err(e)) => {
-                chunks.lock().await.finish_verify(index, false);
-                return Err(format!("Failed to hash part {}: {}", index, e));
-            }
-            Err(e) => {
-                chunks.lock().await.finish_verify(index, false);
-                return Err(format!("Part hash task failed: {}", e));
-            }
+        let failure = match &hashed {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some(format!("Failed to hash part {}: {}", index, e)),
+            Err(e) => Some(format!("Part hash task failed: {}", e)),
         };
+        if let Some(failure) = failure {
+            let mut manager = chunks.lock().await;
+            manager.finish_verify(index, false);
+            for skipped in jobs {
+                manager.requeue_verify(skipped.index);
+            }
+            return Err(failure);
+        }
+        let ok = matches!(hashed, Ok(Ok(hash)) if hash == expected);
         if !ok {
             tracing::warn!(
                 "[ed2k] Part {} failed MD4 verification, re-downloading",
@@ -944,6 +1125,7 @@ async fn verify_ready_parts(
 fn spawn_peer_task_with_permit(
     candidate: SourceCandidate,
     queued: Arc<QueuedSources>,
+    sources: Arc<parking_lot::Mutex<SourceBook>>,
     addr: SocketAddrV4,
     client_hash: [u8; 16],
     client_id: u32,
@@ -978,11 +1160,20 @@ fn spawn_peer_task_with_permit(
             &throttle,
         )
         .await;
-        if let Ok(PeerOutcome::Queued(rank)) = result {
-            if queued.add(candidate, rank, reask_delay()) {
-                tracing::debug!("[ed2k] Peer {} queued us at rank {}", addr, rank);
+        let requeued = match result {
+            Ok(PeerOutcome::Queued(rank)) => {
+                let added = queued.add(candidate, rank, reask_delay());
+                if added {
+                    tracing::debug!("[ed2k] Peer {} queued us at rank {}", addr, rank);
+                }
+                added
             }
-        }
+            Ok(PeerOutcome::Recheck) => queued.add(candidate, u16::MAX, VERIFY_RECHECK_DELAY),
+            _ => false,
+        };
+        sources
+            .lock()
+            .record_end(addr, session_end(&result, requeued), Instant::now());
         peer_count.fetch_sub(1, Ordering::Relaxed);
         wake.notify_one();
 
@@ -992,10 +1183,20 @@ fn spawn_peer_task_with_permit(
     });
 }
 
+fn session_end(result: &Result<PeerOutcome, String>, requeued: bool) -> SessionEnd {
+    match (result, requeued) {
+        (Err(error), _) if MISCONDUCT_ERRORS.contains(&error.as_str()) => SessionEnd::Done,
+        (Err(_), _) => SessionEnd::Failed,
+        (Ok(_), true) => SessionEnd::Requeued,
+        (Ok(_), false) => SessionEnd::Done,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOutcome {
     Finished,
     Queued(u16),
+    Recheck,
 }
 
 async fn run_peer_download(
@@ -1032,6 +1233,17 @@ async fn run_peer_download(
     .await;
     chunks.lock().await.release_peer(peer_id);
     result
+}
+
+async fn block_wanted(
+    chunks: &Mutex<ChunkManager>,
+    peer: u64,
+    offset: u64,
+    len: usize,
+) -> Result<bool, String> {
+    let manager = chunks.lock().await;
+    let wanted = manager.begin_write(peer, offset, len)?.is_some();
+    Ok(wanted)
 }
 
 fn can_serve(file_size: u64, caps: &PeerCaps) -> bool {
@@ -1129,11 +1341,19 @@ pub(crate) async fn peer_session(
                 parts,
             }) => {
                 if fh == *file_hash {
-                    let needs = chunks.lock().await.needs_any(&parts);
+                    let (needs, verifying) = {
+                        let manager = chunks.lock().await;
+                        (
+                            manager.needs_any(&parts),
+                            manager.awaits_verification(&parts),
+                        )
+                    };
                     peer_parts = parts;
                     if needs && got_hello {
                         slot_requested = true;
                         peer.request_slot(file_hash).await?;
+                    } else if verifying {
+                        return Ok(PeerOutcome::Recheck);
                     } else {
                         return Ok(PeerOutcome::Finished);
                     }
@@ -1145,7 +1365,7 @@ pub(crate) async fn peer_session(
             }) => {
                 if fh == *file_hash {
                     if !chunks.lock().await.set_chunk_hashes(hashes) {
-                        return Err("peer sent a hashset that does not match the file hash".into());
+                        return Err(BAD_HASHSET_ERROR.into());
                     }
                     verify_ready_parts(chunks, completed).await?;
                     if got_slot {
@@ -1169,19 +1389,24 @@ pub(crate) async fn peer_session(
                 start,
                 data,
             }) => {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => return Err("cancelled".to_string()),
-                    _ = throttle.acquire(data.len()) => {}
-                }
-                let accepted =
-                    fh == *file_hash && write_block(chunks, peer_id, start, data).await?;
+                let wanted =
+                    fh == *file_hash && block_wanted(chunks, peer_id, start, data.len()).await?;
+                let accepted = if wanted {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return Err("cancelled".to_string()),
+                        _ = throttle.acquire(data.len()) => {}
+                    }
+                    write_block(chunks, peer_id, start, data).await?
+                } else {
+                    false
+                };
                 if accepted {
                     rejected = 0;
                     slot_retries = 0;
                 } else {
                     rejected += 1;
                     if rejected > MAX_PEER_REJECTED_PACKETS {
-                        return Err("peer keeps sending data that was not requested".into());
+                        return Err(UNREQUESTED_DATA_ERROR.into());
                     }
                 }
                 verify_ready_parts(chunks, completed).await?;
@@ -1190,7 +1415,7 @@ pub(crate) async fn peer_session(
                     let mut cm = chunks.lock().await;
                     completed.store(cm.completed_length(), Ordering::Relaxed);
                     if cm.is_banned(peer_id) {
-                        return Err("peer served corrupt data".into());
+                        return Err(CORRUPT_DATA_ERROR.into());
                     }
                     if cm.is_complete() {
                         (true, vec![])
@@ -1335,6 +1560,7 @@ mod tests {
 
     use super::super::protocol::Ed2kPacket;
     use super::*;
+    use std::collections::HashSet;
     use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Semaphore as TestGate;
@@ -1525,6 +1751,22 @@ mod tests {
         assert!(run_unreachable(&link, &fin, kad_status).await.is_err());
         assert!(partial::part_path(&fin).exists());
         assert!(partial::load_met(&partial::met_path(&fin), &link).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_partial_without_a_record_is_never_deleted() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = super::super::parse_ed2k_link(
+            "ed2k://|file|test.bin|1|0123456789abcdef0123456789abcdef|/",
+        )
+        .unwrap();
+        let fin = directory.path().join("test.bin");
+        std::fs::write(partial::part_path(&fin), b"foreign").unwrap();
+        let kad_status = Arc::new(parking_lot::Mutex::new(None));
+        let error = run_unreachable(&link, &fin, kad_status).await.unwrap_err();
+        assert!(error.contains("belongs to another download"));
+        assert_eq!(std::fs::read(partial::part_path(&fin)).unwrap(), b"foreign");
+        assert!(!partial::met_path(&fin).exists());
     }
 
     #[tokio::test]
@@ -1955,6 +2197,258 @@ mod tests {
         }
     }
 
+    fn end_session(scheduler: &SourceScheduler, addr: SocketAddrV4, end: SessionEnd, now: Instant) {
+        scheduler.sources.lock().record_end(addr, end, now);
+    }
+
+    #[tokio::test]
+    async fn failed_source_is_accepted_again_after_a_doubling_delay() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 16, 16, dispatcher);
+        let candidate = queued_candidate(1);
+        let second = Duration::from_secs(1);
+        let t0 = Instant::now();
+
+        assert!(scheduler.submit_at(candidate, t0));
+        end_session(&scheduler, candidate.addr, SessionEnd::Failed, t0);
+        assert!(!scheduler.submit_at(candidate, t0));
+        assert!(!scheduler.submit_at(candidate, t0 + SOURCE_RETRY_BASE - second));
+
+        let t1 = t0 + SOURCE_RETRY_BASE;
+        assert!(scheduler.submit_at(candidate, t1));
+        end_session(&scheduler, candidate.addr, SessionEnd::Failed, t1);
+        assert!(!scheduler.submit_at(candidate, t1));
+        assert!(!scheduler.submit_at(candidate, t1 + 2 * SOURCE_RETRY_BASE - second));
+        assert!(scheduler.submit_at(candidate, t1 + 2 * SOURCE_RETRY_BASE));
+        cancel.cancel();
+    }
+
+    #[test]
+    fn source_retry_delay_doubles_up_to_the_cap() {
+        assert_eq!(source_retry_delay(1), SOURCE_RETRY_BASE);
+        assert_eq!(source_retry_delay(2), SOURCE_RETRY_BASE * 2);
+        assert_eq!(source_retry_delay(3), SOURCE_RETRY_BASE * 4);
+        for failures in 0..=64 {
+            assert!(source_retry_delay(failures) <= SOURCE_RETRY_MAX);
+        }
+        assert_eq!(source_retry_delay(u32::MAX), SOURCE_RETRY_MAX);
+    }
+
+    #[tokio::test]
+    async fn source_is_refused_for_good_after_the_last_attempt_fails() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 16, 16, dispatcher);
+        let candidate = queued_candidate(1);
+        let mut now = Instant::now();
+
+        for _ in 0..MAX_SOURCE_ATTEMPTS {
+            assert!(scheduler.submit_at(candidate, now));
+            end_session(&scheduler, candidate.addr, SessionEnd::Failed, now);
+            now += SOURCE_RETRY_MAX;
+        }
+        assert!(!scheduler.submit_at(candidate, now));
+        assert!(!scheduler.submit_at(candidate, now + Duration::from_secs(7 * 24 * 3600)));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_successful_session_resets_the_failure_count() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 16, 16, dispatcher);
+        let candidate = queued_candidate(1);
+        let mut now = Instant::now();
+
+        for _ in 0..MAX_SOURCE_ATTEMPTS - 1 {
+            assert!(scheduler.submit_at(candidate, now));
+            end_session(&scheduler, candidate.addr, SessionEnd::Failed, now);
+            now += SOURCE_RETRY_MAX;
+        }
+        assert!(scheduler.submit_at(candidate, now));
+        end_session(&scheduler, candidate.addr, SessionEnd::Requeued, now);
+        assert!(!scheduler.submit_at(candidate, now + SOURCE_RETRY_MAX));
+        end_session(&scheduler, candidate.addr, SessionEnd::Failed, now);
+        assert!(scheduler.submit_at(candidate, now + SOURCE_RETRY_BASE));
+        end_session(
+            &scheduler,
+            candidate.addr,
+            SessionEnd::Done,
+            now + SOURCE_RETRY_BASE,
+        );
+        assert!(!scheduler.submit_at(candidate, now + SOURCE_RETRY_MAX * 4));
+        cancel.cancel();
+    }
+
+    #[test]
+    fn misconduct_ends_a_source_and_other_errors_count_as_failures() {
+        for error in [
+            BAD_HASHSET_ERROR,
+            UNREQUESTED_DATA_ERROR,
+            CORRUPT_DATA_ERROR,
+        ] {
+            assert_eq!(
+                session_end(&Err(error.to_string()), false),
+                SessionEnd::Done
+            );
+        }
+        for error in [
+            "timed out waiting for peer".to_string(),
+            format!("disconnected: {:?}", Some("connection reset")),
+            "peer keeps revoking the upload slot".to_string(),
+            format!("{CORRUPT_DATA_ERROR} again"),
+        ] {
+            assert_eq!(session_end(&Err(error), false), SessionEnd::Failed);
+        }
+        assert_eq!(
+            session_end(&Ok(PeerOutcome::Queued(3)), true),
+            SessionEnd::Requeued
+        );
+        assert_eq!(
+            session_end(&Ok(PeerOutcome::Queued(3)), false),
+            SessionEnd::Done
+        );
+        assert_eq!(
+            session_end(&Ok(PeerOutcome::Finished), false),
+            SessionEnd::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_misbehaving_source_is_refused_for_the_rest_of_the_download() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 16, 16, dispatcher);
+        let candidate = queued_candidate(1);
+        let now = Instant::now();
+
+        assert!(scheduler.submit_at(candidate, now));
+        let end = session_end(&Err(CORRUPT_DATA_ERROR.to_string()), false);
+        end_session(&scheduler, candidate.addr, end, now);
+        assert!(!scheduler.submit_at(candidate, now + Duration::from_secs(7 * 24 * 3600)));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn pending_source_is_refused_however_late_it_is_offered_again() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 16, 16, dispatcher);
+        let candidate = queued_candidate(1);
+        let now = Instant::now();
+
+        assert!(scheduler.submit_at(candidate, now));
+        assert!(!scheduler.submit_at(candidate, now + Duration::from_secs(365 * 24 * 3600)));
+        cancel.cancel();
+    }
+
+    #[test]
+    fn source_book_stays_within_its_cap_and_keeps_live_entries() {
+        let mut book = SourceBook::new(4);
+        let now = Instant::now();
+        let [live, done, near, far] = [1, 2, 3, 4].map(public_addr);
+        for addr in [live, done, near, far] {
+            assert!(book.admit(addr, now));
+        }
+        book.record_end(done, SessionEnd::Done, now);
+        book.record_end(near, SessionEnd::Failed, now);
+        book.record_end(far, SessionEnd::Failed, now + Duration::from_secs(60));
+
+        let newcomers = [5, 6, 7].map(public_addr);
+        assert!(book.admit(newcomers[0], now));
+        assert_eq!(book.states.len(), 4);
+        assert!(!book.states.contains_key(&far));
+        assert!(book.states.contains_key(&near));
+
+        assert!(book.admit(newcomers[1], now));
+        assert_eq!(book.states.len(), 4);
+        assert!(!book.states.contains_key(&near));
+        assert!(book.states.contains_key(&done));
+
+        assert!(book.admit(newcomers[2], now));
+        assert_eq!(book.states.len(), 4);
+        assert!(!book.states.contains_key(&done));
+
+        assert!(!book.admit(public_addr(8), now));
+        assert_eq!(book.states.len(), 4);
+        assert!(book.states.contains_key(&live));
+        assert!(newcomers.iter().all(|addr| book.states.contains_key(addr)));
+    }
+
+    #[tokio::test]
+    async fn a_full_dial_queue_refuses_a_source_without_evicting_another() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, _started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 1, 0, dispatcher);
+        let now = Instant::now();
+        assert!(scheduler.submit_at(queued_candidate(1), now));
+        {
+            let mut book = scheduler.sources.lock();
+            let failed = SourceState::Failed {
+                failures: 1,
+                retry_at: now + SOURCE_RETRY_BASE,
+            };
+            let mut index = 2;
+            while book.states.len() < MAX_TRACKED_SOURCES {
+                book.states.insert(public_addr(index), failed);
+                index += 1;
+            }
+        }
+        let before = scheduler.sources.lock().states.clone();
+
+        assert!(!scheduler.submit_at(queued_candidate(MAX_TRACKED_SOURCES + 10), now));
+        assert_eq!(scheduler.sources.lock().states, before);
+        cancel.cancel();
+    }
+
+    #[test]
+    fn kad_relookup_follows_the_interval_or_sustained_idleness() {
+        let finished = Instant::now();
+        let second = Duration::from_secs(1);
+        let minute = Duration::from_secs(60);
+
+        assert!(!kad_relookup_due(finished, None, finished));
+        assert!(!kad_relookup_due(
+            finished,
+            None,
+            finished + KAD_RELOOKUP_INTERVAL - second
+        ));
+        assert!(kad_relookup_due(
+            finished,
+            None,
+            finished + KAD_RELOOKUP_INTERVAL
+        ));
+
+        assert!(!kad_relookup_due(
+            finished,
+            Some(finished),
+            finished + KAD_IDLE_RELOOKUP_DELAY - second
+        ));
+        assert!(kad_relookup_due(
+            finished,
+            Some(finished),
+            finished + KAD_IDLE_RELOOKUP_DELAY
+        ));
+
+        let idle = finished + 10 * minute;
+        assert!(!kad_relookup_due(
+            finished,
+            Some(idle),
+            idle + KAD_IDLE_RELOOKUP_DELAY - second
+        ));
+        assert!(kad_relookup_due(
+            finished,
+            Some(idle),
+            idle + KAD_IDLE_RELOOKUP_DELAY
+        ));
+        assert!(!kad_relookup_due(
+            finished,
+            Some(finished - 10 * minute),
+            finished + second
+        ));
+    }
+
     enum FakePeerEnd {
         Close,
         Hold,
@@ -2004,17 +2498,75 @@ mod tests {
         addr
     }
 
-    async fn session_against(
-        addr: SocketAddrV4,
+    async fn fake_sending_peer(file_hash: [u8; 16], blocks: Vec<(u64, Vec<u8>)>) -> SocketAddrV4 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = match listener.local_addr().expect("addr") {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!("bound to an IPv4 address"),
+        };
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 256];
+            let _ = stream.read(&mut scratch).await;
+            let mut status = file_hash.to_vec();
+            status.extend_from_slice(&2u16.to_le_bytes());
+            status.push(0b11);
+            let mut packets = vec![
+                Ed2kPacket::new(PROTO_EDONKEY, OP_HELLO_ANSWER, vec![0; 26]),
+                Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_STATUS, status),
+                Ed2kPacket::new(PROTO_EDONKEY, OP_SLOT_GIVEN, Vec::new()),
+            ];
+            for (start, data) in blocks {
+                let end = start + data.len() as u64;
+                let mut payload = file_hash.to_vec();
+                payload.extend_from_slice(&(start as u32).to_le_bytes());
+                payload.extend_from_slice(&(end as u32).to_le_bytes());
+                payload.extend_from_slice(&data);
+                packets.push(Ed2kPacket::new(PROTO_EDONKEY, OP_SENDING_PART, payload));
+            }
+            packets.push(Ed2kPacket::new(
+                PROTO_EDONKEY,
+                OP_FILE_REQ_ANS_NOFILE,
+                file_hash.to_vec(),
+            ));
+            for packet in packets {
+                if stream.write_all(&packet.encode()).await.is_err() {
+                    return;
+                }
+            }
+            while stream
+                .read(&mut scratch)
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false)
+            {}
+        });
+        addr
+    }
+
+    async fn fixture_chunks(
         fixture_dir: &Path,
-        timeouts: PeerTimeouts,
-    ) -> Result<PeerOutcome, String> {
-        let (data, _hashes, file_hash) = two_part_fixture();
+        size: u64,
+        file_hash: [u8; 16],
+    ) -> Arc<Mutex<ChunkManager>> {
         let fin = fixture_dir.join("f.bin");
-        let mut cm = ChunkManager::new(partial::part_path(&fin), data.len() as u64)
-            .with_file_hash(file_hash);
+        let mut cm = ChunkManager::new(partial::part_path(&fin), size).with_file_hash(file_hash);
         cm.init_file().await.expect("init file");
-        let chunks = Arc::new(Mutex::new(cm));
+        Arc::new(Mutex::new(cm))
+    }
+
+    async fn session_with(
+        addr: SocketAddrV4,
+        chunks: &Arc<Mutex<ChunkManager>>,
+        file_hash: [u8; 16],
+        timeouts: PeerTimeouts,
+        throttle: &Throttle,
+    ) -> Result<PeerOutcome, String> {
         let completed = Arc::new(AtomicU64::new(0));
         peer_session(
             timeouts,
@@ -2026,13 +2578,56 @@ mod tests {
             0,
             0,
             &file_hash,
-            &chunks,
+            chunks,
             &completed,
             &CancellationToken::new(),
             risuko_http::ProxyConnector::direct(),
-            &Throttle::unlimited(),
+            throttle,
         )
         .await
+    }
+
+    async fn session_against(
+        addr: SocketAddrV4,
+        fixture_dir: &Path,
+        timeouts: PeerTimeouts,
+    ) -> Result<PeerOutcome, String> {
+        let (data, _hashes, file_hash) = two_part_fixture();
+        let chunks = fixture_chunks(fixture_dir, data.len() as u64, file_hash).await;
+        session_with(addr, &chunks, file_hash, timeouts, &Throttle::unlimited()).await
+    }
+
+    #[tokio::test]
+    async fn unrequested_block_skips_the_limiter_and_requested_block_still_waits() {
+        use super::super::chunks::ED2K_BLOCK_SIZE;
+        use risuko_util::limiter::RateLimiter;
+        let (data, _hashes, file_hash) = two_part_fixture();
+        let rate = 32 * 1024;
+        let requested = 8 * 1024;
+        let unrequested = (4 * ED2K_BLOCK_SIZE, vec![0; ED2K_BLOCK_SIZE as usize]);
+        let addr = fake_sending_peer(
+            file_hash,
+            vec![unrequested, (0, data[..requested].to_vec())],
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunks = fixture_chunks(dir.path(), data.len() as u64, file_hash).await;
+        let started = Instant::now();
+        let throttle = Throttle::new(
+            Arc::new(RateLimiter::new(rate)),
+            Arc::new(RateLimiter::unlimited()),
+        );
+        throttle.acquire(rate as usize).await;
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            session_with(addr, &chunks, file_hash, PeerTimeouts::default(), &throttle),
+        )
+        .await
+        .expect("an unrequested block must not wait on the limiter");
+        assert_eq!(outcome, Ok(PeerOutcome::Finished));
+        assert_eq!(chunks.lock().await.completed_length(), requested as u64);
+        assert!(started.elapsed() >= Duration::from_millis(240));
     }
 
     #[tokio::test]

@@ -121,7 +121,6 @@
     </div>
     <task-files
       v-else
-      ref="torrentFileList"
       mode="ADD"
       :files="files"
       @selection-change="handleSelectionChange"
@@ -352,11 +351,6 @@ export default {
 					: listTorrentFiles(resolved.files || []);
 
 				this.$emit("change", filePath, SELECTED_ALL_FILES);
-				this.$nextTick(() => {
-					if (!this.previewDisabled) {
-						this.$refs.torrentFileList?.toggleAllSelection();
-					}
-				});
 			} catch (err: unknown) {
 				logger.warn(
 					"[Risuko] parse torrent failed:",
@@ -1104,9 +1098,6 @@ export default {
 			this.previewExcludedRanges = [];
 			this.previewSelectRangesCache = {};
 			this.parseVersion += 1;
-			if (this.$refs.torrentFileList) {
-				this.$refs.torrentFileList.clearSelection();
-			}
 			if (emitChange) {
 				this.$emit("change", "", NONE_SELECTED_FILES);
 			}

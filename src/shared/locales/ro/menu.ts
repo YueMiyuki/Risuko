@@ -1,8 +1,8 @@
 export default {
 	app: "Risuko",
-	file: "File",
+	file: "Fișier",
 	task: "Sarcină",
-	edit: "Edit",
+	edit: "Editare",
 	window: "Fereastra",
 	help: "Ajutor",
 };

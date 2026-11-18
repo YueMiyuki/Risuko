@@ -212,10 +212,8 @@ export default {
 					?.then(() => {
 						this.$msg.success(this.$t("task.resume-selected-tasks-success"));
 					})
-					.catch(({ code }) => {
-						if (code === 1) {
-							this.$msg.error(this.$t("task.resume-selected-tasks-fail"));
-						}
+					.catch(() => {
+						this.$msg.error(this.$t("task.resume-selected-tasks-fail"));
 					});
 			} else {
 				useTaskStore()
@@ -223,10 +221,8 @@ export default {
 					.then(() => {
 						this.$msg.success(this.$t("task.resume-all-task-success"));
 					})
-					.catch(({ code }) => {
-						if (code === 1) {
-							this.$msg.error(this.$t("task.resume-all-task-fail"));
-						}
+					.catch(() => {
+						this.$msg.error(this.$t("task.resume-all-task-fail"));
 					});
 			}
 		},
@@ -237,10 +233,8 @@ export default {
 					?.then(() => {
 						this.$msg.success(this.$t("task.pause-selected-tasks-success"));
 					})
-					.catch(({ code }) => {
-						if (code === 1) {
-							this.$msg.error(this.$t("task.pause-selected-tasks-fail"));
-						}
+					.catch(() => {
+						this.$msg.error(this.$t("task.pause-selected-tasks-fail"));
 					});
 			} else {
 				useTaskStore()
@@ -248,10 +242,8 @@ export default {
 					.then(() => {
 						this.$msg.success(this.$t("task.pause-all-task-success"));
 					})
-					.catch(({ code }) => {
-						if (code === 1) {
-							this.$msg.error(this.$t("task.pause-all-task-fail"));
-						}
+					.catch(() => {
+						this.$msg.error(this.$t("task.pause-all-task-fail"));
 					});
 			}
 		},
@@ -261,10 +253,8 @@ export default {
 				.then(() => {
 					this.$msg.success(this.$t("task.purge-record-success"));
 				})
-				.catch(({ code }) => {
-					if (code === 1) {
-						this.$msg.error(this.$t("task.purge-record-fail"));
-					}
+				.catch(() => {
+					this.$msg.error(this.$t("task.purge-record-fail"));
 				});
 		},
 		formatBytes(value, precision = 1) {

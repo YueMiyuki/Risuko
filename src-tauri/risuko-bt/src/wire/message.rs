@@ -319,46 +319,18 @@ impl MessageDecoder {
             Ok(buf.copy_to_bytes(n))
         };
         let msg = match id {
-            id::CHOKE => {
-                take(buf, remaining, id)?;
-                Message::Choke
-            }
-            id::UNCHOKE => {
-                take(buf, remaining, id)?;
-                Message::Unchoke
-            }
-            id::INTERESTED => {
-                take(buf, remaining, id)?;
-                Message::Interested
-            }
-            id::NOT_INTERESTED => {
-                take(buf, remaining, id)?;
-                Message::NotInterested
-            }
-            id::HAVE => {
-                if remaining != 4 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 4,
-                        got: remaining,
-                    });
-                }
-                Message::Have {
-                    piece_index: buf.get_u32(),
-                }
-            }
+            id::CHOKE => Message::Choke,
+            id::UNCHOKE => Message::Unchoke,
+            id::INTERESTED => Message::Interested,
+            id::NOT_INTERESTED => Message::NotInterested,
+            id::HAVE => Message::Have {
+                piece_index: buf.get_u32(),
+            },
             id::BITFIELD => {
                 let b = take(buf, remaining, id)?;
                 Message::Bitfield(b)
             }
             id::REQUEST => {
-                if remaining != 12 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 12,
-                        got: remaining,
-                    });
-                }
                 let index = buf.get_u32();
                 let begin = buf.get_u32();
                 let length = buf.get_u32();
@@ -382,13 +354,6 @@ impl MessageDecoder {
                 Message::Piece { index, begin, data }
             }
             id::CANCEL => {
-                if remaining != 12 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 12,
-                        got: remaining,
-                    });
-                }
                 let index = buf.get_u32();
                 let begin = buf.get_u32();
                 let length = buf.get_u32();
@@ -398,44 +363,10 @@ impl MessageDecoder {
                     length,
                 }
             }
-            id::PORT => {
-                if remaining != 2 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 2,
-                        got: remaining,
-                    });
-                }
-                Message::Port(buf.get_u16())
-            }
-            id::HAVE_ALL => {
-                if remaining != 0 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 0,
-                        got: remaining,
-                    });
-                }
-                Message::HaveAll
-            }
-            id::HAVE_NONE => {
-                if remaining != 0 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 0,
-                        got: remaining,
-                    });
-                }
-                Message::HaveNone
-            }
+            id::PORT => Message::Port(buf.get_u16()),
+            id::HAVE_ALL => Message::HaveAll,
+            id::HAVE_NONE => Message::HaveNone,
             id::REJECT_REQUEST => {
-                if remaining != 12 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 12,
-                        got: remaining,
-                    });
-                }
                 let index = buf.get_u32();
                 let begin = buf.get_u32();
                 let length = buf.get_u32();
@@ -445,26 +376,8 @@ impl MessageDecoder {
                     length,
                 }
             }
-            id::SUGGEST_PIECE => {
-                if remaining != 4 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 4,
-                        got: remaining,
-                    });
-                }
-                Message::SuggestPiece(buf.get_u32())
-            }
-            id::ALLOWED_FAST => {
-                if remaining != 4 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 4,
-                        got: remaining,
-                    });
-                }
-                Message::AllowedFast(buf.get_u32())
-            }
+            id::SUGGEST_PIECE => Message::SuggestPiece(buf.get_u32()),
+            id::ALLOWED_FAST => Message::AllowedFast(buf.get_u32()),
             id::EXTENDED => {
                 if remaining < 1 {
                     return Err(MessageError::Truncated {
@@ -478,13 +391,6 @@ impl MessageDecoder {
                 Message::Extended { ext_id, payload }
             }
             id::HASH_REQUEST | id::HASH_REJECT => {
-                if remaining != 48 {
-                    return Err(MessageError::Truncated {
-                        id,
-                        expected: 48,
-                        got: remaining,
-                    });
-                }
                 let mut pieces_root = [0u8; 32];
                 buf.copy_to_slice(&mut pieces_root);
                 let base_layer = buf.get_u32();

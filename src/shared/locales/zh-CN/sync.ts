@@ -51,6 +51,7 @@ export default {
 	"category-ports": "端口",
 	"category-ftp": "FTP / SFTP",
 	"category-g2-gnutella": "G2 / Gnutella",
+	"category-usenet": "Usenet",
 	"category-misc": "其他",
 	login: "登录",
 	logout: "退出登录",
@@ -76,4 +77,9 @@ export default {
 	"login-required": "请登录以启用云同步",
 	"login-or": "或",
 	"login-github-fail": "GitHub 登录失败",
+	"login-link-only":
+		"此邮箱的登录请求过于频繁，验证码已暂停发放。请打开邮件中的链接登录。",
+	"login-link-fail": "无法完成登录，请在登录窗口中重新开始。",
+	"login-server-outdated":
+		"此同步服务器版本过旧，不支持当前版本 Risuko 的登录链接。请重新获取邮件并直接输入验证码（不要打开链接），或更新服务器。",
 };

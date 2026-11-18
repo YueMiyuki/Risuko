@@ -106,8 +106,7 @@ pub(crate) async fn run_urn_fetch(
     cancel_token: CancellationToken,
     proxy: risuko_http::ProxyConnector,
 ) -> Result<PathBuf, GnutellaError> {
-    let out_path = urn_out_path(req.dir, req.file_name, req.urn, req.default_name);
-    let fetch_path = out_path.clone();
+    let fetch_path = urn_out_path(req.dir, req.file_name, req.urn, req.default_name);
     connections.store(1, Ordering::Relaxed);
     let fetch = fetch_by_urn_with_proxy(
         req.host,
@@ -136,8 +135,7 @@ pub(crate) async fn run_urn_fetch(
     };
     connections.store(0, Ordering::Relaxed);
     speed.store(0, Ordering::Relaxed);
-    result?;
-    Ok(out_path)
+    result
 }
 
 #[cfg(test)]

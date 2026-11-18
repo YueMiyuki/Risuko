@@ -7,6 +7,6 @@ export default {
 	copied: "Копирано",
 	"copy-failed": "Неуспешно копиране на информацията за версията",
 	license: "Лиценз",
-	release: "Съобщение",
+	release: "Издания",
 	support: "Подкрепа",
 };

@@ -15,6 +15,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use risuko_engine::engine::http::{run_http_download_multi, PIECE_SIZE};
 use risuko_engine::engine::speed_limiter::SpeedLimiter;
+use risuko_engine::engine::{CHUNK_META_SUFFIX, RESUME_META_SUFFIX};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -216,6 +217,81 @@ async fn mirror_failover_with_checksum_verify() {
         PAYLOAD_LEN as u64,
         "completed counter should match payload"
     );
+}
+
+#[tokio::test]
+async fn two_downloads_with_one_name_both_arrive_intact() {
+    let payload = Arc::new(make_payload());
+    let addr = spawn_good_server(payload.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![format!("http://{addr}/file.bin")];
+    let options = options_with(vec![]);
+
+    let fetch = || {
+        let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+        run_http_download_multi(
+            &uris,
+            &dir,
+            "file.bin",
+            &options,
+            total,
+            completed,
+            speed,
+            conns,
+            ct,
+            gl,
+            tl,
+            cc,
+            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        )
+    };
+    let (first, second) = tokio::join!(fetch(), fetch());
+    let (first, second) = (first.unwrap(), second.unwrap());
+
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read(&first).unwrap(), *payload);
+    assert_eq!(std::fs::read(&second).unwrap(), *payload);
+}
+
+#[tokio::test]
+async fn another_downloads_partial_file_is_left_alone() {
+    let payload = Arc::new(make_payload());
+    let addr = spawn_good_server(payload.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let theirs = tmp.path().join("file.bin.part");
+    std::fs::write(&theirs, b"another download's bytes").unwrap();
+    let uris = vec![format!("http://{addr}/file.bin")];
+    let options = options_with(vec![(
+        "risuko-reserved-parts",
+        json!([theirs.to_string_lossy()]),
+    )]);
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+    let adopted = std::sync::Arc::new(parking_lot::Mutex::new(None));
+
+    let saved = run_http_download_multi(
+        &uris,
+        &dir,
+        "file.bin",
+        &options,
+        total,
+        completed,
+        speed,
+        conns,
+        ct,
+        gl,
+        tl,
+        cc,
+        adopted.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(saved, tmp.path().join("file.1.bin"));
+    assert_eq!(adopted.lock().as_deref(), Some("file.1.bin"));
+    assert_eq!(std::fs::read(&saved).unwrap(), *payload);
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"another download's bytes");
 }
 
 #[tokio::test]
@@ -1426,4 +1502,406 @@ async fn changed_resource_restarts_once_without_burning_retries() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "workers must not spend retry backoff on a changed resource"
     );
+}
+
+#[tokio::test]
+async fn refused_resume_probe_keeps_the_partial() {
+    let payload = Arc::new(make_payload());
+    let requests = Arc::new(AtomicU32::new(0));
+    let (p, n) = (payload.clone(), requests.clone());
+    let addr = serve_with(move |req| {
+        let len = p.len() as u64;
+        match parse_range(&p, &req) {
+            Some((start, end, slice)) if n.fetch_add(1, Ordering::SeqCst) < 3 => {
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+                    .header("ETag", "\"v1\"")
+                    .body(Full::new(Bytes::from(slice)))
+                    .unwrap()
+            }
+            _ => Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from_static(b"expired")))
+                .unwrap(),
+        }
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![format!("http://{addr}/file.bin")];
+    let options = options_with(vec![("max-worker-retries", json!("1"))]);
+    let part = tmp.path().join("file.bin.part");
+    let sidecar = tmp.path().join(format!("file.bin.part{CHUNK_META_SUFFIX}"));
+    let fetch = || {
+        let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+        run_http_download_multi(
+            &uris,
+            &dir,
+            "file.bin",
+            &options,
+            total,
+            completed,
+            speed,
+            conns,
+            ct,
+            gl,
+            tl,
+            cc,
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+    };
+
+    fetch()
+        .await
+        .expect_err("the server stops serving before the last piece");
+    let meta: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    assert!(
+        !meta["pieces"].as_array().unwrap().is_empty(),
+        "the first session must record finished pieces"
+    );
+    let part_len = std::fs::metadata(&part).unwrap().len();
+
+    let err = fetch()
+        .await
+        .expect_err("a refused probe must fail the resume");
+    assert!(err.contains("partial progress kept"), "got: {err}");
+    assert!(sidecar.exists(), "the sidecar must survive a refused probe");
+    assert_eq!(
+        std::fs::metadata(&part).unwrap().len(),
+        part_len,
+        "the partial must survive a refused probe"
+    );
+}
+
+#[tokio::test]
+async fn error_page_with_its_own_etag_does_not_discard_progress() {
+    let payload = Arc::new(make_payload());
+    let requests = Arc::new(AtomicU32::new(0));
+    let served = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (p, n, s) = (payload.clone(), requests.clone(), served.clone());
+    let addr = serve_with(move |req| {
+        let len = p.len() as u64;
+        let Some((start, end, slice)) = parse_range(&p, &req) else {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", "\"v1\"")
+                .body(Full::new(Bytes::from(p.as_ref().clone())))
+                .unwrap();
+        };
+        if n.fetch_add(1, Ordering::SeqCst) == 2 {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("ETag", "\"errpage\"")
+                .body(Full::new(Bytes::from_static(b"busy")))
+                .unwrap();
+        }
+        s.lock().push((start, end));
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+            .header("ETag", "\"v1\"")
+            .body(Full::new(Bytes::from(slice)))
+            .unwrap()
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![format!("http://{addr}/file.bin")];
+    let options = options_with(vec![("max-worker-retries", json!("2"))]);
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+    let path = run_http_download_multi(
+        &uris,
+        &dir,
+        "file.bin",
+        &options,
+        total,
+        completed,
+        speed,
+        conns,
+        ct,
+        gl,
+        tl,
+        cc,
+        Arc::new(parking_lot::Mutex::new(None)),
+    )
+    .await
+    .expect("a transient error page must not fail the download");
+    assert_eq!(std::fs::read(path).unwrap(), *payload);
+
+    let served = served.lock().clone();
+    let mut distinct = served.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        served.len(),
+        "a range was served twice, so the download restarted: {served:?}"
+    );
+}
+
+fn validated_response(
+    payload: &[u8],
+    req: &Request<Incoming>,
+    etag: &str,
+    honour_range: bool,
+) -> Response<Full<Bytes>> {
+    let len = payload.len() as u64;
+    match parse_range(payload, req).filter(|_| honour_range) {
+        Some((start, end, slice)) => Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Range", format!("bytes {start}-{end}/{len}"))
+            .header("ETag", etag)
+            .body(Full::new(Bytes::from(slice)))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::OK)
+            .header("Accept-Ranges", "bytes")
+            .header("ETag", etag)
+            .body(Full::new(Bytes::from(payload.to_vec())))
+            .unwrap(),
+    }
+}
+
+async fn spawn_validating_server(
+    payload: Arc<Vec<u8>>,
+    etag: &'static str,
+) -> (SocketAddr, Arc<parking_lot::Mutex<Option<String>>>) {
+    let seen = Arc::new(parking_lot::Mutex::new(None));
+    let last_if_range = seen.clone();
+    let addr = serve_with(move |req| {
+        let if_range = req
+            .headers()
+            .get(hyper::header::IF_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let honour_range = if_range.as_deref().is_none_or(|v| v == etag);
+        if if_range.is_some() {
+            *last_if_range.lock() = if_range;
+        }
+        validated_response(&payload, &req, etag, honour_range)
+    })
+    .await;
+    (addr, seen)
+}
+
+async fn spawn_careless_server(payload: Arc<Vec<u8>>, etag: &'static str) -> SocketAddr {
+    serve_with(move |req| validated_response(&payload, &req, etag, true)).await
+}
+
+async fn spawn_truncating_server(payload: Arc<Vec<u8>>, etag: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let len = payload.len();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&payload[..len / 2]).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    addr
+}
+
+async fn fetch_single(
+    addr: SocketAddr,
+    dir: &str,
+    mut extra: Vec<(&str, Value)>,
+) -> Result<PathBuf, String> {
+    let uris = vec![format!("http://{addr}/stream")];
+    extra.push(("split", json!("1")));
+    let options = options_with(extra);
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+    run_http_download_multi(
+        &uris,
+        dir,
+        "out.bin",
+        &options,
+        total,
+        completed,
+        speed,
+        conns,
+        ct,
+        gl,
+        tl,
+        cc,
+        Arc::new(parking_lot::Mutex::new(None)),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn single_connection_resume_keeps_a_matching_partial() {
+    let payload = Arc::new(small_payload(4000));
+    let (addr, if_range) = spawn_validating_server(payload.clone(), "\"v1\"").await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let record = tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}"));
+    std::fs::write(tmp.path().join("out.bin.part"), &payload[..1000]).unwrap();
+    std::fs::write(&record, br#"{"etag":"\"v1\""}"#).unwrap();
+
+    let result = fetch_single(addr, &dir, vec![])
+        .await
+        .expect("a matching partial must resume");
+
+    assert_eq!(std::fs::read(&result).unwrap(), *payload);
+    assert_eq!(if_range.lock().as_deref(), Some("\"v1\""));
+    assert!(
+        !record.exists(),
+        "the record must go with the finished partial"
+    );
+}
+
+#[tokio::test]
+async fn single_connection_resume_restarts_when_the_remote_file_changed() {
+    let payload = Arc::new(small_payload(4000));
+    let (addr, _) = spawn_validating_server(payload.clone(), "\"v2\"").await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::fs::write(tmp.path().join("out.bin.part"), vec![0xFFu8; 1000]).unwrap();
+    std::fs::write(
+        tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}")),
+        br#"{"etag":"\"v1\""}"#,
+    )
+    .unwrap();
+
+    let result = fetch_single(addr, &dir, vec![])
+        .await
+        .expect("a changed remote file must restart from zero");
+
+    assert_eq!(
+        std::fs::read(&result).unwrap(),
+        *payload,
+        "bytes from the old remote file must not survive"
+    );
+}
+
+#[tokio::test]
+async fn single_connection_resume_restarts_when_a_server_ignores_if_range() {
+    let payload = Arc::new(small_payload(4000));
+    let addr = spawn_careless_server(payload.clone(), "\"v2\"").await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::fs::write(tmp.path().join("out.bin.part"), vec![0xFFu8; 1000]).unwrap();
+    std::fs::write(
+        tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}")),
+        br#"{"etag":"\"v1\""}"#,
+    )
+    .unwrap();
+
+    let result = fetch_single(addr, &dir, vec![])
+        .await
+        .expect("a changed remote file must restart from zero");
+
+    assert_eq!(
+        std::fs::read(&result).unwrap(),
+        *payload,
+        "bytes from the old remote file must not survive"
+    );
+}
+
+#[tokio::test]
+async fn single_connection_resume_without_a_record_still_appends() {
+    let payload = Arc::new(small_payload(4000));
+    let addr = spawn_careless_server(payload.clone(), "\"v2\"").await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::fs::write(tmp.path().join("out.bin.part"), &payload[..1000]).unwrap();
+
+    let result = fetch_single(addr, &dir, vec![])
+        .await
+        .expect("a partial without a record must resume");
+
+    assert_eq!(std::fs::read(&result).unwrap(), *payload);
+}
+
+#[tokio::test]
+async fn single_connection_resume_survives_a_server_that_rejects_if_range() {
+    let payload = Arc::new(small_payload(4000));
+    let without_if_range = Arc::new(AtomicU32::new(0));
+    let (p, plain) = (payload.clone(), without_if_range.clone());
+    let addr = serve_with(move |req| {
+        if req.headers().contains_key(hyper::header::IF_RANGE) {
+            return Response::builder()
+                .status(StatusCode::PRECONDITION_FAILED)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
+        plain.fetch_add(1, Ordering::SeqCst);
+        validated_response(&p, &req, "\"v1\"", true)
+    })
+    .await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    std::fs::write(tmp.path().join("out.bin.part"), &payload[..1000]).unwrap();
+    std::fs::write(
+        tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}")),
+        br#"{"etag":"\"v1\""}"#,
+    )
+    .unwrap();
+
+    let result = fetch_single(addr, &dir, vec![])
+        .await
+        .expect("a rejected validator must not fail the resume");
+
+    assert_eq!(std::fs::read(&result).unwrap(), *payload);
+    assert!(
+        without_if_range.load(Ordering::SeqCst) >= 1,
+        "the retry must drop the rejected validator"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_single_connection_download_records_the_validator() {
+    let payload = Arc::new(small_payload(4000));
+    let addr = spawn_truncating_server(payload, "\"v1\"").await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    fetch_single(addr, &dir, vec![("max-worker-retries", json!("0"))])
+        .await
+        .expect_err("every response is cut short");
+
+    let record = tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}"));
+    let meta: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert_eq!(meta["etag"], "\"v1\"");
 }

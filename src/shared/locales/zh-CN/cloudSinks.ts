@@ -44,6 +44,8 @@ export default {
 	privateKeyHint: "可选。当密码为空时使用。",
 	sftpBasePath: "基础路径",
 	sftpBasePathPlaceholder: "/home/user/uploads",
+	ftpBasePathHint:
+		"留空或填写 / 时，文件会上传到登录后所在的目录；/uploads 这样的路径从服务器根目录算起。",
 
 	ftpSecure: "FTPS（TLS）",
 	ftpSecureHint: "在控制通道上协商显式 TLS（FTPS）。",
@@ -98,7 +100,7 @@ export default {
 	ruleMatchSection: "匹配条件",
 	rulePreview: "预览",
 	unnamedRule: "未命名规则",
-	removed: "已移除“{label}”",
+	removed: "已移除“{{label}}”",
 	deleteRule: "删除规则",
 	cancelJob: "取消上传",
 	disabled: "已禁用",

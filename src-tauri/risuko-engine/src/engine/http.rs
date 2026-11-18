@@ -1,3 +1,4 @@
+use super::util::is_cross_device_error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -7,7 +8,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use risuko_http::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING,
-    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_UNMODIFIED_SINCE,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
     LAST_MODIFIED, RANGE, TRANSFER_ENCODING,
 };
 use risuko_http::Client;
@@ -15,6 +16,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::options::json_bool;
+use super::resume_meta::{self, ResumeMeta};
 use super::speed_limiter::{parse_speed_limit, SpeedEma, SpeedLimiter, MIN_EMA_SAMPLE_SECS};
 use risuko_bt::limiter::Throttle;
 
@@ -24,6 +26,8 @@ const CHUNK_MAX_RETRIES: u32 = 5;
 pub const PIECE_SIZE: u64 = 1024 * 1024;
 const META_VERSION: u32 = 2;
 const MAX_PIECE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_MULTI_CHUNK_LENGTH: u64 = MAX_PIECE_SIZE << 20;
+const MAX_FILENAME_BYTES: usize = 255 - PART_SUFFIX.len() - CHUNK_META_SUFFIX.len() - 8;
 const META_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const PARTIAL_ERROR_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 const PARTIAL_ERROR_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(250);
@@ -84,6 +88,12 @@ fn has_resume_validator(etag: &Option<String>, last_modified: &Option<String>) -
     etag.as_deref().is_some_and(is_strong_etag) || last_modified.is_some()
 }
 
+fn multi_chunk_eligible(probe: &ProbeResult, resume_multi: bool, min_split_size: u64) -> bool {
+    probe.range_supported
+        && (1..=MAX_MULTI_CHUNK_LENGTH).contains(&probe.content_length)
+        && (resume_multi || probe.content_length / min_split_size >= 2)
+}
+
 fn choose_piece_size(content_length: u64, workers: usize) -> u64 {
     let target = content_length / (workers.max(1) as u64).saturating_mul(4);
     (target / PIECE_SIZE * PIECE_SIZE).clamp(PIECE_SIZE, MAX_PIECE_SIZE)
@@ -142,20 +152,8 @@ pub fn relocate_partial(
             .map_err(|e| format!("Failed to create destination dir {}: {e}", parent.display()))?;
     }
     relocate_file_pair(&old_part, &new_part, &old_meta, &new_meta)?;
+    resume_meta::relocate(&old_part, &new_part);
     Ok(true)
-}
-
-fn is_cross_device_error(e: &std::io::Error) -> bool {
-    if e.kind() == std::io::ErrorKind::CrossesDevices {
-        return true;
-    }
-    match e.raw_os_error() {
-        #[cfg(unix)]
-        Some(18) => true,
-        #[cfg(windows)]
-        Some(17) => true,
-        _ => false,
-    }
 }
 
 fn sync_path(path: &Path) -> Result<(), String> {
@@ -260,13 +258,22 @@ pub fn sanitize_filename(name: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
-    if base.is_empty() || base == "." || base == ".." {
+    let base = if base.is_empty() || base == "." || base == ".." {
         "download".to_string()
     } else if cfg!(windows) {
         super::util::safe_filename(&base, "download")
     } else {
-        base
-    }
+        base.chars()
+            .map(|c| {
+                if risuko_util::is_invisible_format_char(c) || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    risuko_util::truncate_filename(&base, MAX_FILENAME_BYTES)
 }
 
 fn save_piece_meta(
@@ -276,22 +283,28 @@ fn save_piece_meta(
     etag: &Option<String>,
     last_modified: &Option<String>,
 ) {
-    if !has_resume_validator(etag, last_modified) {
+    let path = chunk_meta_path(part_path);
+    let resumable = has_resume_validator(etag, last_modified);
+    if !resumable && path.exists() {
         return;
     }
-    let pieces: Vec<PieceProgress> = queue
-        .pieces
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let c = p.completed.load(Ordering::Relaxed);
-            if c == 0 {
-                None
-            } else {
-                Some(PieceProgress { i: i as u32, c })
-            }
-        })
-        .collect();
+    let pieces: Vec<PieceProgress> = if resumable {
+        queue
+            .pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let c = p.completed.load(Ordering::Relaxed);
+                if c == 0 {
+                    None
+                } else {
+                    Some(PieceProgress { i: i as u32, c })
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let meta = ChunkMeta {
         version: META_VERSION,
         content_length,
@@ -300,7 +313,6 @@ fn save_piece_meta(
         last_modified: last_modified.clone(),
         pieces,
     };
-    let path = chunk_meta_path(part_path);
     if let Ok(json) = serde_json::to_string(&meta) {
         let _ = crate::traits::write_file_atomically(&path, json.as_bytes());
     }
@@ -365,6 +377,13 @@ fn delete_chunk_meta(part_path: &Path) {
     let mut tmp = path.into_os_string();
     tmp.push(".tmp");
     let _ = fs::remove_file(tmp);
+}
+
+fn truncate_oversized_part(file: &fs::File, content_length: u64) -> std::io::Result<()> {
+    if file.metadata()?.len() > content_length {
+        file.set_len(content_length)?;
+    }
+    Ok(())
 }
 
 const PIECE_FREE: u8 = 0;
@@ -643,6 +662,14 @@ async fn verify_output(
     Ok(())
 }
 
+pub(crate) async fn verify_checksum_option(
+    path: &Path,
+    options: &Map<String, Value>,
+) -> Result<(), String> {
+    let whole_checksum = parse_whole_checksum_option(options)?;
+    verify_output(path, 0, &None, &whole_checksum).await
+}
+
 pub async fn fetch_for_metalink_probe(
     uri: &str,
     options: &Map<String, Value>,
@@ -867,6 +894,10 @@ pub(crate) fn apply_netrc_auth(headers: &mut HeaderMap, uri: &str, options: &Map
         Err(_) => return,
     };
     if !parsed.username().is_empty() || parsed.password().is_some() {
+        let user = percent_encoding::percent_decode_str(parsed.username()).decode_utf8_lossy();
+        let pass = percent_encoding::percent_decode_str(parsed.password().unwrap_or_default())
+            .decode_utf8_lossy();
+        insert_basic_auth(headers, &user, &pass);
         return;
     }
     let host = match parsed.host_str() {
@@ -895,13 +926,20 @@ pub(crate) fn apply_netrc_auth(headers: &mut HeaderMap, uri: &str, options: &Map
     if user.is_empty() && pass.is_empty() {
         return;
     }
-    let raw = format!("{user}:{pass}");
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
-    let value = format!("Basic {encoded}");
-    if let Ok(v) = HeaderValue::from_str(&value) {
-        headers.insert(risuko_http::header::AUTHORIZATION, v);
+    if insert_basic_auth(headers, user, pass) {
         tracing::debug!("Applied netrc credentials for {host}");
+    }
+}
+
+fn insert_basic_auth(headers: &mut HeaderMap, user: &str, pass: &str) -> bool {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    match HeaderValue::from_str(&format!("Basic {encoded}")) {
+        Ok(value) => {
+            headers.insert(risuko_http::header::AUTHORIZATION, value);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -912,12 +950,23 @@ fn build_mirror_headers(
 ) -> Vec<HeaderMap> {
     all_uris
         .iter()
-        .map(|u| {
-            let mut h = base_headers.clone();
-            apply_netrc_auth(&mut h, u, options);
-            h
-        })
+        .map(|u| headers_for_uri(base_headers, u, options))
         .collect()
+}
+
+pub(crate) const COOKIE_HOST_OPTION: &str = "risuko-cookie-host";
+
+fn headers_for_uri(base_headers: &HeaderMap, uri: &str, options: &Map<String, Value>) -> HeaderMap {
+    let mut headers = base_headers.clone();
+    if let Some(scope) = options.get(COOKIE_HOST_OPTION).and_then(Value::as_str) {
+        let in_scope = super::cookie_store::host_of(uri)
+            .is_some_and(|host| super::cookie_store::host_matches(&host, scope));
+        if !in_scope {
+            headers.remove(risuko_http::header::COOKIE);
+        }
+    }
+    apply_netrc_auth(&mut headers, uri, options);
+    headers
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1030,7 +1079,10 @@ async fn run_single_uri_download(
     adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
     is_stale_retry: bool,
 ) -> Result<PathBuf, String> {
-    tracing::info!("Starting download: uri={uri}, dir={dir}, out={out}");
+    tracing::info!(
+        "Starting download: uri={}, dir={dir}, out={out}",
+        super::util::redact_url(uri)
+    );
     let dir_path = Path::new(dir);
     fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
@@ -1097,9 +1149,7 @@ async fn run_single_uri_download(
         client.clone()
     };
     let base_headers = build_headers(options);
-    let mut headers = base_headers.clone();
-    apply_netrc_auth(&mut headers, uri, options);
-    let headers = headers;
+    let headers = headers_for_uri(&base_headers, uri, options);
     let stall = StallWatchdog::from_options(options);
     let falloc_mode = {
         let mode = super::falloc::Mode::from_option(options.get("file-allocation"));
@@ -1127,7 +1177,7 @@ async fn run_single_uri_download(
 
     let mut last_modified_header: Option<String> = None;
 
-    let is_http = uri.starts_with("http://") || uri.starts_with("https://");
+    let is_http = is_http_scheme(uri);
 
     let has_cf_clearance = effective_cookies_have_name(&client, &headers, uri, "cf_clearance");
     let wants_range_probe = split > 1 || filename_was_url_derived;
@@ -1143,7 +1193,18 @@ async fn run_single_uri_download(
     let probe_for_name: Option<ProbeResult> = if is_http && wants_range_probe && !has_cf_clearance {
         let mut attempt: u32 = 0;
         loop {
-            match probe_range_support(&range_client, uri, &headers).await {
+            let probed = match with_idle_timeout(
+                idle_timeout,
+                &cancel_token,
+                probe_range_support(&range_client, uri, &headers),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(IdleError::Cancelled) => return Err("Download cancelled".to_string()),
+                Err(IdleError::TimedOut) => Err("Range probe timed out".to_string()),
+            };
+            match probed {
                 Ok(p) => break Some(p),
                 Err(e)
                     if has_sidecar
@@ -1217,6 +1278,22 @@ async fn run_single_uri_download(
             }
         }
     }
+    let mut existing_size = existing_size;
+    let (part_claim, renamed) = super::part_claim::claim_or_rename(
+        dir_path,
+        &filename,
+        &part_path,
+        options,
+        auto_rename,
+        &cancel_token,
+    )
+    .await?;
+    if let Some(renamed) = renamed {
+        *adopted_filename.lock() = Some(renamed.filename.clone());
+        filename = renamed.filename;
+        part_path = renamed.part_path;
+        existing_size = 0;
+    }
 
     if let Some(e) = probe_error {
         return Err(if e.contains(CLOUDFLARE_MARKER) {
@@ -1235,11 +1312,7 @@ async fn run_single_uri_download(
     let mut stale_from_multi: Option<String> = None;
     if is_http && (split > 1 || sidecar_probe.is_some()) {
         match probe_for_name.as_ref().or(sidecar_probe.as_ref()) {
-            Some(probe)
-                if probe.range_supported
-                    && probe.content_length > 0
-                    && (resume_multi || probe.content_length / min_split_size >= 2) =>
-            {
+            Some(probe) if multi_chunk_eligible(probe, resume_multi, min_split_size) => {
                 if use_remote_time {
                     last_modified_header = probe.last_modified.clone();
                 }
@@ -1252,6 +1325,7 @@ async fn run_single_uri_download(
                 tracing::debug!(
                     "run_single_uri_download calling run_multi_chunk: part_path={part_path:?}, filename={filename:?}"
                 );
+                resume_meta::delete(&part_path);
                 let mirror_headers = build_mirror_headers(all_uris, &base_headers, options);
                 let result = run_multi_chunk(
                     &range_client,
@@ -1317,6 +1391,7 @@ async fn run_single_uri_download(
         tracing::info!("Removing pre-allocated .part before single-connection fallback");
         let _ = fs::remove_file(&part_path);
         delete_chunk_meta(&part_path);
+        resume_meta::delete(&part_path);
     }
     connections.store(1, Ordering::Relaxed);
 
@@ -1363,7 +1438,7 @@ async fn run_single_uri_download(
                 Err(ref e)
                     if single_attempt < max_worker_retries
                         && !cancel_token.is_cancelled()
-                        && is_transient_single_error(e) =>
+                        && is_transient_single_error(e, all_uris.len() <= 1) =>
                 {
                     single_attempt += 1;
                     let resumed = completed.load(Ordering::Relaxed);
@@ -1391,12 +1466,14 @@ async fn run_single_uri_download(
         if e.contains(STALE_PART_REMOVED) && !is_stale_retry {
             tracing::info!("Retrying download after stale .part removal");
             delete_chunk_meta(&part_path);
+            resume_meta::delete(&part_path);
             completed.store(0, Ordering::Relaxed);
             total.store(0, Ordering::Relaxed);
             speed.store(0, Ordering::Relaxed);
             for cc in &chunk_completed {
                 cc.store(0, Ordering::Relaxed);
             }
+            drop(part_claim);
             return Box::pin(run_single_uri_download(
                 uri,
                 all_uris,
@@ -1639,6 +1716,20 @@ async fn drain_response_body(resp: risuko_http::Response) {
     .await;
 }
 
+pub(crate) fn initial_part_path(dir: &str, out: &str, uri: &str) -> PathBuf {
+    let name = if out.is_empty() {
+        sanitize_filename(&infer_filename_from_uri(uri))
+    } else {
+        sanitize_filename(out)
+    };
+    let part_name = if name.ends_with(PART_SUFFIX) {
+        name
+    } else {
+        format!("{name}{PART_SUFFIX}")
+    };
+    Path::new(dir).join(part_name)
+}
+
 async fn cancellable_sleep(cancel_token: &CancellationToken, dur: std::time::Duration) -> bool {
     tokio::select! {
         _ = cancel_token.cancelled() => false,
@@ -1692,6 +1783,11 @@ async fn probe_range_support(
         let err = cloudflare_error(uri, status);
         drain_response_body(resp).await;
         return Err(err);
+    }
+
+    if status >= 400 {
+        drain_response_body(resp).await;
+        return Err(format!("Range probe HTTP error: {status}"));
     }
 
     tracing::debug!(
@@ -2002,6 +2098,7 @@ async fn run_multi_chunk(
             .open(part_path)
             .map_err(|e| format!("Failed to create file: {e}"))?;
         let f = tokio::task::spawn_blocking(move || {
+            truncate_oversized_part(&f, content_length)?;
             super::falloc::allocate(&f, content_length, falloc_mode).map(|_| f)
         })
         .await
@@ -2009,6 +2106,13 @@ async fn run_multi_chunk(
         .map_err(|e| format!("Failed to pre-allocate file: {e}"))?;
         Arc::new(f)
     };
+    save_piece_meta(
+        part_path,
+        &queue,
+        content_length,
+        &expected_etag,
+        &expected_last_modified,
+    );
 
     let speed_cancel = cancel_token.clone();
     let speed_completed = completed.clone();
@@ -2504,7 +2608,7 @@ async fn download_piece_stream(
         return Err(PieceDownloadError::Source(err));
     }
 
-    if let Some(expected) = strong_expected_etag {
+    if let Some(expected) = strong_expected_etag.filter(|_| status == 200 || status == 206) {
         let mismatch = resp
             .headers()
             .get(ETAG)
@@ -2844,7 +2948,7 @@ async fn finish_piece_writer(writer: ChunkWriter) -> Result<u64, PieceDownloadEr
     writer.finish().await.map_err(PieceDownloadError::Storage)
 }
 
-fn is_transient_single_error(e: &str) -> bool {
+fn is_transient_single_error(e: &str, sole_source: bool) -> bool {
     if e.contains("cancelled")
         || e.contains(STALE_PART_REMOVED)
         || e.contains("Cloudflare")
@@ -2854,11 +2958,12 @@ fn is_transient_single_error(e: &str) -> bool {
     {
         return false;
     }
-    if e.contains("HTTP error: 412") {
-        return true;
-    }
-    if e.contains("HTTP error:") {
-        return false;
+    if let Some((_, status)) = e.split_once("HTTP error: ") {
+        return status.starts_with("412")
+            || (sole_source
+                && ["408", "425", "429", "500", "502", "503", "504"]
+                    .iter()
+                    .any(|code| status.starts_with(code)));
     }
     e.contains("Download failed:")
         || e.contains("Stream error")
@@ -2894,6 +2999,11 @@ async fn run_single_download(
     } else {
         0
     };
+    let saved = if existing_size > 0 {
+        resume_meta::load(part_path)
+    } else {
+        None
+    };
 
     completed.store(existing_size, Ordering::Relaxed);
 
@@ -2901,8 +3011,19 @@ async fn run_single_download(
         .get(uri)
         .headers(headers.clone())
         .header(ACCEPT_ENCODING, "identity");
+    let mut sent_if_range = false;
     if existing_size > 0 {
         req = req.header(RANGE, format!("bytes={existing_size}-"));
+        let validator = saved.as_ref().and_then(|meta| {
+            meta.etag
+                .as_deref()
+                .filter(|tag| is_strong_etag(tag))
+                .or(meta.last_modified.as_deref())
+        });
+        if let Some(validator) = validator {
+            req = req.header(IF_RANGE, validator);
+            sent_if_range = true;
+        }
     } else if force_range {
         req = req.header(RANGE, "bytes=0-");
     }
@@ -2933,10 +3054,39 @@ async fn run_single_download(
         return Err(err);
     }
 
+    let current = ResumeMeta {
+        etag: resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        last_modified: resp
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let remote_changed = saved
+        .as_ref()
+        .is_some_and(|saved| saved.conflicts_with(&current));
+
     if status == 416
         && existing_size > 0
         && unsatisfied_range_total(resp.headers()) == Some(existing_size)
     {
+        if remote_changed {
+            tracing::warn!(
+                "Got 416 for a complete .part, but the remote file changed since the partial \
+                 was started; deleting stale .part"
+            );
+            drain_response_body(resp).await;
+            if let Err(e) = fs::remove_file(part_path) {
+                return Err(format!("Failed to delete stale .part: {e}"));
+            }
+            resume_meta::delete(part_path);
+            return Err(format!("Download will retry: {STALE_PART_REMOVED}"));
+        }
         let last_modified = resp
             .headers()
             .get(LAST_MODIFIED)
@@ -2946,6 +3096,7 @@ async fn run_single_download(
         total.store(existing_size, Ordering::Relaxed);
         verify_part(part_path, integrity).await?;
         let final_path = finalize_download(part_path, filename, dir_path, auto_rename)?;
+        resume_meta::delete(part_path);
         return Ok((final_path, last_modified));
     }
 
@@ -2954,6 +3105,7 @@ async fn run_single_download(
         if let Err(e) = fs::remove_file(part_path) {
             return Err(format!("Failed to delete stale .part: {e}"));
         }
+        resume_meta::delete(part_path);
         return Err(format!("Download will retry: {STALE_PART_REMOVED}"));
     }
 
@@ -2962,9 +3114,17 @@ async fn run_single_download(
         let body = read_body_prefix(resp, 512, idle_timeout, &cancel_token).await;
         let snippet = String::from_utf8_lossy(&body);
         tracing::warn!(
-            "Single download got HTTP {status} for {uri}; force_range={force_range}; \
-             headers={header_dump}; body[..512]={snippet:?}"
+            "Single download got HTTP {status} for {}; force_range={force_range}; \
+             headers={header_dump}; body[..512]={snippet:?}",
+            super::util::redact_url(uri)
         );
+        if status == 412 && sent_if_range {
+            tracing::warn!(
+                "Server rejected the If-Range validator with 412; \
+                 the next attempt resumes without one"
+            );
+            resume_meta::delete(part_path);
+        }
         return Err(format!("HTTP error: {status}"));
     }
 
@@ -2993,6 +3153,19 @@ async fn run_single_download(
             if let Err(e) = fs::remove_file(part_path) {
                 return Err(format!("Failed to delete stale .part: {e}"));
             }
+            resume_meta::delete(part_path);
+            return Err(format!("Download will retry: {STALE_PART_REMOVED}"));
+        }
+        if remote_changed {
+            tracing::warn!(
+                "Server returned 206, but the remote file changed since the partial was started; \
+                 deleting stale .part and retrying"
+            );
+            drain_response_body(resp).await;
+            if let Err(e) = fs::remove_file(part_path) {
+                return Err(format!("Failed to delete stale .part: {e}"));
+            }
+            resume_meta::delete(part_path);
             return Err(format!("Download will retry: {STALE_PART_REMOVED}"));
         }
         existing_size
@@ -3037,6 +3210,9 @@ async fn run_single_download(
         }
         Arc::new(f)
     };
+    if write_offset == 0 {
+        resume_meta::save(part_path, &current);
+    }
 
     let speed_cancel = cancel_token.clone();
     let speed_completed = completed.clone();
@@ -3112,6 +3288,7 @@ async fn run_single_download(
         "run_single_download finalizing: part_path={part_path:?}, final_filename={final_filename:?}"
     );
     let final_path = finalize_download(part_path, &final_filename, dir_path, auto_rename)?;
+    resume_meta::delete(part_path);
     Ok((final_path, resp_last_modified))
 }
 
@@ -3478,6 +3655,132 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_http_statuses_are_retried_on_a_single_connection() {
+        for status in [
+            "412 Precondition Failed",
+            "429 Too Many Requests",
+            "503 Service Unavailable",
+        ] {
+            assert!(is_transient_single_error(
+                &format!("HTTP error: {status}"),
+                true
+            ));
+        }
+        for status in [
+            "403 Forbidden",
+            "404 Not Found",
+            "416 Range Not Satisfiable",
+        ] {
+            assert!(!is_transient_single_error(
+                &format!("HTTP error: {status}"),
+                true
+            ));
+        }
+        assert!(!is_transient_single_error(
+            "HTTP error: 503 Service Unavailable",
+            false
+        ));
+        assert!(is_transient_single_error(
+            "HTTP error: 412 Precondition Failed",
+            false
+        ));
+    }
+
+    #[test]
+    fn scoped_cookies_are_not_sent_to_other_hosts() {
+        let mut base = HeaderMap::new();
+        base.insert(
+            risuko_http::header::COOKIE,
+            HeaderValue::from_static("sid=1"),
+        );
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        let has_cookie = |uri: &str, options: &Map<String, Value>| {
+            headers_for_uri(&base, uri, options).contains_key(risuko_http::header::COOKIE)
+        };
+        assert!(has_cookie("https://mirror.test/f", &options));
+
+        options.insert(
+            COOKIE_HOST_OPTION.into(),
+            Value::String("example.com".into()),
+        );
+        assert!(has_cookie("https://example.com/f", &options));
+        assert!(has_cookie("https://dl.example.com/f", &options));
+        assert!(!has_cookie("https://example.com.evil.test/f", &options));
+        assert!(!has_cookie("https://mirror.test/f", &options));
+    }
+
+    #[test]
+    fn url_credentials_become_basic_auth() {
+        let mut headers = HeaderMap::new();
+        apply_netrc_auth(
+            &mut headers,
+            "https://us%40er:p%3Ass@example.com/file",
+            &Map::new(),
+        );
+        assert_eq!(
+            headers.get(risuko_http::header::AUTHORIZATION).unwrap(),
+            "Basic dXNAZXI6cDpzcw=="
+        );
+    }
+
+    #[test]
+    fn overlong_filenames_are_truncated_on_a_char_boundary() {
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+        let long = format!("{}.mkv", "\u{6f22}".repeat(120));
+        let name = sanitize_filename(&long);
+        assert!(name.len() <= MAX_FILENAME_BYTES);
+        assert!(name.ends_with(".mkv"));
+        assert!(name.starts_with('\u{6f22}'));
+        let no_ext = sanitize_filename(&"a".repeat(400));
+        assert_eq!(no_ext.len(), MAX_FILENAME_BYTES);
+    }
+
+    #[test]
+    fn control_characters_never_reach_a_file_name() {
+        for (name, ext) in [
+            ("a\u{0}b.zip", ".zip"),
+            ("line\nbreak\r.txt", ".txt"),
+            ("esc\u{1b}[31m.bin", ".bin"),
+        ] {
+            let sanitized = sanitize_filename(name);
+            assert!(
+                !sanitized.chars().any(char::is_control),
+                "control character kept in {sanitized:?}"
+            );
+            assert!(sanitized.ends_with(ext), "extension lost in {sanitized:?}");
+        }
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn oversized_totals_are_not_split() {
+        let probe = |content_length| ProbeResult {
+            content_length,
+            etag: None,
+            last_modified: None,
+            suggested_filename: None,
+            content_type: None,
+            range_supported: true,
+            final_url: None,
+        };
+        assert!(multi_chunk_eligible(
+            &probe(8 * PIECE_SIZE),
+            false,
+            PIECE_SIZE
+        ));
+        assert!(multi_chunk_eligible(
+            &probe(MAX_MULTI_CHUNK_LENGTH),
+            false,
+            PIECE_SIZE
+        ));
+        assert!(!multi_chunk_eligible(&probe(u64::MAX), false, PIECE_SIZE));
+        assert!(!multi_chunk_eligible(&probe(u64::MAX), true, PIECE_SIZE));
+        assert!(!multi_chunk_eligible(&probe(0), true, PIECE_SIZE));
+        assert!(!multi_chunk_eligible(&probe(PIECE_SIZE), false, PIECE_SIZE));
+    }
 
     fn h(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut hm = HeaderMap::new();
@@ -3918,6 +4221,37 @@ mod tests {
     }
 
     #[test]
+    fn relocate_partial_moves_the_resume_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let old_part = old_dir.join("file.bin.part");
+        std::fs::write(&old_part, b"partial-bytes").unwrap();
+        let record = ResumeMeta {
+            etag: Some("\"v1\"".to_string()),
+            ..Default::default()
+        };
+        resume_meta::save(&old_part, &record);
+
+        let moved = relocate_partial(
+            old_dir.to_str().unwrap(),
+            "file.bin",
+            new_dir.to_str().unwrap(),
+            "renamed.bin",
+        )
+        .expect("relocate");
+
+        assert!(moved);
+        assert!(!resume_meta::path(&old_part).exists());
+        assert_eq!(
+            resume_meta::load(&new_dir.join("renamed.bin.part")),
+            Some(record)
+        );
+    }
+
+    #[test]
     fn detects_cross_device_rename_errors() {
         #[cfg(unix)]
         {
@@ -4028,6 +4362,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_part_is_cut_back_to_the_content_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("big.part");
+        let f = fs::File::create(&part).unwrap();
+        f.set_len(100).unwrap();
+        truncate_oversized_part(&f, 40).unwrap();
+        assert_eq!(fs::metadata(&part).unwrap().len(), 40);
+
+        f.set_len(100).unwrap();
+        truncate_oversized_part(&f, 200).unwrap();
+        assert_eq!(fs::metadata(&part).unwrap().len(), 100);
+    }
+
+    #[test]
     fn last_modified_resumes_without_strong_etag() {
         let (_dir, part, q) = meta_fixture("lm", PIECE_SIZE * 2, PIECE_SIZE * 2);
         q.pieces[0].completed.store(5, Ordering::Relaxed);
@@ -4042,6 +4390,9 @@ mod tests {
 
         delete_chunk_meta(&part);
         save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &None);
+        assert!(chunk_meta_path(&part).exists());
+        assert!(probe_from_sidecar(&part).is_none());
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &weak, &None).is_none());
         assert!(!chunk_meta_path(&part).exists());
     }
 
@@ -4228,6 +4579,45 @@ mod tests {
         cancel.cancel();
         let r = with_idle_timeout(None, &cancel, std::future::pending::<()>()).await;
         assert_eq!(r, Err(IdleError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_checksum_option_is_verified_and_a_mismatch_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut options = Map::new();
+        assert!(verify_checksum_option(&path, &options).await.is_ok());
+
+        options.insert(
+            "checksum".into(),
+            Value::String(
+                "sha-256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            ),
+        );
+        assert!(verify_checksum_option(&path, &options).await.is_ok());
+        assert!(path.exists());
+
+        options.insert(
+            "checksum".into(),
+            Value::String(
+                "sha-256=0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
+        );
+        assert!(verify_checksum_option(&path, &options).await.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_first_part_path_follows_the_name_or_the_link() {
+        assert_eq!(
+            initial_part_path("/d", "", "http://h/a/file.bin"),
+            Path::new("/d/file.bin.part")
+        );
+        assert_eq!(
+            initial_part_path("/d", "named.iso", "http://h/a/file.bin"),
+            Path::new("/d/named.iso.part")
+        );
     }
 
     #[test]

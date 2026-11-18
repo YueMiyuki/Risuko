@@ -26,7 +26,10 @@ pub async fn run_m3u8_download(
     global_limiter: Arc<SpeedLimiter>,
     task_limiter: Arc<SpeedLimiter>,
 ) -> Result<PathBuf, String> {
-    tracing::info!("[m3u8] Starting download: uri={uri}, dir={dir}, out={out}");
+    tracing::info!(
+        "[m3u8] Starting download: uri={}, dir={dir}, out={out}",
+        crate::engine::util::redact_url(uri)
+    );
 
     let dir_path = Path::new(dir);
     std::fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
@@ -49,7 +52,7 @@ pub async fn run_m3u8_download(
             tracing::info!(
                 "[m3u8] Selected variant: bandwidth={}, url={}",
                 variant.bandwidth,
-                variant.url
+                crate::engine::util::redact_url(&variant.url)
             );
             let media = if same_host(uri, &variant.url) {
                 parser::fetch_and_parse_playlist(&variant.url, &client).await?
@@ -88,7 +91,7 @@ pub async fn run_m3u8_download(
     let total_segments = segments.len();
     tracing::info!(
         "[m3u8] Downloading {total_segments} segments from {}",
-        media_playlist_url
+        crate::engine::util::redact_url(&media_playlist_url)
     );
 
     let split = options
@@ -142,13 +145,9 @@ pub async fn run_m3u8_download(
     let (seg_paths, progress) = match segments_result {
         Ok(result) => result,
         Err(e) => {
-            let cancelled = cancel_token.is_cancelled() && e.contains("cancelled");
             cancel_token.cancel();
             speed.store(0, Ordering::Relaxed);
             speed_tracker.abort();
-            if !cancelled {
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-            }
             return Err(e);
         }
     };
@@ -245,6 +244,28 @@ fn select_variant<'a>(variants: &'a [Variant], options: &Map<String, Value>) -> 
         .unwrap_or(&variants[0])
 }
 
+fn client_headers(
+    options: &Map<String, Value>,
+    netrc_uri: Option<&str>,
+) -> risuko_http::header::HeaderMap {
+    let mut headers = http::build_headers(options);
+    if let Some(scope) = options
+        .get(http::COOKIE_HOST_OPTION)
+        .and_then(Value::as_str)
+    {
+        let in_scope = netrc_uri
+            .and_then(crate::engine::cookie_store::host_of)
+            .is_some_and(|host| crate::engine::cookie_store::host_matches(&host, scope));
+        if !in_scope {
+            headers.remove(risuko_http::header::COOKIE);
+        }
+    }
+    if let Some(uri) = netrc_uri {
+        http::apply_netrc_auth(&mut headers, uri, options);
+    }
+    headers
+}
+
 fn build_client(
     options: &Map<String, Value>,
     netrc_uri: Option<&str>,
@@ -260,10 +281,7 @@ fn build_client(
         .tcp_nodelay(true)
         .tcp_keepalive(std::time::Duration::from_secs(60));
 
-    let mut headers = http::build_headers(options);
-    if let Some(uri) = netrc_uri {
-        http::apply_netrc_auth(&mut headers, uri, options);
-    }
+    let headers = client_headers(options, netrc_uri);
     if !headers.contains_key(risuko_http::header::USER_AGENT) {
         builder = builder.user_agent("Mozilla/5.0");
     }
@@ -353,10 +371,18 @@ fn playlist_hash(playlist_url: &str, segments: &[parser::Segment], media_sequenc
     hasher.finish()
 }
 
+const MAX_DIR_NAME_BYTES: usize = 255;
+
 fn gid_component(gid: &str) -> String {
     gid.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
+}
+
+fn temp_dir_file_component(filename: &str, gid: &str) -> String {
+    let safe = crate::engine::util::safe_filename(filename, "download");
+    let fixed = ".m3u8_".len() + 1 + gid_component(gid).len() + 1 + 16;
+    risuko_util::truncate_filename(&safe, MAX_DIR_NAME_BYTES.saturating_sub(fixed))
 }
 
 fn temp_dir_name_for(
@@ -368,7 +394,7 @@ fn temp_dir_name_for(
 ) -> String {
     format!(
         ".m3u8_{}_{}_{:016x}",
-        crate::engine::util::safe_filename(filename, "download"),
+        temp_dir_file_component(filename, gid),
         gid_component(gid),
         playlist_hash(playlist_url, segments, media_sequence)
     )
@@ -413,7 +439,11 @@ pub fn remove_temp_dirs(gid: &str, dir: &str, uri: &str, out: &str) {
         ".m3u8_{}_",
         crate::engine::util::safe_filename(&filename, "download")
     );
-    let own_prefix = format!("{legacy_prefix}{}_", gid_component(gid));
+    let own_prefix = format!(
+        ".m3u8_{}_{}_",
+        temp_dir_file_component(&filename, gid),
+        gid_component(gid)
+    );
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -579,6 +609,47 @@ mod tests {
         assert!(build_client(&options, Some("https://site.example/a.m3u8")).is_ok());
     }
 
+    fn cookie_options(scope: Option<&str>) -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("cookie".into(), "sid=abc".into());
+        if let Some(scope) = scope {
+            options.insert(http::COOKIE_HOST_OPTION.into(), scope.into());
+        }
+        options
+    }
+
+    #[test]
+    fn unscoped_cookie_goes_to_every_host() {
+        let options = cookie_options(None);
+        for uri in [Some("https://site.example/a.m3u8"), None] {
+            let headers = client_headers(&options, uri);
+            assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
+        }
+    }
+
+    #[test]
+    fn scoped_cookie_goes_only_to_its_host() {
+        let options = cookie_options(Some("site.example"));
+        let headers = client_headers(&options, Some("https://site.example/a.m3u8"));
+        assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
+        assert!(!client_headers(&options, None).contains_key(risuko_http::header::COOKIE));
+        assert!(
+            !client_headers(&options, Some("https://cdn.other.example/a.m3u8"))
+                .contains_key(risuko_http::header::COOKIE)
+        );
+    }
+
+    #[test]
+    fn scoped_cookie_reaches_subdomains_of_its_host() {
+        let options = cookie_options(Some("site.example"));
+        let headers = client_headers(&options, Some("https://video.site.example/a.m3u8"));
+        assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
+        assert!(
+            !client_headers(&options, Some("https://notsite.example/a.m3u8"))
+                .contains_key(risuko_http::header::COOKIE)
+        );
+    }
+
     #[test]
     fn netrc_credentials_apply_and_stay_on_the_task_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -687,6 +758,34 @@ mod tests {
         remove_temp_dirs("gidone", dir.to_str().unwrap(), "https://e.com/p.m3u8", "");
         assert!(!inferred.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_dir_names_fit_in_a_single_path_component() {
+        let one = [seg("https://e.com/1.ts")];
+        for name in [
+            format!("{}.ts", "a".repeat(240)),
+            format!("{}.ts", "字".repeat(100)),
+        ] {
+            let dir_name =
+                temp_dir_name_for("0123456789abcdef", &name, "https://e.com/p.m3u8", &one, 0);
+            assert!(dir_name.len() <= MAX_DIR_NAME_BYTES, "{}", dir_name.len());
+        }
+    }
+
+    #[test]
+    fn long_named_temp_dirs_are_removed_with_the_task() {
+        let root = tempfile::tempdir().unwrap();
+        let one = [seg("https://e.com/1.ts")];
+        let gid = "0123456789abcdef";
+        let url = "https://e.com/p.m3u8";
+        let long_name = format!("{}.ts", "a".repeat(240));
+        let temp = root
+            .path()
+            .join(temp_dir_name_for(gid, &long_name, url, &one, 0));
+        std::fs::create_dir_all(&temp).unwrap();
+        remove_temp_dirs(gid, root.path().to_str().unwrap(), url, &long_name);
+        assert!(!temp.exists());
     }
 
     #[tokio::test]

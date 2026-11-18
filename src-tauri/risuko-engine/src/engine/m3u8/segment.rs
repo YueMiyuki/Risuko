@@ -15,6 +15,7 @@ use super::parser::Segment;
 use crate::engine::speed_limiter::SpeedLimiter;
 
 const SEGMENT_MAX_RETRIES: u32 = 5;
+const MAX_ENCRYPTED_SEGMENT_BYTES: usize = 512 << 20;
 const SEGMENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const KEY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROGRESS_FILENAME: &str = ".m3u8.progress";
@@ -366,6 +367,9 @@ async fn attempt_segment_download(
         ctx.throttle.acquire(len).await;
 
         if encryption.is_some() {
+            if ciphertext.len() + len > MAX_ENCRYPTED_SEGMENT_BYTES {
+                return Err("Encrypted segment is too large".to_string());
+            }
             ciphertext.extend_from_slice(chunk);
         } else {
             file.write_all(chunk)

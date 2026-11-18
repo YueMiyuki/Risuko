@@ -198,7 +198,7 @@
 import { Pencil, X } from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
 import type { DownloadTask } from "@shared/types/task";
-import { checkTaskIsBT, getTaskName } from "@shared/utils";
+import { checkTaskIsBT, getFileName, getTaskName } from "@shared/utils";
 import { convertTrackerDataToLine } from "@shared/utils/tracker";
 import type { PropType } from "vue";
 import SelectDirectory from "@/components/Native/SelectDirectory.vue";
@@ -543,37 +543,26 @@ export default {
 						.filter(Boolean),
 				);
 				const optionTracker =
-					typeof options.btTracker === "string"
-						? options.btTracker
-						: typeof options["bt-tracker"] === "string"
-							? (options["bt-tracker"] as string)
-							: "";
+					typeof options.btTracker === "string" ? options.btTracker : "";
 				const form: EditForm = {
 					out:
 						(typeof options.out === "string" && options.out) ||
-						this.task.files?.[0]?.path?.split(/[/\\]/).pop() ||
+						getFileName(this.task.files?.[0]?.path ?? "") ||
 						"",
 					dir:
 						(typeof options.dir === "string" && options.dir) ||
 						this.task.dir ||
 						"",
 					split: Math.max(1, Math.min(128, Number(options.split) || 16)),
-					maxDownloadLimit: normalizeLimit(
-						options.maxDownloadLimit ?? options["max-download-limit"],
-					),
+					maxDownloadLimit: normalizeLimit(options.maxDownloadLimit),
 					primaryUri: uris[0] || "",
 					mirrors: uris.slice(1),
 					trackersToAdd: "",
 					allProxy:
-						(typeof options.allProxy === "string" && options.allProxy) ||
-						(typeof options["all-proxy"] === "string" &&
-							(options["all-proxy"] as string)) ||
-						"",
+						(typeof options.allProxy === "string" && options.allProxy) || "",
 					userAgent:
 						headerUserAgent ||
 						(typeof options.userAgent === "string" && options.userAgent) ||
-						(typeof options["user-agent"] === "string" &&
-							(options["user-agent"] as string)) ||
 						"",
 					referer:
 						(typeof options.referer === "string" && options.referer) || "",

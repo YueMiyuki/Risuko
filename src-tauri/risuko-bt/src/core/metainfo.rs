@@ -519,7 +519,12 @@ pub(crate) fn info_private(info: &Value) -> bool {
 }
 
 pub(crate) fn is_safe_component(s: &str) -> bool {
-    if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']) {
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains(['/', '\\', '\0'])
+        || s.eq_ignore_ascii_case(crate::storage::PARTS_DIR)
+    {
         return false;
     }
     let b = s.as_bytes();
@@ -542,10 +547,19 @@ pub fn sanitize_windows_component(s: &str) -> String {
         return "_".into();
     }
     let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|port| {
+            let mut chars = port.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('1'..='9' | '¹' | '²' | '³'), None)
+            )
+        });
     if reserved {
         out.insert(0, '_');
     }
@@ -1060,6 +1074,13 @@ fn parse_piece_layers(top: &Value) -> Result<std::collections::BTreeMap<Id32, Ve
 mod tests {
     use super::*;
 
+    #[test]
+    fn parts_directory_name_is_not_a_safe_component() {
+        assert!(!is_safe_component(".risuko-parts"));
+        assert!(!is_safe_component(".Risuko-Parts"));
+        assert!(is_safe_component("risuko-parts"));
+    }
+
     fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError> {
         let mut info = validate_info_undeduped(value)?;
         dedupe_file_list(&mut info.files);
@@ -1105,6 +1126,13 @@ mod tests {
         assert_eq!(sanitize_windows_component("a. ."), "a");
         assert_eq!(sanitize_windows_component("..."), "_");
         assert_eq!(sanitize_windows_component("COM10"), "COM10");
+        assert_eq!(sanitize_windows_component("conin$"), "_conin$");
+        assert_eq!(sanitize_windows_component("CONOUT$.log"), "_CONOUT$.log");
+        assert_eq!(sanitize_windows_component("COM¹"), "_COM¹");
+        assert_eq!(sanitize_windows_component("lpt³.txt"), "_lpt³.txt");
+        assert_eq!(sanitize_windows_component("COM0"), "COM0");
+        assert_eq!(sanitize_windows_component("COM⁴"), "COM⁴");
+        assert_eq!(sanitize_windows_component("CONIN"), "CONIN");
     }
 
     #[test]

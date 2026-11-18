@@ -239,6 +239,23 @@ test("normalizes bypass entries and redacts proxy credentials", () => {
 		JSON.stringify(camelSettings).includes("pbh-token-secret"),
 		true,
 	);
+	const secrets = redactProxySettings({
+		cloudSyncToken: "session-token",
+		savedCredentials: [{ password: "hunter2" }],
+		"ftp-passwd": "ftp-secret",
+		sftpPrivateKeyPassphrase: "key-secret",
+		header: "Cookie: sid=abc",
+		p2PProxy: "socks5://bob:secret@proxy.example:1080",
+		dir: "/downloads",
+	});
+	assert.equal(secrets.p2PProxy, "socks5://proxy.example:1080");
+	assert.equal(secrets.dir, "/downloads");
+	assert.equal(
+		/session-token|hunter2|ftp-secret|key-secret|sid=abc/.test(
+			JSON.stringify(secrets),
+		),
+		false,
+	);
 });
 
 test("normalizes IP networks and rejects malformed bypass entries", () => {

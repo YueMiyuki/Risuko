@@ -58,6 +58,7 @@ pub fn system_defaults() -> Map<String, Value> {
     m.insert("pbh-listen-port".into(), json!(16801));
     m.insert("pbh-rpc-secret".into(), json!(""));
     m.insert("remote-time".into(), json!(false));
+    m.insert("rpc-allow-any-dir".into(), json!(false));
     m.insert("seed-ratio".into(), json!(0));
     m.insert("seed-time".into(), json!(0));
     m.insert("split".into(), json!(16));
@@ -126,6 +127,7 @@ pub fn user_defaults() -> Map<String, Value> {
     m.insert("auto-hide-window".into(), json!(false));
     m.insert("auto-retry".into(), json!(false));
     m.insert("auto-retry-interval".into(), json!(5));
+    m.insert("auto-retry-max-attempts".into(), json!(5));
     m.insert("auto-retry-strategy".into(), json!("static"));
     m.insert("auto-sync-tracker".into(), json!(true));
     m.insert("doh-provider".into(), json!("cloudflare"));
@@ -199,11 +201,8 @@ pub fn user_defaults() -> Map<String, Value> {
             "https://cdn.jsdelivr.net/gh/ngosang/trackerslist/trackers_best.txt"
         ]),
     );
-    m.insert("tray-theme".into(), json!("auto"));
     m.insert("tray-speedometer".into(), json!(is_macos));
     m.insert("m3u8-output-format".into(), json!("ts"));
-    m.insert("update-channel".into(), json!("latest"));
-    m.insert("window-state".into(), json!({}));
     m
 }
 
@@ -308,7 +307,6 @@ mod tests {
             "auto-check-update",
             "rpc-host",
             "m3u8-output-format",
-            "tray-theme",
             "log-level",
             "doh-provider",
         ];

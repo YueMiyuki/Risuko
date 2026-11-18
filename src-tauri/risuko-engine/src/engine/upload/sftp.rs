@@ -8,7 +8,10 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::sink::{SftpConfig, UploadControl, UploadFile, UploadSink};
+use super::sink::{
+    write_or_stall, SftpConfig, UploadControl, UploadError, UploadFile, UploadSink,
+    UPLOAD_CLEANUP_TIMEOUT,
+};
 use crate::engine::ssh_auth::authenticate;
 use crate::engine::ssh_known_hosts::TofuHandler;
 
@@ -33,13 +36,18 @@ impl SftpSink {
         Ok(Self { cfg })
     }
 
-    async fn connect(&self) -> Result<(client::Handle<TofuHandler>, SftpSession), String> {
+    async fn connect(&self) -> Result<(client::Handle<TofuHandler>, SftpSession), UploadError> {
         let config = Arc::new(client::Config::default());
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
         let handler = TofuHandler::new(addr.clone());
-        let mut session = client::connect(config, &addr, handler)
-            .await
-            .map_err(|e| format!("SSH connect failed: {e}"))?;
+        let mut session = client::connect(config, &addr, handler).await.map_err(|e| {
+            let message = format!("SSH connect failed: {e}");
+            if matches!(e, russh::Error::UnknownKey) {
+                UploadError::fatal(message)
+            } else {
+                UploadError::transient(message)
+            }
+        })?;
 
         let key = if self.cfg.private_key.is_empty() {
             None
@@ -54,7 +62,7 @@ impl SftpSink {
         };
         let password = (!self.cfg.password.is_empty()).then_some(self.cfg.password.as_str());
         if !authenticate(&mut session, &self.cfg.username, key, password).await? {
-            return Err("SFTP authentication failed".into());
+            return Err(UploadError::fatal("SFTP authentication failed"));
         }
 
         let channel = session
@@ -119,9 +127,9 @@ impl SftpSink {
 
 #[async_trait]
 impl UploadSink for SftpSink {
-    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String> {
+    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, UploadError> {
         if ctl.cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(UploadError::fatal("cancelled"));
         }
 
         let (_ssh, sftp) = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
@@ -150,7 +158,7 @@ impl UploadSink for SftpSink {
         let local: PathBuf = file.local_path.clone();
         let mut local_file = tokio::fs::File::open(&local)
             .await
-            .map_err(|e| format!("open {}: {e}", local.display()))?;
+            .map_err(|e| UploadError::fatal(format!("open {}: {e}", local.display())))?;
 
         let mut buf = vec![0u8; COPY_BUF];
         let mut sent: u64 = 0;
@@ -160,31 +168,34 @@ impl UploadSink for SftpSink {
             sftp: &SftpSession,
             remote_tmp: &str,
         ) {
-            let _ = remote_file.shutdown().await;
-            if let Err(e) = sftp.remove_file(remote_tmp).await {
-                tracing::debug!("SFTP cleanup of partial {remote_tmp} ignored: {e}");
-            }
+            let cleanup = async {
+                let _ = remote_file.shutdown().await;
+                if let Err(e) = sftp.remove_file(remote_tmp).await {
+                    tracing::debug!("SFTP cleanup of partial {remote_tmp} ignored: {e}");
+                }
+            };
+            let _ = tokio::time::timeout(UPLOAD_CLEANUP_TIMEOUT, cleanup).await;
         }
 
         loop {
             if ctl.cancel.is_cancelled() {
                 discard_partial(remote_file, &sftp, &remote_tmp).await;
-                return Err("cancelled".into());
+                return Err(UploadError::fatal("cancelled"));
             }
 
             let n = match local_file.read(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
                     discard_partial(remote_file, &sftp, &remote_tmp).await;
-                    return Err(format!("local read: {e}"));
+                    return Err(UploadError::fatal(format!("local read: {e}")));
                 }
             };
             if n == 0 {
                 break;
             }
-            if let Err(e) = remote_file.write_all(&buf[..n]).await {
+            if let Err(e) = write_or_stall(&mut remote_file, &buf[..n], &ctl.cancel, "SFTP").await {
                 discard_partial(remote_file, &sftp, &remote_tmp).await;
-                return Err(format!("SFTP write: {e}"));
+                return Err(e);
             }
             sent += n as u64;
             ctl.report(sent, file.size.max(sent));
@@ -194,7 +205,7 @@ impl UploadSink for SftpSink {
             if let Err(re) = sftp.remove_file(&remote_tmp).await {
                 tracing::debug!("SFTP cleanup after close failure ignored: {re}");
             }
-            return Err(format!("SFTP close: {e}"));
+            return Err(format!("SFTP close: {e}").into());
         }
 
         // Some servers' SFTPv3 `rename` fails if the destination exists
@@ -205,7 +216,7 @@ impl UploadSink for SftpSink {
             let _ = sftp.remove_file(&remote).await;
             if let Err(e2) = sftp.rename(&remote_tmp, &remote).await {
                 let _ = sftp.remove_file(&remote_tmp).await;
-                return Err(format!("SFTP rename {remote_tmp} -> {remote}: {e2}"));
+                return Err(format!("SFTP rename {remote_tmp} -> {remote}: {e2}").into());
             }
         }
 
@@ -219,7 +230,7 @@ impl UploadSink for SftpSink {
 
     async fn test(&self) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(20), async {
-            let (_ssh, sftp) = self.connect().await?;
+            let (_ssh, sftp) = self.connect().await.map_err(|e| e.message)?;
             let probe = if self.cfg.base_path.trim().is_empty() {
                 "/".to_string()
             } else {

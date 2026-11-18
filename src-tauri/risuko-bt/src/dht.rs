@@ -1780,14 +1780,6 @@ impl Dht {
         routes
     }
 
-    pub fn save_routing_state(&self, path: impl AsRef<Path>) -> std::io::Result<usize> {
-        save_routing_state_file(
-            path.as_ref(),
-            &self.routing_snapshot(),
-            &self.persisted_ids(),
-        )
-    }
-
     fn persisted_ids(&self) -> SavedIds {
         if self.proxy_datagram.is_some() {
             return self.saved_ids;

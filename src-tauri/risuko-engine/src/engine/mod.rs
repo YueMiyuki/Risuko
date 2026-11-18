@@ -1,3 +1,4 @@
+pub(crate) mod boot_id;
 pub mod cookie_store;
 pub mod dns;
 pub use risuko_ed2k as ed2k;
@@ -6,6 +7,7 @@ pub mod events;
 pub mod falloc;
 pub mod ftp;
 pub mod hasher;
+pub(crate) mod headless_policy;
 pub mod http;
 pub mod m3u8;
 pub mod manager;
@@ -13,8 +15,11 @@ pub mod media;
 pub mod metalink;
 pub mod netrc;
 pub mod options;
+pub(crate) mod part_claim;
+pub(crate) mod resume_meta;
 pub mod routing;
 pub mod rpc;
+pub mod rpc_paths;
 pub mod rss;
 pub mod session;
 pub mod speed_limiter;
@@ -42,10 +47,14 @@ pub mod gnutella;
 #[cfg(test)]
 mod p2p_tests;
 
+pub use headless_policy::task_path_from_status;
 pub use session::SESSION_FILENAME;
+
+pub const USER_AGENT: &str = concat!("Risuko/", env!("CARGO_PKG_VERSION"));
 pub use util::is_windows_device_name;
 
 pub const CHUNK_META_SUFFIX: &str = ".chunks";
+pub const RESUME_META_SUFFIX: &str = ".resume";
 
 pub const STARTUP_ONLY_KEYS: &[&str] = &[
     "rpc-listen-port",
@@ -194,17 +203,72 @@ struct EngineInstance {
     progress_task: tokio::task::JoinHandle<()>,
     auto_save_task: tokio::task::JoinHandle<()>,
     event_bridge_task: tokio::task::JoinHandle<()>,
+    task_list_task: tokio::task::JoinHandle<()>,
 }
 
-fn parse_config_bool(value: Option<&serde_json::Value>) -> bool {
-    value.and_then(options::json_bool).unwrap_or(false)
+pub(crate) fn spawn_maintenance_loops(
+    manager: &Arc<TaskManager>,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let mgr_for_progress = manager.clone();
+    let progress_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let mgr = mgr_for_progress.clone();
+            if let Err(e) = tokio::spawn(async move { mgr.update_progress().await }).await {
+                tracing::error!("Progress update panicked: {}", e);
+            }
+        }
+    });
+
+    const EVENT_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
+    let mgr_for_save = manager.clone();
+    let mut events = mgr_for_save.subscribe_events();
+    let auto_save_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = mgr_for_save.wait_for_save_request() => {
+                    tokio::time::sleep(EVENT_SAVE_DEBOUNCE).await;
+                }
+                received = events.recv(), if events_open => {
+                    if let Err(tokio::sync::broadcast::error::RecvError::Closed) = received {
+                        events_open = false;
+                        continue;
+                    }
+                    tokio::time::sleep(EVENT_SAVE_DEBOUNCE).await;
+                    while events.try_recv().is_ok() {}
+                }
+            }
+            let mgr = mgr_for_save.clone();
+            match tokio::spawn(async move { mgr.save_session().await }).await {
+                Ok(Err(e)) => tracing::warn!("Auto-save session failed: {}", e),
+                Err(e) => tracing::error!("Auto-save session panicked: {}", e),
+                Ok(Ok(_)) => {}
+            }
+        }
+    });
+
+    (progress_task, auto_save_task)
 }
 
-pub fn should_start_embedded_engine(config: &ConfigManager) -> bool {
-    let external_enabled =
-        parse_config_bool(config.get_user_config().get("external-engine-enabled"));
-
-    !external_enabled
+pub(crate) fn spawn_task_list_notifier(
+    manager: &Arc<TaskManager>,
+    sink: Arc<dyn EventSink>,
+) -> tokio::task::JoinHandle<()> {
+    const TASK_LIST_EVENT_GAP: Duration = Duration::from_secs(1);
+    let manager = manager.clone();
+    tokio::spawn(async move {
+        loop {
+            manager.wait_for_task_list_change().await;
+            sink.emit("engine:task-list-changed", serde_json::json!({}));
+            tokio::time::sleep(TASK_LIST_EVENT_GAP).await;
+        }
+    })
 }
 
 pub async fn start_engine(
@@ -212,11 +276,6 @@ pub async fn start_engine(
     event_sink: Arc<dyn EventSink>,
     upload_sinks: Option<Arc<UploadSinkManager>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !should_start_embedded_engine(config) {
-        tracing::info!("Embedded engine start skipped because external engine mode is enabled");
-        return Ok(());
-    }
-
     {
         let guard = ENGINE_INSTANCE.lock().await;
         if guard.is_some() {
@@ -262,10 +321,10 @@ pub async fn start_engine(
         events.clone(),
         rpc_shutdown_tx.clone(),
     );
-    rpc_server
-        .start()
-        .await
-        .map_err(|e| format!("Failed to start RPC server: {}", e))?;
+    if let Err(e) = rpc_server.start().await {
+        manager.shutdown().await;
+        return Err(format!("Failed to start RPC server: {e}").into());
+    }
 
     let pbh_rpc_server = if let Some(pbh) = pbh_config {
         let pbh_listen_port = pbh.port;
@@ -293,33 +352,8 @@ pub async fn start_engine(
         None
     };
 
-    let mgr_for_progress = manager.clone();
-    let progress_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let mgr = mgr_for_progress.clone();
-            if let Err(e) = tokio::spawn(async move { mgr.update_progress().await }).await {
-                tracing::error!("Progress update panicked: {}", e);
-            }
-        }
-    });
-
-    let mgr_for_save = manager.clone();
-    let auto_save_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let mgr = mgr_for_save.clone();
-            match tokio::spawn(async move { mgr.save_session().await }).await {
-                Ok(Err(e)) => tracing::warn!("Auto-save session failed: {}", e),
-                Err(e) => tracing::error!("Auto-save session panicked: {}", e),
-                Ok(Ok(_)) => {}
-            }
-        }
-    });
+    let (progress_task, auto_save_task) = spawn_maintenance_loops(&manager);
+    let task_list_task = spawn_task_list_notifier(&manager, event_sink.clone());
 
     let sink = event_sink.clone();
     let mut event_rx = events.subscribe();
@@ -366,7 +400,6 @@ pub async fn start_engine(
                                             &gid_owned,
                                             f.local_path,
                                             f.remote_relative,
-                                            f.size,
                                             f.category,
                                             &kind,
                                             override_id.clone(),
@@ -396,6 +429,7 @@ pub async fn start_engine(
         progress_task,
         auto_save_task,
         event_bridge_task,
+        task_list_task,
     };
 
     *ENGINE_INSTANCE.lock().await = Some(instance);
@@ -435,6 +469,7 @@ pub async fn stop_engine() -> Result<(), Box<dyn std::error::Error>> {
         instance.progress_task.abort();
         instance.auto_save_task.abort();
         instance.event_bridge_task.abort();
+        instance.task_list_task.abort();
 
         instance.rpc_server.stop();
         if let Some(mut pbh) = instance.pbh_rpc_server {
@@ -459,18 +494,12 @@ pub async fn restart_engine(
     upload_sinks: Option<Arc<UploadSinkManager>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stop_engine().await?;
-    if should_start_embedded_engine(config) {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        start_engine(config, event_sink, upload_sinks).await?;
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    start_engine(config, event_sink, upload_sinks).await?;
     Ok(())
 }
 
 pub async fn reload_p2p_profile(config: &ConfigManager) -> Result<(), Box<dyn std::error::Error>> {
-    if !should_start_embedded_engine(config) {
-        tracing::info!("Skipping P2P profile reload because the embedded engine is disabled");
-        return Ok(());
-    }
     let Some(manager) = get_manager().await else {
         tracing::info!("Skipping P2P profile reload because the engine manager is unavailable");
         return Ok(());

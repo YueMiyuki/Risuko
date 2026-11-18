@@ -1,45 +1,254 @@
 export default {
 	basic: "Основные",
 	advanced: "Расширенные",
+	cloudSinks: "Облачные хранилища",
+	usenet: "Usenet",
+	search: "Поиск",
+	"search-placeholder": "Поиск по всем настройкам",
+	"search-all-tabs": "Все настройки",
+	"search-results": "Найдено настроек: {{count}}",
+	"search-no-results": "Подходящих настроек не найдено",
+	"search-clear": "Очистить поиск",
+	"search-go-to-tab": "Открыть настройку",
+	"search-more-results": "Уточните запрос, чтобы увидеть больше результатов",
+	"usenet-tips":
+		"Управление провайдерами NNTP и безопасными параметрами очистки архивов по умолчанию.",
+	"usenet-profiles": "Профили провайдеров",
+	"usenet-profiles-tips":
+		"Настройте приоритет провайдера, безопасность, аутентификацию и ограничения соединений.",
+	"usenet-add-profile": "Добавить профиль",
+	"usenet-no-profiles": "Профили провайдеров не настроены.",
+	"usenet-no-profiles-tips":
+		"Добавьте хотя бы одного провайдера, прежде чем импортировать загрузку NZB.",
+	"usenet-edit-profile": "Изменить профиль",
+	"usenet-profile-dialog-tips":
+		"Настройки профиля могут синхронизироваться между устройствами. Учётные данные остаются только на этом устройстве.",
+	"usenet-profile-dialog-tips-vault":
+		"Настройки профиля могут синхронизироваться между устройствами. Учётные данные хранятся в защищённой связке ключей этого устройства.",
+	"usenet-profile-name": "Название профиля",
+	"usenet-profile-name-placeholder": "Основной провайдер",
+	"usenet-profile-host": "Хост NNTP",
+	"usenet-profile-port": "Порт",
+	"usenet-security": "Безопасность соединения",
+	"usenet-tls": "Неявный TLS",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "NNTP без шифрования",
+	"usenet-authentication": "Аутентификация",
+	"usenet-auth-credentials": "Имя пользователя и пароль",
+	"usenet-auth-anonymous": "Анонимно",
+	"usenet-username": "Имя пользователя",
+	"usenet-password": "Пароль",
+	"usenet-credentials-saved": "Учётные данные сохранены",
+	"usenet-credentials-unavailable": "Состояние учётных данных недоступно",
+	"usenet-credentials-saved-tips":
+		"Учётные данные уже сохранены. Оставьте оба поля пустыми, чтобы не менять их.",
+	"usenet-plain-warning-title": "Незашифрованное соединение",
+	"usenet-plain-opt-in":
+		"Я понимаю и хочу разрешить NNTP без шифрования для этого профиля.",
+	"usenet-plain-warning":
+		"NNTP без шифрования не защищает учётные данные и загружаемые данные. Используйте его, только если этого явно требует ваш провайдер.",
+	"usenet-enabled": "Включён",
+	"usenet-enabled-tips":
+		"Отключённые профили сохраняются, но не используются для загрузок.",
+	"usenet-disabled": "Отключён",
+	"usenet-priority": "Приоритет",
+	"usenet-priority-tips":
+		"Сначала пробуются меньшие значения. Профили с равным приоритетом делят нагрузку.",
+	"usenet-priority-value": "Приоритет {{value}}",
+	"usenet-max-connections": "Максимум соединений",
+	"usenet-max-connections-tips":
+		"Предел числа соединений для этого профиля провайдера.",
+	"usenet-connections-value": "Соединений: {{value}}",
+	"usenet-test": "Проверить",
+	"usenet-edit": "Изменить профиль",
+	"usenet-remove": "Удалить",
+	"usenet-remove-title": "Удалить профиль провайдера?",
+	"usenet-remove-confirm":
+		"Профиль {{name}} больше не будет доступен для загрузок. Его сохранённые учётные данные также будут удалены с этого устройства.",
+	"usenet-profile-saved": "Профиль провайдера сохранён.",
+	"usenet-profile-removed": "Профиль {{name}} удалён.",
+	"usenet-test-success": "Подключено к {{name}}.",
+	"usenet-test-failed": "Не удалось подключиться: {{message}}",
+	"usenet-validation-name": "Введите название профиля.",
+	"usenet-validation-host": "Введите хост NNTP.",
+	"usenet-validation-port": "Порт должен быть от 1 до 65535.",
+	"usenet-validation-plain":
+		"Перед сохранением подтвердите предупреждение о NNTP без шифрования.",
+	"usenet-validation-priority": "Приоритет должен быть не меньше нуля.",
+	"usenet-validation-connections": "Число соединений должно быть от 1 до 128.",
+	"usenet-validation-credentials":
+		"Введите и имя пользователя, и пароль либо выберите анонимную аутентификацию.",
+	"usenet-validation-credential-status":
+		"Состояние учётных данных недоступно. Повторите попытку, прежде чем менять этот профиль.",
+	"usenet-cleanup": "Очистка после успеха",
+	"usenet-cleanup-tips":
+		"Очистка выполняется только после полной сборки и успешного извлечения.",
+	"usenet-cleanup-action": "После подтверждённого успеха",
+	"usenet-cleanup-keep": "Сохранять все исходные файлы",
+	"usenet-cleanup-keep-tips": "Сохраняет файлы PAR2 и все тома архива.",
+	"usenet-cleanup-par2": "Удалять файлы PAR2",
+	"usenet-cleanup-par2-tips":
+		"Удаляет файлы чётности, но оставляет загруженные тома архива.",
+	"usenet-cleanup-all": "Удалять PAR2 и тома архива",
+	"usenet-cleanup-all-tips":
+		"Удаляет файлы чётности и тома архива после успешного извлечения.",
+	"usenet-archive-safety": "Безопасность архивов",
+	"usenet-limits-defaults":
+		"Ограничения на уровне задания защищают хранилище и вычислительные ресурсы при проверке и извлечении.",
+	"usenet-desktop-limits": "Ограничения для ПК",
+	"usenet-android-limits": "Ограничения для Android",
+	"usenet-limits-summary":
+		"Элементов: {{entries}} · всего после распаковки: {{total}} · на элемент: {{perEntry}}",
+	"usenet-limits-secondary-summary":
+		"Коэффициент {{ratio}}:1 · уровней вложенности: {{depth}} · резерв свободного места: {{reserve}} · активных часов: {{hours}}",
+	"usenet-customize-limits": "Настроить ограничения",
+	"usenet-hide-limits": "Скрыть ограничения",
+	"usenet-limits-adjusted": "Синхронизированные ограничения скорректированы",
+	"usenet-limits-adjusted-tips":
+		"Одно или несколько значений превысили жёсткий предел этой платформы и были уменьшены.",
+	"usenet-max-entries": "Максимум элементов",
+	"usenet-max-expanded": "Общий размер после распаковки",
+	"usenet-max-entry": "Размер одного элемента",
+	"usenet-max-depth": "Глубина вложенности",
+	"usenet-max-ratio": "Коэффициент сжатия",
+	"usenet-free-space-reserve": "Резерв свободного места",
+	"usenet-max-active-time": "Время активной обработки",
+	"usenet-unit-entries": "элементов",
+	"usenet-unit-levels": "уровней",
+	"usenet-unit-hours": "часов",
+	"usenet-limits-hard-cap":
+		"Значения не могут превышать значения платформы по умолчанию более чем в четыре раза. Переопределения для отдельных заданий подтверждаются отдельно.",
+	"usenet-restore-limits": "Восстановить значения платформы",
+	"usenet-limits-restored":
+		"Ограничения для архивов восстановлены до значений платформы по умолчанию.",
 	save: "Сохранить и применить",
 	"save-success-message": "Настройки сохранены успешно",
 	"save-fail-message": "Ошибка при сохранении настроек",
 	discard: "Отмена",
+	"history-directories": "Недавние каталоги загрузки",
+	"favorite-directory": "Избранный каталог",
+	"unfavorite-directory": "Удалить каталог из избранного",
+	"remove-history-directory": "Удалить каталог из истории",
 	startup: "Запускать",
-	"open-at-login": "Запускать програму вместе со стартом операционной системы",
+	"open-at-login": "Запускать программу вместе со стартом операционной системы",
 	"keep-window-state":
 		"Во время закрытия приложения, сохранять размер и положение окна",
 	"auto-resume-all": "Автоматически возобновлять все незавершенные задачи",
 	"default-dir": "Папка по умолчанию",
+	"file-category-dirs": "Пути по категориям",
+	"file-category-dirs-tips":
+		"Переопределите путь загрузки по умолчанию для определённых типов файлов. Оставьте пустым, чтобы использовать путь по умолчанию.",
+	"task-routing-rules": "Правила маршрутизации заданий",
+	"task-routing-rules-tips":
+		"Направляет задания в папки по шаблонам имён файлов. Применяется первое подходящее правило.",
+	"task-routing-rule-pattern-placeholder": "Шаблон (напр. *.mkv)",
+	"task-routing-rule-label-placeholder": "Тег",
+	"task-routing-rule-dir-placeholder": "Папка",
+	"task-routing-rule-add": "Добавить правило",
+	"file-category-music": "Музыка",
+	"file-category-video": "Видео",
+	"file-category-image": "Изображения",
+	"file-category-document": "Документы",
+	"file-category-compressed": "Архивы",
+	"file-category-program": "Программы",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Из-за ограничения в App Store, рекомендуется устанавливать путь по умолчанию как ~/Downloads",
-	"transfer-settings": "коробка передач",
+	"transfer-settings": "Передача данных",
 	"transfer-speed-upload": "Лимит отдачи",
 	"transfer-speed-download": "Лимит загрузки",
 	"transfer-speed-unlimited": "Безлимитно",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "Сохранить магнитную ссылку как торрент-файл",
+	"bt-create-subfolder": "Помещать торренты из нескольких файлов в подпапку",
+	"bt-create-subfolder-tips":
+		"Если включено, загрузки BitTorrent и magnet из нескольких файлов помещаются в папку с названием торрента. Если отключено, файлы записываются прямо в папку загрузки.",
+	"bt-upload-rate-limit": "Лимит отдачи BitTorrent",
+	"bt-upload-rate-limit-tips":
+		"Ограничивает отдачу BitTorrent в дополнение к общему лимиту отдачи. 0 означает отсутствие отдельного ограничения.",
 	"bt-auto-download-content": "Автоматически загружать магнит и торрент",
 	"bt-force-encryption": "Принудительное шифрование BT",
-	"keep-seeding": "Продолжайте посев, пока не остановите его вручную",
-	"seed-ratio": "Соотношение семян",
-	"seed-time": "Время посева",
+	"keep-seeding": "Продолжать раздачу, пока не остановите её вручную",
+	"seed-ratio": "Коэффициент раздачи",
+	"seed-time": "Время раздачи",
 	"seed-time-unit": "минут",
 	"task-manage": "Менеджер задач",
 	"max-concurrent-downloads": "Максимум активных задач",
+	"connections-per-task": "Соединений на задание",
 	"max-connection-per-server": "Максимум соединений на сервер",
+	"auto-retry": "Автоповтор неудавшихся заданий",
+	"auto-retry-strategy": "Режим интервала повтора",
+	"auto-retry-strategy-static": "Постоянный",
+	"auto-retry-strategy-exponential": "Экспоненциальная задержка",
+	"auto-retry-interval": "Базовый интервал повтора",
+	"auto-retry-interval-unit": "секунд",
+	"auto-retry-max-attempts": "Максимум попыток повтора (0 = без ограничений)",
+	"worker-max-retries": "Максимум повторов на часть для воркера",
+	"auto-detect-low-speed-tasks": "Автоопределение заданий с низкой скоростью",
+	"auto-detect-low-speed-tasks-tips":
+		"Если выполняющееся задание остаётся ниже порога скорости, оно автоматически приостанавливается и перезапускается.",
+	"low-speed-threshold": "Порог низкой скорости",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "Надёжность HTTP / сети",
+	"http-reliability-tips":
+		"Настройка таймаута подключения и обнаружения зависших передач для загрузок HTTP/HTTPS/FTP.",
+	"connect-timeout": "Таймаут подключения",
+	"nzb-body-timeout": "Таймаут тела NZB",
+	"lowest-speed-limit": "Минимальный предел скорости",
+	"lowest-speed-limit-timeout": "Таймаут зависания",
+	"lowest-speed-limit-help":
+		"Если скорость загрузки остаётся ниже минимального предела в течение таймаута зависания, воркер прерывается и (при включённом автоповторе) перезапускается. Установите предел 0, чтобы отключить.",
+	"uri-selector": "Выбор зеркала",
+	"uri-selector-feedback":
+		"По обратной связи (отбрасывать медленные и неисправные зеркала)",
+	"uri-selector-inorder": "По порядку (пробовать зеркала слева направо)",
+	"uri-selector-adaptive": "Адаптивно (предпочитать самое быстрое)",
+	"unit-seconds": "секунд",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "Хранение",
+	"storage-tips": "Как движок резервирует место на диске перед загрузкой.",
+	"file-allocation": "Выделение места под файлы",
+	"file-allocation-falloc": "Предварительное выделение (falloc)",
+	"file-allocation-trunc": "Усечение (только задать длину)",
+	"file-allocation-none": "Нет (расти по мере необходимости)",
+	"file-allocation-tips":
+		"Предварительное выделение заранее резервирует реальные блоки диска, чтобы избежать ENOSPC посреди загрузки и уменьшить фрагментацию. На файловых системах без такой поддержки переключается на усечение.",
 	"new-task-show-downloading":
 		"Автоматически отображать задачу после ее добавления",
 	"no-confirm-before-delete-task":
 		"Перед удалением задачи подтверждение не требуется",
+	"auto-file-renaming": "Автоматически переименовывать дубликаты файлов",
+	"auto-file-renaming-tips":
+		'Если файл с таким именем уже существует, сохранять как "file.1.ext" вместо перезаписи',
+	"use-remote-file-time":
+		"Использовать время изменения удалённого файла при сохранении",
+	"use-remote-file-time-tips":
+		"Устанавливать время изменения файла по метке времени с удалённого сервера",
 	continue: "Продолжить",
 	"task-completed-notify": "Сообщение после окончания загрузки",
+	"clipboard-watch": "Отслеживать буфер обмена на наличие ссылок для загрузки",
+	"clipboard-watch-tips":
+		"Когда вы где-либо копируете magnet-ссылку или ссылку на файл, Risuko предложит скачать её.",
+	"clipboard-watch-ext": "Отслеживаемые расширения файлов",
+	"clipboard-watch-ext-tips":
+		"Запрос вызывают только ссылки http(s), оканчивающиеся на эти расширения. Ссылки magnet, ed2k и torrent вызывают его всегда. Разделяйте пробелами или запятыми.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"Risuko теперь отслеживает буфер обмена на наличие ссылок для загрузки. Отключить это можно в разделе Настройки → Основные.",
 	"prevent-sleep-while-downloading":
 		"Не допускать перехода системы в спящий режим во время загрузки",
 	"prevent-sleep-while-downloading-tips":
 		"Поддерживать компьютер в активном состоянии, пока выполняется задача",
+	"shutdown-when-complete": "Выключить компьютер после завершения всех заданий",
+	"shutdown-when-complete-tips":
+		"Однократно: выключает компьютер, когда очередь загрузок опустеет",
+	"shutdown-countdown-title": "Выключение через {{seconds}} с…",
+	"shutdown-countdown-cancel": "Отмена",
+	"shutdown-failed": "Не удалось выключить компьютер. Проверьте права доступа.",
 	"auto-purge-record":
 		"Автоматически чистить записи о загрузках после закрытия приложения",
+	"purge-record-on-start": "Очищать записи о загрузках при запуске приложения",
 	ui: "UI",
 	appearance: "Внешний вид",
 	"theme-auto": "Автоматически",
@@ -71,7 +280,16 @@ export default {
 	"change-language": "Сменить язык",
 	"hide-app-menu": "Скрыть меню приложения (только для Windows и Linux)",
 	proxy: "Proxy",
+	"proxy-http-profile": "Прокси для HTTP / FTP / Usenet",
+	"proxy-p2p-profile": "Прокси для P2P",
 	"enable-proxy": "Использовать Proxy",
+	"enable-p2p-proxy": "Использовать прокси для P2P",
+	"proxy-p2p-tcp-server": "TCP-прокси-сервер",
+	"proxy-p2p-tcp-bypass": "Исключения TCP-прокси",
+	"proxy-p2p-udp-server": "UDP-прокси-сервер",
+	"proxy-p2p-udp-server-placeholder":
+		"Необязательно; оставьте пустым, чтобы использовать TCP-прокси для P2P",
+	"proxy-p2p-udp-bypass": "Исключения UDP-прокси",
 	"proxy-bypass-input-tips":
 		"Обойти настройки прокси для этих хостов и доменов, по одному в строке",
 	"proxy-scope-label": "Используется для",
@@ -83,34 +301,72 @@ export default {
 	"proxy-scope-update-trackers-desc":
 		"Получать списки BT-трекеров через прокси",
 	"proxy-tips": "Посмотреть руководство по прокси",
+	"proxy-p2p-tips":
+		"Для DHT, UDP-трекеров и uTP требуется SOCKS5 или SOCKS5H. HTTP-прокси используются только для TCP-соединений P2P.",
+	"proxy-p2p-udp-tips":
+		"Оставьте UDP-прокси пустым, чтобы использовать маршрут TCP для P2P. Для проксирования UDP нужен SOCKS5 или SOCKS5H; HTTP-прокси не могут передавать UDP.",
+	"proxy-p2p-restart-title": "Перезапустить загрузки P2P?",
+	"proxy-p2p-restart-confirm":
+		"Изменение прокси для P2P перезапускает активные одноранговые загрузки. Загрузки HTTP, FTP и Usenet продолжают работать.",
+	doh: "DNS over HTTPS",
+	"doh-tips":
+		"Определять адреса хостов через зашифрованную конечную точку DNS вместо системного преобразователя",
+	"doh-enable": "Включить DNS over HTTPS",
+	"doh-provider": "Провайдер",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "Свой",
+	"doh-url": "URL конечной точки",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "Конечная точка DoH должна начинаться с https://",
+	"doh-bootstrap": "Начальные IP-адреса",
+	"doh-bootstrap-placeholder":
+		"IP-адреса для доступа к конечной точке, через запятую (необязательно)",
+	"doh-fallback": "Переходить на системный DNS",
+	"doh-fallback-tips":
+		"Если запрос DoH не удался, использовать системный DNS вместо сбоя загрузки",
 	"bt-tracker": "Tracker Сервер",
 	"bt-tracker-input-tips": "Tracker сервера, один в строку",
 	"bt-tracker-tips": "Рекомендовано: ",
+	"bt-max-peers-per-torrent": "Максимум пиров на торрент",
+	"bt-max-peers-per-torrent-tips":
+		"Максимальное число одновременных соединений с пирами на торрент. Большие значения улучшают поиск пиров в рое (требуется перезапуск движка)",
+	"bt-max-outstanding-per-peer": "Максимум ожидающих запросов на пира",
+	"bt-max-outstanding-per-peer-tips":
+		"Максимальное число одновременных запросов блоков, конвейеризуемых каждому пиру (предел, до 500). 0 включает адаптивное значение по умолчанию 6–500; общий бюджет запросов торрента делится между активными пирами. Требуется перезапуск движка",
+	"bt-max-connections": "Максимум соединений с пирами",
+	"bt-max-connections-tips":
+		"Общее число соединений с пирами по всем торрентам, от 20 до 5000. Уменьшение значения не разрывает уже открытые соединения, а лишь сдерживает новые. В Linux, macOS и Android действующее значение также ограничено половиной системного лимита файловых дескрипторов",
+	"bt-ban-corrupt-peers": "Блокировать пиров, отправляющих повреждённые данные",
+	"bt-ban-corrupt-peers-tips":
+		"Блокировать IP-адрес до конца сеанса, если части данных, в отправке которых он участвовал, снова и снова не проходят проверку хеша. Один IP-адрес могут совместно использовать многие пользователи (мобильные операторы, общие сети), поэтому блокировка может отрезать и ни в чём не повинных пиров (требуется перезапуск движка)",
+	"bt-ban-corrupt-strikes": "Неудачных частей до блокировки",
+	"bt-ban-corrupt-strikes-tips":
+		"Сколько неудачных частей может быть связано с IP-адресом до его блокировки. Большие значения терпимее к случайным повреждениям (требуется перезапуск движка)",
+	"bt-enable-upnp": "Проброс портов UPnP / NAT-PMP",
+	"bt-enable-upnp-tips":
+		"Автоматически открывать порт прослушивания BitTorrent на маршрутизаторе через UPnP IGD, NAT-PMP или PCP (требуется перезапуск движка)",
+	"bt-upnp-lease": "Срок аренды сопоставления портов (секунд)",
+	"bt-upnp-lease-tips":
+		"Срок аренды сопоставлений портов UPnP и NAT-PMP. Более короткие сроки быстрее восстанавливаются после устаревших сопоставлений (требуется перезапуск движка)",
+	"bt-enable-lsd": "Обнаружение локальных сервисов (LSD)",
+	"bt-enable-lsd-tips":
+		"Находить пиров в локальной сети через многоадресную рассылку BEP-14 (требуется перезапуск движка)",
+	"bt-encryption-policy": "Шифрование протокола",
+	"bt-encryption-policy-tips":
+		'Политика MSE/PE для соединений с пирами. Вариант "Предпочитать шифрование" сначала пробует шифрование и при неудаче переходит на открытый текст (требуется перезапуск движка)',
+	"bt-encryption-plaintext": "Только открытый текст",
+	"bt-encryption-prefer": "Предпочитать шифрование",
+	"bt-encryption-require": "Требовать шифрование",
+	"bt-listen-v6": "Прослушивание IPv6",
+	"bt-listen-v6-tips":
+		"Привязать дополнительный TCP-слушатель IPv6 к тому же порту (требуется перезапуск движка)",
 	"sync-tracker-tips": "Синхронизация",
 	"auto-sync-tracker": "Обновлять список трекеров каждый день автоматически",
-	port: "Порты прослушивания",
-	"bt-port": "Порт прослушивания BT",
-	"dht-port": "Порт прослушивания DHT",
-	security: "Безопастность",
-	rpc: "RPC",
-	"rpc-listen-port": "Порт прослушивания RPC",
-	"rpc-secret": "RPC Secret",
-	"rpc-secret-tips": "Смотреть инструкцию RPC Secret",
-	pbh: "PeerBanHelper",
-	"pbh-enable": "Включить API PeerBanHelper",
-	"pbh-enable-tips":
-		"Открывает JSON-RPC-слушатель, совместимый с Aria2Next, чтобы PeerBanHelper мог отслеживать и блокировать пиры BitTorrent",
-	"pbh-listen-port": "Порт прослушивания PeerBanHelper",
-	"pbh-rpc-secret": "RPC-токен PeerBanHelper",
-	"generate-pbh-rpc-secret": "Сгенерировать новый токен",
-	"pbh-endpoint-hint":
-		"В PeerBanHelper добавьте загрузчик Aria2Next с адресом http://127.0.0.1:{{port}}/jsonrpc",
-	"engine-overrides": "Engine Overrides (JSON)",
-	"engine-overrides-placeholder":
-		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
-	"engine-overrides-tips":
-		"Advanced: set arbitrary engine option keys as a JSON object. Changes take effect after restart.",
-	"engine-overrides-invalid": "Engine Overrides must be a valid JSON object.",
+	"ed2k-server": "Серверы eDonkey",
+	"ed2k-server-input-tips": "Серверы eDonkey, по одному в строке (ip:port)",
+	"ed2k-server-tips": "Если пусто, используются серверы по умолчанию",
 	"ed2k-kad": "eMule Kad",
 	"ed2k-enable-kad": "Включить поиск источников через Kad",
 	"ed2k-enable-kad-tips":
@@ -120,24 +376,114 @@ export default {
 		"UDP-порт для поиска источников через Kad. Допустимые значения: 1-65535 (требуется перезапуск движка)",
 	"ed2k-kad-port-invalid":
 		"UDP-порт Kad должен быть целым числом от 1 до 65535",
+	"listen-port-invalid":
+		"Порт BT должен быть портом от 1 до 65535, диапазоном вроде 6881-6889 или списком таких значений через запятую",
+	"dht-listen-port-invalid":
+		"Порт DHT должен быть портом от 1 до 65535, диапазоном вроде 6881-6889 или списком таких значений через запятую",
+	"ed2k-port-invalid": "Порт ED2K должен быть целым числом от 1 до 65535",
 	"ed2k-enable-upload": "Раздавать файлы через ED2K",
 	"ed2k-enable-upload-tips":
 		"Отдавать другим пирам завершённые файлы и проверенные части текущих загрузок ED2K. Kad может показывать файл, который вы перестали раздавать, ещё до 5 часов (требуется перезапуск движка)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"Учётные данные по умолчанию для загрузок FTP, FTPS и SFTP",
+	"ftp-username": "Имя пользователя FTP",
+	"ftp-password": "Пароль FTP",
+	"sftp-private-key": "Путь к закрытому ключу SSH",
+	"sftp-private-key-content": "Содержимое закрытого ключа SSH",
+	"sftp-private-key-tips":
+		"Путь к файлу закрытого ключа PEM, напр. ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips": "Вставьте сюда содержимое закрытого ключа PEM",
+	"sftp-key-passphrase": "Парольная фраза ключа",
+	"sftp-key-passphrase-tips":
+		"Оставьте пустым, если у ключа нет парольной фразы",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "Формат вывода",
+	"media-settings": "Медиасайты (yt-dlp)",
+	"media-settings-tips":
+		"Настройки по умолчанию для загрузок с медиасайтов (YouTube, Vimeo, Bilibili и других). Требуется yt-dlp в PATH; для объединения отдельных видео- и аудиопотоков нужен ffmpeg.",
+	"media-format": "Предпочтительный формат",
+	"media-format-placeholder":
+		"напр. bestvideo+bestaudio/best (строка формата yt-dlp)",
+	"media-format-tips":
+		"Селектор формата yt-dlp. Оставьте пустым для лучшего качества. Примеры: bestvideo[height<=1080]+bestaudio/best, 137+140",
+	port: "Порты прослушивания",
+	"bt-port": "Порт прослушивания BT",
+	"dht-port": "Порт прослушивания DHT",
+	"ed2k-port": "Порт прослушивания ed2k",
+	security: "Безопасность",
+	rpc: "RPC",
+	"rpc-host": "Адрес сервера",
+	"rpc-host-local": "Только это устройство",
+	"rpc-host-all": "Все сетевые интерфейсы",
+	"rpc-host-custom": "Свой ({{host}})",
+	"rpc-host-exposed-tips":
+		"Другие устройства в вашей сети могут обращаться к порту RPC, а при включении также к порту PeerBanHelper. Любой, кто знает секрет, может добавлять загрузки и управлять ими.",
+	"rpc-listen-port": "Порт прослушивания RPC",
+	"rpc-secret": "RPC Secret",
+	"rpc-secret-tips": "Смотреть инструкцию RPC Secret",
+	"rpc-allow-any-dir":
+		"Разрешить клиентам RPC использовать любой локальный путь",
+	"rpc-allow-any-dir-tips":
+		"Если выключено, загрузки, добавленные через RPC, можно сохранять только в папку загрузок, её подпапки, а также в ваши папки категорий и маршрутизации, а клиенты RPC не могут заставить приложение читать файл cookie, netrc или ключ SSH.",
+	pbh: "PeerBanHelper",
+	"pbh-enable": "Включить API PeerBanHelper",
+	"pbh-enable-tips":
+		"Открывает JSON-RPC-слушатель, совместимый с Aria2Next, чтобы PeerBanHelper мог отслеживать и блокировать пиры BitTorrent",
+	"pbh-listen-port": "Порт прослушивания PeerBanHelper",
+	"pbh-rpc-secret": "RPC-токен PeerBanHelper",
+	"generate-pbh-rpc-secret": "Сгенерировать новый токен",
+	"pbh-endpoint-hint":
+		"В PeerBanHelper добавьте загрузчик Aria2Next с адресом http://127.0.0.1:{{port}}/jsonrpc",
+	"randomize-port": "Выбрать случайный порт",
+	"generate-rpc-secret": "Создать новый секрет RPC",
+	"copy-rpc-url": "Копировать URL RPC",
+	"engine-overrides": "Переопределения движка (JSON)",
+	"engine-overrides-placeholder":
+		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
+	"engine-overrides-tips":
+		"Для опытных пользователей: задайте произвольные ключи параметров движка в виде объекта JSON. Изменения вступают в силу после перезапуска.",
+	"engine-overrides-invalid":
+		"Переопределения движка должны быть корректным объектом JSON.",
 	"engine-overrides-reserved-keys":
 		"Проигнорированы зарезервированные ключи переопределения движка: {{keys}}",
 	"engine-overrides-too-large":
 		"Переопределения движка слишком велики: не более 64 ключей, 64 символов на ключ и 2048 символов на значение.",
-	"external-engine-enable": "Use External Engine",
-	"external-engine-enable-tips":
-		"When enabled, Risuko will not auto-start the embedded engine.",
-	"external-engine-ip": "External Engine IP",
-	"external-engine-port": "External Engine Port",
-	"external-engine-secret": "External Engine Secret",
 	developer: "Разработчик",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Макет User-Agent",
+	cookies: "Cookie",
+	"cookies-tips":
+		"Загружать cookie из файла cookies.txt в формате Netscape/Mozilla (также принимается вывод curl/wget).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "Сохранённые учётные данные доменов",
+	"saved-cookies-tips":
+		"Cookie и User-Agent, импортированные из браузера при обходе Cloudflare или других защищённых аутентификацией загрузок. Risuko использует их для новых загрузок на том же домене, пока они не истекут или не перестанут работать.",
+	"saved-cookies-empty": "Сохранённых учётных данных пока нет.",
+	"saved-cookies-host": "Домен",
+	"saved-cookies-browser": "Браузер",
+	"saved-cookies-count": "Cookie",
+	"saved-cookies-imported": "Импортировано",
+	"saved-cookies-actions": "Действия",
+	"saved-cookies-clear": "Очистить все",
+	"saved-cookies-confirm-clear":
+		"Удалить все сохранённые учётные данные доменов? Будущие загрузки с этих сайтов могут не работать, пока вы не импортируете их снова.",
+	"saved-cookies-delete": "Удалить",
+	netrc: "Учётные данные .netrc",
+	"netrc-tips":
+		"Подставлять HTTP Basic-аутентификацию из файла .netrc, если в URL нет встроенных учётных данных. По умолчанию: ~/.netrc (или %USERPROFILE%/_netrc в Windows).",
+	"netrc-path-placeholder": "Переопределить путь к .netrc (необязательно)",
+	"no-netrc": "Отключить поиск в .netrc",
+	"no-netrc-tips":
+		"Полностью пропускать .netrc. Полезно, если в файле хранятся учётные данные не для загрузок.",
 	"app-log-path": "Путь к журналу приложения",
-	"download-session-path": "Загрузить путь сессии",
+	"log-dir-override-placeholder":
+		"Своя папка журналов (оставьте пустым для значения по умолчанию)",
+	"log-dir-override-tips":
+		"Журналы сейчас записываются в {{path}}. Если задать свою папку (например, внутри Загрузок), они станут видны в любом файловом менеджере. Изменения вступят в силу после следующего перезапуска приложения.",
+	"download-session-path": "Путь к сеансу загрузок",
+	"session-reset": "Сбросить сеанс загрузок",
+	"session-reset-confirm": "Вы уверены, что хотите сбросить сеанс загрузок?",
 	"factory-reset": "Настройки по умолчанию",
 	"factory-reset-confirm":
 		"Вы уверены, что хотите вернуться к настройкам по умолчанию?",
@@ -146,6 +492,7 @@ export default {
 		"Установить как клиента по умолчанию для следующих протоколов",
 	"protocols-magnet": "Magnet [ magnet:// ]",
 	"protocols-thunder": "Thunder [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -161,9 +508,6 @@ export default {
 	"auto-update": "Автоматическое обновление",
 	"auto-check-update": "Автоматически проверять обновления",
 	"last-check-update-time": "Последняя проверка на обновления прошла в",
-	"not-saved": "Настройки не сохранены",
-	"not-saved-confirm":
-		"Измененные настройки будут потеряны, вы обязательно уйдете?",
 	"completion-script": "Скрипт после завершения",
 	"completion-script-enabled": "Запускать скрипт после завершения загрузки",
 	"completion-script-tips":
@@ -181,10 +525,38 @@ export default {
 	"completion-script-test-ok": "Проверка скрипта успешна",
 	"completion-script-test-fail": "Проверка скрипта не удалась",
 	"completion-script-empty": "Сначала укажите команду",
-	"history-directories": "Недавние каталоги загрузки",
-	"favorite-directory": "Избранный каталог",
-	"unfavorite-directory": "Удалить каталог из избранного",
-	"remove-history-directory": "Удалить каталог из истории",
-	"randomize-port": "Выбрать случайный порт",
-	"generate-rpc-secret": "Создать новый секрет RPC",
+	"completion-script-not-approved":
+		"Скрипт после завершения не был разрешён, поэтому ничего не сохранено.",
+	"not-saved": "Настройки не сохранены",
+	"not-saved-confirm":
+		"Измененные настройки будут потеряны, вы обязательно уйдете?",
+	"saved-credentials": "Сохранённые учётные данные",
+	"saved-credentials-description":
+		"Управление сохранёнными учётными данными аутентификации для загрузок",
+	"no-saved-credentials": "Нет сохранённых учётных данных",
+	"credential-host": "Хост",
+	"credential-label": "Название",
+	"credential-protocol": "Протокол",
+	"credential-last-used": "Последнее использование",
+	"credential-delete": "Удалить учётные данные",
+	"credential-delete-confirm":
+		"Вы уверены, что хотите удалить эти сохранённые учётные данные?",
+	"vault-enabled": "Секреты хранятся в связке ключей ОС",
+	"vault-disabled":
+		"Связка ключей ОС недоступна — секреты хранятся в открытом виде",
+	"credential-encrypted-badge": "Хранится в связке ключей ОС",
+	"credential-vault-unavailable":
+		"Связка ключей ОС недоступна; новые учётные данные будут сохранены в открытом виде",
+	"speed-limit-enabled": "Включить ограничения скорости",
+	"speed-limit-enabled-description":
+		"Применять указанные ниже ограничения. Если отключено, загрузки идут на полной скорости; значения сохраняются.",
+	"appearance-theme": "Тема",
+	"appearance-typography": "Типографика",
+	"appearance-window": "Окно",
+	"task-list-style": "Список заданий",
+	"task-list-style-description": "Как загрузки отображаются в списке заданий.",
+	"task-list-style-compact": "Компактный",
+	"task-list-style-card": "Карточки",
+	"sidebar-collapsed": "Свернуть боковую панель",
+	"sidebar-collapsed-description": "Показывать в боковой панели только значки.",
 };

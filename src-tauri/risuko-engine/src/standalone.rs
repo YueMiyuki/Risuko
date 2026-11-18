@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tokio::sync::Notify;
@@ -66,11 +65,22 @@ pub fn load_engine_options(config_dir: &Path) -> EngineOptions {
     EngineOptions::from_config(&system, &user)
 }
 
+fn require_rpc_secret(options: &mut EngineOptions) {
+    if options.rpc_secret().is_empty() {
+        tracing::warn!("system.json is unreadable; using a temporary RPC secret for this run");
+        options.set(
+            "rpc-secret".into(),
+            Value::from(crate::config::generate_rpc_secret()),
+        );
+    }
+}
+
 pub struct StandaloneConfig {
     pub config_dir: PathBuf,
     pub rpc_port: Option<u16>,
     pub enable_rpc: bool,
     pub require_download_dir: bool,
+    pub headless_policies: bool,
 }
 
 pub struct StandaloneEngine {
@@ -82,6 +92,7 @@ pub struct StandaloneEngine {
     pbh_rpc_server: Option<RpcServer>,
     progress_task: JoinHandle<()>,
     auto_save_task: JoinHandle<()>,
+    policy_task: Option<crate::engine::headless_policy::PolicyTask>,
 }
 
 impl StandaloneEngine {
@@ -91,9 +102,12 @@ impl StandaloneEngine {
             .map_err(|e| format!("Failed to create config dir: {e}"))?;
         tracing::debug!("Config directory: {}", config_dir.display());
         crate::engine::set_file_usenet_credential_resolver(config_dir.clone()).await;
-        crate::config::ensure_rpc_secret_on_disk(&config_dir);
+        let system_config_usable = crate::config::ensure_rpc_secret_on_disk(&config_dir);
 
         let mut options = load_engine_options(&config_dir);
+        if cfg.enable_rpc && !system_config_usable {
+            require_rpc_secret(&mut options);
+        }
         if let Some(port) = cfg.rpc_port {
             options.set("rpc-listen-port".into(), Value::from(port));
         }
@@ -167,26 +181,12 @@ impl StandaloneEngine {
         }
         drop(rpc_shutdown_tx);
 
-        let mgr = manager.clone();
-        let progress_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                mgr.update_progress().await;
-            }
-        });
-
-        let mgr = manager.clone();
-        let auto_save_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(e) = mgr.save_session().await {
-                    tracing::warn!("Auto-save session failed: {}", e);
-                }
-            }
+        let (progress_task, auto_save_task) = crate::engine::spawn_maintenance_loops(&manager);
+        let policy_task = cfg.headless_policies.then(|| {
+            tracing::info!(
+                "headless policies: auto-retry and completion script are handled by the engine"
+            );
+            crate::engine::headless_policy::spawn(manager.clone(), &events, &config_dir)
         });
 
         // notify_one stores a permit so a late waiter still wakes
@@ -208,6 +208,7 @@ impl StandaloneEngine {
             pbh_rpc_server,
             progress_task,
             auto_save_task,
+            policy_task,
         })
     }
 
@@ -222,6 +223,9 @@ impl StandaloneEngine {
         if let Some(mut pbh) = self.pbh_rpc_server.take() {
             pbh.stop();
         }
+        if let Some(policy) = self.policy_task.take() {
+            policy.stop().await;
+        }
         self.manager.shutdown().await;
     }
 }
@@ -229,6 +233,25 @@ impl StandaloneEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_system_config_never_leaves_rpc_without_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("system.json"), "{").unwrap();
+        assert!(!crate::config::ensure_rpc_secret_on_disk(dir.path()));
+
+        let mut options = load_engine_options(dir.path());
+        assert!(options.rpc_secret().is_empty());
+        require_rpc_secret(&mut options);
+        let secret = options.rpc_secret();
+        assert!(!secret.is_empty());
+        require_rpc_secret(&mut options);
+        assert_eq!(options.rpc_secret(), secret);
+
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(crate::config::ensure_rpc_secret_on_disk(fresh.path()));
+        assert!(!load_engine_options(fresh.path()).rpc_secret().is_empty());
+    }
 
     #[test]
     fn app_identifier_matches_tauri_config() {

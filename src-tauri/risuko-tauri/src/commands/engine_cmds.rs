@@ -340,6 +340,18 @@ pub async fn restart_engine(handle: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn stop_engine_for_update() -> Result<(), String> {
+    let stop = risuko_engine::engine::stop_engine();
+    match tokio::time::timeout(std::time::Duration::from_secs(15), stop).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(_) => {
+            tracing::warn!("Timed out stopping engine before update install");
+            Ok(())
+        }
+    }
+}
+
 async fn add_torrent_by_path_inner(path: &str, options: Option<Value>) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
@@ -1054,6 +1066,13 @@ pub async fn pause_task(gid: String) -> Result<String, String> {
 pub async fn unpause_task(gid: String) -> Result<String, String> {
     let manager = engine::get_manager().await.ok_or("Engine not running")?;
     manager.unpause(&gid).await?;
+    Ok(gid)
+}
+
+#[tauri::command]
+pub async fn restart_task(gid: String) -> Result<String, String> {
+    let manager = engine::get_manager().await.ok_or("Engine not running")?;
+    manager.restart_task(&gid).await?;
     Ok(gid)
 }
 

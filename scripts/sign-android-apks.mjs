@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { walkFiles } from "./walk-files.mjs";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -83,48 +84,24 @@ function findBuildTool(name) {
 	return join(buildToolsRoot, versions[0], toolName);
 }
 
-function findUnsignedApks(root) {
+function findApks(root, matches) {
 	if (!existsSync(root)) {
 		fail(`APK output directory not found: ${root}`);
 	}
-	const results = [];
-	const stack = [root];
-	while (stack.length > 0) {
-		const current = stack.pop();
-		for (const entry of readdirSync(current, { withFileTypes: true })) {
-			const fullPath = join(current, entry.name);
-			if (entry.isDirectory()) {
-				stack.push(fullPath);
-			} else if (entry.isFile() && entry.name.endsWith("-unsigned.apk")) {
-				results.push(fullPath);
-			}
-		}
-	}
-	return results.sort();
+	return walkFiles(root)
+		.filter((path) => matches(basename(path)))
+		.sort();
+}
+
+function findUnsignedApks(root) {
+	return findApks(root, (name) => name.endsWith("-unsigned.apk"));
 }
 
 function findDebugApks(root) {
-	if (!existsSync(root)) {
-		fail(`APK output directory not found: ${root}`);
-	}
-	const results = [];
-	const stack = [root];
-	while (stack.length > 0) {
-		const current = stack.pop();
-		for (const entry of readdirSync(current, { withFileTypes: true })) {
-			const fullPath = join(current, entry.name);
-			if (entry.isDirectory()) {
-				stack.push(fullPath);
-			} else if (
-				entry.isFile() &&
-				/-debug\.apk$/.test(entry.name) &&
-				!entry.name.includes("-aligned")
-			) {
-				results.push(fullPath);
-			}
-		}
-	}
-	return results.sort();
+	return findApks(
+		root,
+		(name) => /-debug\.apk$/.test(name) && !name.includes("-aligned"),
+	);
 }
 
 function resolveKeystore() {

@@ -10,7 +10,7 @@ use risuko_http::{Client, ClientBuilder, Url};
 use sha2::{Digest, Sha256};
 
 use super::sink::{
-    run_with_stall, Heartbeat, S3Config, UploadControl, UploadFile, UploadSink,
+    run_with_stall, Heartbeat, S3Config, UploadControl, UploadError, UploadFile, UploadSink,
     UPLOAD_STALL_TIMEOUT,
 };
 use crate::engine::util::{ERROR_SNIPPET_BYTES, RESPONSE_BODY_LIMIT};
@@ -179,9 +179,9 @@ impl S3Sink {
         &self,
         file: &UploadFile,
         ctl: &UploadControl,
-    ) -> Result<String, String> {
+    ) -> Result<String, UploadError> {
         let key = self.object_key(&file.remote_relative);
-        let url = self.object_url(&key)?;
+        let url = self.object_url(&key).map_err(UploadError::fatal)?;
         let part_size = choose_part_size(file.size);
 
         let upload_id = self.initiate_multipart(&url, ctl).await?;
@@ -206,7 +206,7 @@ impl S3Sink {
         url: &Url,
         upload_id: &str,
         part_size: u64,
-    ) -> Result<String, String> {
+    ) -> Result<String, UploadError> {
         let total = file.size;
 
         let mut descriptors: Vec<(u32, u64, u64)> = Vec::new();
@@ -217,9 +217,9 @@ impl S3Sink {
             descriptors.push((part_number, offset, len));
             offset += len;
             if part_number as u64 >= MAX_PARTS && offset < total {
-                return Err(format!(
+                return Err(UploadError::fatal(format!(
                     "S3 multipart: part count exceeded {MAX_PARTS} (file too large for chosen part size)"
-                ));
+                )));
             }
             part_number += 1;
         }
@@ -231,12 +231,12 @@ impl S3Sink {
                 let uploaded = uploaded.clone();
                 async move {
                     if ctl.cancel.is_cancelled() {
-                        return Err("cancelled".to_string());
+                        return Err(UploadError::fatal("cancelled"));
                     }
                     let etag = self
                         .upload_part(file, ctl, url, upload_id, pn, off, len, &uploaded, total)
                         .await?;
-                    Ok::<(u32, String), String>((pn, etag))
+                    Ok::<(u32, String), UploadError>((pn, etag))
                 }
             }))
             .buffer_unordered(MULTIPART_CONCURRENCY)
@@ -250,7 +250,11 @@ impl S3Sink {
         Ok(url.to_string())
     }
 
-    async fn initiate_multipart(&self, url: &Url, ctl: &UploadControl) -> Result<String, String> {
+    async fn initiate_multipart(
+        &self,
+        url: &Url,
+        ctl: &UploadControl,
+    ) -> Result<String, UploadError> {
         let mut init_url = url.clone();
         init_url.set_query(Some("uploads="));
         let now = chrono_now_utc();
@@ -266,20 +270,26 @@ impl S3Sink {
             .timeout(Duration::from_secs(30));
 
         let resp = tokio::select! {
-            _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
+            _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
             r = req.send() => r.map_err(|e| format!("S3 initiate multipart: {e}"))?,
         };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-            return Err(format!("S3 initiate multipart returned {status}: {body}"));
+            return Err(UploadError::http(
+                status.as_u16(),
+                format!("S3 initiate multipart returned {status}: {body}"),
+            ));
         }
         let body = resp
             .text_limited(RESPONSE_BODY_LIMIT)
             .await
             .map_err(|e| format!("S3 initiate multipart read body: {e}"))?;
-        parse_upload_id(&body)
-            .ok_or_else(|| format!("S3 initiate multipart: missing UploadId in response: {body}"))
+        parse_upload_id(&body).ok_or_else(|| {
+            UploadError::transient(format!(
+                "S3 initiate multipart: missing UploadId in response: {body}"
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -294,7 +304,7 @@ impl S3Sink {
         len: u64,
         uploaded: &Arc<AtomicU64>,
         total: u64,
-    ) -> Result<String, String> {
+    ) -> Result<String, UploadError> {
         let mut attempt = 1;
         loop {
             let part_last = Arc::new(AtomicU64::new(0));
@@ -319,12 +329,15 @@ impl S3Sink {
             let sent = part_last.load(Ordering::Relaxed);
             crate::engine::util::atomic_saturating_sub(uploaded, sent);
             if !retryable || attempt >= PART_ATTEMPTS || ctl.cancel.is_cancelled() {
-                return Err(err);
+                return Err(UploadError {
+                    message: err,
+                    retryable,
+                });
             }
             tracing::warn!("S3 UploadPart {part_number} attempt {attempt} failed: {err}");
             let backoff = Duration::from_secs(1 << (attempt - 1));
             tokio::select! {
-                _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
+                _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
                 _ = tokio::time::sleep(backoff) => {}
             }
             attempt += 1;
@@ -419,7 +432,7 @@ impl S3Sink {
         url: &Url,
         upload_id: &str,
         parts: &[(u32, String)],
-    ) -> Result<(), String> {
+    ) -> Result<(), UploadError> {
         let body = build_complete_xml(parts);
         let body_bytes = body.into_bytes();
         let payload_hash = hex::encode(Sha256::digest(&body_bytes));
@@ -451,12 +464,13 @@ impl S3Sink {
             .await
             .unwrap_or_default();
         if !status.is_success() {
-            return Err(format!(
-                "S3 CompleteMultipart returned {status}: {resp_body}"
+            return Err(UploadError::http(
+                status.as_u16(),
+                format!("S3 CompleteMultipart returned {status}: {resp_body}"),
             ));
         }
         if resp_body.contains("<Error>") {
-            return Err(format!("S3 CompleteMultipart error body: {resp_body}"));
+            return Err(format!("S3 CompleteMultipart error body: {resp_body}").into());
         }
         Ok(())
     }
@@ -490,9 +504,9 @@ impl S3Sink {
 
 #[async_trait]
 impl UploadSink for S3Sink {
-    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String> {
+    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, UploadError> {
         if ctl.cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(UploadError::fatal("cancelled"));
         }
 
         if file.size > MULTIPART_THRESHOLD {
@@ -500,7 +514,7 @@ impl UploadSink for S3Sink {
         }
 
         let key = self.object_key(&file.remote_relative);
-        let url = self.object_url(&key)?;
+        let url = self.object_url(&key).map_err(UploadError::fatal)?;
 
         let now = chrono_now_utc();
         let amz_date = now.0;
@@ -533,14 +547,17 @@ impl UploadSink for S3Sink {
 
         let send_fut = async { req.send().await.map_err(|e| format!("PUT failed: {e}")) };
         let resp = tokio::select! {
-            _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
+            _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
             r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r?,
         };
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-            return Err(format!("S3 PUT {url} returned {status}: {body}"));
+            return Err(UploadError::http(
+                status.as_u16(),
+                format!("S3 PUT {url} returned {status}: {body}"),
+            ));
         }
 
         ctl.report(file.size, file.size);
@@ -578,7 +595,27 @@ impl UploadSink for S3Sink {
             .map_err(|e| format!("HEAD bucket: {e}"))?;
 
         let status = resp.status();
-        if status.is_success() || status.as_u16() == 403 {
+        if status.is_success() {
+            return Ok(());
+        }
+        if status.as_u16() == 403 {
+            let now = chrono_now_utc();
+            let auth = self.sign_request("GET", &url, "", UNSIGNED, &now.0, &now.1);
+            let resp = self
+                .client
+                .request(risuko_http::Method::GET, url.as_str())
+                .header("host", self.canonical_host())
+                .header("x-amz-content-sha256", UNSIGNED)
+                .header("x-amz-date", now.0)
+                .header("authorization", auth)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|e| format!("GET bucket: {e}"))?;
+            let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
+            if s3_error_is_credential_failure(&body) {
+                return Err(format!("S3 credentials rejected: {body}"));
+            }
             return Ok(());
         }
         let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
@@ -659,6 +696,19 @@ fn epoch_to_ymdhms(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
 
 fn is_retryable_status(code: u16) -> bool {
     code >= 500 || code == 408 || code == 429
+}
+
+fn s3_error_is_credential_failure(body: &str) -> bool {
+    [
+        "<Code>SignatureDoesNotMatch</Code>",
+        "<Code>InvalidAccessKeyId</Code>",
+        "<Code>InvalidToken</Code>",
+        "<Code>ExpiredToken</Code>",
+        "<Code>AuthorizationHeaderMalformed</Code>",
+        "<Code>RequestTimeTooSkewed</Code>",
+    ]
+    .iter()
+    .any(|code| body.contains(code))
 }
 
 fn choose_part_size(file_size: u64) -> u64 {
@@ -965,5 +1015,27 @@ mod tests {
              <Part><PartNumber>2</PartNumber><ETag>\"etag2\"</ETag></Part>\
              </CompleteMultipartUpload>"
         );
+    }
+
+    #[test]
+    fn credential_error_codes_are_told_apart_from_access_denied() {
+        for code in [
+            "SignatureDoesNotMatch",
+            "InvalidAccessKeyId",
+            "InvalidToken",
+            "ExpiredToken",
+            "AuthorizationHeaderMalformed",
+            "RequestTimeTooSkewed",
+        ] {
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>m</Message></Error>"
+            );
+            assert!(s3_error_is_credential_failure(&body), "{code}");
+        }
+        assert!(!s3_error_is_credential_failure(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+        ));
+        assert!(!s3_error_is_credential_failure(""));
+        assert!(!s3_error_is_credential_failure("service unavailable"));
     }
 }

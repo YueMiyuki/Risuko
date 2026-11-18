@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use suppaftp::tokio::{AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::sink::{FtpConfig, UploadControl, UploadFile, UploadSink};
+use super::sink::{
+    write_or_stall, FtpConfig, UploadControl, UploadError, UploadFile, UploadSink,
+    UPLOAD_CLEANUP_TIMEOUT, UPLOAD_STALL_TIMEOUT,
+};
 
 const COPY_BUF: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -65,18 +68,20 @@ impl FtpSink {
     async fn connect_secure(&self) -> Result<AsyncRustlsFtpStream, String> {
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
         let connector = self.tls_connector();
-        if is_implicit_ftps_port(self.cfg.port) {
+        let mut ftp = if is_implicit_ftps_port(self.cfg.port) {
             AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &self.cfg.host)
                 .await
-                .map_err(|e| format!("FTPS connect failed: {e}"))
+                .map_err(|e| format!("FTPS connect failed: {e}"))?
         } else {
             AsyncRustlsFtpStream::connect(&addr)
                 .await
                 .map_err(|e| format!("FTPS connect failed: {e}"))?
                 .into_secure(connector, &self.cfg.host)
                 .await
-                .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))
-        }
+                .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))?
+        };
+        ftp.set_passive_nat_workaround(true);
+        Ok(ftp)
     }
 }
 
@@ -111,7 +116,7 @@ macro_rules! copy_to {
     ($ftp:expr, $local:expr, $remote:expr, $size:expr, $ctl:expr) => {{
         let mut local_file = tokio::fs::File::open(&$local)
             .await
-            .map_err(|e| format!("open {}: {e}", $local.display()))?;
+            .map_err(|e| UploadError::fatal(format!("open {}: {e}", $local.display())))?;
 
         let part_remote = format!("{}.part", $remote);
         let mut writer = $ftp
@@ -121,36 +126,36 @@ macro_rules! copy_to {
 
         let mut buf = vec![0u8; COPY_BUF];
         let mut sent: u64 = 0;
-        let copy_res: Result<(), String> = async {
+        let copy_res: Result<(), UploadError> = async {
             loop {
                 if $ctl.cancel.is_cancelled() {
-                    return Err("cancelled".into());
+                    return Err(UploadError::fatal("cancelled"));
                 }
                 let n = local_file
                     .read(&mut buf)
                     .await
-                    .map_err(|e| format!("local read: {e}"))?;
+                    .map_err(|e| UploadError::fatal(format!("local read: {e}")))?;
                 if n == 0 {
                     break;
                 }
-                writer
-                    .write_all(&buf[..n])
-                    .await
-                    .map_err(|e| format!("FTP write: {e}"))?;
+                write_or_stall(&mut writer, &buf[..n], &$ctl.cancel, "FTP").await?;
                 sent += n as u64;
                 $ctl.report(sent, $size.max(sent));
             }
-            writer
-                .flush()
+            tokio::time::timeout(UPLOAD_STALL_TIMEOUT, writer.flush())
                 .await
+                .map_err(|_| "FTP flush timed out".to_string())?
                 .map_err(|e| format!("FTP flush: {e}"))?;
             Ok(())
         }
         .await;
 
         if let Err(e) = copy_res {
-            let _ = writer.finish().await;
-            let _ = $ftp.rm(part_remote.as_str()).await;
+            let _ = tokio::time::timeout(UPLOAD_CLEANUP_TIMEOUT, async {
+                let _ = writer.finish().await;
+                let _ = $ftp.rm(part_remote.as_str()).await;
+            })
+            .await;
             return Err(e);
         }
         writer
@@ -173,9 +178,9 @@ macro_rules! copy_to {
 
 #[async_trait]
 impl UploadSink for FtpSink {
-    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String> {
+    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, UploadError> {
         if ctl.cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(UploadError::fatal("cancelled"));
         }
 
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
@@ -191,7 +196,7 @@ impl UploadSink for FtpSink {
                 .map_err(|_| "FTPS connect timed out".to_string())??;
             ftp.login(&user, &pass)
                 .await
-                .map_err(|e| format!("FTP login failed: {e}"))?;
+                .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
                 .map_err(|e| format!("FTP binary mode: {e}"))?;
@@ -203,9 +208,10 @@ impl UploadSink for FtpSink {
                 .await
                 .map_err(|_| "FTP connect timed out".to_string())?
                 .map_err(|e| format!("FTP connect failed: {e}"))?;
+            ftp.set_passive_nat_workaround(true);
             ftp.login(&user, &pass)
                 .await
-                .map_err(|e| format!("FTP login failed: {e}"))?;
+                .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
                 .map_err(|e| format!("FTP binary mode: {e}"))?;

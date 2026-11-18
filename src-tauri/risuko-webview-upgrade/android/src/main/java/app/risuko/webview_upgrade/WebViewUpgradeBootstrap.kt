@@ -71,6 +71,10 @@ internal object WebViewUpgradeBootstrap {
     }
 
     private fun trySwap(context: Context, packageName: String): Boolean {
+        if (!PackageTrust.isTrusted(context, packageName)) {
+            Log.w(LOG_TAG, "refusing untrusted WebView package $packageName")
+            return false
+        }
         return try {
             WebViewSwap.swapToInstalledPackage(context, packageName)
             true
@@ -97,6 +101,7 @@ internal object WebViewUpgradeBootstrap {
         for (pkg in CANDIDATE_PACKAGES) {
             val major = installedMajor(context, pkg) ?: continue
             if (major <= systemMajor) continue
+            if (!PackageTrust.isTrusted(context, pkg)) continue
             if (best == null || major > best.second) best = pkg to major
         }
         return best

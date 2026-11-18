@@ -6,8 +6,6 @@ use windows_sys::Win32::{
     Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
 };
 
-pub const ELEVATION_REQUIRED: &str = "risuko:elevation-required";
-
 pub fn decrypt_value(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     if encrypted.len() < 3 {
         bail!("encrypted data too short");
@@ -41,7 +39,7 @@ fn decrypt_v20(data: &[u8], _master_key: &[u8]) -> Result<Vec<u8>> {
         bail!("v20 data too short");
     }
 
-    bail!("{}", ELEVATION_REQUIRED);
+    bail!("{}", crate::APP_BOUND_UNSUPPORTED);
 }
 
 fn decrypt_dpapi(data: &[u8]) -> Result<Vec<u8>> {

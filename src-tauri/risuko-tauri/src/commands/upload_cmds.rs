@@ -100,20 +100,16 @@ async fn fill_from_vault(
     id: &str,
     config: &mut SinkConfig,
 ) {
-    if vault.enabled() {
-        match vault.get_sink(id) {
-            Ok(Some(secrets)) => {
-                apply_sink_secrets(config, &secrets);
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("Failed to load vault entry for sink {id}: {e}, trying fallback");
-            }
-        }
-    }
     if let Some(secrets) = mgr.get_sink_secret_fallback(id).await {
         apply_sink_secrets(config, &secrets);
+        return;
+    }
+    if vault.enabled() {
+        match vault.get_sink(id) {
+            Ok(Some(secrets)) => apply_sink_secrets(config, &secrets),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Failed to load vault entry for sink {id}: {e}"),
+        }
     }
 }
 
@@ -129,7 +125,14 @@ async fn persist_sink_secrets(
                 match vault.put_sink(id, &v) {
                     Ok(()) => {
                         if let Err(e) = mgr.remove_sink_secret_fallback(id).await {
-                            tracing::warn!("Failed to clear stale fallback for sink {id}: {e}");
+                            tracing::warn!(
+                                "Failed to clear stale fallback for sink {id}: {e}; replacing it"
+                            );
+                            if let Err(e) = mgr.put_sink_secret_fallback(id, &v).await {
+                                tracing::warn!(
+                                    "Failed to replace stale fallback secrets for sink {id}: {e}"
+                                );
+                            }
                         }
                         return;
                     }
@@ -160,30 +163,24 @@ async fn persist_sink_secrets(
 pub async fn rehydrate_upload_sinks(mgr: &UploadSinkManager, vault: &Arc<VaultManager>) {
     let sinks = mgr.list_sinks().await;
     for mut record in sinks {
-        let mut secrets: Option<Value> = None;
-        let lookup = {
-            let vault = vault.clone();
-            let id = record.id.clone();
-            tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get_sink(&id))).await
-        };
-        match lookup {
-            Ok(Some(Ok(Some(v)))) => secrets = Some(v),
-            Ok(Some(Ok(None))) | Ok(None) => {}
-            Ok(Some(Err(e))) => {
-                tracing::warn!(
-                    "Failed to load vault entry for sink {}: {e}, trying fallback",
-                    record.id
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Vault lookup for sink {} did not complete: {e}, trying fallback",
-                    record.id
-                );
-            }
-        }
+        let mut secrets = mgr.get_sink_secret_fallback(&record.id).await;
         if secrets.is_none() {
-            secrets = mgr.get_sink_secret_fallback(&record.id).await;
+            let lookup = {
+                let vault = vault.clone();
+                let id = record.id.clone();
+                tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get_sink(&id)))
+                    .await
+            };
+            match lookup {
+                Ok(Some(Ok(found))) => secrets = found,
+                Ok(None) => {}
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("Failed to load vault entry for sink {}: {e}", record.id);
+                }
+                Err(e) => {
+                    tracing::warn!("Vault lookup for sink {} did not complete: {e}", record.id);
+                }
+            }
         }
         let Some(secrets) = secrets else { continue };
         let id = record.id.clone();

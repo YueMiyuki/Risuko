@@ -1,15 +1,158 @@
 export default {
 	basic: "Grunnleggende",
 	advanced: "Avansert",
+	cloudSinks: "Skymål",
+	usenet: "Usenet",
+	search: "Søk",
+	"search-placeholder": "Søk i alle innstillinger",
+	"search-all-tabs": "Alle innstillinger",
+	"search-results": "{{count}} samsvarende innstillinger",
+	"search-no-results": "Fant ingen samsvarende innstillinger",
+	"search-clear": "Tøm søk",
+	"search-go-to-tab": "Åpne innstilling",
+	"search-more-results": "Avgrens søket for å se flere resultater",
+	"usenet-tips":
+		"Administrer NNTP-leverandører og standarder for trygg opprydding av arkiver.",
+	"usenet-profiles": "Leverandørprofiler",
+	"usenet-profiles-tips":
+		"Konfigurer leverandørprioritet, sikkerhet, autentisering og tilkoblingsgrenser.",
+	"usenet-add-profile": "Legg til profil",
+	"usenet-no-profiles": "Ingen leverandørprofiler er konfigurert.",
+	"usenet-no-profiles-tips":
+		"Legg til minst én leverandør før du importerer en NZB-nedlasting.",
+	"usenet-edit-profile": "Rediger profil",
+	"usenet-profile-dialog-tips":
+		"Profilinnstillinger kan synkroniseres mellom enheter. Legitimasjon forblir lokal på denne enheten.",
+	"usenet-profile-dialog-tips-vault":
+		"Profilinnstillinger kan synkroniseres mellom enheter. Legitimasjon lagres i denne enhetens sikre nøkkelring.",
+	"usenet-profile-name": "Profilnavn",
+	"usenet-profile-name-placeholder": "Primær leverandør",
+	"usenet-profile-host": "NNTP-vert",
+	"usenet-profile-port": "Port",
+	"usenet-security": "Tilkoblingssikkerhet",
+	"usenet-tls": "Implisitt TLS",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "Ukryptert NNTP",
+	"usenet-authentication": "Autentisering",
+	"usenet-auth-credentials": "Brukernavn og passord",
+	"usenet-auth-anonymous": "Anonym",
+	"usenet-username": "Brukernavn",
+	"usenet-password": "Passord",
+	"usenet-credentials-saved": "Legitimasjon lagret",
+	"usenet-credentials-unavailable": "Status for legitimasjon er utilgjengelig",
+	"usenet-credentials-saved-tips":
+		"Legitimasjon er allerede lagret. La begge feltene stå tomme for å beholde den uendret.",
+	"usenet-plain-warning-title": "Ukryptert tilkobling",
+	"usenet-plain-opt-in":
+		"Jeg forstår og vil tillate ukryptert NNTP for denne profilen.",
+	"usenet-plain-warning":
+		"Ukryptert NNTP krypterer verken legitimasjon eller nedlastede data. Bruk det bare når leverandøren uttrykkelig krever det.",
+	"usenet-enabled": "Aktivert",
+	"usenet-enabled-tips":
+		"Deaktiverte profiler beholdes, men brukes ikke til nedlastinger.",
+	"usenet-disabled": "Deaktivert",
+	"usenet-priority": "Prioritet",
+	"usenet-priority-tips":
+		"Lavere verdier prøves først. Like prioriteter deler belastningen.",
+	"usenet-priority-value": "Prioritet {{value}}",
+	"usenet-max-connections": "Maksimalt antall tilkoblinger",
+	"usenet-max-connections-tips":
+		"Tilkoblingsgrensen for denne leverandørprofilen.",
+	"usenet-connections-value": "{{value}} tilkoblinger",
+	"usenet-test": "Test",
+	"usenet-edit": "Rediger profil",
+	"usenet-remove": "Fjern",
+	"usenet-remove-title": "Fjerne leverandørprofilen?",
+	"usenet-remove-confirm":
+		"{{name}} vil ikke lenger være tilgjengelig for nedlastinger. Den lagrede legitimasjonen fjernes også fra denne enheten.",
+	"usenet-profile-saved": "Leverandørprofilen er lagret.",
+	"usenet-profile-removed": "{{name}} ble fjernet.",
+	"usenet-test-success": "Koblet til {{name}}.",
+	"usenet-test-failed": "Tilkoblingen mislyktes: {{message}}",
+	"usenet-validation-name": "Skriv inn et profilnavn.",
+	"usenet-validation-host": "Skriv inn en NNTP-vert.",
+	"usenet-validation-port": "Porten må være mellom 1 og 65535.",
+	"usenet-validation-plain":
+		"Bekreft advarselen om ukryptert NNTP før du lagrer.",
+	"usenet-validation-priority": "Prioriteten må være null eller høyere.",
+	"usenet-validation-connections":
+		"Antall tilkoblinger må være mellom 1 og 128.",
+	"usenet-validation-credentials":
+		"Skriv inn både brukernavn og passord, eller velg anonym autentisering.",
+	"usenet-validation-credential-status":
+		"Status for legitimasjon er utilgjengelig. Prøv igjen før du endrer denne profilen.",
+	"usenet-cleanup": "Opprydding etter suksess",
+	"usenet-cleanup-tips":
+		"Oppryddingen kjøres bare etter fullstendig sammensetting og vellykket utpakking.",
+	"usenet-cleanup-action": "Etter verifisert suksess",
+	"usenet-cleanup-keep": "Behold alle filer",
+	"usenet-cleanup-keep-tips": "Beholder PAR2-filer og alle arkivvolumer.",
+	"usenet-cleanup-par2": "Slett PAR2-filer",
+	"usenet-cleanup-par2-tips":
+		"Fjerner paritetsfiler, men beholder nedlastede arkivvolumer.",
+	"usenet-cleanup-all": "Slett PAR2- og arkivvolumer",
+	"usenet-cleanup-all-tips":
+		"Fjerner paritetsfiler og arkivvolumer etter at utpakkingen er vellykket.",
+	"usenet-archive-safety": "Arkivsikkerhet",
+	"usenet-limits-defaults":
+		"Grenser for hele oppgaven beskytter lagring og behandling under verifisering og utpakking.",
+	"usenet-desktop-limits": "Grenser for skrivebord",
+	"usenet-android-limits": "Grenser for Android",
+	"usenet-limits-summary":
+		"{{entries}} oppføringer · {{total}} total utvidelse · {{perEntry}} per oppføring",
+	"usenet-limits-secondary-summary":
+		"{{ratio}}:1 forhold · {{depth}} nestede nivåer · {{reserve}} reservert ledig plass · {{hours}} aktive timer",
+	"usenet-customize-limits": "Tilpass grenser",
+	"usenet-hide-limits": "Skjul grenser",
+	"usenet-limits-adjusted": "Synkroniserte grenser ble justert",
+	"usenet-limits-adjusted-tips":
+		"En eller flere verdier overskred denne plattformens absolutte tak og ble redusert.",
+	"usenet-max-entries": "Maks. antall oppføringer",
+	"usenet-max-expanded": "Total utvidet størrelse",
+	"usenet-max-entry": "Størrelse per oppføring",
+	"usenet-max-depth": "Nestingsdybde",
+	"usenet-max-ratio": "Komprimeringsforhold",
+	"usenet-free-space-reserve": "Reservert ledig plass",
+	"usenet-max-active-time": "Aktiv behandlingstid",
+	"usenet-unit-entries": "oppføringer",
+	"usenet-unit-levels": "nivåer",
+	"usenet-unit-hours": "timer",
+	"usenet-limits-hard-cap":
+		"Verdiene kan ikke overstige fire ganger plattformens standardverdier. Overstyringer per oppgave bekreftes separat.",
+	"usenet-restore-limits": "Gjenopprett plattformstandarder",
+	"usenet-limits-restored":
+		"Arkivgrensene er gjenopprettet til plattformstandardene.",
 	save: "Lagre og bruk",
 	"save-success-message": "Lagre innstillinger vellykket",
 	"save-fail-message": "Lagring av innstillinger mislyktes",
 	discard: "Forkast",
+	"history-directories": "Nylige nedlastingsmapper",
+	"favorite-directory": "Favorittmappe",
+	"unfavorite-directory": "Fjern mappe fra favoritter",
+	"remove-history-directory": "Fjern mappe fra historikk",
 	startup: "Oppstart",
 	"open-at-login": "Åpne ved pålogging",
 	"keep-window-state": "Behold vinduets størrelse og posisjon når du går ut",
 	"auto-resume-all": "Gjenoppta automatisk alle uferdige oppgaver",
 	"default-dir": "Standard bane",
+	"file-category-dirs": "Kategoribaner",
+	"file-category-dirs-tips":
+		"Overstyr standard nedlastingsbane for bestemte filtyper. La stå tom for å bruke standardbanen.",
+	"task-routing-rules": "Regler for oppgaveruting",
+	"task-routing-rules-tips":
+		"Ruter oppgaver til mapper basert på filnavnmønstre. Første samsvarende regel gjelder.",
+	"task-routing-rule-pattern-placeholder": "Mønster (f.eks. *.mkv)",
+	"task-routing-rule-label-placeholder": "Tagg",
+	"task-routing-rule-dir-placeholder": "Mappe",
+	"task-routing-rule-add": "Legg til regel",
+	"file-category-music": "Musikk",
+	"file-category-video": "Video",
+	"file-category-image": "Bilde",
+	"file-category-document": "Dokument",
+	"file-category-compressed": "Komprimert",
+	"file-category-program": "Program",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"På grunn av begrensninger for tillatelse av sandkasse i App Store, anbefales standard nedlastningskatalog å settes til ~ / Nedlastinger",
 	"transfer-settings": "Overføring",
@@ -18,6 +161,12 @@ export default {
 	"transfer-speed-unlimited": "Ubegrenset",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "Lagre magnetkobling som torrentfil",
+	"bt-create-subfolder": "Grupper torrenter med flere filer i en undermappe",
+	"bt-create-subfolder-tips":
+		"Når dette er aktivert, legges BitTorrent- og magnet-nedlastinger med flere filer i en mappe oppkalt etter torrenten. Når det er deaktivert, skrives filene direkte til nedlastingsmappen.",
+	"bt-upload-rate-limit": "BitTorrent-opplastingsgrense",
+	"bt-upload-rate-limit-tips":
+		"Begrenser BitTorrent-opplastinger i tillegg til den globale opplastingsgrensen. 0 betyr ingen egen grense.",
 	"bt-auto-download-content": "Last ned Magnet og Torrent-innholdet automatisk",
 	"bt-force-encryption": "TVANGSKRYPTERING AV BT",
 	"keep-seeding": "Fortsett seeding til du stopper manuelt",
@@ -26,19 +175,79 @@ export default {
 	"seed-time-unit": "minutter",
 	"task-manage": "Oppgavebehandling",
 	"max-concurrent-downloads": "Maksimum aktive oppgaver",
+	"connections-per-task": "Tilkoblinger per oppgave",
 	"max-connection-per-server": "Maksimal tilkobling per server",
+	"auto-retry": "Prøv mislykkede oppgaver på nytt automatisk",
+	"auto-retry-strategy": "Intervallmodus for nye forsøk",
+	"auto-retry-strategy-static": "Fast",
+	"auto-retry-strategy-exponential": "Eksponentiell backoff",
+	"auto-retry-interval": "Grunnintervall for nye forsøk",
+	"auto-retry-interval-unit": "sekunder",
+	"auto-retry-max-attempts": "Maks. antall nye forsøk (0 = ubegrenset)",
+	"worker-max-retries": "Maks. nye forsøk per stykke i arbeideren",
+	"auto-detect-low-speed-tasks": "Oppdag oppgaver med lav hastighet automatisk",
+	"auto-detect-low-speed-tasks-tips":
+		"Hvis en kjørende oppgave holder seg under hastighetsgrensen, settes den på pause og startes på nytt automatisk.",
+	"low-speed-threshold": "Grense for lav hastighet",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "HTTP / nettverkspålitelighet",
+	"http-reliability-tips":
+		"Juster tidsavbrudd for tilkobling og oppdagelse av fastlåste overføringer for HTTP/HTTPS/FTP-nedlastinger.",
+	"connect-timeout": "Tidsavbrudd for tilkobling",
+	"nzb-body-timeout": "Tidsavbrudd for NZB-innhold",
+	"lowest-speed-limit": "Laveste hastighetsgrense",
+	"lowest-speed-limit-timeout": "Tidsavbrudd for stopp",
+	"lowest-speed-limit-help":
+		"Hvis en nedlasting holder seg under laveste hastighetsgrense i hele tidsavbruddet for stopp, avbrytes arbeideren og startes på nytt (hvis automatisk nytt forsøk er aktivert). Sett grensen til 0 for å slå dette av.",
+	"uri-selector": "Speilvalg",
+	"uri-selector-feedback": "Tilbakemelding (dropp trege/feilende speil)",
+	"uri-selector-inorder": "I rekkefølge (prøv speil fra venstre til høyre)",
+	"uri-selector-adaptive": "Adaptiv (foretrekk raskeste)",
+	"unit-seconds": "sekunder",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "Lagring",
+	"storage-tips": "Hvordan motoren reserverer diskplass før nedlasting.",
+	"file-allocation": "Filallokering",
+	"file-allocation-falloc": "Forhåndsallokering (falloc)",
+	"file-allocation-trunc": "Avkorting (angi bare lengde)",
+	"file-allocation-none": "Ingen (vokser etter behov)",
+	"file-allocation-tips":
+		"Forhåndsallokering reserverer faktiske diskblokker på forhånd for å unngå ENOSPC midt i nedlastingen og redusere fragmentering. Faller tilbake til avkorting på filsystemer som ikke støtter det.",
 	"new-task-show-downloading":
 		"Vis nedlasting automatisk etter at oppgaven er lagt til",
 	"no-confirm-before-delete-task":
 		"Ingen bekreftelse er nødvendig før du sletter oppgaven",
+	"auto-file-renaming": "Gi duplikate filer nytt navn automatisk",
+	"auto-file-renaming-tips":
+		'Når en fil med samme navn allerede finnes, lagres den som "file.1.ext" i stedet for å overskrive den',
+	"use-remote-file-time":
+		"Bruk filens endringstidspunkt fra serveren ved lagring",
+	"use-remote-file-time-tips":
+		"Sett filens endringstidspunkt til tidsstempelet fra serveren",
 	continue: "Fortsette",
 	"task-completed-notify": "Varsling etter nedlasting er fullført",
+	"clipboard-watch": "Overvåk utklippstavlen for nedlastingslenker",
+	"clipboard-watch-tips":
+		"Når du kopierer en magnet- eller fillenke et sted, tilbyr Risuko å laste den ned.",
+	"clipboard-watch-ext": "Overvåkede filetternavn",
+	"clipboard-watch-ext-tips":
+		"Bare http(s)-lenker som slutter på disse filetternavnene utløser forespørselen. Magnet-, ed2k- og torrent-lenker gjør det alltid. Skill med mellomrom eller komma.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"Risuko overvåker nå utklippstavlen din for nedlastingslenker. Slå det av i Innstillinger → Grunnleggende.",
 	"prevent-sleep-while-downloading":
 		"Hindre at systemet går i dvale under nedlasting",
 	"prevent-sleep-while-downloading-tips":
 		"Hold datamaskinen våken så lenge en aktiv oppgave pågår",
+	"shutdown-when-complete": "Slå av datamaskinen når alle oppgaver er fullført",
+	"shutdown-when-complete-tips":
+		"Én gang: slår av datamaskinen når nedlastingskøen er tom",
+	"shutdown-countdown-title": "Slår av om {{seconds}} s…",
+	"shutdown-countdown-cancel": "Avbryt",
+	"shutdown-failed": "Kunne ikke slå av. Sjekk tillatelser.",
 	"auto-purge-record":
 		"Tøm nedlastingsposter automatisk når du avslutter appen",
+	"purge-record-on-start": "Tøm nedlastingsposter når appen starter",
 	ui: "UI",
 	appearance: "Utseende",
 	"theme-auto": "Auto",
@@ -70,7 +279,16 @@ export default {
 	"change-language": "Skifte språk",
 	"hide-app-menu": "Skjul appmeny (kun Windows og Linux)",
 	proxy: "Proxy",
+	"proxy-http-profile": "HTTP / FTP / Usenet-proxy",
+	"proxy-p2p-profile": "P2P-proxy",
 	"enable-proxy": "Aktiver proxy",
+	"enable-p2p-proxy": "Aktiver P2P-proxy",
+	"proxy-p2p-tcp-server": "TCP-proxyserver",
+	"proxy-p2p-tcp-bypass": "Omgå TCP-proxy",
+	"proxy-p2p-udp-server": "UDP-proxyserver",
+	"proxy-p2p-udp-server-placeholder":
+		"Valgfritt; la stå tomt for å bruke TCP-P2P-proxyen",
+	"proxy-p2p-udp-bypass": "Omgå UDP-proxy",
 	"proxy-bypass-input-tips":
 		"Omgå proxy-innstillinger for disse vertene og domenene, en per linje",
 	"proxy-scope-label": "Brukes for",
@@ -79,23 +297,133 @@ export default {
 	"proxy-scope-update-app": "Oppdater applikasjonen",
 	"proxy-scope-update-app-desc":
 		"Ser etter programoppdateringer gjennom proxyen",
-	"proxy-scope-update-trackers": "Oppdater sporingskapsler",
+	"proxy-scope-update-trackers": "Oppdater trackere",
 	"proxy-scope-update-trackers-desc":
 		"Henter BT-sporingslister gjennom proxyen",
 	"proxy-tips": "Se Proxy Manual",
+	"proxy-p2p-tips":
+		"SOCKS5 eller SOCKS5H kreves for DHT, UDP-trackere og uTP. HTTP-proxyer brukes bare til TCP-P2P-tilkoblinger.",
+	"proxy-p2p-udp-tips":
+		"La UDP-proxyen stå tom for å gjenbruke TCP-P2P-ruten. UDP-proxy krever SOCKS5 eller SOCKS5H; HTTP-proxyer kan ikke bære UDP.",
+	"proxy-p2p-restart-title": "Starte P2P-nedlastinger på nytt?",
+	"proxy-p2p-restart-confirm":
+		"Hvis du endrer P2P-proxyen, startes aktive peer-to-peer-nedlastinger på nytt. HTTP-, FTP- og Usenet-nedlastinger fortsetter å kjøre.",
+	doh: "DNS over HTTPS",
+	"doh-tips":
+		"Slå opp vertsnavn via et kryptert DNS-endepunkt i stedet for systemets resolver",
+	"doh-enable": "Aktiver DNS over HTTPS",
+	"doh-provider": "Leverandør",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "Egendefinert",
+	"doh-url": "Endepunkt-URL",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "DoH-endepunktet må starte med https://",
+	"doh-bootstrap": "Bootstrap-IP-er",
+	"doh-bootstrap-placeholder":
+		"IP-er for å nå endepunktet, kommaseparert (valgfritt)",
+	"doh-fallback": "Bruk system-DNS som reserve",
+	"doh-fallback-tips":
+		"Hvis en DoH-forespørsel mislykkes, slå opp via systemets resolver i stedet for å la nedlastingen mislykkes",
 	"bt-tracker": "Tracker-servere",
 	"bt-tracker-input-tips": "Tracker-servere, en per linje",
 	"bt-tracker-tips": "Anbefalt:",
+	"bt-max-peers-per-torrent": "Maks. peere per torrent",
+	"bt-max-peers-per-torrent-tips":
+		"Maksimalt antall samtidige peer-tilkoblinger per torrent. Høyere verdier gir bedre oppdagelse av swarmen (krever omstart av motoren)",
+	"bt-max-outstanding-per-peer": "Maks. utestående forespørsler per peer",
+	"bt-max-outstanding-per-peer-tips":
+		"Maksimalt antall samtidige chunk-forespørsler som pipelines til hver peer (tak, opptil 500). 0 bruker den adaptive standarden på 6–500; et forespørselsbudsjett for hele torrenten deles mellom aktive peere. Krever omstart av motoren",
+	"bt-max-connections": "Maks. peer-tilkoblinger",
+	"bt-max-connections-tips":
+		"Totalt antall peer-tilkoblinger på tvers av alle torrenter, 20 til 5000. Hvis du senker verdien, kuttes aldri tilkoblinger som allerede er åpne; den holder bare tilbake nye. På Linux, macOS og Android er den effektive verdien også begrenset til halvparten av systemets grense for filbeskrivere",
+	"bt-ban-corrupt-peers": "Utesteng peere som sender ødelagte data",
+	"bt-ban-corrupt-peers-tips":
+		"Blokker en IP-adresse for resten av økten hvis stykker den har bidratt til å sende gjentatte ganger feiler hash-kontrollen. Mange brukere kan dele én IP (mobiloperatører, delte nettverk), så en utestengelse kan også ramme uskyldige peere (krever omstart av motoren)",
+	"bt-ban-corrupt-strikes": "Mislykkede stykker før utestengelse",
+	"bt-ban-corrupt-strikes-tips":
+		"Hvor mange mislykkede stykker en IP-adresse kan bidra til før den utestenges. Høyere verdier tåler tilfeldig korrupsjon (krever omstart av motoren)",
+	"bt-enable-upnp": "UPnP / NAT-PMP-portvideresending",
+	"bt-enable-upnp-tips":
+		"Åpne BitTorrent-lytteporten på ruteren automatisk via UPnP IGD, NAT-PMP eller PCP (krever omstart av motoren)",
+	"bt-upnp-lease": "Varighet for portmapping (sekunder)",
+	"bt-upnp-lease-tips":
+		"Varighet for UPnP- og NAT-PMP-portmappinger. Kortere varighet gir raskere gjenoppretting fra utdaterte mappinger (krever omstart av motoren)",
+	"bt-enable-lsd": "Lokal tjenesteoppdagelse (LSD)",
+	"bt-enable-lsd-tips":
+		"Finn peere på det lokale nettverket via BEP-14-multicast (krever omstart av motoren)",
+	"bt-encryption-policy": "Protokollkryptering",
+	"bt-encryption-policy-tips":
+		"MSE/PE-policy for peer-tilkoblinger. «Foretrekk kryptering» prøver kryptering først og faller tilbake til ren tekst (krever omstart av motoren)",
+	"bt-encryption-plaintext": "Bare ukryptert",
+	"bt-encryption-prefer": "Foretrekk kryptering",
+	"bt-encryption-require": "Krev kryptering",
+	"bt-listen-v6": "Lytt på IPv6",
+	"bt-listen-v6-tips":
+		"Bind en ekstra IPv6 TCP-lytter på samme port (krever omstart av motoren)",
 	"sync-tracker-tips": "Synkroniser",
 	"auto-sync-tracker": "Oppdater trackerlisten hver dag automatisk",
+	"ed2k-server": "eDonkey-servere",
+	"ed2k-server-input-tips": "eDonkey-servere, én per linje (ip:port)",
+	"ed2k-server-tips": "Standardservere brukes hvis feltet er tomt",
+	"ed2k-kad": "eMule Kad",
+	"ed2k-enable-kad": "Aktiver kildesøk via Kad",
+	"ed2k-enable-kad-tips":
+		"Finn ED2K-kilder via eMule Kad-nettverket (krever omstart av motoren)",
+	"ed2k-kad-port": "Kad UDP-port",
+	"ed2k-kad-port-tips":
+		"UDP-port som brukes til Kad-søk. Gyldige verdier er 1-65535 (krever omstart av motoren)",
+	"ed2k-kad-port-invalid": "Kad UDP-port må være et heltall fra 1 til 65535",
+	"listen-port-invalid":
+		"BT-porten må være en port fra 1 til 65535, et område som 6881-6889, eller en kommaseparert liste av disse",
+	"dht-listen-port-invalid":
+		"DHT-porten må være en port fra 1 til 65535, et område som 6881-6889, eller en kommaseparert liste av disse",
+	"ed2k-port-invalid": "ED2K-porten må være et heltall fra 1 til 65535",
+	"ed2k-enable-upload": "Del filer via ED2K",
+	"ed2k-enable-upload-tips":
+		"Last opp ferdige filer og verifiserte deler av pågående ED2K-nedlastinger til andre noder. Kad kan fortsatt liste en fil du har sluttet å dele i opptil 5 timer (krever omstart av motoren)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"Standard legitimasjon for FTP-, FTPS- og SFTP-nedlastinger",
+	"ftp-username": "FTP-brukernavn",
+	"ftp-password": "FTP-passord",
+	"sftp-private-key": "Bane til privat SSH-nøkkel",
+	"sftp-private-key-content": "Innhold i privat SSH-nøkkel",
+	"sftp-private-key-tips":
+		"Bane til privat PEM-nøkkelfil, f.eks. ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips":
+		"Lim inn innholdet i den private PEM-nøkkelen her",
+	"sftp-key-passphrase": "Passordfrase for nøkkel",
+	"sftp-key-passphrase-tips": "La stå tom hvis nøkkelen ikke har passordfrase",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "Utdataformat",
+	"media-settings": "Mediesider (yt-dlp)",
+	"media-settings-tips":
+		"Standardinnstillinger for nedlastinger fra mediesider (YouTube, Vimeo, Bilibili og flere). Krever yt-dlp i PATH; ffmpeg trengs for å slå sammen separate video- og lydstrømmer.",
+	"media-format": "Foretrukket format",
+	"media-format-placeholder":
+		"f.eks. bestvideo+bestaudio/best (yt-dlp-formatstreng)",
+	"media-format-tips":
+		"yt-dlp-formatvelger. La stå tom for best kvalitet. Eksempler: bestvideo[height<=1080]+bestaudio/best, 137+140",
 	port: "Lytt på porter",
 	"bt-port": "BT-lytteport",
 	"dht-port": "DHT-lytteport",
+	"ed2k-port": "ed2k-lytteport",
 	security: "Sikkerhet",
 	rpc: "RPC",
+	"rpc-host": "Serveradresse",
+	"rpc-host-local": "Bare denne enheten",
+	"rpc-host-all": "Alle nettverksgrensesnitt",
+	"rpc-host-custom": "Egendefinert ({{host}})",
+	"rpc-host-exposed-tips":
+		"Andre enheter i nettverket ditt kan nå RPC-porten, og PeerBanHelper-porten når den er aktivert. Alle som kjenner hemmeligheten, kan legge til og styre nedlastinger.",
 	"rpc-listen-port": "RPC lytteport",
 	"rpc-secret": "RPC Secret",
 	"rpc-secret-tips": "Se RPC Secret Manual",
+	"rpc-allow-any-dir": "La RPC-klienter bruke hvilken som helst lokal bane",
+	"rpc-allow-any-dir-tips":
+		"Når dette er av, kan nedlastinger lagt til via RPC bare lagres i nedlastingsmappen, undermappene og kategori- og rutingmappene dine, og RPC-klienter kan ikke få appen til å lese en cookie-, netrc- eller SSH-nøkkelfil.",
 	pbh: "PeerBanHelper",
 	"pbh-enable": "Aktiver PeerBanHelper-API",
 	"pbh-enable-tips":
@@ -105,38 +433,53 @@ export default {
 	"generate-pbh-rpc-secret": "Generer et nytt token",
 	"pbh-endpoint-hint":
 		"I PeerBanHelper, legg til en Aria2Next-nedlaster som peker til http://127.0.0.1:{{port}}/jsonrpc",
-	"engine-overrides": "Engine Overrides (JSON)",
+	"randomize-port": "Velg en tilfeldig port",
+	"generate-rpc-secret": "Generer en ny RPC-hemmelighet",
+	"copy-rpc-url": "Kopier RPC-URL",
+	"engine-overrides": "Motoroverstyringer (JSON)",
 	"engine-overrides-placeholder":
 		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
 	"engine-overrides-tips":
-		"Advanced: set arbitrary engine option keys as a JSON object. Changes take effect after restart.",
-	"engine-overrides-invalid": "Engine Overrides must be a valid JSON object.",
-	"ed2k-kad": "eMule Kad",
-	"ed2k-enable-kad": "Aktiver kildesøk via Kad",
-	"ed2k-enable-kad-tips":
-		"Finn ED2K-kilder via eMule Kad-nettverket (krever omstart av motoren)",
-	"ed2k-kad-port": "Kad UDP-port",
-	"ed2k-kad-port-tips":
-		"UDP-port som brukes til Kad-søk. Gyldige verdier er 1-65535 (krever omstart av motoren)",
-	"ed2k-kad-port-invalid": "Kad UDP-port må være et heltall fra 1 til 65535",
-	"ed2k-enable-upload": "Del filer via ED2K",
-	"ed2k-enable-upload-tips":
-		"Last opp ferdige filer og verifiserte deler av pågående ED2K-nedlastinger til andre noder. Kad kan fortsatt liste en fil du har sluttet å dele i opptil 5 timer (krever omstart av motoren)",
+		"Avansert: angi vilkårlige nøkler for motoralternativer som et JSON-objekt. Endringer trer i kraft etter omstart.",
+	"engine-overrides-invalid":
+		"Motoroverstyringer må være et gyldig JSON-objekt.",
 	"engine-overrides-reserved-keys":
 		"Ignorerte reserverte nøkler for motoroverstyring: {{keys}}",
 	"engine-overrides-too-large":
 		"Motoroverstyringer er for store: maksimalt 64 nøkler, 64 tegn per nøkkel og 2048 tegn per verdi.",
-	"external-engine-enable": "Use External Engine",
-	"external-engine-enable-tips":
-		"When enabled, Risuko will not auto-start the embedded engine.",
-	"external-engine-ip": "External Engine IP",
-	"external-engine-port": "External Engine Port",
-	"external-engine-secret": "External Engine Secret",
 	developer: "Utvikler",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Mock User-Agent",
+	cookies: "Cookies",
+	"cookies-tips":
+		"Last inn cookies fra en cookies.txt-fil i Netscape-/Mozilla-format (godtar også utdata fra curl/wget).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "Lagret legitimasjon for domener",
+	"saved-cookies-tips":
+		"Cookies og User-Agent importert fra en nettleser ved omgåelse av Cloudflare eller andre autentiseringsbeskyttede nedlastinger. Risuko gjenbruker disse for nye nedlastinger på samme domene til de utløper eller slutter å fungere.",
+	"saved-cookies-empty": "Ingen lagret legitimasjon ennå.",
+	"saved-cookies-host": "Domene",
+	"saved-cookies-browser": "Nettleser",
+	"saved-cookies-count": "Cookies",
+	"saved-cookies-imported": "Importert",
+	"saved-cookies-actions": "Handlinger",
+	"saved-cookies-clear": "Tøm alle",
+	"saved-cookies-confirm-clear":
+		"Slette all lagret domenelegitimasjon? Fremtidige nedlastinger fra disse nettstedene kan mislykkes til du importerer på nytt.",
+	"saved-cookies-delete": "Slett",
+	netrc: ".netrc-legitimasjon",
+	"netrc-tips":
+		"Legg inn HTTP Basic-autentisering fra en .netrc-fil når URL-en ikke har innebygd legitimasjon. Standard: ~/.netrc (eller %USERPROFILE%/_netrc på Windows).",
+	"netrc-path-placeholder": "Overstyr .netrc-bane (valgfritt)",
+	"no-netrc": "Slå av .netrc-oppslag",
+	"no-netrc-tips":
+		"Hopp over .netrc helt. Nyttig når filen inneholder legitimasjon som ikke gjelder nedlastinger.",
 	"app-log-path": "Apploggbane",
-	"download-session-path": "Last ned øktstien",
+	"log-dir-override-placeholder":
+		"Egendefinert loggmappe (la stå tom for standard)",
+	"log-dir-override-tips":
+		"Logger skrives for øyeblikket til {{path}}. Hvis du angir en egendefinert mappe (f.eks. inne i Nedlastinger), blir de synlige i alle filbehandlere. Endringer trer i kraft etter neste omstart av appen.",
+	"download-session-path": "Bane for nedlastingsøkt",
 	"session-reset": "Tilbakestill nedlastingsøkten",
 	"session-reset-confirm":
 		"Er du sikker på at du vil tilbakestille nedlastingsøkten?",
@@ -146,8 +489,9 @@ export default {
 	"download-protocol": "Protokoller",
 	"protocols-default-client":
 		"Angi som standardklient for følgende protokoller",
-	"protocols-magnet": "Magnet [magnet: //]",
-	"protocols-thunder": "Torden [torden: //]",
+	"protocols-magnet": "Magnet [ magnet:// ]",
+	"protocols-thunder": "Thunder [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -164,9 +508,6 @@ export default {
 	"auto-update": "Automatisk oppdatering",
 	"auto-check-update": "Sjekk automatisk for oppdatering",
 	"last-check-update-time": "Siste gang sjekket for oppdatering",
-	"not-saved": "Preferansene er ikke lagret",
-	"not-saved-confirm":
-		"De endrede preferansene vil gå tapt, er du sikker på at du vil forlate?",
 	"completion-script": "Skript ved fullføring",
 	"completion-script-enabled": "Kjør et skript når nedlastingen er fullført",
 	"completion-script-tips":
@@ -184,10 +525,38 @@ export default {
 	"completion-script-test-ok": "Skripttest vellykket",
 	"completion-script-test-fail": "Skripttest mislyktes",
 	"completion-script-empty": "Angi en kommando først",
-	"history-directories": "Nylige nedlastingsmapper",
-	"favorite-directory": "Favorittmappe",
-	"unfavorite-directory": "Fjern mappe fra favoritter",
-	"remove-history-directory": "Fjern mappe fra historikk",
-	"randomize-port": "Velg en tilfeldig port",
-	"generate-rpc-secret": "Generer en ny RPC-hemmelighet",
+	"completion-script-not-approved":
+		"Fullføringsskriptet ble ikke tillatt, så ingenting ble lagret.",
+	"not-saved": "Preferansene er ikke lagret",
+	"not-saved-confirm":
+		"De endrede preferansene vil gå tapt, er du sikker på at du vil forlate?",
+	"saved-credentials": "Lagret legitimasjon",
+	"saved-credentials-description":
+		"Administrer lagret autentiseringslegitimasjon for nedlastinger",
+	"no-saved-credentials": "Ingen lagret legitimasjon",
+	"credential-host": "Vert",
+	"credential-label": "Navn",
+	"credential-protocol": "Protokoll",
+	"credential-last-used": "Sist brukt",
+	"credential-delete": "Slett legitimasjon",
+	"credential-delete-confirm":
+		"Er du sikker på at du vil slette denne lagrede legitimasjonen?",
+	"vault-enabled": "Hemmeligheter lagres i systemets nøkkelring",
+	"vault-disabled":
+		"Systemets nøkkelring er utilgjengelig – hemmeligheter lagres i klartekst",
+	"credential-encrypted-badge": "Lagret i systemets nøkkelring",
+	"credential-vault-unavailable":
+		"Får ikke kontakt med systemets nøkkelring; ny legitimasjon lagres i klartekst",
+	"speed-limit-enabled": "Aktiver hastighetsgrenser",
+	"speed-limit-enabled-description":
+		"Bruk grensene nedenfor. Når dette er av, kjører nedlastinger i full hastighet; verdiene beholdes.",
+	"appearance-theme": "Tema",
+	"appearance-typography": "Typografi",
+	"appearance-window": "Vindu",
+	"task-list-style": "Oppgaveliste",
+	"task-list-style-description": "Hvordan nedlastinger vises i oppgavelisten.",
+	"task-list-style-compact": "Kompakt",
+	"task-list-style-card": "Kort",
+	"sidebar-collapsed": "Skjul sidefeltet",
+	"sidebar-collapsed-description": "Vis bare ikoner i sidefeltet.",
 };

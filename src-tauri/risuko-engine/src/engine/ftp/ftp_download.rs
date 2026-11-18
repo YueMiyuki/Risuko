@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{FtpProtocol, FtpUri};
 use crate::engine::options::json_bool;
+use crate::engine::part_claim::{claim_or_rename, PartClaim};
+use crate::engine::resume_meta::{self, ResumeMeta};
 use crate::engine::speed_limiter::{SpeedEma, SpeedLimiter};
+pub(super) use crate::engine::util::http_proxy_from_options;
 use risuko_bt::limiter::Throttle;
 
 const PART_SUFFIX: &str = ".part";
@@ -42,6 +45,16 @@ macro_rules! ftp_transfer {
         if remote_size > 0 {
             $total.store(remote_size, Ordering::Relaxed);
         }
+        let remote_mtime = $ftp
+            .mdtm(remote_path)
+            .await
+            .ok()
+            .map(|t| t.and_utc().timestamp());
+        let current = ResumeMeta {
+            size: (remote_size > 0).then_some(remote_size),
+            mtime: remote_mtime,
+            ..Default::default()
+        };
 
         $connections.store(1, Ordering::Relaxed);
 
@@ -49,6 +62,16 @@ macro_rules! ftp_transfer {
             fs::metadata(&$part_path).map(|m| m.len()).unwrap_or(0)
         } else {
             0
+        };
+        let existing_size = if resume_meta::should_restart(&$part_path, existing_size, &current) {
+            tracing::warn!(
+                "FTP remote file changed since the partial was started; restarting from 0"
+            );
+            let _ = fs::remove_file(&$part_path);
+            resume_meta::delete(&$part_path);
+            0
+        } else {
+            existing_size
         };
 
         let effective_size = if remote_size > 0 {
@@ -113,6 +136,9 @@ macro_rules! ftp_transfer {
                     .await
                     .map_err(|e| format!("Failed to create part file: {e}"))?
             };
+            if resume_offset == 0 {
+                resume_meta::save(&$part_path, &current);
+            }
 
             let mut bytes_downloaded = resume_offset;
             let mut buf = vec![0u8; BUF_SIZE];
@@ -204,6 +230,7 @@ pub async fn run_ftp_ftps_download(
     cancel_token: CancellationToken,
     global_limiter: Arc<SpeedLimiter>,
     task_limiter: Arc<SpeedLimiter>,
+    adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<PathBuf, String> {
     tracing::info!(
         "Starting FTP{} download: host={}, path={}",
@@ -219,15 +246,15 @@ pub async fn run_ftp_ftps_download(
     let dir_path = Path::new(dir);
     fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
-    let filename = output_filename(&parsed.path, out);
-
-    let part_name = if filename.ends_with(PART_SUFFIX) {
-        filename.clone()
-    } else {
-        format!("{filename}{PART_SUFFIX}")
-    };
-    let part_path = dir_path.join(&part_name);
-    let _part_claim = super::PartClaim::acquire(&part_path)?;
+    let output = claim_output(
+        dir_path,
+        &parsed.path,
+        out,
+        options,
+        &cancel_token,
+        &adopted_filename,
+    )
+    .await?;
 
     let user = parsed
         .user
@@ -248,7 +275,7 @@ pub async fn run_ftp_ftps_download(
     let job = FtpJob {
         parsed,
         options,
-        part_path: &part_path,
+        part_path: &output.part_path,
         user: &user,
         password: &password,
         control_proxy,
@@ -269,11 +296,15 @@ pub async fn run_ftp_ftps_download(
     speed.store(0, Ordering::Relaxed);
     connections.store(0, Ordering::Relaxed);
 
-    let auto_rename = options
-        .get("auto-file-renaming")
-        .and_then(json_bool)
-        .unwrap_or(true);
-    let final_path = finalize_download(&part_path, &filename, dir_path, auto_rename)?;
+    crate::engine::http::verify_checksum_option(&output.part_path, options).await?;
+
+    let final_path = finalize_download(
+        &output.part_path,
+        &output.filename,
+        dir_path,
+        output.auto_rename,
+    )?;
+    resume_meta::delete(&output.part_path);
     tracing::info!("FTP download complete: {}", final_path.display());
     Ok(final_path)
 }
@@ -358,6 +389,7 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
                 .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))?
         };
 
+        ftp.set_passive_nat_workaround(true);
         if ipv6 {
             ftp.set_mode(suppaftp::Mode::ExtendedPassive);
         }
@@ -399,6 +431,7 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
                 .map_err(|e| format!("FTP connect failed: {e}"))?
         };
 
+        ftp.set_passive_nat_workaround(true);
         if ipv6 {
             ftp.set_mode(suppaftp::Mode::ExtendedPassive);
         }
@@ -453,6 +486,57 @@ pub(super) fn host_port(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+pub(super) struct ClaimedOutput {
+    pub filename: String,
+    pub part_path: PathBuf,
+    pub auto_rename: bool,
+    _claim: PartClaim,
+}
+
+pub(super) fn part_path_for(dir_path: &Path, filename: &str) -> PathBuf {
+    if filename.ends_with(PART_SUFFIX) {
+        dir_path.join(filename)
+    } else {
+        dir_path.join(format!("{filename}{PART_SUFFIX}"))
+    }
+}
+
+pub(super) async fn claim_output(
+    dir_path: &Path,
+    remote_path: &str,
+    out: &str,
+    options: &Map<String, Value>,
+    cancel_token: &CancellationToken,
+    adopted_filename: &parking_lot::Mutex<Option<String>>,
+) -> Result<ClaimedOutput, String> {
+    let mut filename = output_filename(remote_path, out);
+    let mut part_path = part_path_for(dir_path, &filename);
+    let auto_rename = options
+        .get("auto-file-renaming")
+        .and_then(json_bool)
+        .unwrap_or(true);
+    let (claim, renamed) = claim_or_rename(
+        dir_path,
+        &filename,
+        &part_path,
+        options,
+        auto_rename,
+        cancel_token,
+    )
+    .await?;
+    if let Some(renamed) = renamed {
+        *adopted_filename.lock() = Some(renamed.filename.clone());
+        filename = renamed.filename;
+        part_path = renamed.part_path;
+    }
+    Ok(ClaimedOutput {
+        filename,
+        part_path,
+        auto_rename,
+        _claim: claim,
+    })
 }
 
 pub(super) fn output_filename(path: &str, out: &str) -> String {
@@ -549,7 +633,7 @@ pub(super) fn finalize_download(
         filename.to_string()
     };
     let final_path = if auto_rename {
-        reserve_unique_path(dir_path, &final_name)?
+        crate::engine::util::reserve_unique_path(dir_path, &final_name)?
     } else {
         dir_path.join(&final_name)
     };
@@ -564,52 +648,12 @@ pub(super) fn finalize_download(
     Ok(final_path)
 }
 
-fn reserve_unique_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    let (stem, ext) = match name.rfind('.') {
-        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
-        _ => (name, ""),
-    };
-    for n in 0u32.. {
-        let candidate = if n == 0 {
-            dir.join(name)
-        } else {
-            dir.join(format!("{stem}.{n}{ext}"))
-        };
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_) => return Ok(candidate),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("Failed to reserve output file: {e}")),
-        }
-    }
-    Err("Failed to reserve output filename".to_string())
-}
-
 pub(super) fn option_str(options: &Map<String, Value>, key: &str) -> Option<String> {
     options
         .get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-}
-
-pub(super) fn http_proxy_from_options(
-    options: &Map<String, Value>,
-) -> Result<Option<risuko_http::ProxyConnector>, String> {
-    let server = option_str(options, "all-proxy").unwrap_or_default();
-    if server.is_empty() {
-        return Ok(None);
-    }
-    let proxy = risuko_http::Proxy::all(&server)
-        .map_err(|error| format!("Invalid HTTP profile proxy: {error}"))?;
-    let bypass = option_str(options, "no-proxy").unwrap_or_default();
-    Ok(Some(
-        risuko_http::ProxyConnector::from_proxy(proxy)
-            .with_no_proxy(risuko_http::NoProxy::parse(bypass)),
-    ))
 }
 
 fn proxy_for_target(
@@ -743,6 +787,70 @@ pub(super) fn basename_from_ftp_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn another_downloads_partial_is_left_alone() {
+        use crate::engine::part_claim::RESERVED_PARTS_OPTION;
+
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("file.bin.part");
+        fs::write(&theirs, b"paused elsewhere").unwrap();
+        let mut options = Map::new();
+        options.insert(
+            RESERVED_PARTS_OPTION.into(),
+            serde_json::json!([theirs.to_string_lossy()]),
+        );
+        let cancel = CancellationToken::new();
+        let adopted = parking_lot::Mutex::new(None);
+
+        let output = claim_output(dir.path(), "/pub/file.bin", "", &options, &cancel, &adopted)
+            .await
+            .unwrap();
+        assert_eq!(output.filename, "file.1.bin");
+        assert_eq!(output.part_path, dir.path().join("file.1.bin.part"));
+        assert_eq!(adopted.lock().as_deref(), Some("file.1.bin"));
+        assert_eq!(fs::read(&theirs).unwrap(), b"paused elsewhere");
+
+        options.insert("auto-file-renaming".into(), Value::Bool(false));
+        assert!(
+            claim_output(dir.path(), "/pub/file.bin", "", &options, &cancel, &adopted)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_downloads_own_partial_is_resumed_and_a_second_writer_is_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file.bin.part"), b"mine").unwrap();
+        let cancel = CancellationToken::new();
+        let adopted = parking_lot::Mutex::new(None);
+        let none = Map::new();
+
+        let first = claim_output(dir.path(), "/pub/file.bin", "", &none, &cancel, &adopted)
+            .await
+            .unwrap();
+        assert_eq!(first.filename, "file.bin");
+        assert!(first.auto_rename);
+        assert_eq!(*adopted.lock(), None);
+
+        let second = claim_output(dir.path(), "/pub/file.bin", "", &none, &cancel, &adopted)
+            .await
+            .unwrap();
+        assert_eq!(second.filename, "file.1.bin");
+        drop(first);
+        let named = claim_output(
+            dir.path(),
+            "/pub/file.bin",
+            "kept.iso",
+            &none,
+            &cancel,
+            &adopted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(named.part_path, dir.path().join("kept.iso.part"));
+    }
 
     #[test]
     fn host_port_brackets_ipv6_literals() {

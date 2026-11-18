@@ -1,6 +1,5 @@
 import { MAX_BT_TRACKER_LENGTH, ONE_SECOND } from "@shared/constants";
 import { normalizeProxyConfig, type ProxyConfig } from "@shared/types/config";
-import axios from "axios";
 
 const TRACKER_SOURCE_CACHE_TTL = 10 * 60 * ONE_SECOND;
 const trackerSourceCache = new Map<
@@ -13,20 +12,6 @@ const normalizeSource = (source: string[] = []) => {
 	return [
 		...new Set(source.map((item) => String(item).trim()).filter(Boolean)),
 	].sort();
-};
-
-const convertToAxiosProxy = (proxyServer = "") => {
-	if (!proxyServer) {
-		return;
-	}
-
-	const { username, password, protocol, hostname, port } = new URL(proxyServer);
-	return {
-		protocol: protocol.replace(":", ""),
-		host: hostname,
-		port: port ? Number(port) : undefined,
-		...(username || password ? { auth: { username, password } } : {}),
-	};
 };
 
 const buildTrackerSourceCacheKey = (source = [], proxyServer = "") => {
@@ -51,24 +36,24 @@ const getCachedTrackerSource = (key: string, now: number) => {
 
 export const fetchBtTrackerFromSource = async (
 	source: string[],
-	proxyConfig: ProxyConfig = {},
-	resolveProxy?: (url: string) => Promise<string | null>,
-	fetchSource?: (urls: string[]) => Promise<string[]>,
+	proxyConfig: ProxyConfig,
+	fetchSource: (urls: string[]) => Promise<string[]>,
 ) => {
 	if (!source?.length) {
 		return [];
 	}
 
 	const now = Date.now();
-	const normalized = normalizeProxyConfig(proxyConfig).http;
-	const { enable, server, bypass, scope = [] } = normalized;
-	const proxyEnabled = enable && server && scope.includes("update-trackers");
-	const proxyCacheKey = fetchSource
-		? `${enable ? "1" : "0"}|${server || ""}|${bypass || ""}|${scope.join(",")}`
-		: proxyEnabled
-			? `${server}|${bypass || ""}`
-			: "";
-	const cacheKey = buildTrackerSourceCacheKey(source, proxyCacheKey);
+	const {
+		enable,
+		server,
+		bypass,
+		scope = [],
+	} = normalizeProxyConfig(proxyConfig).http;
+	const cacheKey = buildTrackerSourceCacheKey(
+		source,
+		`${enable ? "1" : "0"}|${server || ""}|${bypass || ""}|${scope.join(",")}`,
+	);
 	const cached = getCachedTrackerSource(cacheKey, now);
 	if (cached) {
 		return cached;
@@ -80,48 +65,16 @@ export const fetchBtTrackerFromSource = async (
 	}
 
 	const requestPromise = (async () => {
-		const requestUrls = source.map((url) => appendCacheBust(url, now));
-		if (fetchSource) {
-			const values = await fetchSource(requestUrls);
-			const result = [...new Set(values)];
+		const values = await fetchSource(
+			source.map((url) => appendCacheBust(url, now)),
+		);
+		const result = [...new Set(values)];
+		if (result.length > 0) {
 			trackerSourceCache.set(cacheKey, {
 				value: result,
 				expiresAt: Date.now() + TRACKER_SOURCE_CACHE_TTL,
 			});
-			return result;
 		}
-		const proxies = proxyEnabled
-			? await Promise.all(
-					requestUrls.map(async (requestUrl) => {
-						const resolved = resolveProxy
-							? await resolveProxy(requestUrl)
-							: server || null;
-						return resolved ? convertToAxiosProxy(resolved) : undefined;
-					}),
-				)
-			: requestUrls.map(() => undefined);
-
-		const results = await Promise.allSettled(
-			requestUrls.map((requestUrl, index) =>
-				axios
-					.get(requestUrl, {
-						timeout: 30 * ONE_SECOND,
-						proxy: proxies[index],
-					})
-					.then((value) => value.data),
-			),
-		);
-		const values = results
-			.filter(
-				(item): item is PromiseFulfilledResult<string> =>
-					item.status === "fulfilled",
-			)
-			.map((item) => item.value);
-		const result = [...new Set(values)];
-		trackerSourceCache.set(cacheKey, {
-			value: result,
-			expiresAt: Date.now() + TRACKER_SOURCE_CACHE_TTL,
-		});
 		return result;
 	})().finally(() => {
 		trackerSourceInFlight.delete(cacheKey);

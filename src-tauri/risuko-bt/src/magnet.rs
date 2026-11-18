@@ -54,28 +54,6 @@ pub struct Resolved {
 
 const DEFAULT_LISTEN_PORT: u16 = 6881;
 
-pub async fn resolve_with_port_and_utp_and_proxy(
-    magnet_uri: &str,
-    extra_trackers: &[String],
-    listen_port: u16,
-    budget: Duration,
-    encryption: crate::peer::EncryptionPolicy,
-    utp: Option<Arc<crate::utp::UtpSocket>>,
-    proxy: Option<risuko_http::ProxyConnector>,
-) -> Result<Resolved, String> {
-    resolve_with_peers_and_port_and_utp_and_proxy(
-        magnet_uri,
-        extra_trackers,
-        &[],
-        listen_port,
-        budget,
-        encryption,
-        utp,
-        proxy,
-    )
-    .await
-}
-
 pub async fn resolve_with_peers(
     magnet_uri: &str,
     extra_trackers: &[String],
@@ -192,6 +170,9 @@ pub async fn resolve_with_conn_budget(
                         tracker_ids.lock().insert(url.clone(), id);
                     }
                     for p in r.peers {
+                        if !super::tracker::tracker_may_supply(&url, p) {
+                            continue;
+                        }
                         if let Some(tracker_peers) = &tracker_peers {
                             if is_dialable_peer_addr(p) {
                                 tracker_peers.lock().insert(p);
@@ -231,11 +212,19 @@ pub async fn resolve_with_conn_budget(
     }
     if !magnet.peers.is_empty() {
         let tx = peer_tx.clone();
-        let magnet_peers = magnet.clone();
+        let mut magnet_peers = magnet.clone();
+        if proxy.as_ref().is_some_and(|p| p.has_proxy()) {
+            magnet_peers
+                .peers
+                .retain(|peer| matches!(peer, super::core::magnet::MagnetPeer::Addr(_)));
+        }
         tokio::spawn(async move {
             use futures_util::StreamExt;
             let mut addrs = std::pin::pin!(magnet_peers.resolve_peers());
             while let Some(addr) = addrs.next().await {
+                if addr.ip().to_canonical().is_loopback() {
+                    continue;
+                }
                 if tx.send((addr, PeerSource::Manual)).is_err() {
                     break;
                 }
@@ -1896,6 +1885,36 @@ mod tests {
         assert!(datagrams_reaching_udp_tracker(None).await > 0);
         let unowned = SocketAddr::from(([192, 0, 2, 1], 0));
         assert_eq!(datagrams_reaching_udp_tracker(Some(unowned)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn magnet_peer_hints_never_dial_loopback() {
+        let hinted = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let supplied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}&x.pe={}",
+            "12".repeat(20),
+            hinted.local_addr().unwrap()
+        );
+        let extra = [supplied.local_addr().unwrap()];
+        let resolving = tokio::spawn(async move {
+            resolve_with_peers(
+                &magnet,
+                &[],
+                &extra,
+                Duration::from_secs(5),
+                crate::peer::EncryptionPolicy::PlaintextOnly,
+            )
+            .await
+        });
+        let supplied_dial = tokio::time::timeout(Duration::from_secs(3), supplied.accept()).await;
+        assert!(
+            supplied_dial.is_ok(),
+            "caller-supplied peers are still dialled"
+        );
+        let hinted_dial = tokio::time::timeout(Duration::from_millis(500), hinted.accept()).await;
+        assert!(hinted_dial.is_err(), "a magnet hint reached loopback");
+        resolving.abort();
     }
 
     fn spawn_resolve(

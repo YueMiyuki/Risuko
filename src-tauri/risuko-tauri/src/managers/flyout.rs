@@ -1,60 +1,17 @@
-#[cfg(not(target_os = "android"))]
+use super::panel::Panel;
 use super::panel_gate::ShowStep;
-#[cfg(not(target_os = "android"))]
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
-#[cfg(not(target_os = "android"))]
 pub const FLYOUT_LABEL: &str = "tray-panel";
 
-#[cfg(not(target_os = "android"))]
-const FLYOUT_WIDTH: f64 = 396.0;
-#[cfg(not(target_os = "android"))]
-const FLYOUT_HEIGHT: f64 = 540.0;
-
-#[cfg(not(target_os = "android"))]
-fn build_flyout(app: &AppHandle) -> Result<(), tauri::Error> {
-    if app.get_webview_window(FLYOUT_LABEL).is_some() {
-        return Ok(());
-    }
-
-    let builder = WebviewWindowBuilder::new(app, FLYOUT_LABEL, WebviewUrl::App("tray.html".into()))
-        .title("Risuko Quick Panel")
-        .inner_size(FLYOUT_WIDTH, FLYOUT_HEIGHT)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .visible(false)
-        .focused(false)
-        .transparent(true)
-        .shadow(false)
-        .accept_first_mouse(true);
-
-    #[cfg(target_os = "macos")]
-    let builder = builder.visible_on_all_workspaces(true);
-
-    builder.build()?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "android"))]
-fn spawn_build(app: &AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let ok = match build_flyout(&app) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("[Risuko] failed to build flyout window: {}", e);
-                false
-            }
-        };
-        if let Some(state) = app.try_state::<crate::state::AppState>() {
-            if let Ok(mut gate) = state.flyout_gate.lock() {
-                gate.built(ok);
-            }
-        }
-    });
-}
+static FLYOUT: Panel = Panel {
+    label: FLYOUT_LABEL,
+    page: "tray.html",
+    title: "Risuko Quick Panel",
+    width: 396.0,
+    height: 540.0,
+    gate: |state| &state.flyout_gate,
+};
 
 #[cfg(target_os = "macos")]
 pub fn demote_if_ui_hidden(app: &AppHandle) {
@@ -71,7 +28,6 @@ pub fn demote_if_ui_hidden(app: &AppHandle) {
     }
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn cache_tray_rect(app: &AppHandle, rect: &tauri::Rect, scale_factor: f64) {
     let pos = rect.position.to_physical::<f64>(scale_factor);
     let size = rect.size.to_physical::<f64>(scale_factor);
@@ -82,9 +38,8 @@ pub fn cache_tray_rect(app: &AppHandle, rect: &tauri::Rect, scale_factor: f64) {
     }
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn toggle_flyout(app: &AppHandle) {
-    let window = app.get_webview_window(FLYOUT_LABEL);
+    let window = FLYOUT.window(app);
 
     if let Some(window) = &window {
         if window.is_visible().unwrap_or(false) {
@@ -95,51 +50,25 @@ pub fn toggle_flyout(app: &AppHandle) {
         }
     }
 
-    let Some(state) = app.try_state::<crate::state::AppState>() else {
-        return;
-    };
-    let step = {
-        let Ok(mut gate) = state.flyout_gate.lock() else {
-            return;
-        };
-        if gate.cancel_pending() {
-            return;
-        }
-        gate.request_show(window.is_some())
-    };
-    match (step, window) {
-        (ShowStep::ShowNow, Some(window)) => present(app, &window),
-        (ShowStep::Build, _) => spawn_build(app),
+    let step = FLYOUT.with_gate(app, |gate| {
+        (!gate.cancel_pending()).then(|| gate.request_show(window.is_some()))
+    });
+    match (step.flatten(), window) {
+        (Some(ShowStep::ShowNow), Some(window)) => present(app, &window),
+        (Some(ShowStep::Build), _) => FLYOUT.spawn_build(app),
         _ => {}
     }
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn on_ready(app: &AppHandle) {
-    let Some(state) = app.try_state::<crate::state::AppState>() else {
-        return;
-    };
-    let want_show = state
-        .flyout_gate
-        .lock()
-        .map(|mut gate| gate.page_ready())
-        .unwrap_or(false);
-    if want_show {
-        if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
+    if FLYOUT.page_ready(app) {
+        if let Some(window) = FLYOUT.window(app) {
             present(app, &window);
         }
     }
 }
 
-#[cfg(not(target_os = "android"))]
 fn present(app: &AppHandle, window: &WebviewWindow) {
-    position_flyout(app, window);
-    let _ = window.show();
-    let _ = window.set_focus();
+    FLYOUT.show(app, window);
     let _ = window.emit("flyout:show", ());
-}
-
-#[cfg(not(target_os = "android"))]
-fn position_flyout(app: &AppHandle, window: &WebviewWindow) {
-    super::position_near_tray(app, window, FLYOUT_WIDTH, FLYOUT_HEIGHT);
 }

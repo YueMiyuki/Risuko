@@ -1,6 +1,6 @@
 export default {
 	app: "Risuko",
-	file: "Berlas",
+	file: "Berkas",
 	task: "Tugas",
 	edit: "Edit",
 	window: "Window",

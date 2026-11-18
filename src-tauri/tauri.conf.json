@@ -65,6 +65,7 @@
 	},
 	"plugins": {
 		"deep-link": {
+			"mobile": [{ "scheme": ["risuko"] }],
 			"desktop": {
 				"schemes": [
 					"mo",

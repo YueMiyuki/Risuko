@@ -1,6 +1,6 @@
 export default {
-	undo: "Undo",
-	redo: "Redo",
+	undo: "Anulează",
+	redo: "Refă",
 	cut: "Taie",
 	copy: "Copiază",
 	paste: "Lipeşte",

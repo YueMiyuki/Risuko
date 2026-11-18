@@ -440,6 +440,7 @@
             <div class="dialog-field">
               <Label>{{ $t('cloudSinks.basePath') }}</Label>
               <Input v-model="form.ftp.basePath" placeholder="/uploads" autocomplete="off" />
+              <p class="dialog-hint">{{ $t('cloudSinks.ftpBasePathHint') }}</p>
             </div>
             <div class="dialog-field-toggle">
               <ui-checkbox v-model="form.ftp.secure">
@@ -790,7 +791,6 @@ import {
 	X,
 } from "@lucide/vue";
 import type { SavedCredential } from "@shared/types/credential";
-import { CREDENTIAL_SECRET_FIELDS } from "@shared/types/credential";
 import type {
 	SinkConfig,
 	UploadJob,
@@ -1225,7 +1225,11 @@ export default defineComponent({
 					if (!this.form.sftp.username.trim()) {
 						return this.$t("cloudSinks.errSftpUsernameRequired") as string;
 					}
-					if (!this.form.sftp.password && !this.form.sftp.privateKey) {
+					if (
+						!this.editingId &&
+						!this.form.sftp.password &&
+						!this.form.sftp.privateKey
+					) {
 						return this.$t("cloudSinks.errSftpAuthRequired") as string;
 					}
 					break;
@@ -1376,27 +1380,6 @@ export default defineComponent({
 					createdAt: existing.createdAt,
 					lastUsedAt: existing.lastUsedAt,
 				};
-				const mappedRec = mapped as unknown as Record<
-					string,
-					string | undefined
-				>;
-				const existingRec = existing as unknown as Record<
-					string,
-					string | undefined
-				>;
-				const credentialRec = credential as unknown as Record<
-					string,
-					string | undefined
-				>;
-				for (const key of CREDENTIAL_SECRET_FIELDS) {
-					if (!Object.hasOwn(mappedRec, key)) {
-						if (existingRec[key] !== undefined) {
-							credentialRec[key] = existingRec[key];
-						}
-					} else {
-						credentialRec[key] = mappedRec[key];
-					}
-				}
 				await preferenceStore.saveCredential(credential);
 			} else {
 				const now = Date.now();

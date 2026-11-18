@@ -368,6 +368,40 @@
                 <NumberInput v-model="form.seedTime" :min="0" :max="525600" :step="1" />
               </div>
             </div>
+            <div class="settings-select-group">
+              <div class="settings-select-item" data-preference-search-target="preferences.bt-upload-rate-limit">
+                <label class="settings-select-item-label"
+                  ><ArrowUp :size="12" style="vertical-align: middle; margin-right: 4px" />{{
+                    $t('preferences.bt-upload-rate-limit')
+                  }}</label
+                >
+                <div class="settings-inline-input">
+                  <NumberInput
+                    :model-value="speedLimitAmount('btUploadRateLimit')"
+                    :min="0"
+                    :max="65535"
+                    :step="1"
+                    @update:model-value="(amount) => setSpeedLimitAmount('btUploadRateLimit', amount)"
+                  />
+                  <Select
+                    :model-value="speedLimitUnit('btUploadRateLimit')"
+                    @update:model-value="(unit) => setSpeedLimitUnit('btUploadRateLimit', unit)"
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="item in speedUnits" :key="item.value" :value="item.value">
+                        {{ item.label }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.bt-upload-rate-limit-tips') }}
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -405,7 +439,7 @@
             </div>
             <div
               class="settings-row"
-              data-preference-search-target="preferences.auto-retry preferences.auto-retry-strategy preferences.auto-retry-interval preferences.worker-max-retries"
+              data-preference-search-target="preferences.auto-retry preferences.auto-retry-strategy preferences.auto-retry-interval preferences.auto-retry-max-attempts preferences.worker-max-retries"
             >
               <div class="settings-row-content">
                 <span class="settings-row-title">{{ $t('preferences.auto-retry') }}</span>
@@ -445,13 +479,19 @@
                 </label>
                 <NumberInput v-model="form.autoRetryInterval" :min="1" :max="300" :step="1" />
               </div>
+              <div class="settings-select-item">
+                <label class="settings-select-item-label">
+                  {{ $t('preferences.auto-retry-max-attempts') }}
+                </label>
+                <NumberInput v-model="form.autoRetryMaxAttempts" :min="0" :max="1000" :step="1" />
+              </div>
             </div>
             <div v-if="form.autoRetry" class="settings-select-group">
               <div class="settings-select-item">
                 <label class="settings-select-item-label">
                   {{ $t('preferences.worker-max-retries') }}
                 </label>
-                <NumberInput v-model="form.workerMaxRetries" :min="1" :max="20" :step="1" />
+                <NumberInput v-model="form.maxWorkerRetries" :min="1" :max="20" :step="1" />
               </div>
             </div>
             <div
@@ -662,6 +702,7 @@ import {
 import {
 	APP_RUN_MODE,
 	DEFAULT_CLIPBOARD_WATCH_EXTENSIONS,
+	DOH_PROVIDERS,
 	ENGINE_MAX_CONCURRENT_DOWNLOADS,
 	ENGINE_RPC_PORT,
 	FILE_CATEGORIES,
@@ -676,6 +717,7 @@ import {
 	parseBooleanConfig,
 } from "@shared/utils";
 import logger from "@shared/utils/logger";
+import { formatSpeedLimit } from "@shared/utils/speedLimit";
 import { reduceTrackerString } from "@shared/utils/tracker";
 import { invoke } from "@tauri-apps/api/core";
 import { cloneDeep, isEmpty } from "lodash";
@@ -696,6 +738,12 @@ import { Textarea } from "@/components/ui/textarea";
 import is from "@/shims/platform";
 import { useAppStore } from "@/store/app";
 import { usePreferenceStore } from "@/store/preference";
+import {
+	finalizeAdvancedChanges,
+	resolveDohProvider,
+} from "@/utils/advancedPreferenceSave";
+import { normalizeMaxAttempts } from "@/utils/autoRetry";
+import { approveCompletionScript, pendingCompletionScript } from "@/utils/task";
 import { getRisukoVersion } from "@/utils/version";
 
 const RETRY_STRATEGY_STATIC = "static";
@@ -771,6 +819,10 @@ const normalizeBasicConfig = (data) => {
 		);
 	}
 
+	if ("autoRetryMaxAttempts" in data) {
+		data.autoRetryMaxAttempts = normalizeMaxAttempts(data.autoRetryMaxAttempts);
+	}
+
 	if ("split" in data) {
 		data.split = normalizePositiveInt(data.split, 16, 1, 128);
 	}
@@ -800,9 +852,9 @@ const normalizeBasicConfig = (data) => {
 				: RETRY_STRATEGY_STATIC;
 	}
 
-	if ("workerMaxRetries" in data) {
-		data.workerMaxRetries = normalizePositiveInt(
-			data.workerMaxRetries,
+	if ("maxWorkerRetries" in data) {
+		data.maxWorkerRetries = normalizePositiveInt(
+			data.maxWorkerRetries,
 			5,
 			1,
 			20,
@@ -818,10 +870,12 @@ const initForm = (config) => {
 		autoFileRenaming,
 		autoRetry,
 		autoRetryInterval,
+		autoRetryMaxAttempts,
 		autoRetryStrategy,
-		workerMaxRetries,
+		maxWorkerRetries,
 		btForceEncryption,
 		btSaveMetadata,
+		btUploadRateLimit,
 		clipboardWatch,
 		clipboardWatchExtensions,
 		dir,
@@ -853,13 +907,15 @@ const initForm = (config) => {
 		autoFileRenaming: parseBooleanConfig(autoFileRenaming, true),
 		autoRetry: parseBooleanConfig(autoRetry),
 		autoRetryInterval: normalizePositiveInt(autoRetryInterval, 5, 1, 300),
+		autoRetryMaxAttempts: normalizeMaxAttempts(autoRetryMaxAttempts),
 		autoRetryStrategy:
 			autoRetryStrategy === RETRY_STRATEGY_EXPONENTIAL
 				? RETRY_STRATEGY_EXPONENTIAL
 				: RETRY_STRATEGY_STATIC,
-		workerMaxRetries: normalizePositiveInt(workerMaxRetries, 5, 1, 20),
+		maxWorkerRetries: normalizePositiveInt(maxWorkerRetries, 5, 1, 20),
 		btForceEncryption: parseBooleanConfig(btForceEncryption),
 		btSaveMetadata: parseBooleanConfig(btSaveMetadata),
+		btUploadRateLimit,
 		clipboardWatch: parseBooleanConfig(clipboardWatch, true),
 		clipboardWatchExtensions: (Array.isArray(clipboardWatchExtensions)
 			? clipboardWatchExtensions
@@ -896,10 +952,10 @@ const initForm = (config) => {
 		newTaskShowDownloading: parseBooleanConfig(newTaskShowDownloading),
 		noConfirmBeforeDeleteTask: parseBooleanConfig(noConfirmBeforeDeleteTask),
 		openAtLogin: parseBooleanConfig(openAtLogin),
-		preventSleepWhileDownloading:
-			preventSleepWhileDownloading === undefined
-				? false
-				: parseBooleanConfig(preventSleepWhileDownloading),
+		preventSleepWhileDownloading: parseBooleanConfig(
+			preventSleepWhileDownloading,
+			true,
+		),
 		shutdownWhenComplete: parseBooleanConfig(shutdownWhenComplete),
 		purgeRecordOnStart: parseBooleanConfig(purgeRecordOnStart),
 		resumeAllWhenAppLaunched: parseBooleanConfig(resumeAllWhenAppLaunched),
@@ -937,7 +993,9 @@ export default {
 	data() {
 		const preferenceStore = usePreferenceStore();
 		const formOriginal = initForm(preferenceStore.config);
-		const form = initForm({ ...formOriginal, ...changedConfig.basic });
+		const form = isEmpty(changedConfig.basic)
+			? cloneDeep(formOriginal)
+			: initForm({ ...preferenceStore.config, ...changedConfig.basic });
 
 		return {
 			appVersion: "",
@@ -1089,6 +1147,18 @@ export default {
 			const limit = speedLimit > 0 ? `${speedLimit}${value}` : 0;
 			this.form.maxOverallUploadLimit = limit;
 		},
+		speedLimitAmount(key) {
+			return parseInt(this.form[key], 10);
+		},
+		speedLimitUnit(key) {
+			return extractSpeedUnit(this.form[key]);
+		},
+		setSpeedLimitAmount(key, amount) {
+			this.form[key] = formatSpeedLimit(amount, this.speedLimitUnit(key));
+		},
+		setSpeedLimitUnit(key, unit) {
+			this.form[key] = formatSpeedLimit(this.speedLimitAmount(key), unit);
+		},
 		onKeepSeedingToggle(enable) {
 			this.form.keepSeeding = !!enable;
 			if (!enable) {
@@ -1112,9 +1182,42 @@ export default {
 				});
 		},
 		async submitForm(_formName) {
+			const advanced: Record<string, unknown> = { ...changedConfig.advanced };
+			if (!isEmpty(advanced)) {
+				const saved = usePreferenceStore().config;
+				const pending = { ...saved, ...advanced };
+				const finalized = finalizeAdvancedChanges(
+					advanced,
+					{
+						engineOverridesText: advanced.engineOverridesText,
+						dohProvider:
+							advanced.dohProvider ??
+							resolveDohProvider(
+								saved.dohProvider,
+								saved.dohUrl,
+								DOH_PROVIDERS,
+							),
+						dohEnable: parseBooleanConfig(pending.dohEnable, false),
+						dohUrl: pending.dohUrl,
+						dohBootstrap: pending.dohBootstrap,
+					},
+					DOH_PROVIDERS,
+				);
+				if (finalized.error) {
+					this.$msg.error(this.$t(finalized.error));
+					return;
+				}
+				if (finalized.droppedOverrideKeys.length) {
+					this.$msg.warning(
+						this.$t("preferences.engine-overrides-reserved-keys", {
+							keys: finalized.droppedOverrideKeys.join(", "),
+						}),
+					);
+				}
+			}
 			const data = {
 				...normalizeBasicConfig(diffConfig(this.formOriginal, this.form)),
-				...changedConfig.advanced,
+				...advanced,
 			};
 			const proxy = data.proxy;
 			const p2pProxyChanged =
@@ -1138,6 +1241,15 @@ export default {
 				"[Risuko] preference changed data:",
 				redactProxySettings(data as Record<string, unknown>),
 			);
+
+			const script = pendingCompletionScript(
+				advanced,
+				usePreferenceStore().config,
+			);
+			if (script && !(await approveCompletionScript(script))) {
+				this.$msg.error(this.$t("preferences.completion-script-not-approved"));
+				return;
+			}
 
 			usePreferenceStore()
 				.save(data)

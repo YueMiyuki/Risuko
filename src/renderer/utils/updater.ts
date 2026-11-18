@@ -233,7 +233,19 @@ async function askToInstall(
 				: { id: feedbackToastId, duration: Number.POSITIVE_INFINITY },
 		);
 	}
+	const exitsOnInstall = is.windows();
+	let interrupted: string[] = [];
 	try {
+		if (exitsOnInstall) {
+			interrupted = await invoke<{ gid: string }[]>("tell_active", {
+				keys: ["gid"],
+			})
+				.then((tasks) =>
+					Array.isArray(tasks) ? tasks.map((task) => task.gid) : [],
+				)
+				.catch(() => []);
+			await invoke("stop_engine_for_update").catch(() => {});
+		}
 		await update.install();
 
 		if (showFeedback()) {
@@ -261,6 +273,14 @@ async function askToInstall(
 
 		await invoke("relaunch_app");
 	} catch (error) {
+		if (exitsOnInstall) {
+			await invoke("restart_engine").catch(() => {});
+			await Promise.all(
+				interrupted.map((gid) =>
+					invoke("unpause_task", { gid }).catch(() => {}),
+				),
+			);
+		}
 		updaterState.status = "error";
 		updaterState.error = errorMessage(error);
 		if (showFeedback()) {

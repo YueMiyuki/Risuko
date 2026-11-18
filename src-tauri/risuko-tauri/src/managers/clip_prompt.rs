@@ -1,68 +1,20 @@
-#[cfg(not(target_os = "android"))]
+use super::panel::Panel;
 use super::panel_gate::ShowStep;
-#[cfg(not(target_os = "android"))]
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
-#[cfg(not(target_os = "android"))]
 pub const CLIP_PROMPT_LABEL: &str = "clip-prompt";
 
-#[cfg(not(target_os = "android"))]
-const PROMPT_WIDTH: f64 = 384.0;
-#[cfg(not(target_os = "android"))]
-const PROMPT_HEIGHT: f64 = 156.0;
+static PROMPT: Panel = Panel {
+    label: CLIP_PROMPT_LABEL,
+    page: "clip-prompt.html",
+    title: "Risuko",
+    width: 384.0,
+    height: 156.0,
+    gate: |state| &state.clip_gate,
+};
 
-#[cfg(not(target_os = "android"))]
-fn build_prompt(app: &AppHandle) -> Result<(), tauri::Error> {
-    if app.get_webview_window(CLIP_PROMPT_LABEL).is_some() {
-        return Ok(());
-    }
-
-    let builder = WebviewWindowBuilder::new(
-        app,
-        CLIP_PROMPT_LABEL,
-        WebviewUrl::App("clip-prompt.html".into()),
-    )
-    .title("Risuko")
-    .inner_size(PROMPT_WIDTH, PROMPT_HEIGHT)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .visible(false)
-    .focused(false)
-    .transparent(true)
-    .shadow(false)
-    .accept_first_mouse(true);
-
-    #[cfg(target_os = "macos")]
-    let builder = builder.visible_on_all_workspaces(true);
-
-    builder.build()?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "android"))]
-fn spawn_build(app: &AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let ok = match build_prompt(&app) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("[Risuko] failed to build clip-prompt window: {}", e);
-                false
-            }
-        };
-        if let Some(state) = app.try_state::<crate::state::AppState>() {
-            if let Ok(mut gate) = state.clip_gate.lock() {
-                gate.built(ok);
-            }
-        }
-    });
-}
-
-#[cfg(not(target_os = "android"))]
 pub fn show_clip_prompt(app: &AppHandle, uri: &str) {
-    let window = app.get_webview_window(CLIP_PROMPT_LABEL);
+    let window = PROMPT.window(app);
     #[cfg(target_os = "macos")]
     {
         let already_open = window
@@ -79,55 +31,35 @@ pub fn show_clip_prompt(app: &AppHandle, uri: &str) {
     if let Ok(mut pending) = state.pending_clip_uri.lock() {
         *pending = Some(uri.to_string());
     }
-    let step = {
-        let Ok(mut gate) = state.clip_gate.lock() else {
-            return;
-        };
-        gate.request_show(window.is_some())
-    };
-    match (step, window) {
-        (ShowStep::ShowNow, Some(window)) => present(app, &window, uri),
-        (ShowStep::Build, _) => spawn_build(app),
+    match (PROMPT.request_show(app, window.is_some()), window) {
+        (Some(ShowStep::ShowNow), Some(window)) => present(app, &window, uri),
+        (Some(ShowStep::Build), _) => PROMPT.spawn_build(app),
         _ => {}
     }
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn on_ready(app: &AppHandle) {
     let Some(state) = app.try_state::<crate::state::AppState>() else {
         return;
     };
-    let want_show = state
-        .clip_gate
-        .lock()
-        .map(|mut gate| gate.page_ready())
-        .unwrap_or(false);
-    if !want_show {
+    if !PROMPT.page_ready(app) {
         return;
     }
     let uri = state.pending_clip_uri.lock().ok().and_then(|g| g.clone());
-    let (Some(uri), Some(window)) = (uri, app.get_webview_window(CLIP_PROMPT_LABEL)) else {
+    let (Some(uri), Some(window)) = (uri, PROMPT.window(app)) else {
         return;
     };
     present(app, &window, &uri);
 }
 
-#[cfg(not(target_os = "android"))]
 fn present(app: &AppHandle, window: &WebviewWindow, uri: &str) {
-    position_prompt(app, window);
-    let _ = window.show();
-    let _ = window.set_focus();
+    PROMPT.show(app, window);
     let _ = window.emit("clip-prompt:show", uri.to_string());
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn hide_clip_prompt(app: &AppHandle) {
-    if let Some(state) = app.try_state::<crate::state::AppState>() {
-        if let Ok(mut gate) = state.clip_gate.lock() {
-            gate.cancel_pending();
-        }
-    }
-    if let Some(window) = app.get_webview_window(CLIP_PROMPT_LABEL) {
+    PROMPT.with_gate(app, |gate| gate.cancel_pending());
+    if let Some(window) = PROMPT.window(app) {
         #[cfg(target_os = "macos")]
         crate::managers::flyout::demote_if_ui_hidden(app);
         let _ = window.hide();
@@ -166,9 +98,4 @@ mod prev_focus {
             app.activateWithOptions(NSApplicationActivationOptions::empty());
         }
     }
-}
-
-#[cfg(not(target_os = "android"))]
-fn position_prompt(app: &AppHandle, window: &WebviewWindow) {
-    super::position_near_tray(app, window, PROMPT_WIDTH, PROMPT_HEIGHT);
 }

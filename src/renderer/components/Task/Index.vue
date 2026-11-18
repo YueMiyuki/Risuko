@@ -118,7 +118,12 @@
 import { ArrowDownNarrowWide, ArrowUpNarrowWide, Search, X } from "@lucide/vue";
 import { ADD_TASK_TYPE } from "@shared/constants";
 import { redactProxySettings } from "@shared/types/config";
-import { bytesToSize, getTaskUri, parseHeader } from "@shared/utils";
+import {
+	bytesToSize,
+	getTaskName,
+	getTaskUri,
+	parseHeader,
+} from "@shared/utils";
 import logger from "@shared/utils/logger";
 import api from "@/api";
 import { commands } from "@/components/CommandManager/instance";
@@ -365,10 +370,12 @@ export default {
 					...options,
 				},
 			};
-			useTaskStore()
+			return useTaskStore()
 				.addUri(payload)
+				.then(() => true)
 				.catch((err) => {
-					this.$msg.error(err.message);
+					this.$msg.error(err?.message || String(err));
+					return false;
 				});
 		},
 		showAddTaskDialog(
@@ -437,8 +444,8 @@ export default {
 				const fileTarget = isRemoveWithFiles
 					? await this.resolveFullTask(task)
 					: task;
-				await this.removeTaskItem(task, taskName);
-				if (isRemoveWithFiles) {
+				const removed = await this.removeTaskItem(task, taskName);
+				if (isRemoveWithFiles && removed) {
 					try {
 						await this.deleteTaskFiles(fileTarget);
 					} catch (err) {
@@ -456,8 +463,8 @@ export default {
 				const fileTarget = isRemoveWithFiles
 					? await this.resolveFullTask(task)
 					: task;
-				await this.removeTaskRecordItem(task, taskName);
-				if (isRemoveWithFiles) {
+				const removed = await this.removeTaskRecordItem(task, taskName);
+				if (isRemoveWithFiles && removed) {
 					try {
 						await this.deleteTaskFiles(fileTarget);
 					} catch (err) {
@@ -477,14 +484,14 @@ export default {
 						taskName,
 					}),
 				);
-			} catch (err) {
-				if ((err as { code?: number })?.code === 1) {
-					this.$msg.error(
-						this.$t("task.delete-task-fail", {
-							taskName,
-						}),
-					);
-				}
+				return true;
+			} catch {
+				this.$msg.error(
+					this.$t("task.delete-task-fail", {
+						taskName,
+					}),
+				);
+				return false;
 			}
 		},
 		async removeTaskRecordItem(task, taskName) {
@@ -495,14 +502,14 @@ export default {
 						taskName,
 					}),
 				);
-			} catch (err) {
-				if ((err as { code?: number })?.code === 1) {
-					this.$msg.error(
-						this.$t("task.remove-record-fail", {
-							taskName,
-						}),
-					);
-				}
+				return true;
+			} catch {
+				this.$msg.error(
+					this.$t("task.remove-record-fail", {
+						taskName,
+					}),
+				);
+				return false;
 			}
 		},
 		async removeTasks(taskList, isRemoveWithFiles = false) {
@@ -514,8 +521,8 @@ export default {
 				const fileTargets = isRemoveWithFiles
 					? await this.resolveFullTasks([...fileEntries, ...taskEntries])
 					: [];
-				await this.removeTaskItems(gids);
-				if (isRemoveWithFiles) {
+				const removed = await this.removeTaskItems(gids);
+				if (isRemoveWithFiles && removed) {
 					try {
 						await this.batchDeleteTaskFiles(fileTargets);
 					} catch (err) {
@@ -573,10 +580,10 @@ export default {
 			try {
 				await useTaskStore().batchRemoveTask(gids);
 				this.$msg.success(this.$t("task.batch-delete-task-success"));
-			} catch (err) {
-				if ((err as { code?: number })?.code === 1) {
-					this.$msg.error(this.$t("task.batch-delete-task-fail"));
-				}
+				return true;
+			} catch {
+				this.$msg.error(this.$t("task.batch-delete-task-fail"));
+				return false;
 			}
 		},
 		handlePauseTask(payload) {
@@ -584,24 +591,20 @@ export default {
 			this.$msg.info(this.$t("task.download-pause-message", { taskName }));
 			useTaskStore()
 				.pauseTask(task)
-				.catch(({ code }) => {
-					if (code === 1) {
-						this.$msg.error(this.$t("task.pause-task-fail", { taskName }));
-					}
+				.catch(() => {
+					this.$msg.error(this.$t("task.pause-task-fail", { taskName }));
 				});
 		},
 		handleResumeTask(payload) {
 			const { task, taskName } = payload;
 			useTaskStore()
 				.resumeTask(task)
-				.catch(({ code }) => {
-					if (code === 1) {
-						this.$msg.error(
-							this.$t("task.resume-task-fail", {
-								taskName,
-							}),
-						);
-					}
+				.catch(() => {
+					this.$msg.error(
+						this.$t("task.resume-task-fail", {
+							taskName,
+						}),
+					);
 				});
 		},
 		handleStopTaskSeeding(payload) {
@@ -614,9 +617,21 @@ export default {
 		},
 		handleRestartTask(payload) {
 			const { task, taskName, showDialog } = payload;
+			if (!showDialog) {
+				useTaskStore()
+					.restartTask(task)
+					.catch(() => {
+						this.$msg.error(
+							this.$t("task.resume-task-fail", {
+								taskName,
+							}),
+						);
+					});
+				return;
+			}
+
 			const { gid } = task;
 			const uri = getTaskUri(task);
-
 			useTaskStore()
 				.getTaskOption(gid)
 				.then((data: Record<string, string>) => {
@@ -626,15 +641,9 @@ export default {
 						dir,
 						header,
 						split,
-						out: taskName,
+						out: getTaskName(task, { maxLen: -1 }),
 					};
-
-					if (showDialog) {
-						this.showAddTaskDialog(uri, options);
-					} else {
-						this.directAddTask(uri, options);
-						useTaskStore().removeTaskRecord(task);
-					}
+					this.showAddTaskDialog(uri, options);
 				});
 		},
 		handleRevealInFolder(payload) {

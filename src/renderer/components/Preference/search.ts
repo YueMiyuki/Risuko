@@ -40,84 +40,6 @@ interface PreferenceSearchEnvironment {
 type TranslationBundle = Record<string, unknown>;
 type Translate = (key: string) => unknown;
 
-const APPEARANCE_PREFIXES = [
-	"appearance",
-	"font-",
-	"theme-",
-	"task-list-style",
-	"sidebar-collapsed",
-	"hide-app-menu",
-	"auto-hide-window",
-	"tray-speedometer",
-];
-
-const ADVANCED_PREFIXES = [
-	"completion-script",
-	"proxy",
-	"enable-proxy",
-	"enable-p2p-proxy",
-	"doh",
-	"bt-tracker",
-	"sync-tracker",
-	"auto-sync-tracker",
-	"bt-max-",
-	"bt-ban-",
-	"bt-enable-",
-	"bt-upnp",
-	"bt-listen-",
-	"bt-encryption-",
-	"bt-create-subfolder",
-	"http-reliability",
-	"connect-timeout",
-	"nzb-body-timeout",
-	"lowest-speed-",
-	"uri-selector",
-	"storage",
-	"file-allocation",
-	"ed2k-server",
-	"ed2k-kad",
-	"ed2k-enable-kad",
-	"ed2k-enable-upload",
-	"gift-",
-	"ftp-",
-	"sftp-",
-	"saved-credentials",
-	"no-saved-credentials",
-	"credential-",
-	"vault-",
-	"auto-update",
-	"auto-check-update",
-	"last-check-update-time",
-	"m3u8-",
-	"media-",
-	"rpc",
-	"pbh",
-	"external-engine-",
-	"port",
-	"bt-port",
-	"dht-port",
-	"ed2k-port",
-	"download-protocol",
-	"protocols-",
-	"user-agent",
-	"mock-user-agent",
-	"cookies",
-	"load-cookies-",
-	"saved-cookies",
-	"netrc",
-	"no-netrc",
-	"developer",
-	"app-log-path",
-	"log-dir-override",
-	"engine-overrides",
-	"session-reset",
-	"factory-reset",
-	"randomize-port",
-	"generate-rpc-secret",
-	"generate-pbh-rpc-secret",
-	"copy-rpc-url",
-];
-
 const TARGETS: Record<string, string> = {
 	"preferences.run-mode-standard": "preferences.run-mode",
 	"preferences.run-mode-tray": "preferences.run-mode",
@@ -140,6 +62,7 @@ const TARGETS: Record<string, string> = {
 		"preferences.auto-retry-strategy",
 	"preferences.auto-retry-strategy-static": "preferences.auto-retry-strategy",
 	"preferences.auto-retry-interval": "preferences.auto-retry",
+	"preferences.auto-retry-max-attempts": "preferences.auto-retry",
 	"preferences.worker-max-retries": "preferences.auto-retry",
 	"preferences.low-speed-threshold": "preferences.auto-detect-low-speed-tasks",
 	"preferences.clipboard-watch-ext": "preferences.clipboard-watch",
@@ -189,9 +112,6 @@ const TARGETS: Record<string, string> = {
 	"preferences.file-allocation-falloc": "preferences.file-allocation",
 	"preferences.file-allocation-trunc": "preferences.file-allocation",
 	"preferences.file-allocation-none": "preferences.file-allocation",
-	"preferences.external-engine-ip": "preferences.external-engine-enable",
-	"preferences.external-engine-port": "preferences.external-engine-enable",
-	"preferences.external-engine-secret": "preferences.external-engine-enable",
 	"preferences.protocols-default-client": "preferences.download-protocol",
 	"preferences.protocols-magnet": "preferences.download-protocol",
 	"preferences.protocols-thunder": "preferences.download-protocol",
@@ -283,6 +203,7 @@ const BASIC_KEYS = [
 	"preferences.keep-seeding",
 	"preferences.seed-ratio",
 	"preferences.seed-time",
+	"preferences.bt-upload-rate-limit",
 	"preferences.max-concurrent-downloads",
 	"preferences.connections-per-task",
 	"preferences.auto-retry",
@@ -290,6 +211,7 @@ const BASIC_KEYS = [
 	"preferences.auto-retry-strategy-exponential",
 	"preferences.auto-retry-strategy-static",
 	"preferences.auto-retry-interval",
+	"preferences.auto-retry-max-attempts",
 	"preferences.worker-max-retries",
 	"preferences.auto-detect-low-speed-tasks",
 	"preferences.low-speed-threshold",
@@ -407,14 +329,11 @@ const ADVANCED_KEYS = [
 	"preferences.m3u8-output-format-label",
 	"preferences.media-settings",
 	"preferences.media-format",
-	"preferences.external-engine-enable",
-	"preferences.external-engine-ip",
-	"preferences.external-engine-port",
-	"preferences.external-engine-secret",
 	"preferences.rpc",
 	"preferences.rpc-host",
 	"preferences.rpc-listen-port",
 	"preferences.rpc-secret",
+	"preferences.rpc-allow-any-dir",
 	"preferences.pbh",
 	"preferences.pbh-enable",
 	"preferences.pbh-listen-port",
@@ -578,38 +497,6 @@ const SEARCH_DEFINITIONS = [
 	return definition;
 });
 
-function startsWithAny(value: string, prefixes: string[]): boolean {
-	return prefixes.some(
-		(prefix) => value === prefix || value.startsWith(prefix),
-	);
-}
-
-function getRouteForKey(key: string): PreferenceSearchRoute | null {
-	if (key.startsWith("cloudSinks.")) {
-		return "cloud-sinks";
-	}
-	if (key.startsWith("sync.")) {
-		return "sync";
-	}
-
-	if (!key.startsWith("preferences.")) {
-		return null;
-	}
-
-	const localKey = key.slice("preferences.".length);
-	if (startsWithAny(localKey, APPEARANCE_PREFIXES)) {
-		return "appearance";
-	}
-	if (localKey.startsWith("usenet-")) {
-		return "usenet";
-	}
-	if (startsWithAny(localKey, ADVANCED_PREFIXES)) {
-		return "advanced";
-	}
-
-	return "basic";
-}
-
 function getTranslationValue(
 	bundle: TranslationBundle | undefined,
 	key: string,
@@ -696,7 +583,6 @@ export function buildPreferenceSearchEntries(
 export function filterPreferenceSearchEntries(
 	entries: PreferenceSearchEntry[],
 	query: string,
-	limit = Number.POSITIVE_INFINITY,
 ): PreferenceSearchEntry[] {
 	const normalizedQuery = normalizeSearchText(query);
 	if (!normalizedQuery) {
@@ -732,7 +618,6 @@ export function filterPreferenceSearchEntries(
 			}
 			return left.entry.label.localeCompare(right.entry.label);
 		})
-		.slice(0, limit)
 		.map(({ entry }) => entry);
 }
 
@@ -775,4 +660,4 @@ export function resolvePreferenceSearchTarget<T>(
 	);
 }
 
-export { getRouteForKey, normalizeSearchText };
+export { normalizeSearchText };

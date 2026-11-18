@@ -45,15 +45,15 @@ export interface RssItem {
 	media_urls?: string[];
 }
 
-type PatternKind = "contains" | "glob" | "regex";
+export type PatternKind = "contains" | "glob" | "regex";
 
-interface Pattern {
+export interface Pattern {
 	value: string;
 	kind: PatternKind;
 	case_sensitive: boolean;
 }
 
-type EpisodeSelector =
+export type EpisodeSelector =
 	| { type: "all" }
 	| { type: "from"; start: number }
 	| { type: "range"; start: number; end: number }

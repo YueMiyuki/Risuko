@@ -1,4 +1,4 @@
-use super::types::{Ed2kFileLink, Ed2kSource};
+use super::types::{Ed2kFileLink, Ed2kSource, MAX_ED2K_FILE_SIZE};
 
 pub fn is_ed2k_uri(uri: &str) -> bool {
     uri.trim().to_lowercase().starts_with("ed2k://")
@@ -30,6 +30,9 @@ pub fn parse_ed2k_link(uri: &str) -> Result<Ed2kFileLink, String> {
 
     if file_size == 0 {
         return Err("File size cannot be zero".to_string());
+    }
+    if file_size > MAX_ED2K_FILE_SIZE {
+        return Err(format!("File size {file_size} exceeds the eD2K limit"));
     }
 
     let hash_str = parts[2].to_lowercase();
@@ -124,6 +127,13 @@ mod tests {
             parsed.aich_hash.as_deref(),
             Some("H52BRVWPBBTAED5NXQDH2RJDDAKRUWST")
         );
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_file() {
+        let hash = "0123456789abcdef0123456789abcdef";
+        assert!(parse_ed2k_link(&format!("ed2k://|file|x|{MAX_ED2K_FILE_SIZE}|{hash}|/")).is_ok());
+        assert!(parse_ed2k_link(&format!("ed2k://|file|x|{}|{hash}|/", u64::MAX)).is_err());
     }
 
     #[test]

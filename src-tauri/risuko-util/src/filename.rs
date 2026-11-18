@@ -1,8 +1,11 @@
+const MAX_SAFE_FILENAME_BYTES: usize = 230;
+
 pub fn safe_filename(name: &str, fallback: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {
             if c.is_control()
+                || is_invisible_format_char(c)
                 || matches!(
                     c,
                     '/' | '\\' | ':' | '<' | '>' | '|' | '?' | '*' | '"' | '\0'
@@ -23,7 +26,34 @@ pub fn safe_filename(name: &str, fallback: &str) -> String {
     if is_windows_device_name(trimmed) {
         return fallback.to_string();
     }
-    trimmed.to_string()
+    truncate_filename(trimmed, MAX_SAFE_FILENAME_BYTES)
+}
+
+pub fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+pub fn truncate_filename(name: &str, max_bytes: usize) -> String {
+    if name.len() <= max_bytes {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= 16 => name.split_at(dot),
+        _ => (name, ""),
+    };
+    let mut keep = max_bytes.saturating_sub(ext.len()).min(stem.len());
+    while !stem.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{ext}", &stem[..keep])
 }
 
 pub fn is_windows_device_name(name: &str) -> bool {
@@ -70,6 +100,24 @@ mod tests {
         assert_eq!(safe_filename(" CON", "fallback"), "fallback");
         assert_eq!(safe_filename(" COM1.txt", "fallback"), "fallback");
         assert_eq!(safe_filename("console.log", "fallback"), "console.log");
+    }
+
+    #[test]
+    fn safe_filename_neutralises_direction_overrides() {
+        assert_eq!(
+            safe_filename("invoice\u{202E}fdp.exe", "x"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(safe_filename("a\u{200B}b\u{FEFF}.txt", "x"), "a_b_.txt");
+    }
+
+    #[test]
+    fn safe_filename_caps_length_on_a_char_boundary() {
+        let name = safe_filename(&format!("{}.mkv", "\u{6f22}".repeat(200)), "x");
+        assert!(name.len() <= MAX_SAFE_FILENAME_BYTES);
+        assert!(name.ends_with(".mkv"));
+        assert_eq!(truncate_filename("short.txt", 230), "short.txt");
+        assert_eq!(truncate_filename(&"a".repeat(300), 10), "a".repeat(10));
     }
 
     #[test]

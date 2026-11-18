@@ -216,9 +216,12 @@ impl Contact {
 pub enum InsertResult {
     Inserted,
     Updated,
+    Known,
     Rejected,
     SelfContact,
 }
+
+const MAX_HEARSAY_CONTACTS_PER_IP: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct RoutingTable {
@@ -289,6 +292,24 @@ impl RoutingTable {
     }
 
     pub fn insert(&mut self, contact: Contact) -> InsertResult {
+        self.insert_checked(contact, false)
+    }
+
+    pub fn insert_hearsay(&mut self, contact: Contact) -> InsertResult {
+        if self.by_id.contains_key(&contact.id) {
+            return InsertResult::Known;
+        }
+        if is_public_ipv4(*contact.addr.ip()) {
+            let same_ip = self
+                .buckets
+                .iter()
+                .flatten()
+                .filter(|known| known.addr.ip() == contact.addr.ip())
+                .count();
+            if same_ip >= MAX_HEARSAY_CONTACTS_PER_IP {
+                return InsertResult::Known;
+            }
+        }
         self.insert_checked(contact, false)
     }
 
@@ -666,6 +687,42 @@ mod tests {
         table.mark_failed(id);
 
         assert!(table.remove_if_unchanged(&snapshot).is_some());
+    }
+
+    #[test]
+    fn hearsay_cannot_move_a_known_contact_or_flood_one_address() {
+        let mut table = RoutingTable::new(NodeId(id(0)));
+        assert_eq!(
+            table.insert(contact(1, [8, 8, 8, 8])),
+            InsertResult::Inserted
+        );
+
+        assert_eq!(
+            table.insert_hearsay(contact(1, [9, 9, 9, 9])),
+            InsertResult::Known
+        );
+        assert_eq!(
+            table.get(NodeId(id(1))).unwrap().addr.ip(),
+            &Ipv4Addr::new(8, 8, 8, 8)
+        );
+
+        assert_eq!(
+            table.insert_hearsay(contact(2, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            table.insert_hearsay(contact(3, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            table.insert_hearsay(contact(4, [1, 1, 1, 1])),
+            InsertResult::Known
+        );
+        assert!(table.get(NodeId(id(4))).is_none());
+        assert_eq!(
+            table.insert(contact(4, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
     }
 
     #[test]

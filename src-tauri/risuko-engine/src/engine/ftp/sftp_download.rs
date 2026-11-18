@@ -15,15 +15,14 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::ftp_download::{
-    host_port, http_proxy_from_options, option_str, output_filename, read_timeout_from_options,
+    claim_output, host_port, http_proxy_from_options, option_str, read_timeout_from_options,
     retry_transient,
 };
 use super::FtpUri;
-use crate::engine::options::json_bool;
+use crate::engine::resume_meta::{self, ResumeMeta};
 use crate::engine::speed_limiter::{SpeedEma, SpeedLimiter};
 use crate::engine::ssh_known_hosts::TofuHandler;
 
-const PART_SUFFIX: &str = ".part";
 const BUF_SIZE: usize = 64 * 1024;
 const SFTP_READ_AHEAD: usize = 64;
 
@@ -136,6 +135,7 @@ pub async fn run_sftp_download(
     cancel_token: CancellationToken,
     global_limiter: Arc<SpeedLimiter>,
     task_limiter: Arc<SpeedLimiter>,
+    adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<PathBuf, String> {
     tracing::info!(
         "Starting SFTP download: host={}, path={}",
@@ -146,15 +146,15 @@ pub async fn run_sftp_download(
     let dir_path = Path::new(dir);
     fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
-    let filename = output_filename(&parsed.path, out);
-
-    let part_name = if filename.ends_with(PART_SUFFIX) {
-        filename.clone()
-    } else {
-        format!("{filename}{PART_SUFFIX}")
-    };
-    let part_path = dir_path.join(&part_name);
-    let _part_claim = super::PartClaim::acquire(&part_path)?;
+    let output = claim_output(
+        dir_path,
+        &parsed.path,
+        out,
+        options,
+        &cancel_token,
+        &adopted_filename,
+    )
+    .await?;
 
     let user = parsed
         .user
@@ -176,7 +176,7 @@ pub async fn run_sftp_download(
     let job = SftpJob {
         parsed,
         options,
-        part_path: &part_path,
+        part_path: &output.part_path,
         user: &user,
         password: password.as_deref(),
         private_key_source: private_key_source.as_deref(),
@@ -191,12 +191,15 @@ pub async fn run_sftp_download(
     };
     retry_transient(options, &cancel_token, || sftp_attempt(&job)).await?;
 
-    let auto_rename = options
-        .get("auto-file-renaming")
-        .and_then(json_bool)
-        .unwrap_or(true);
-    let final_path =
-        super::ftp_download::finalize_download(&part_path, &filename, dir_path, auto_rename)?;
+    crate::engine::http::verify_checksum_option(&output.part_path, options).await?;
+
+    let final_path = super::ftp_download::finalize_download(
+        &output.part_path,
+        &output.filename,
+        dir_path,
+        output.auto_rename,
+    )?;
+    resume_meta::delete(&output.part_path);
     tracing::info!("SFTP download complete: {}", final_path.display());
     Ok(final_path)
 }
@@ -309,16 +312,24 @@ async fn sftp_attempt(job: &SftpJob<'_>) -> Result<(), String> {
     connections.store(1, Ordering::Relaxed);
 
     let remote_path = &parsed.path;
-    let file_size = match sftp.stat(remote_path).await {
-        Ok(attrs) => attrs.attrs.size.unwrap_or(0),
+    let (file_size, mtime) = match sftp.stat(remote_path).await {
+        Ok(attrs) => (
+            attrs.attrs.size.unwrap_or(0),
+            attrs.attrs.mtime.map(i64::from),
+        ),
         Err(e) => {
             tracing::warn!("SFTP stat failed (continuing without size): {e}");
-            0
+            (0, None)
         }
     };
     if file_size > 0 {
         total.store(file_size, Ordering::Relaxed);
     }
+    let current = ResumeMeta {
+        size: (file_size > 0).then_some(file_size),
+        mtime,
+        ..Default::default()
+    };
 
     let existing_size = if part_path.exists() {
         fs::metadata(part_path).map(|m| m.len()).unwrap_or(0)
@@ -326,11 +337,17 @@ async fn sftp_attempt(job: &SftpJob<'_>) -> Result<(), String> {
         0
     };
 
-    let resume_offset = if existing_size > 0 && file_size > 0 && existing_size <= file_size {
-        existing_size
-    } else {
-        0
-    };
+    let stale = resume_meta::should_restart(part_path, existing_size, &current);
+    if stale {
+        tracing::warn!("SFTP remote file changed since the partial was started; restarting from 0");
+    }
+
+    let resume_offset =
+        if !stale && existing_size > 0 && file_size > 0 && existing_size <= file_size {
+            existing_size
+        } else {
+            0
+        };
 
     if resume_offset > 0 {
         completed.store(resume_offset, Ordering::Relaxed);
@@ -355,6 +372,9 @@ async fn sftp_attempt(job: &SftpJob<'_>) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to create part file: {e}"))?
     };
+    if resume_offset == 0 {
+        resume_meta::save(part_path, &current);
+    }
 
     let mut bytes_downloaded = resume_offset;
     let mut last_speed_time = Instant::now();
@@ -474,21 +494,23 @@ async fn sftp_attempt(job: &SftpJob<'_>) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn is_pasted_private_key(source: &str) -> bool {
+    source.contains("----BEGIN")
+}
+
 async fn load_private_key(
     source: &str,
     passphrase: Option<&str>,
 ) -> Result<russh::keys::PrivateKey, String> {
-    let pem_content = if source.contains("----BEGIN") {
+    let pem_content = if is_pasted_private_key(source) {
         source.to_string()
     } else {
-        let path = if source.starts_with('~') {
-            if let Some(home) = dirs::home_dir() {
-                home.join(&source[2..])
-            } else {
-                PathBuf::from(source)
-            }
-        } else {
-            PathBuf::from(source)
+        let home_relative = source
+            .strip_prefix("~/")
+            .or_else(|| source.strip_prefix("~\\"));
+        let path = match (home_relative, dirs::home_dir()) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(source),
         };
 
         tokio::fs::read_to_string(&path)

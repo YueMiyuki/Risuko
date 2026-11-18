@@ -25,7 +25,7 @@ pub fn is_fd_exhaustion(err: &std::io::Error) -> bool {
     }
 }
 
-fn nofile_soft_limit() -> Option<u64> {
+pub(crate) fn nofile_soft_limit() -> Option<u64> {
     #[cfg(unix)]
     {
         let mut lim = libc::rlimit {
@@ -74,10 +74,6 @@ impl ConnBudget {
         })
     }
 
-    pub fn unlimited() -> Arc<Self> {
-        Self::new(usize::MAX)
-    }
-
     pub fn limit(&self) -> usize {
         self.limit.load(Ordering::Relaxed)
     }
@@ -90,15 +86,19 @@ impl ConnBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    pub fn metadata_reserve(&self) -> usize {
-        let limit = self.limit();
+    fn reserve_for(limit: usize) -> usize {
         METADATA_RESERVE_MIN
             .max(limit / 50)
             .min(limit / METADATA_RESERVE_MAX_FRACTION)
     }
 
+    pub fn metadata_reserve(&self) -> usize {
+        Self::reserve_for(self.limit())
+    }
+
     fn torrent_cap(&self) -> usize {
-        self.limit() - self.metadata_reserve()
+        let limit = self.limit();
+        limit.saturating_sub(Self::reserve_for(limit))
     }
 
     pub fn is_full(&self) -> bool {
@@ -276,6 +276,22 @@ mod tests {
         assert_eq!(ConnBudget::new(1000).metadata_reserve(), 20);
         assert_eq!(ConnBudget::new(16).metadata_reserve(), 4);
         assert_eq!(ConnBudget::new(3).metadata_reserve(), 0);
+    }
+
+    #[test]
+    fn torrent_cap_is_the_limit_minus_the_reserve_for_any_limit() {
+        for limit in [0, 1, 10, 100, 10_000] {
+            let budget = ConnBudget {
+                limit: AtomicUsize::new(limit),
+                used: AtomicUsize::new(0),
+            };
+            assert_eq!(budget.torrent_cap(), limit - budget.metadata_reserve());
+        }
+        let empty = ConnBudget {
+            limit: AtomicUsize::new(0),
+            used: AtomicUsize::new(0),
+        };
+        assert_eq!(empty.torrent_cap(), 0);
     }
 
     #[test]

@@ -46,10 +46,16 @@ impl EngineEvent {
         }
     }
 
-    pub fn to_notification(&self) -> Value {
+    pub fn to_notification(&self, aria2_namespace: bool) -> Value {
+        let method = self.method_name();
+        let method = if aria2_namespace {
+            method.replacen("risuko.", "aria2.", 1)
+        } else {
+            method.to_string()
+        };
         serde_json::json!({
             "jsonrpc": "2.0",
-            "method": self.method_name(),
+            "method": method,
             "params": [self.params()]
         })
     }
@@ -77,7 +83,7 @@ impl EventBroadcaster {
 
 impl Default for EventBroadcaster {
     fn default() -> Self {
-        Self::new(256)
+        Self::new(4096)
     }
 }
 
@@ -87,7 +93,7 @@ mod tests {
 
     #[test]
     fn notifications_carry_the_completion_flags() {
-        let params = |event: EngineEvent| event.to_notification()["params"][0].clone();
+        let params = |event: EngineEvent| event.to_notification(false)["params"][0].clone();
         assert_eq!(
             params(EngineEvent::DownloadComplete {
                 gid: "a".into(),
@@ -105,6 +111,19 @@ mod tests {
         assert_eq!(
             params(EngineEvent::DownloadStart { gid: "c".into() }),
             serde_json::json!({ "gid": "c" })
+        );
+    }
+
+    #[test]
+    fn notifications_follow_the_client_namespace() {
+        let event = EngineEvent::DownloadStart { gid: "c".into() };
+        assert_eq!(
+            event.to_notification(false)["method"],
+            "risuko.onDownloadStart"
+        );
+        assert_eq!(
+            event.to_notification(true)["method"],
+            "aria2.onDownloadStart"
         );
     }
 }

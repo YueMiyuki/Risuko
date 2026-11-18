@@ -28,7 +28,6 @@ tauri = { version = "2", features = [
 	"image-png",
 	"macos-private-api",
 ] }
-tauri-plugin-store = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = { version = "2", default-features = false, features = [
 	"xdg-portal",
@@ -36,7 +35,7 @@ tauri-plugin-dialog = { version = "2", default-features = false, features = [
 tauri-plugin-shell = "2"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-autostart = "2"
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-notification = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
@@ -59,7 +58,6 @@ linker_messages = "allow"
 [package.metadata.cargo-machete]
 ignored = [
 	"serde_json",
-	"tauri-plugin-store",
 	"tauri-plugin-deep-link",
 	"tauri-plugin-dialog",
 	"tauri-plugin-shell",
@@ -98,7 +96,6 @@ tauri = { version = "2", features = [
 	"image-png",
 	"macos-private-api",
 ] }
-tauri-plugin-store = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-shell = { workspace = true }

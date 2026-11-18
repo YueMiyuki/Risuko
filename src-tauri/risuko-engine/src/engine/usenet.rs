@@ -267,13 +267,20 @@ pub fn parse(bytes: &[u8]) -> Result<NzbDocument, String> {
 }
 
 fn subject_filename(subject: &str) -> Option<String> {
-    let mut value = subject.trim();
-    if let Some((_, suffix)) = value.rsplit_once(" - ") {
-        value = suffix.trim();
-    }
-    for marker in [" yEnc", " yEnc) ", " yEnc]"] {
-        if let Some((prefix, _)) = value.split_once(marker) {
-            value = prefix.trim();
+    let quoted = subject
+        .split_once('"')
+        .and_then(|(_, rest)| rest.rsplit_once('"'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| !name.is_empty());
+    let mut value = quoted.unwrap_or_else(|| subject.trim());
+    if quoted.is_none() {
+        if let Some((_, suffix)) = value.rsplit_once(" - ") {
+            value = suffix.trim();
+        }
+        for marker in [" yEnc", " yEnc) ", " yEnc]"] {
+            if let Some((prefix, _)) = value.split_once(marker) {
+                value = prefix.trim();
+            }
         }
     }
     value = value.trim_matches(['"', '\'']);
@@ -419,6 +426,14 @@ mod tests {
             )
             .as_deref(),
             Some("rar-files.part01.rar")
+        );
+        assert_eq!(
+            subject_filename(r#"[1/5] - "Artist - Track.mp3" yEnc (1/9)"#).as_deref(),
+            Some("Artist - Track.mp3")
+        );
+        assert_eq!(
+            subject_filename("some post - plain.bin yEnc (1/2)").as_deref(),
+            Some("plain.bin")
         );
     }
 

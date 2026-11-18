@@ -3,6 +3,7 @@ import logger from "@shared/utils/logger";
 import { defineStore } from "pinia";
 import api from "@/api";
 import { usePreferenceStore } from "@/store/preference";
+import { rssOutputName } from "@/utils/rssName";
 
 const DEFAULT_ITEMS_PER_PAGE = 20;
 const ITEMS_PER_PAGE_OPTIONS = [10, 20, 30, 50, 100];
@@ -253,6 +254,7 @@ export const useRssStore = defineStore("rss", {
 			try {
 				const feed = (await api.addRssFeed(url)) as RssFeed;
 				this.feeds.push(feed);
+				await this.fetchItems(feed.id);
 				return feed;
 			} finally {
 				this.loading = false;
@@ -330,13 +332,7 @@ export const useRssStore = defineStore("rss", {
 							ext = lastSegment.slice(dotIdx);
 						}
 					} catch {}
-					const baseName = feed.title
-						.replace(/\s+/g, "_")
-						.replace(/[^\w\-_.]/g, "");
-					options.out = `${baseName}_${item.title
-						.replace(/\s+/g, "_")
-						.replace(/[^\w\-_.]/g, "")
-						.slice(0, 80)}${ext}`;
+					options.out = rssOutputName(feed.title, item.title, ext);
 				}
 			}
 
@@ -358,7 +354,7 @@ export const useRssStore = defineStore("rss", {
 			this.rules = (await api.getRssRules()) as RssRule[];
 		},
 
-		async addRule(rule: Omit<RssRule, "id">) {
+		async addRule(rule: RssRule) {
 			const created = (await api.addRssRule(rule)) as RssRule;
 			this.rules.push(created);
 			return created;
@@ -561,16 +557,6 @@ export const useRssStore = defineStore("rss", {
 			if (this.currentPage > this.totalPages) {
 				this.currentPage = this.totalPages;
 			}
-		},
-
-		async deleteItem(feedId: string, itemId: string) {
-			await api.deleteRssItems([[feedId, [itemId]]]);
-			const feedItems = this.items[feedId];
-			if (feedItems) {
-				this.items[feedId] = feedItems.filter((i) => i.id !== itemId);
-			}
-			this.selectedItemIds = this.selectedItemIds.filter((id) => id !== itemId);
-			this.ensurePageInRange();
 		},
 
 		async clearItemDownload(feedId: string, itemId: string) {

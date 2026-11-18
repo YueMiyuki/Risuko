@@ -54,10 +54,10 @@ glob = "0.3"
 globset = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
 suppaftp = { version = "12", features = ["tokio-rustls-ring", "deprecated"] }
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "3"
+same-file = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", features = ["fs"] }
@@ -66,7 +66,7 @@ nix = { version = "0.31", features = ["fs"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 hyper = { version = "1", features = ["server", "http1"] }

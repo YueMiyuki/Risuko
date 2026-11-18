@@ -1,8 +1,8 @@
 export default {
 	reload: "Újratöltés",
-	close: "Bezáras",
+	close: "Bezárás",
 	minimize: "Kis méret",
 	zoom: "Zoom",
-	"toggle-fullscreen": "Belépés teljes képernyöbe",
-	front: "Minden elöre",
+	"toggle-fullscreen": "Belépés teljes képernyőbe",
+	front: "Minden előre",
 };

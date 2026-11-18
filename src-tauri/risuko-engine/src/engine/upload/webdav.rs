@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use risuko_http::{Client, ClientBuilder, StatusCode, Url};
 
 use super::sink::{
-    run_with_stall, Heartbeat, UploadControl, UploadFile, UploadSink, WebdavConfig,
+    run_with_stall, Heartbeat, UploadControl, UploadError, UploadFile, UploadSink, WebdavConfig,
     UPLOAD_STALL_TIMEOUT,
 };
 use crate::engine::util::ERROR_SNIPPET_BYTES;
@@ -87,7 +87,7 @@ impl WebdavSink {
         target: &Url,
         file: &UploadFile,
         ctl: &UploadControl,
-    ) -> Result<risuko_http::Response, String> {
+    ) -> Result<risuko_http::Response, UploadError> {
         let path: PathBuf = file.local_path.clone();
         let total = file.size;
         let progress = ctl.clone();
@@ -114,14 +114,14 @@ impl WebdavSink {
 
         let send_fut = async { req.send().await.map_err(|e| format!("PUT failed: {e}")) };
         let resp = tokio::select! {
-            _ = ctl.cancel.cancelled() => return Err("cancelled".into()),
+            _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
             r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r?,
         };
 
         Ok(resp)
     }
 
-    async fn ensure_parent_dirs(&self, target: &Url) -> Result<(), String> {
+    async fn ensure_parent_dirs(&self, target: &Url) -> Result<(), UploadError> {
         let base_path = self.base_url.path().trim_end_matches('/');
         let target_path = target.path();
         let rel = target_path.strip_prefix(base_path).unwrap_or(target_path);
@@ -155,9 +155,9 @@ impl WebdavSink {
                 StatusCode::CREATED | StatusCode::METHOD_NOT_ALLOWED | StatusCode::OK
             ) {
                 let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-                return Err(format!(
-                    "MKCOL {} failed with status {}: {}",
-                    url, status, body
+                return Err(UploadError::http(
+                    status.as_u16(),
+                    format!("MKCOL {} failed with status {}: {}", url, status, body),
                 ));
             }
         }
@@ -167,11 +167,13 @@ impl WebdavSink {
 
 #[async_trait]
 impl UploadSink for WebdavSink {
-    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, String> {
-        let target = self.resolve(&file.remote_relative)?;
+    async fn upload(&self, file: &UploadFile, ctl: &UploadControl) -> Result<String, UploadError> {
+        let target = self
+            .resolve(&file.remote_relative)
+            .map_err(UploadError::fatal)?;
 
         if ctl.cancel.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(UploadError::fatal("cancelled"));
         }
 
         let mut created_parents = false;
@@ -195,7 +197,10 @@ impl UploadSink for WebdavSink {
             }
             if !status.is_success() {
                 let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-                return Err(format!("PUT {} returned {}: {}", target, status, body));
+                return Err(UploadError::http(
+                    status.as_u16(),
+                    format!("PUT {} returned {}: {}", target, status, body),
+                ));
             }
             break;
         }

@@ -21,7 +21,7 @@ pub async fn fetch_by_urn(
     out_path: &Path,
     completed: Arc<AtomicU64>,
     cancel: CancellationToken,
-) -> Result<(), GnutellaError> {
+) -> Result<PathBuf, GnutellaError> {
     fetch_by_urn_with_proxy(
         host,
         port,
@@ -46,7 +46,7 @@ pub async fn fetch_by_urn_with_proxy(
     completed: Arc<AtomicU64>,
     cancel: CancellationToken,
     proxy: risuko_http::ProxyConnector,
-) -> Result<(), GnutellaError> {
+) -> Result<PathBuf, GnutellaError> {
     let part_path = part_path_for(out_path);
     let existing = match tokio::fs::metadata(&part_path).await {
         Ok(m) if m.is_file() && m.len() > 0 && m.len() < file_size => m.len(),
@@ -68,8 +68,14 @@ pub async fn fetch_by_urn_with_proxy(
         host.to_string()
     };
     let req = format!(
-        "GET {}?{} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: Risuko/0.1\r\nX-Gnutella-Content-URN: {}\r\n{}Accept: */*\r\nConnection: close\r\n\r\n",
-        n2r_path, urn, host_hdr, port, urn, range
+        "GET {}?{} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: {}\r\nX-Gnutella-Content-URN: {}\r\n{}Accept: */*\r\nConnection: close\r\n\r\n",
+        n2r_path,
+        urn,
+        host_hdr,
+        port,
+        crate::engine::USER_AGENT,
+        urn,
+        range
     );
     wr.write_all(req.as_bytes()).await?;
 
@@ -124,8 +130,15 @@ pub async fn fetch_by_urn_with_proxy(
             return Err(GnutellaError::Network("sha1 mismatch".into()));
         }
     }
-    tokio::fs::rename(&part_path, out_path).await?;
-    Ok(())
+    let final_path = match (out_path.parent(), out_path.file_name()) {
+        (Some(dir), Some(name)) => {
+            crate::engine::util::reserve_unique_path(dir, &name.to_string_lossy())
+                .map_err(GnutellaError::Network)?
+        }
+        _ => out_path.to_path_buf(),
+    };
+    tokio::fs::rename(&part_path, &final_path).await?;
+    Ok(final_path)
 }
 
 const MAX_HEAD: usize = 32 * 1024;
@@ -227,7 +240,11 @@ fn parse_head(head: &str) -> Result<ResponseHead, GnutellaError> {
 }
 
 fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
-    let spec = value.trim().strip_prefix("bytes")?.trim_start();
+    let (unit, spec) = value.trim().split_at_checked(5)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let spec = spec.trim_start();
     let (range, total) = spec.split_once('/')?;
     let (first, last) = range.split_once('-')?;
     Some((
@@ -362,7 +379,7 @@ mod tests {
         (port, task)
     }
 
-    async fn fetch(port: u16, urn: &str, size: u64, out: &Path) -> Result<(), GnutellaError> {
+    async fn fetch(port: u16, urn: &str, size: u64, out: &Path) -> Result<PathBuf, GnutellaError> {
         fetch_by_urn(
             "127.0.0.1",
             port,
@@ -374,6 +391,25 @@ mod tests {
             CancellationToken::new(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn an_existing_file_is_kept_and_the_download_gets_a_new_name() {
+        let data = b"fresh download".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.docx");
+        std::fs::write(&out, b"mine").unwrap();
+        let mut resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", data.len()).into_bytes();
+        resp.extend_from_slice(&data);
+        let (port, srv) = serve(resp).await;
+        let saved = fetch(port, &urn_of(&data), data.len() as u64, &out)
+            .await
+            .unwrap();
+        srv.await.unwrap();
+        assert_eq!(saved, dir.path().join("report.1.docx"));
+        assert_eq!(std::fs::read(&out).unwrap(), b"mine");
+        assert_eq!(std::fs::read(&saved).unwrap(), data);
     }
 
     #[test]
@@ -389,6 +425,8 @@ mod tests {
         assert_eq!(parse_content_range("bytes 5-9/10"), Some((5, 9, Some(10))));
         assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
         assert_eq!(parse_content_range("items 5-9/10"), None);
+        assert_eq!(parse_content_range("Bytes 5-9/10"), Some((5, 9, Some(10))));
+        assert_eq!(parse_content_range("by"), None);
     }
 
     #[tokio::test]

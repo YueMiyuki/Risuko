@@ -75,6 +75,8 @@ pub struct TorrentStats {
     pub finished: bool,
     pub file_progress: Arc<Vec<u64>>,
     pub error: Option<String>,
+    pub storage_error: bool,
+    pub flush_failed: bool,
     pub live: Option<LiveStats>,
     pub peers: Arc<[PeerSnapshot]>,
     pub peers_seq: u64,
@@ -94,12 +96,24 @@ impl TorrentStats {
             finished: false,
             file_progress,
             error: None,
+            storage_error: false,
+            flush_failed: false,
             live: Some(LiveStats::default()),
             peers: Arc::from(Vec::new()),
             peers_seq: 0,
             swarm_seeders: None,
             swarm_leechers: None,
         }
+    }
+
+    pub(crate) fn set_error(&mut self, error: String, storage: bool) {
+        self.error = Some(error);
+        self.storage_error = storage;
+    }
+
+    pub(crate) fn clear_error(&mut self) {
+        self.error = None;
+        self.storage_error = false;
     }
 
     pub(crate) fn set_peers(&mut self, peers: Vec<PeerSnapshot>) {
@@ -158,6 +172,19 @@ mod tests {
         stats.clear_peers();
         assert_ne!(stats.peers_seq, polled.peers_seq);
         assert!(stats.peers.is_empty());
+    }
+
+    #[test]
+    fn clearing_the_error_also_clears_its_kind() {
+        let mut stats = TorrentStats::initial(10, 10, vec![10]);
+        assert_eq!((stats.error.as_deref(), stats.storage_error), (None, false));
+        stats.set_error("Disk write failed: full".into(), true);
+        assert_eq!(
+            (stats.error.as_deref(), stats.storage_error),
+            (Some("Disk write failed: full"), true)
+        );
+        stats.clear_error();
+        assert_eq!((stats.error.as_deref(), stats.storage_error), (None, false));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::engine::usenet::{UsenetCredentials, UsenetProviderProfile};
 use parking_lot::Mutex;
 use risuko_bt::limiter::Throttle;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
@@ -573,11 +573,9 @@ fn tls_connector() -> TlsConnector {
             INSTALL_PROVIDER.call_once(|| {
                 let _ = rustls::crypto::ring::default_provider().install_default();
             });
-            let mut roots = RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             TlsConnector::from(Arc::new(
                 ClientConfig::builder()
-                    .with_root_certificates(roots)
+                    .with_root_certificates(risuko_http::tls_roots())
                     .with_no_client_auth(),
             ))
         })
@@ -650,7 +648,7 @@ fn response_error(response: NntpResponse, context: &str) -> NntpError {
             code: response.code,
             message: "server requires or rejected authentication".into(),
         }
-    } else if matches!(response.code, 400 | 401 | 502) {
+    } else if matches!(response.code, 400 | 401 | 403 | 502 | 503) {
         NntpError::ServiceUnavailable {
             code: response.code,
             message: context.into(),
@@ -937,6 +935,24 @@ impl ProviderPool {
         ordered
     }
 
+    pub fn cooling_down_profiles(&self) -> Vec<UsenetProviderProfile> {
+        let now = Instant::now();
+        let health = self.health.lock();
+        let mut cooling: Vec<_> = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.enabled && profile.deleted_at.is_none())
+            .filter(|profile| {
+                health
+                    .get(&profile.id)
+                    .is_some_and(|state| state.unhealthy_until.is_some_and(|until| until > now))
+            })
+            .cloned()
+            .collect();
+        cooling.sort_by_key(|profile| profile.priority);
+        cooling
+    }
+
     pub fn ordered_profiles_with_preference(
         &self,
         preferred_profile_id: Option<&str>,
@@ -1030,6 +1046,18 @@ impl ProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_server_faults_fail_over_to_another_provider() {
+        for code in [400, 401, 403, 502, 503] {
+            let error = response_error(NntpResponse { code }, "ARTICLE");
+            assert_eq!(error.failover_class(), FailoverClass::Retryable, "{code}");
+        }
+        let error = response_error(NntpResponse { code: 500 }, "ARTICLE");
+        assert_eq!(error.failover_class(), FailoverClass::Permanent);
+        let error = response_error(NntpResponse { code: 481 }, "ARTICLE");
+        assert_eq!(error.failover_class(), FailoverClass::Authentication);
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1095,6 +1123,39 @@ mod tests {
             &NntpError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, "down")),
         );
         assert_eq!(pool.ordered_profiles()[0].id, "b");
+    }
+
+    #[test]
+    fn cooling_down_profiles_lists_only_active_cooldowns() {
+        let mut disabled = profile("disabled", 2);
+        disabled.enabled = false;
+        let mut tombstone = profile("tombstone", 3);
+        tombstone.deleted_at = Some(1);
+        let pool = ProviderPool::new(vec![
+            profile("primary", 0),
+            profile("backup", 1),
+            disabled,
+            tombstone,
+        ])
+        .unwrap();
+        assert!(pool.cooling_down_profiles().is_empty());
+
+        let transient = || NntpError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        pool.mark_failure("backup", &transient());
+        pool.mark_failure("disabled", &transient());
+        pool.mark_failure("tombstone", &transient());
+
+        let ordered: Vec<_> = pool.ordered_profiles().into_iter().map(|p| p.id).collect();
+        assert_eq!(ordered, ["primary"]);
+        let cooling: Vec<_> = pool
+            .cooling_down_profiles()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(cooling, ["backup"]);
+
+        pool.mark_success("backup");
+        assert!(pool.cooling_down_profiles().is_empty());
     }
 
     #[test]

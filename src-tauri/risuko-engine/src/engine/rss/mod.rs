@@ -124,8 +124,10 @@ impl RssManager {
     pub fn load(&self) -> Result<(), String> {
         if let Some(val) = self.storage.load(RSS_STORE_KEY)? {
             if let Some(data_val) = val.get("data").cloned() {
-                let data: RssStore = serde_json::from_value(data_val)
-                    .map_err(|e| format!("Failed to parse RSS data: {e}"))?;
+                let data: RssStore = serde_json::from_value(data_val).map_err(|e| {
+                    crate::traits::keep_unreadable_copy(self.storage.as_ref(), RSS_STORE_KEY, &val);
+                    format!("Failed to parse RSS data: {e}")
+                })?;
                 // blocking_lock() would panic inside a Tokio worker
                 let mut s = self
                     .store
@@ -226,8 +228,21 @@ impl RssManager {
 
         let result = fetch_feed(&url, etag, last_modified).await;
         let outcome = self.apply_fetch(feed_id, result).await;
+        if let Ok(new_items) = &outcome {
+            self.auto_download(feed_id, new_items).await;
+        }
         self.save().await?;
         outcome
+    }
+
+    async fn auto_download(&self, feed_id: &str, new_items: &[RssItem]) -> bool {
+        let mut dirty = false;
+        for item in new_items {
+            if !item.is_downloaded {
+                dirty |= self.evaluate_and_download(feed_id, item).await;
+            }
+        }
+        dirty
     }
 
     async fn apply_fetch(
@@ -311,7 +326,21 @@ impl RssManager {
     }
 
     pub async fn update_all_feeds(&self) -> Vec<(String, Vec<RssItem>)> {
-        self.update_feeds(false).await
+        let new_items_per_feed = self.update_feeds(false).await;
+        self.auto_download_all(&new_items_per_feed).await;
+        new_items_per_feed
+    }
+
+    async fn auto_download_all(&self, new_items_per_feed: &[(String, Vec<RssItem>)]) {
+        let mut dirty = false;
+        for (feed_id, new_items) in new_items_per_feed {
+            dirty |= self.auto_download(feed_id, new_items).await;
+        }
+        if dirty {
+            if let Err(e) = self.save().await {
+                tracing::warn!("Failed to save RSS store: {}", e);
+            }
+        }
     }
 
     async fn update_feeds(&self, only_due: bool) -> Vec<(String, Vec<RssItem>)> {
@@ -344,8 +373,24 @@ impl RssManager {
             .collect()
             .await;
 
+        self.apply_fetched(fetched).await
+    }
+
+    async fn apply_fetched(
+        &self,
+        fetched: Vec<(String, Result<Fetched, FetchFailure>)>,
+    ) -> Vec<(String, Vec<RssItem>)> {
         let mut all_new = Vec::new();
+        let mut dirty = false;
         for (feed_id, result) in fetched {
+            let unchanged = matches!(result, Ok(Fetched::NotModified)) && {
+                let s = self.store.lock().await;
+                s.feeds
+                    .iter()
+                    .find(|f| f.id == feed_id)
+                    .is_some_and(|f| f.error_count == 0)
+            };
+            dirty |= !unchanged;
             match self.apply_fetch(&feed_id, result).await {
                 Ok(new_items) if !new_items.is_empty() => {
                     all_new.push((feed_id, new_items));
@@ -356,8 +401,10 @@ impl RssManager {
                 }
             }
         }
-        if let Err(e) = self.save().await {
-            tracing::warn!("Failed to save RSS store: {}", e);
+        if dirty {
+            if let Err(e) = self.save().await {
+                tracing::warn!("Failed to save RSS store: {}", e);
+            }
         }
         all_new
     }
@@ -689,15 +736,19 @@ impl RssManager {
         best
     }
 
-    pub async fn dry_run_rule(&self, rule: RssRule, sample_size: usize) -> Vec<DryRunMatch> {
+    pub async fn dry_run_rule(
+        &self,
+        rule: RssRule,
+        sample_size: usize,
+    ) -> Result<Vec<DryRunMatch>, String> {
+        validate_patterns(&rule)?;
         let items: Vec<RssItem> = {
             let s = self.store.lock().await;
-            let mut all: Vec<RssItem> = s.items.values().flat_map(|v| v.iter().cloned()).collect();
+            let mut all: Vec<&RssItem> = s.items.values().flatten().collect();
             all.sort_by_key(|i| std::cmp::Reverse(i.pub_date.unwrap_or(0)));
-            all.truncate(sample_size.max(1));
-            all
+            all.into_iter().take(sample_size.max(1)).cloned().collect()
         };
-        items
+        Ok(items
             .into_iter()
             .map(|item| {
                 let parsed = item
@@ -714,7 +765,7 @@ impl RssManager {
                     reason: eval.reason,
                 }
             })
-            .collect()
+            .collect())
     }
 
     pub fn start_polling(rss: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -723,21 +774,7 @@ impl RssManager {
 
             loop {
                 let new_items_per_feed = rss.update_feeds(true).await;
-
-                let mut dirty = false;
-                for (feed_id, new_items) in &new_items_per_feed {
-                    for item in new_items {
-                        if item.is_downloaded {
-                            continue;
-                        }
-                        dirty |= rss.evaluate_and_download(feed_id, item).await;
-                    }
-                }
-                if dirty {
-                    if let Err(e) = rss.save().await {
-                        tracing::warn!("Failed to save RSS store: {}", e);
-                    }
-                }
+                rss.auto_download_all(&new_items_per_feed).await;
 
                 let min_interval = {
                     let s = rss.store.lock().await;
@@ -1029,6 +1066,10 @@ fn validate_rule(rule: &RssRule) -> Result<(), String> {
     if rule.name.trim().is_empty() {
         return Err("Rule name cannot be empty".into());
     }
+    validate_patterns(rule)
+}
+
+fn validate_patterns(rule: &RssRule) -> Result<(), String> {
     for p in rule.title_must.iter().chain(rule.title_must_not.iter()) {
         match p.kind {
             PatternKind::Regex => {
@@ -1139,7 +1180,7 @@ fn http_client() -> Result<&'static risuko_http::Client, String> {
     }
     let client = risuko_http::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Risuko/1.0")
+        .user_agent(super::USER_AGENT)
         .gzip(true)
         .brotli(true)
         .deflate(true)
@@ -1209,7 +1250,7 @@ async fn fetch_feed(
         }
     })?;
 
-    let feed = tokio::task::spawn_blocking(move || feed_rs::parser::parse(&body[..]))
+    let feed = tokio::task::spawn_blocking(move || parse_feed(&body[..]))
         .await
         .map_err(|e| transient(format!("Feed parse task failed: {e}")))?
         .map_err(|e| FetchFailure {
@@ -1223,12 +1264,37 @@ async fn fetch_feed(
     })
 }
 
+fn parse_feed(body: &[u8]) -> feed_rs::parser::ParseFeedResult<feed_rs::model::Feed> {
+    feed_rs::parser::Builder::new()
+        .id_generator(|links, title, _| match links.first() {
+            Some(link) => feed_rs::parser::generate_id_from_link_and_title(link, title),
+            None => String::new(),
+        })
+        .build()
+        .parse(body)
+}
+
 fn entry_item_id(entry: &feed_rs::model::Entry) -> String {
-    if entry.id.is_empty() {
-        item_id(entry.links.first().map(|l| l.href.as_str()).unwrap_or(""))
-    } else {
-        item_id(&entry.id)
+    if !entry.id.is_empty() {
+        return item_id(&entry.id);
     }
+    if let Some(url) = extract_enclosure(entry).0 {
+        return item_id(&url);
+    }
+    if let Some(link) = entry.links.first() {
+        return item_id(&link.href);
+    }
+    let title = entry
+        .title
+        .as_ref()
+        .map(|t| t.content.as_str())
+        .unwrap_or_default();
+    let date = entry
+        .published
+        .or(entry.updated)
+        .map(|dt| dt.timestamp())
+        .unwrap_or_default();
+    item_id(&format!("{title}\n{date}"))
 }
 
 fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssItem> {
@@ -1241,15 +1307,13 @@ fn extract_items(feed_id: &str, entries: &[feed_rs::model::Entry]) -> Vec<RssIte
 fn extract_item(feed_id: &str, entry: &feed_rs::model::Entry) -> RssItem {
     {
         {
-            let guid = entry.id.clone();
             let link = entry
                 .links
                 .first()
                 .map(|l| l.href.clone())
                 .unwrap_or_default();
 
-            let id_source = if guid.is_empty() { &link } else { &guid };
-            let id = item_id(id_source);
+            let id = entry_item_id(entry);
 
             let title = entry
                 .title
@@ -1494,48 +1558,44 @@ fn scrape_media_from_html(html: &str) -> Vec<String> {
 }
 
 fn decode_html_entities(s: &str) -> String {
-    let s = s
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">");
+    const NAMED: [(&str, char); 6] = [
+        ("amp;", '&'),
+        ("quot;", '"'),
+        ("#39;", '\''),
+        ("apos;", '\''),
+        ("lt;", '<'),
+        ("gt;", '>'),
+    ];
 
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'&' && i + 2 < bytes.len() && bytes[i + 1] == b'#' {
-            let rest = &s[i + 2..];
-            let (is_hex, digits_start) = if rest.starts_with('x') || rest.starts_with('X') {
-                (true, 1)
-            } else {
-                (false, 0)
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 1..];
+        if let Some((name, ch)) = NAMED.iter().find(|(name, _)| tail.starts_with(name)) {
+            out.push(*ch);
+            rest = &tail[name.len()..];
+            continue;
+        }
+        if let Some(numeric) = tail.strip_prefix('#') {
+            let (radix, digits) = match numeric.strip_prefix(['x', 'X']) {
+                Some(hex) => (16, hex),
+                None => (10, numeric),
             };
-            let digits: &str = {
-                let src = &rest[digits_start..];
-                match src.find(';') {
-                    Some(end) => &src[..end],
-                    None => "",
-                }
-            };
-            if !digits.is_empty() {
-                let parsed = if is_hex {
-                    u32::from_str_radix(digits, 16).ok()
-                } else {
-                    digits.parse::<u32>().ok()
-                };
-                if let Some(ch) = parsed.and_then(char::from_u32) {
-                    out.push(ch);
-                    i += 2 + digits_start + digits.len() + 1;
-                    continue;
-                }
+            let decoded = digits.find(';').and_then(|end| {
+                let ch = u32::from_str_radix(&digits[..end], radix).ok()?;
+                Some((char::from_u32(ch)?, end))
+            });
+            if let Some((ch, end)) = decoded {
+                out.push(ch);
+                rest = &digits[end + 1..];
+                continue;
             }
         }
-        out.push(s[i..].chars().next().unwrap());
-        i += s[i..].chars().next().unwrap().len_utf8();
+        out.push('&');
+        rest = tail;
     }
+    out.push_str(rest);
     out
 }
 
@@ -1706,6 +1766,17 @@ fn sanitize_article_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_entities_decode_once() {
+        assert_eq!(decode_html_entities("a&amp;b=1&amp;c=2"), "a&b=1&c=2");
+        assert_eq!(decode_html_entities("&amp;lt;x&amp;#39;"), "&lt;x&#39;");
+        assert_eq!(
+            decode_html_entities("&#65;&#x42;&quot;&apos;&lt;&gt;"),
+            "AB\"'<>"
+        );
+        assert_eq!(decode_html_entities("x&y&#;&#zz;&"), "x&y&#;&#zz;&");
+    }
     use crate::traits::FileStorage;
     use tempfile::TempDir;
 
@@ -2220,6 +2291,77 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_rule_samples_newest_items_across_feeds() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dated = |feed: &str, id: &str, title: &str, date: u64| {
+            let mut item = sample_item(feed, id, title);
+            item.pub_date = Some(date);
+            item
+        };
+        {
+            let mut s = mgr.store.blocking_lock();
+            s.items.insert(
+                "f1".into(),
+                vec![
+                    dated("f1", "a1", "Old keep", 100),
+                    dated("f1", "a2", "New keep", 500),
+                ],
+            );
+            s.items.insert(
+                "f2".into(),
+                vec![
+                    dated("f2", "b1", "Mid skip", 300),
+                    dated("f2", "b2", "Oldest keep", 50),
+                ],
+            );
+        }
+        let mut rule = empty_v2_rule("Keep");
+        rule.title_must = vec![Pattern {
+            value: "keep".into(),
+            kind: PatternKind::Contains,
+            case_sensitive: false,
+        }];
+        let results = rt.block_on(mgr.dry_run_rule(rule.clone(), 3)).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.item_id.as_str()).collect();
+        assert_eq!(ids, ["a2", "b1", "a1"]);
+        let matched: Vec<bool> = results.iter().map(|r| r.matched).collect();
+        assert_eq!(matched, [true, false, true]);
+        assert_eq!(rt.block_on(mgr.dry_run_rule(rule, 0)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dry_run_rule_rejects_invalid_patterns_but_not_unnamed_rules() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        {
+            let mut s = mgr.store.blocking_lock();
+            s.items
+                .insert("f1".into(), vec![sample_item("f1", "a1", "Some title")]);
+        }
+        let mut rule = empty_v2_rule("");
+        rule.title_must = vec![Pattern {
+            value: "[bad".into(),
+            kind: PatternKind::Regex,
+            case_sensitive: false,
+        }];
+        let err = rt.block_on(mgr.dry_run_rule(rule.clone(), 10)).unwrap_err();
+        assert!(err.contains("Invalid regex"));
+        rule.title_must.clear();
+        rule.title_must_not = vec![Pattern {
+            value: "[".into(),
+            kind: PatternKind::Glob,
+            case_sensitive: false,
+        }];
+        let err = rt.block_on(mgr.dry_run_rule(rule.clone(), 10)).unwrap_err();
+        assert!(err.contains("Invalid glob"));
+        rule.title_must_not.clear();
+        assert_eq!(rt.block_on(mgr.dry_run_rule(rule, 10)).unwrap().len(), 1);
+    }
+
+    #[test]
     fn extract_items_keeps_full_content_alongside_summary() {
         let xml = br#"<?xml version="1.0"?>
 <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
@@ -2237,6 +2379,54 @@ mod tests {
         assert!(items[0].content.contains("Full body here"));
         let html = build_article_html(&items[0]);
         assert!(html.contains("Full body here"));
+    }
+
+    #[test]
+    fn guidless_linkless_items_keep_one_id_across_parses() {
+        let xml = br#"<?xml version="1.0"?>
+<rss version="2.0">
+<channel><title>t</title>
+<item>
+  <title>Same Title</title>
+  <enclosure url="https://e.com/a.torrent" type="application/x-bittorrent" length="1"/>
+</item>
+<item>
+  <title>Same Title</title>
+  <enclosure url="https://e.com/b.torrent" type="application/x-bittorrent" length="1"/>
+</item>
+</channel></rss>"#;
+        let first = extract_items("f1", &parse_feed(&xml[..]).unwrap().entries);
+        let second = extract_items("f1", &parse_feed(&xml[..]).unwrap().entries);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].id, second[0].id);
+        assert_eq!(first[1].id, second[1].id);
+        assert_ne!(first[0].id, first[1].id);
+    }
+
+    #[test]
+    fn items_with_a_guid_or_link_keep_their_previous_ids() {
+        let xml = br#"<?xml version="1.0"?>
+<rss version="2.0">
+<channel><title>t</title>
+<item>
+  <title>With Guid</title>
+  <guid>g-1</guid>
+  <enclosure url="https://e.com/a.torrent" type="application/x-bittorrent" length="1"/>
+</item>
+<item>
+  <title>With Link</title>
+  <link>https://e.com/post</link>
+  <enclosure url="https://e.com/b.torrent" type="application/x-bittorrent" length="1"/>
+</item>
+</channel></rss>"#;
+        let old = feed_rs::parser::parse(&xml[..]).unwrap();
+        let new = extract_items("f1", &parse_feed(&xml[..]).unwrap().entries);
+        assert_eq!(new.len(), 2);
+        for (entry, item) in old.entries.iter().zip(&new) {
+            assert!(!entry.id.is_empty());
+            assert_eq!(item.id, item_id(&entry.id));
+        }
+        assert_eq!(new[0].id, item_id("g-1"));
     }
 
     #[test]
@@ -2282,6 +2472,30 @@ mod tests {
         assert_eq!(feeds.len(), 1);
         let items = rt.block_on(mgr2.get_items("f1"));
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_data_is_kept_when_load_fails() {
+        let dir = TempDir::new().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(FileStorage::new(dir.path().to_path_buf()));
+        let stored = serde_json::json!({"data": {"feeds": 5}});
+        storage.save(RSS_STORE_KEY, &stored).unwrap();
+
+        assert!(RssManager::new(storage).load().is_err());
+
+        let prefix = format!("{RSS_STORE_KEY}.unreadable-");
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+        assert_eq!(kept, stored);
     }
 
     fn rss_xml(count: usize) -> Vec<u8> {
@@ -2347,6 +2561,52 @@ mod tests {
         let s = mgr.store.lock().await;
         assert_eq!(s.feeds[0].error_count, 0);
         assert!(s.feeds[0].last_attempt_at.is_some());
+    }
+
+    struct CountingStorage {
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StorageBackend for CountingStorage {
+        fn load(&self, _key: &str) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &str, _value: &Value) -> Result<(), String> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_poll_with_nothing_new_does_not_save() {
+        let storage = Arc::new(CountingStorage {
+            saves: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mgr = RssManager::new(storage.clone());
+        mgr.store
+            .lock()
+            .await
+            .feeds
+            .push(sample_feed("f1", "https://a.com"));
+        let saves = || storage.saves.load(Ordering::SeqCst);
+
+        let fresh = mgr
+            .apply_fetched(vec![("f1".to_string(), Ok(Fetched::NotModified))])
+            .await;
+        assert!(fresh.is_empty());
+        assert_eq!(saves(), 0);
+
+        mgr.store.lock().await.feeds[0].error_count = 3;
+        mgr.apply_fetched(vec![("f1".to_string(), Ok(Fetched::NotModified))])
+            .await;
+        assert_eq!(saves(), 1);
+        assert_eq!(mgr.store.lock().await.feeds[0].error_count, 0);
+
+        let fresh = mgr.apply_fetched(vec![("f1".to_string(), parsed(1))]).await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.len(), 1);
+        assert_eq!(saves(), 2);
     }
 
     #[tokio::test]

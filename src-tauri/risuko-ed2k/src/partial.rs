@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -8,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use super::types::Ed2kFileLink;
 
 const MET_VERSION: u32 = 1;
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Met {
@@ -137,15 +141,22 @@ pub fn reserve(
 ) -> Result<PathClaim, String> {
     let first = final_path(dir, file_name);
     if !auto_rename {
-        return PathClaim::acquire(&first);
+        let claim = PathClaim::acquire(&first)?;
+        let taken = part_path(&first).exists() || met_path(&first).exists();
+        if taken && load_met(&met_path(&first), link).is_none() {
+            return Err(format!(
+                "{} already exists and belongs to another download",
+                part_path(&first).display()
+            ));
+        }
+        return Ok(claim);
     }
-    for (n, path) in candidates(first).enumerate() {
+    for path in candidates(first) {
         let Ok(claim) = PathClaim::acquire(&path) else {
             continue;
         };
         let owned = load_met(&met_path(&path), link).is_some();
-        let free =
-            !path.exists() && !met_path(&path).exists() && (n == 0 || !part_path(&path).exists());
+        let free = !path.exists() && !met_path(&path).exists() && !part_path(&path).exists();
         if owned || free {
             return Ok(claim);
         }
@@ -188,11 +199,30 @@ pub fn save_met(path: &Path, met: &Met) -> std::io::Result<()> {
 }
 
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = with_suffix(path, ".tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = with_suffix(path, &format!(".{}.{sequence}.tmp", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+        return written;
+    }
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn remove_quiet(path: &Path) {
@@ -302,6 +332,29 @@ mod tests {
         assert!(load_met(&dir.path().join("missing"), &link(10, [1; 16])).is_none());
     }
 
+    fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_target_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin.part.met");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(names_in(dir.path()), vec!["f.bin.part.met"]);
+
+        write_atomic(&path, b"second, longer").unwrap();
+        write_atomic(&path, b"third").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        assert_eq!(names_in(dir.path()), vec!["f.bin.part.met"]);
+    }
+
     #[test]
     fn a_claimed_path_cannot_be_claimed_again_until_released() {
         let dir = tempfile::tempdir().unwrap();
@@ -386,26 +439,34 @@ mod tests {
     }
 
     #[test]
-    fn reserve_accepts_a_stray_part_only_under_the_first_name() {
+    fn reserve_never_takes_a_stray_part() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().to_str().unwrap();
         let fin = dir.path().join("f.bin");
         std::fs::write(part_path(&fin), b"legacy").unwrap();
-        assert_eq!(
-            reserve(d, "f.bin", &link(500, [1; 16]), true)
-                .unwrap()
-                .path(),
-            fin
-        );
+        let claim = reserve(d, "f.bin", &link(500, [1; 16]), true).unwrap();
+        assert_eq!(claim.path(), dir.path().join("f.1.bin"));
+        drop(claim);
+        assert_eq!(std::fs::read(part_path(&fin)).unwrap(), b"legacy");
 
-        std::fs::write(&fin, b"done").unwrap();
-        std::fs::write(part_path(&dir.path().join("f.1.bin")), b"stray").unwrap();
-        assert_eq!(
-            reserve(d, "f.bin", &link(500, [1; 16]), true)
-                .unwrap()
-                .path(),
-            dir.path().join("f.2.bin")
-        );
+        let error = reserve(d, "f.bin", &link(500, [1; 16]), false).unwrap_err();
+        assert!(error.contains("f.bin.part"));
+        assert_eq!(std::fs::read(part_path(&fin)).unwrap(), b"legacy");
+    }
+
+    #[test]
+    fn reserve_without_renaming_refuses_another_files_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let ours = link(500, [1; 16]);
+        let fin = dir.path().join("f.bin");
+        save_met(&met_path(&fin), &Met::new([2; 16], 500, None, vec![])).unwrap();
+        std::fs::write(part_path(&fin), b"theirs").unwrap();
+        assert!(reserve(d, "f.bin", &ours, false).is_err());
+        assert!(part_path(&fin).exists() && met_path(&fin).exists());
+
+        save_met(&met_path(&fin), &Met::new([1; 16], 500, None, vec![])).unwrap();
+        assert_eq!(reserve(d, "f.bin", &ours, false).unwrap().path(), fin);
     }
 
     #[test]

@@ -44,6 +44,15 @@
           <button
             type="button"
             class="task-action"
+            :title="$t('rss.auto-download-rules')"
+            :aria-label="$t('rss.auto-download-rules')"
+            @click="showRulesDialog = true"
+          >
+            <SlidersHorizontal :size="14" />
+          </button>
+          <button
+            type="button"
+            class="task-action"
             :title="$t('rss.add-feed')"
             :aria-label="$t('rss.add-feed')"
             @click="showAddFeedDialog = true"
@@ -176,6 +185,10 @@
       :feed-id="editingFeedId"
       @close="showFeedSettingsDialog = false"
     />
+    <rss-rules-dialog
+      :visible="showRulesDialog"
+      @close="showRulesDialog = false"
+    />
   </div>
 </template>
 
@@ -188,6 +201,7 @@ import {
 	Rows3,
 	Rss,
 	Search,
+	SlidersHorizontal,
 	Trash2,
 	X,
 } from "@lucide/vue";
@@ -205,6 +219,7 @@ import RssAddFeedDialog from "./AddFeedDialog.vue";
 import RssFeedList from "./FeedList.vue";
 import RssFeedSettingsDialog from "./FeedSettingsDialog.vue";
 import RssItemList from "./ItemList.vue";
+import RssRulesDialog from "./RulesDialog.vue";
 
 export default {
 	name: "rss-page",
@@ -223,17 +238,20 @@ export default {
 		SelectItem,
 		SelectTrigger,
 		SelectValue,
+		SlidersHorizontal,
 		Trash2,
 		X,
 		"rss-feed-list": RssFeedList,
 		"rss-item-list": RssItemList,
 		"rss-add-feed-dialog": RssAddFeedDialog,
 		"rss-feed-settings-dialog": RssFeedSettingsDialog,
+		"rss-rules-dialog": RssRulesDialog,
 	},
 	data() {
 		return {
 			showAddFeedDialog: false,
 			showFeedSettingsDialog: false,
+			showRulesDialog: false,
 			editingFeedId: "",
 		};
 	},

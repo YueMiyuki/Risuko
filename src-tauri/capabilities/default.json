@@ -21,22 +21,11 @@
 		"core:tray:allow-set-icon",
 		"core:tray:allow-set-tooltip",
 		"core:menu:default",
-		"dialog:default",
 		"dialog:allow-open",
-		"dialog:allow-save",
-		"dialog:allow-message",
-		"shell:default",
 		{
 			"identifier": "shell:allow-open",
-			"allow": [
-				{ "url": "file://**" },
-				{ "url": "https://**" },
-				{ "url": "http://**" },
-				{ "url": "mailto:**" },
-				{ "url": "tel:**" }
-			]
+			"allow": [{ "url": "https://**" }, { "url": "http://**" }]
 		},
-		"store:default",
 		"deep-link:default",
 		"clipboard-manager:default",
 		"clipboard-manager:allow-read-text",

@@ -1,0 +1,35 @@
+name: Setup Rust for a release target
+description: Install the Rust target, the MSVC environment on Windows, the cargo cache and Linux build deps
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  cache-key:
+    description: Key for the cargo cache
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - name: MSVC environment
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+      with:
+        arch: ${{ inputs.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
+
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      with:
+        workspaces: src-tauri -> target
+        key: ${{ inputs.cache-key }}
+
+    - name: Install Linux build deps
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev pkg-config

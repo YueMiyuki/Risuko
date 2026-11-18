@@ -294,6 +294,7 @@ fn read_cookies_from_db(
     let mut skipped_domain = 0usize;
     let mut decrypted_ok = 0usize;
     let mut decrypted_fail = 0usize;
+    let mut app_bound = 0usize;
     let mut no_key = 0usize;
 
     for raw in cookie_iter.flatten() {
@@ -331,6 +332,9 @@ fn read_cookies_from_db(
                     Err(e) => {
                         tracing::trace!(target: "risuko_cookies", "chromium: decrypt failed for '{}' host_key={}: {}", raw.name, raw.domain, e);
                         decrypted_fail += 1;
+                        if e.to_string().contains(crate::APP_BOUND_UNSUPPORTED) {
+                            app_bound += 1;
+                        }
                         continue;
                     }
                 }
@@ -367,7 +371,18 @@ fn read_cookies_from_db(
         tracing::trace!(target: "risuko_cookies", "chromium: kept cookie name={} domain={} value_len={}", c.name, c.domain, c.value.len());
     }
 
+    app_bound_outcome(cookies.len(), app_bound)?;
     Ok(cookies)
+}
+
+fn app_bound_outcome(kept: usize, app_bound: usize) -> Result<()> {
+    if kept == 0 && app_bound > 0 {
+        eyre::bail!("{}", crate::APP_BOUND_UNSUPPORTED);
+    }
+    if app_bound > 0 {
+        tracing::warn!(target: "risuko_cookies", "chromium: {app_bound} app-bound cookie(s) could not be read");
+    }
+    Ok(())
 }
 
 struct RawCookie {
@@ -426,7 +441,15 @@ fn decrypt_cookie_value(encrypted: &[u8], master_key: &[u8]) -> Result<Vec<u8>> 
 
 #[cfg(test)]
 mod tests {
-    use super::strip_host_hash;
+    use super::{app_bound_outcome, strip_host_hash};
+
+    #[test]
+    fn a_host_with_only_app_bound_cookies_reports_them_as_unsupported() {
+        let refused = app_bound_outcome(0, 3).unwrap_err().to_string();
+        assert!(refused.contains(crate::APP_BOUND_UNSUPPORTED));
+        assert!(app_bound_outcome(2, 3).is_ok());
+        assert!(app_bound_outcome(0, 0).is_ok());
+    }
 
     #[test]
     fn host_hash_stripped_for_v24_encrypted() {

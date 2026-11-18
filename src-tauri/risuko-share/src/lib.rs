@@ -258,6 +258,7 @@ impl ShareManager {
     }
 
     pub async fn start_send(&self, id: String, paths: Vec<PathBuf>) -> Result<SendInfo> {
+        anyhow::ensure!(is_valid_transfer_id(&id), "invalid transfer id");
         anyhow::ensure!(!paths.is_empty(), "no files selected");
         let blobs_dir = self.data_dir.join(format!("send-{id}"));
         let result = self.start_send_inner(id, paths, blobs_dir.clone()).await;
@@ -507,6 +508,7 @@ impl ShareManager {
         dest_dir: PathBuf,
         files: Vec<FileMeta>,
     ) -> Result<()> {
+        anyhow::ensure!(is_valid_transfer_id(&id), "invalid transfer id");
         let blobs_dir = self.data_dir.join(format!("recv-{id}"));
         let stop = Arc::new(AtomicBool::new(false));
         let events = self.events.clone();
@@ -639,6 +641,10 @@ async fn run_receive(
         }
         match item {
             DownloadProgressItem::Progress(offset) => {
+                if exceeds_announced(offset, total) {
+                    path_handle.abort();
+                    anyhow::bail!("sender sent more data than it announced");
+                }
                 emit_receive_progress(events, id, &mut last_emit, offset, total, false);
             }
             DownloadProgressItem::Error(err) => {
@@ -817,12 +823,24 @@ fn file_name(path: &Path) -> String {
 fn sanitize_rel_path(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for component in name.split(['/', '\\']) {
-        let component = component.trim();
-        if component.is_empty() || component == "." || component == ".." || component.contains(':')
-        {
+        let component: String = component
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_control()
+                    || risuko_util::is_invisible_format_char(c)
+                    || matches!(c, ':' | '<' | '>' | '|' | '?' | '*' | '"')
+                {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if component.is_empty() || component == "." || component == ".." {
             continue;
         }
-        if risuko_engine::engine::is_windows_device_name(component) {
+        if risuko_util::is_windows_device_name(&component) {
             out.push(format!("_{component}"));
             continue;
         }
@@ -834,6 +852,22 @@ fn sanitize_rel_path(name: &str) -> PathBuf {
     out
 }
 
+fn is_valid_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn exceeds_announced(received: u64, total: u64) -> bool {
+    total != 0
+        && received
+            > total
+                .saturating_add(total / 8)
+                .saturating_add(4 * 1024 * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +876,57 @@ mod tests {
     fn rel_path_neutralises_device_names() {
         assert_eq!(sanitize_rel_path("a/CON.txt"), PathBuf::from("a/_CON.txt"));
         assert_eq!(sanitize_rel_path("../x/y"), PathBuf::from("x/y"));
+    }
+
+    #[test]
+    fn rel_path_keeps_components_with_reserved_characters() {
+        assert_eq!(
+            sanitize_rel_path("logs/run-12:30:01.txt"),
+            PathBuf::from("logs/run-12_30_01.txt")
+        );
+        assert_eq!(sanitize_rel_path("a:b.txt"), PathBuf::from("a_b.txt"));
+        assert_eq!(
+            sanitize_rel_path("C:\\x\\y?.txt"),
+            PathBuf::from("C_/x/y_.txt")
+        );
+    }
+
+    #[test]
+    fn rel_path_replaces_invisible_format_chars() {
+        let spoofed = sanitize_rel_path("invoice\u{202E}fdp.exe");
+        let spoofed = spoofed.to_string_lossy();
+        assert!(!spoofed.chars().any(risuko_util::is_invisible_format_char));
+        assert!(spoofed.ends_with(".exe"));
+
+        let hidden = sanitize_rel_path("a\u{200B}b\u{2066}c.txt");
+        assert!(!hidden
+            .to_string_lossy()
+            .chars()
+            .any(risuko_util::is_invisible_format_char));
+
+        assert_eq!(
+            sanitize_rel_path("レポート.pdf"),
+            PathBuf::from("レポート.pdf")
+        );
+    }
+
+    #[test]
+    fn transfer_id_validation() {
+        assert!(is_valid_transfer_id("3f2b6c1e-8d4a-4c1b-9e0f-1a2b3c4d5e6f"));
+        assert!(is_valid_transfer_id("abc_123"));
+        for bad in ["", "../x", "a/b", "a\\b", "..", &"a".repeat(65), "a b"] {
+            assert!(!is_valid_transfer_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn announced_size_allowance() {
+        let allowance = 1000 / 8 + 4 * 1024 * 1024;
+        assert!(!exceeds_announced(u64::MAX, 0));
+        assert!(!exceeds_announced(1000, 1000));
+        assert!(!exceeds_announced(1000 + allowance, 1000));
+        assert!(exceeds_announced(1000 + allowance + 1, 1000));
+        assert!(!exceeds_announced(u64::MAX, u64::MAX));
     }
 
     #[test]

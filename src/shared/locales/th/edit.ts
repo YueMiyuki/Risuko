@@ -1,5 +1,5 @@
 export default {
-	undo: "ไม่ทำ",
+	undo: "เลิกทำ",
 	redo: "ทำซ้ำ",
 	cut: "ตัด",
 	copy: "คัดลอก",

@@ -50,25 +50,9 @@ impl ArchiveLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ArchiveUsage {
-    pub entries: u64,
-    pub expanded_bytes: u64,
-    pub max_entry_bytes: u64,
-    pub nesting_depth: u32,
-    pub active_seconds: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveSafetyError {
     UnsafePath,
-    EntryCount,
-    ExpandedBytes,
-    EntryBytes,
-    NestingDepth,
-    CompressionRatio,
-    FreeSpaceReserve,
-    ActiveTime,
     OverrideConfirmation,
     HardCeiling,
 }
@@ -171,42 +155,6 @@ pub fn validate_member_path(path: &str) -> Result<(), ArchiveSafetyError> {
     Ok(())
 }
 
-pub fn check_limits(
-    limits: ArchiveLimits,
-    usage: ArchiveUsage,
-    compressed_bytes: u64,
-    free_space_bytes: Option<u64>,
-) -> Result<(), ArchiveSafetyError> {
-    if usage.entries > limits.max_entries {
-        return Err(ArchiveSafetyError::EntryCount);
-    }
-    if usage.expanded_bytes > limits.max_expanded_bytes {
-        return Err(ArchiveSafetyError::ExpandedBytes);
-    }
-    if usage.max_entry_bytes > limits.max_entry_bytes {
-        return Err(ArchiveSafetyError::EntryBytes);
-    }
-    if usage.nesting_depth > limits.max_nesting_depth {
-        return Err(ArchiveSafetyError::NestingDepth);
-    }
-    if usage.expanded_bytes > 0 && compressed_bytes == 0 {
-        return Err(ArchiveSafetyError::CompressionRatio);
-    }
-    if compressed_bytes > 0 {
-        let max_expanded = compressed_bytes.saturating_mul(limits.max_compression_ratio);
-        if usage.expanded_bytes > max_expanded {
-            return Err(ArchiveSafetyError::CompressionRatio);
-        }
-    }
-    if free_space_bytes.is_some_and(|free| free < limits.free_space_reserve_bytes) {
-        return Err(ArchiveSafetyError::FreeSpaceReserve);
-    }
-    if usage.active_seconds > limits.max_active_seconds {
-        return Err(ArchiveSafetyError::ActiveTime);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,24 +189,6 @@ mod tests {
             );
         }
         assert!(validate_member_path("folder/file.txt").is_ok());
-    }
-
-    #[test]
-    fn enforces_task_wide_limits() {
-        let mut usage = ArchiveUsage {
-            entries: 3,
-            ..Default::default()
-        };
-        assert_eq!(
-            check_limits(limits(), usage, 1, Some(100)),
-            Err(ArchiveSafetyError::EntryCount)
-        );
-        usage.entries = 1;
-        usage.expanded_bytes = 101;
-        assert_eq!(
-            check_limits(limits(), usage, 1, Some(100)),
-            Err(ArchiveSafetyError::ExpandedBytes)
-        );
     }
 
     #[test]
@@ -305,26 +235,5 @@ mod tests {
             validate_limits_override_value(defaults, &value, true),
             Err(ArchiveSafetyError::HardCeiling)
         );
-    }
-
-    #[test]
-    fn compression_ratio_uses_exact_overflow_safe_comparison() {
-        let mut configured = limits();
-        configured.max_expanded_bytes = u64::MAX;
-        let mut usage = ArchiveUsage {
-            expanded_bytes: 101,
-            ..Default::default()
-        };
-        assert_eq!(
-            check_limits(configured, usage, 10, Some(100)),
-            Err(ArchiveSafetyError::CompressionRatio)
-        );
-        usage.expanded_bytes = 1;
-        assert_eq!(
-            check_limits(configured, usage, 0, Some(100)),
-            Err(ArchiveSafetyError::CompressionRatio)
-        );
-        usage.expanded_bytes = 0;
-        assert!(check_limits(configured, usage, 0, Some(100)).is_ok());
     }
 }

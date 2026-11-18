@@ -1,5 +1,5 @@
 export default {
-	app: "موتركس",
+	app: "Risuko",
 	file: "الملف",
 	task: "التحميل",
 	edit: "تعديل",

@@ -83,4 +83,10 @@ export default {
 	"login-required": "Please log in to enable cloud sync",
 	"login-or": "or",
 	"login-github-fail": "GitHub login failed",
+	"login-link-only":
+		"Too many sign-in emails were requested for this address, so codes are paused for now. Open the link in the email to sign in.",
+	"login-link-fail":
+		"Sign-in could not be completed. Start again from the login dialog.",
+	"login-server-outdated":
+		"This sync server is too old for sign-in links from this version of Risuko. Request a new email and type its code without opening the link, or update the server.",
 };

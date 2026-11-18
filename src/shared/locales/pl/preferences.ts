@@ -1,45 +1,256 @@
 export default {
 	basic: "Podstawowe",
 	advanced: "Zaawansowane",
+	cloudSinks: "Cele w chmurze",
+	usenet: "Usenet",
+	search: "Szukaj",
+	"search-placeholder": "Szukaj we wszystkich ustawieniach",
+	"search-all-tabs": "Wszystkie ustawienia",
+	"search-results": "Pasujące ustawienia: {{count}}",
+	"search-no-results": "Nie znaleziono pasujących ustawień",
+	"search-clear": "Wyczyść wyszukiwanie",
+	"search-go-to-tab": "Otwórz ustawienie",
+	"search-more-results": "Zawęź wyszukiwanie, aby zobaczyć więcej wyników",
+	"usenet-tips":
+		"Zarządzaj dostawcami NNTP i bezpiecznymi domyślnymi ustawieniami czyszczenia archiwów.",
+	"usenet-profiles": "Profile dostawców",
+	"usenet-profiles-tips":
+		"Skonfiguruj priorytet dostawcy, zabezpieczenia, uwierzytelnianie i limity połączeń.",
+	"usenet-add-profile": "Dodaj profil",
+	"usenet-no-profiles": "Nie skonfigurowano profili dostawców.",
+	"usenet-no-profiles-tips":
+		"Dodaj co najmniej jednego dostawcę przed zaimportowaniem pobrania NZB.",
+	"usenet-edit-profile": "Edytuj profil",
+	"usenet-profile-dialog-tips":
+		"Ustawienia profilu mogą być synchronizowane między urządzeniami. Dane logowania pozostają lokalnie na tym urządzeniu.",
+	"usenet-profile-dialog-tips-vault":
+		"Ustawienia profilu mogą być synchronizowane między urządzeniami. Dane logowania są przechowywane w bezpiecznym pęku kluczy tego urządzenia.",
+	"usenet-profile-name": "Nazwa profilu",
+	"usenet-profile-name-placeholder": "Główny dostawca",
+	"usenet-profile-host": "Host NNTP",
+	"usenet-profile-port": "Port",
+	"usenet-security": "Zabezpieczenie połączenia",
+	"usenet-tls": "Niejawny TLS",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "Zwykły NNTP",
+	"usenet-authentication": "Uwierzytelnianie",
+	"usenet-auth-credentials": "Nazwa użytkownika i hasło",
+	"usenet-auth-anonymous": "Anonimowe",
+	"usenet-username": "Nazwa użytkownika",
+	"usenet-password": "Hasło",
+	"usenet-credentials-saved": "Dane logowania zapisane",
+	"usenet-credentials-unavailable": "Stan danych logowania niedostępny",
+	"usenet-credentials-saved-tips":
+		"Dane logowania są już zapisane. Pozostaw oba pola puste, aby ich nie zmieniać.",
+	"usenet-plain-warning-title": "Połączenie nieszyfrowane",
+	"usenet-plain-opt-in":
+		"Rozumiem i chcę zezwolić na zwykły NNTP dla tego profilu.",
+	"usenet-plain-warning":
+		"Zwykły NNTP nie szyfruje danych logowania ani pobieranych danych. Używaj go tylko wtedy, gdy dostawca wyraźnie tego wymaga.",
+	"usenet-enabled": "Włączony",
+	"usenet-enabled-tips":
+		"Wyłączone profile są zachowywane, ale nie są używane do pobierania.",
+	"usenet-disabled": "Wyłączony",
+	"usenet-priority": "Priorytet",
+	"usenet-priority-tips":
+		"Niższe wartości są próbowane jako pierwsze. Równe priorytety dzielą obciążenie.",
+	"usenet-priority-value": "Priorytet {{value}}",
+	"usenet-max-connections": "Maksymalna liczba połączeń",
+	"usenet-max-connections-tips": "Limit połączeń dla tego profilu dostawcy.",
+	"usenet-connections-value": "Połączenia: {{value}}",
+	"usenet-test": "Testuj",
+	"usenet-edit": "Edytuj profil",
+	"usenet-remove": "Usuń",
+	"usenet-remove-title": "Usunąć profil dostawcy?",
+	"usenet-remove-confirm":
+		"{{name}} nie będzie już dostępny do pobierania. Zapisane dla niego dane logowania również zostaną usunięte z tego urządzenia.",
+	"usenet-profile-saved": "Zapisano profil dostawcy.",
+	"usenet-profile-removed": "Usunięto {{name}}.",
+	"usenet-test-success": "Połączono z {{name}}.",
+	"usenet-test-failed": "Połączenie nie powiodło się: {{message}}",
+	"usenet-validation-name": "Wpisz nazwę profilu.",
+	"usenet-validation-host": "Wpisz host NNTP.",
+	"usenet-validation-port": "Port musi mieścić się w zakresie od 1 do 65535.",
+	"usenet-validation-plain":
+		"Przed zapisaniem potwierdź ostrzeżenie o zwykłym NNTP.",
+	"usenet-validation-priority": "Priorytet musi wynosić zero lub więcej.",
+	"usenet-validation-connections":
+		"Liczba połączeń musi mieścić się w zakresie od 1 do 128.",
+	"usenet-validation-credentials":
+		"Wpisz nazwę użytkownika i hasło albo wybierz uwierzytelnianie anonimowe.",
+	"usenet-validation-credential-status":
+		"Stan danych logowania jest niedostępny. Spróbuj ponownie przed zmianą tego profilu.",
+	"usenet-cleanup": "Czyszczenie po powodzeniu",
+	"usenet-cleanup-tips":
+		"Czyszczenie uruchamia się dopiero po pełnym złożeniu plików i pomyślnym rozpakowaniu.",
+	"usenet-cleanup-action": "Po zweryfikowanym powodzeniu",
+	"usenet-cleanup-keep": "Zachowaj wszystkie pliki wejściowe",
+	"usenet-cleanup-keep-tips":
+		"Zachowuje pliki PAR2 i wszystkie woluminy archiwum.",
+	"usenet-cleanup-par2": "Usuń pliki PAR2",
+	"usenet-cleanup-par2-tips":
+		"Usuwa pliki parzystości, ale zachowuje pobrane woluminy archiwum.",
+	"usenet-cleanup-all": "Usuń PAR2 i woluminy archiwum",
+	"usenet-cleanup-all-tips":
+		"Usuwa pliki parzystości i woluminy archiwum po pomyślnym rozpakowaniu.",
+	"usenet-archive-safety": "Bezpieczeństwo archiwów",
+	"usenet-limits-defaults":
+		"Limity obejmujące całe zadanie chronią miejsce na dysku i zasoby podczas weryfikacji i rozpakowywania.",
+	"usenet-desktop-limits": "Limity na komputerze",
+	"usenet-android-limits": "Limity na Androidzie",
+	"usenet-limits-summary":
+		"Wpisy: {{entries}} · łącznie po rozpakowaniu: {{total}} · na wpis: {{perEntry}}",
+	"usenet-limits-secondary-summary":
+		"Współczynnik {{ratio}}:1 · zagnieżdżenie: {{depth}} · rezerwa wolnego miejsca: {{reserve}} · czas aktywny: {{hours}} godz.",
+	"usenet-customize-limits": "Dostosuj limity",
+	"usenet-hide-limits": "Ukryj limity",
+	"usenet-limits-adjusted": "Zsynchronizowane limity zostały skorygowane",
+	"usenet-limits-adjusted-tips":
+		"Co najmniej jedna wartość przekraczała twardy limit tej platformy i została zmniejszona.",
+	"usenet-max-entries": "Maksymalna liczba wpisów",
+	"usenet-max-expanded": "Łączny rozmiar po rozpakowaniu",
+	"usenet-max-entry": "Rozmiar pojedynczego wpisu",
+	"usenet-max-depth": "Głębokość zagnieżdżenia",
+	"usenet-max-ratio": "Współczynnik kompresji",
+	"usenet-free-space-reserve": "Rezerwa wolnego miejsca",
+	"usenet-max-active-time": "Czas aktywnego przetwarzania",
+	"usenet-unit-entries": "wpisów",
+	"usenet-unit-levels": "poziomów",
+	"usenet-unit-hours": "godz.",
+	"usenet-limits-hard-cap":
+		"Wartości nie mogą przekraczać czterokrotności domyślnych wartości platformy. Nadpisania dla poszczególnych zadań są potwierdzane osobno.",
+	"usenet-restore-limits": "Przywróć wartości domyślne platformy",
+	"usenet-limits-restored": "Przywrócono domyślne limity archiwów platformy.",
 	save: "Zapisz i zastosuj",
 	"save-success-message": "Pomyślnie zapisano ustawienia",
 	"save-fail-message": "Nie udało się zapisać ustawień",
 	discard: "Odrzuć",
+	"history-directories": "Ostatnie katalogi pobierania",
+	"favorite-directory": "Ulubiony katalog",
+	"unfavorite-directory": "Usuń katalog z ulubionych",
+	"remove-history-directory": "Usuń katalog z historii",
 	startup: "Startup",
 	"open-at-login": "Uruchom przy logowaniu",
 	"keep-window-state": "Zachowaj wielkość i pozycję okna podczas wychodzenia",
 	"auto-resume-all": "Automatycznie uruchom wszystkie zatrzymane zadania",
 	"default-dir": "Domyślna ścieżka",
+	"file-category-dirs": "Ścieżki kategorii",
+	"file-category-dirs-tips":
+		"Zastąp domyślną ścieżkę pobierania dla określonych typów plików. Pozostaw puste, aby użyć ścieżki domyślnej.",
+	"task-routing-rules": "Reguły kierowania zadań",
+	"task-routing-rules-tips":
+		"Kieruje zadania do katalogów na podstawie wzorców nazw plików. Wygrywa pierwsza pasująca reguła.",
+	"task-routing-rule-pattern-placeholder": "Wzorzec (np. *.mkv)",
+	"task-routing-rule-label-placeholder": "Tag",
+	"task-routing-rule-dir-placeholder": "Katalog",
+	"task-routing-rule-add": "Dodaj regułę",
+	"file-category-music": "Muzyka",
+	"file-category-video": "Wideo",
+	"file-category-image": "Obraz",
+	"file-category-document": "Dokument",
+	"file-category-compressed": "Skompresowane",
+	"file-category-program": "Program",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
-		"Z powodu restrykcji dostępu spowodowanych trybem piaskownicy w App Store, domyślną rekomendawaną lokalizacją pobrań jest ~/Downloads",
+		"Z powodu restrykcji dostępu spowodowanych trybem piaskownicy w App Store, domyślną rekomendowaną lokalizacją pobrań jest ~/Downloads",
 	"transfer-settings": "Przesyłanie",
 	"transfer-speed-upload": "Limit prędkości przesyłania",
 	"transfer-speed-download": "Limit prędkości pobierania",
 	"transfer-speed-unlimited": "Nieograniczona",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "Zapisz link magnetyczny jako plik torrent",
+	"bt-create-subfolder": "Grupuj wieloplikowe torrenty w podfolderze",
+	"bt-create-subfolder-tips":
+		"Gdy włączone, wieloplikowe pobrania BitTorrent i magnesów trafiają do folderu nazwanego tak jak torrent. Gdy wyłączone, pliki są zapisywane bezpośrednio w katalogu pobierania.",
+	"bt-upload-rate-limit": "Limit wysyłania BitTorrent",
+	"bt-upload-rate-limit-tips":
+		"Ogranicza wysyłanie BitTorrent niezależnie od globalnego limitu wysyłania. 0 oznacza brak osobnego limitu.",
 	"bt-auto-download-content":
 		"Automatycznie pobieraj zawartość magnesu i torrenta",
-	"bt-force-encryption": "Obrigar a criptografia forçada do BT",
-	"keep-seeding": "Kontynuuj wysiew aż do zatrzymania go ręcznie",
-	"seed-ratio": "Stosunek nasion",
-	"seed-time": "Czas siewu",
+	"bt-force-encryption": "Wymuszaj szyfrowanie BT",
+	"keep-seeding": "Kontynuuj seedowanie aż do zatrzymania go ręcznie",
+	"seed-ratio": "Stosunek seedowania",
+	"seed-time": "Czas seedowania",
 	"seed-time-unit": "minuty",
-	"task-manage": "Zarządzania zadaniami",
+	"task-manage": "Zarządzanie zadaniami",
 	"max-concurrent-downloads": "Maksymalna liczba aktywnych zadań",
+	"connections-per-task": "Połączenia na zadanie",
 	"max-connection-per-server": "Maksymalna liczba połączeń na serwer",
+	"auto-retry": "Automatycznie ponawiaj nieudane zadania",
+	"auto-retry-strategy": "Tryb interwału ponawiania",
+	"auto-retry-strategy-static": "Stały",
+	"auto-retry-strategy-exponential": "Wykładnicze wydłużanie odstępów",
+	"auto-retry-interval": "Podstawowy interwał ponawiania",
+	"auto-retry-interval-unit": "sekundy",
+	"auto-retry-max-attempts": "Maks. liczba prób ponowienia (0 = bez limitu)",
+	"worker-max-retries": "Maks. liczba ponowień na kawałek dla workera",
+	"auto-detect-low-speed-tasks":
+		"Automatycznie wykrywaj zadania o niskiej prędkości",
+	"auto-detect-low-speed-tasks-tips":
+		"Jeśli działające zadanie pozostaje poniżej progu prędkości, zostanie automatycznie wstrzymane i uruchomione ponownie.",
+	"low-speed-threshold": "Próg niskiej prędkości",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "Niezawodność HTTP / sieci",
+	"http-reliability-tips":
+		"Dostosuj limit czasu połączenia i wykrywanie zawieszonych transferów dla pobrań HTTP/HTTPS/FTP.",
+	"connect-timeout": "Limit czasu połączenia",
+	"nzb-body-timeout": "Limit czasu treści NZB",
+	"lowest-speed-limit": "Minimalny limit prędkości",
+	"lowest-speed-limit-timeout": "Limit czasu zawieszenia",
+	"lowest-speed-limit-help":
+		"Jeśli pobieranie pozostaje poniżej minimalnego limitu prędkości przez czas zawieszenia, worker zostaje przerwany i (jeśli włączono automatyczne ponawianie) uruchomiony ponownie. Ustaw limit na 0, aby wyłączyć.",
+	"uri-selector": "Wybór serwera lustrzanego",
+	"uri-selector-feedback":
+		"Ze sprzężeniem zwrotnym (odrzucaj wolne lub zawodne serwery)",
+	"uri-selector-inorder": "Po kolei (próbuj serwerów od lewej do prawej)",
+	"uri-selector-adaptive": "Adaptacyjny (preferuj najszybszy)",
+	"unit-seconds": "sekundy",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "Pamięć masowa",
+	"storage-tips": "Jak silnik rezerwuje miejsce na dysku przed pobieraniem.",
+	"file-allocation": "Alokacja plików",
+	"file-allocation-falloc": "Prealokacja (falloc)",
+	"file-allocation-trunc": "Obcięcie (tylko ustawienie długości)",
+	"file-allocation-none": "Brak (rośnie w razie potrzeby)",
+	"file-allocation-tips":
+		"Prealokacja rezerwuje z góry rzeczywiste bloki dysku, aby uniknąć błędu ENOSPC w trakcie pobierania i zmniejszyć fragmentację. W systemach plików, które jej nie obsługują, wraca do obcięcia.",
 	"new-task-show-downloading":
 		"Automatycznie pokaż pobieranie po dodaniu nowego zadania",
 	"no-confirm-before-delete-task":
 		"Usunięcie zadania nie będzie wymagać potwierdzenia",
+	"auto-file-renaming": "Automatycznie zmieniaj nazwy zduplikowanych plików",
+	"auto-file-renaming-tips":
+		'Gdy plik o tej samej nazwie już istnieje, zapisz jako "file.1.ext" zamiast go nadpisywać',
+	"use-remote-file-time":
+		"Używaj czasu modyfikacji pliku ze zdalnego serwera podczas zapisu",
+	"use-remote-file-time-tips":
+		"Ustaw czas modyfikacji pliku na znacznik czasu ze zdalnego serwera",
 	continue: "Kontynuuj",
-	"task-completed-notify": "Powiadomnie po ukończeniu zadania",
+	"task-completed-notify": "Powiadomienie po ukończeniu zadania",
+	"clipboard-watch": "Obserwuj schowek pod kątem linków do pobrania",
+	"clipboard-watch-tips":
+		"Gdy gdziekolwiek skopiujesz link magnetyczny lub link do pliku, Risuko zaproponuje jego pobranie.",
+	"clipboard-watch-ext": "Obserwowane rozszerzenia plików",
+	"clipboard-watch-ext-tips":
+		"Pytanie pojawia się tylko dla linków http(s) kończących się tymi rozszerzeniami. Linki magnet, ed2k i torrent zawsze je wywołują. Oddziel spacjami lub przecinkami.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"Risuko obserwuje teraz schowek pod kątem linków do pobrania. Wyłącz to w Ustawieniach → Podstawowe.",
 	"prevent-sleep-while-downloading":
 		"Zapobiegaj usypianiu systemu podczas pobierania",
 	"prevent-sleep-while-downloading-tips":
 		"Utrzymuj komputer w stanie aktywnym, gdy trwa aktywne zadanie",
+	"shutdown-when-complete": "Wyłącz komputer po zakończeniu wszystkich zadań",
+	"shutdown-when-complete-tips":
+		"Jednorazowo: wyłącza komputer, gdy kolejka pobierania będzie pusta",
+	"shutdown-countdown-title": "Wyłączenie za {{seconds}} s…",
+	"shutdown-countdown-cancel": "Anuluj",
+	"shutdown-failed": "Nie udało się wyłączyć komputera. Sprawdź uprawnienia.",
 	"auto-purge-record":
 		"Automatycznie usuń pobrane zadania po zamknięciu aplikacji",
+	"purge-record-on-start":
+		"Czyść rekordy pobierania przy uruchomieniu aplikacji",
 	ui: "UI",
 	appearance: "Wygląd",
 	"theme-auto": "Auto",
@@ -71,9 +282,18 @@ export default {
 	"change-language": "Zmień język",
 	"hide-app-menu": "Schowaj menu aplikacji (Tylko Windows i Linux)",
 	proxy: "Proxy",
+	"proxy-http-profile": "Proxy HTTP / FTP / Usenet",
+	"proxy-p2p-profile": "Proxy P2P",
 	"enable-proxy": "Włącz Proxy",
+	"enable-p2p-proxy": "Włącz proxy P2P",
+	"proxy-p2p-tcp-server": "Serwer proxy TCP",
+	"proxy-p2p-tcp-bypass": "Pomijanie proxy TCP",
+	"proxy-p2p-udp-server": "Serwer proxy UDP",
+	"proxy-p2p-udp-server-placeholder":
+		"Opcjonalne; pozostaw puste, aby użyć proxy P2P dla TCP",
+	"proxy-p2p-udp-bypass": "Pomijanie proxy UDP",
 	"proxy-bypass-input-tips":
-		"Omiń ustawiania proxy dla tych hostów i domen, jeden na linię",
+		"Omiń ustawienia proxy dla tych hostów i domen, jeden na linię",
 	"proxy-scope-label": "Używany do",
 	"proxy-scope-download": "Pobierz",
 	"proxy-scope-download-desc": "Kierowanie ruchu pobierania przez proxy",
@@ -84,35 +304,72 @@ export default {
 	"proxy-scope-update-trackers-desc":
 		"Pobieranie list trackerów BT przez proxy",
 	"proxy-tips": "Pokaż instrukcję proxy",
+	"proxy-p2p-tips":
+		"Dla DHT, trackerów UDP i uTP wymagany jest SOCKS5 lub SOCKS5H. Proxy HTTP są używane tylko dla połączeń P2P przez TCP.",
+	"proxy-p2p-udp-tips":
+		"Pozostaw proxy UDP puste, aby użyć tej samej trasy co dla TCP P2P. Proxy UDP wymaga SOCKS5 lub SOCKS5H; proxy HTTP nie przenoszą UDP.",
+	"proxy-p2p-restart-title": "Uruchomić ponownie pobieranie P2P?",
+	"proxy-p2p-restart-confirm":
+		"Zmiana proxy P2P restartuje aktywne pobierania peer-to-peer. Pobieranie HTTP, FTP i Usenet działa dalej.",
+	doh: "DNS przez HTTPS",
+	"doh-tips":
+		"Rozpoznawaj nazwy hostów przez szyfrowany punkt końcowy DNS zamiast systemowego resolvera",
+	"doh-enable": "Włącz DNS przez HTTPS",
+	"doh-provider": "Dostawca",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "Własny",
+	"doh-url": "Adres URL punktu końcowego",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "Punkt końcowy DoH musi zaczynać się od https://",
+	"doh-bootstrap": "Startowe adresy IP",
+	"doh-bootstrap-placeholder":
+		"Adresy IP do połączenia z punktem końcowym, oddzielone przecinkami (opcjonalne)",
+	"doh-fallback": "Wróć do systemowego DNS",
+	"doh-fallback-tips":
+		"Jeśli zapytanie DoH się nie powiedzie, rozpoznaj nazwę przez systemowy resolver zamiast przerywać pobieranie",
 	"bt-tracker": "Trackery",
 	"bt-tracker-input-tips": "Trackery, jeden na linię",
 	"bt-tracker-tips": "Zalecane: ",
+	"bt-max-peers-per-torrent": "Maks. liczba peerów na torrent",
+	"bt-max-peers-per-torrent-tips":
+		"Maksymalna liczba jednoczesnych połączeń z peerami na torrent. Wyższe wartości poprawiają wykrywanie roju (wymaga ponownego uruchomienia silnika)",
+	"bt-max-outstanding-per-peer": "Maks. liczba oczekujących żądań na peera",
+	"bt-max-outstanding-per-peer-tips":
+		"Maksymalna liczba jednoczesnych żądań fragmentów kolejkowanych do każdego peera (limit, do 500). Wartość 0 oznacza adaptacyjną wartość domyślną 6–500; budżet żądań dla całego torrenta jest współdzielony między aktywnymi peerami. Wymaga ponownego uruchomienia silnika",
+	"bt-max-connections": "Maks. liczba połączeń z peerami",
+	"bt-max-connections-tips":
+		"Łączna liczba połączeń z peerami we wszystkich torrentach, od 20 do 5000. Obniżenie limitu nigdy nie zrywa już otwartych połączeń, a jedynie wstrzymuje nowe. W systemach Linux, macOS i Android wartość efektywna jest też ograniczona do połowy systemowego limitu deskryptorów plików",
+	"bt-ban-corrupt-peers": "Banuj peerów wysyłających uszkodzone dane",
+	"bt-ban-corrupt-peers-tips":
+		"Blokuj adres IP do końca sesji, gdy kawałki, do których wysłania się przyczynił, wciąż nie przechodzą weryfikacji skrótu. Wielu użytkowników może współdzielić jeden adres IP (operatorzy komórkowi, sieci współdzielone), więc ban może odciąć także niewinnych peerów (wymaga ponownego uruchomienia silnika)",
+	"bt-ban-corrupt-strikes": "Nieudane kawałki przed banem",
+	"bt-ban-corrupt-strikes-tips":
+		"Ile nieudanych kawałków może pochodzić z jednego adresu IP, zanim zostanie zbanowany. Wyższe wartości tolerują sporadyczne uszkodzenia (wymaga ponownego uruchomienia silnika)",
+	"bt-enable-upnp": "Przekierowanie portów UPnP / NAT-PMP",
+	"bt-enable-upnp-tips":
+		"Automatycznie otwieraj port nasłuchu BitTorrent na routerze przez UPnP IGD, NAT-PMP lub PCP (wymaga ponownego uruchomienia silnika)",
+	"bt-upnp-lease": "Czas dzierżawy mapowania portów (sekundy)",
+	"bt-upnp-lease-tips":
+		"Czas trwania dzierżawy mapowań portów UPnP i NAT-PMP. Krótsze dzierżawy szybciej odzyskują sprawność po nieaktualnych mapowaniach (wymaga ponownego uruchomienia silnika)",
+	"bt-enable-lsd": "Wykrywanie usług lokalnych",
+	"bt-enable-lsd-tips":
+		"Wykrywaj peery w sieci lokalnej przez multicast BEP-14 (wymaga ponownego uruchomienia silnika)",
+	"bt-encryption-policy": "Szyfrowanie protokołu",
+	"bt-encryption-policy-tips":
+		"Zasada MSE/PE dla połączeń z peerami. „Preferuj” najpierw próbuje szyfrowania, a następnie wraca do zwykłego tekstu (wymaga ponownego uruchomienia silnika)",
+	"bt-encryption-plaintext": "Tylko zwykły tekst",
+	"bt-encryption-prefer": "Preferuj szyfrowanie",
+	"bt-encryption-require": "Wymagaj szyfrowania",
+	"bt-listen-v6": "Nasłuchuj na IPv6",
+	"bt-listen-v6-tips":
+		"Powiąż dodatkowy nasłuch TCP IPv6 na tym samym porcie (wymaga ponownego uruchomienia silnika)",
 	"sync-tracker-tips": "Synchronizowane",
 	"auto-sync-tracker": "Codziennie aktualizuj listę trackerów",
-	port: "Nasłuchujące porty",
-	"bt-port": "Torrent nasłuchujący port",
-	"dht-port": "DHT nasłuchujący port",
-	security: "Bezpieczeństwo",
-	rpc: "RPC",
-	"rpc-listen-port": "Port nasłuchu RPC",
-	"rpc-secret": "Sekret RPC",
-	"rpc-secret-tips": "Pokaż instrukcję sekretu RPC",
-	pbh: "PeerBanHelper",
-	"pbh-enable": "Włącz API PeerBanHelper",
-	"pbh-enable-tips":
-		"Udostępnia nasłuch JSON-RPC zgodny z Aria2Next, aby PeerBanHelper mógł monitorować i banować peerów BitTorrent",
-	"pbh-listen-port": "Port nasłuchu PeerBanHelper",
-	"pbh-rpc-secret": "Token RPC PeerBanHelper",
-	"generate-pbh-rpc-secret": "Wygeneruj nowy token",
-	"pbh-endpoint-hint":
-		"W PeerBanHelper dodaj downloader Aria2Next wskazujący na http://127.0.0.1:{{port}}/jsonrpc",
-	"engine-overrides": "Nadpisania silnika (JSON)",
-	"engine-overrides-placeholder":
-		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
-	"engine-overrides-tips":
-		"Zaawansowane: ustaw dowolne klucze opcji silnika jako obiekt JSON. Zmiany zaczną działać po ponownym uruchomieniu.",
-	"engine-overrides-invalid":
-		"Nadpisania silnika muszą być prawidłowym obiektem JSON.",
+	"ed2k-server": "Serwery eDonkey",
+	"ed2k-server-input-tips": "Serwery eDonkey, jeden w wierszu (ip:port)",
+	"ed2k-server-tips": "Jeśli puste, używane są serwery domyślne",
 	"ed2k-kad": "eMule Kad",
 	"ed2k-enable-kad": "Włącz wyszukiwanie źródeł przez Kad",
 	"ed2k-enable-kad-tips":
@@ -122,31 +379,120 @@ export default {
 		"Port UDP używany do wyszukiwania przez Kad. Prawidłowe wartości to 1-65535 (wymaga ponownego uruchomienia silnika)",
 	"ed2k-kad-port-invalid":
 		"Port UDP Kad musi być liczbą całkowitą od 1 do 65535",
+	"listen-port-invalid":
+		"Port BT musi być portem od 1 do 65535, zakresem, np. 6881-6889, lub listą takich wartości oddzielonych przecinkami",
+	"dht-listen-port-invalid":
+		"Port DHT musi być portem od 1 do 65535, zakresem, np. 6881-6889, lub listą takich wartości oddzielonych przecinkami",
+	"ed2k-port-invalid": "Port ED2K musi być liczbą całkowitą od 1 do 65535",
 	"ed2k-enable-upload": "Udostępniaj pliki przez ED2K",
 	"ed2k-enable-upload-tips":
 		"Wysyłaj innym peerom ukończone pliki i zweryfikowane części trwających pobrań ED2K. Kad może jeszcze do 5 godzin wyświetlać plik, którego już nie udostępniasz (wymaga ponownego uruchomienia silnika)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"Domyślne dane logowania dla pobrań FTP, FTPS i SFTP",
+	"ftp-username": "Nazwa użytkownika FTP",
+	"ftp-password": "Hasło FTP",
+	"sftp-private-key": "Ścieżka klucza prywatnego SSH",
+	"sftp-private-key-content": "Zawartość klucza prywatnego SSH",
+	"sftp-private-key-tips":
+		"Ścieżka do pliku klucza prywatnego PEM, np. ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips": "Wklej tutaj zawartość klucza prywatnego PEM",
+	"sftp-key-passphrase": "Hasło klucza",
+	"sftp-key-passphrase-tips": "Pozostaw puste, jeśli klucz nie ma hasła",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "Format wyjściowy",
+	"media-settings": "Serwisy multimedialne (yt-dlp)",
+	"media-settings-tips":
+		"Domyślne ustawienia pobierania z serwisów multimedialnych (YouTube, Vimeo, Bilibili i inne). Wymaga yt-dlp w PATH; ffmpeg jest potrzebny do scalania osobnych strumieni wideo i audio.",
+	"media-format": "Preferowany format",
+	"media-format-placeholder":
+		"np. bestvideo+bestaudio/best (ciąg formatu yt-dlp)",
+	"media-format-tips":
+		"Selektor formatu yt-dlp. Pozostaw puste, aby uzyskać najlepszą jakość. Przykłady: bestvideo[height<=1080]+bestaudio/best, 137+140",
+	port: "Nasłuchujące porty",
+	"bt-port": "Torrent nasłuchujący port",
+	"dht-port": "DHT nasłuchujący port",
+	"ed2k-port": "Port nasłuchu ed2k",
+	security: "Bezpieczeństwo",
+	rpc: "RPC",
+	"rpc-host": "Adres serwera",
+	"rpc-host-local": "Tylko to urządzenie",
+	"rpc-host-all": "Wszystkie interfejsy sieciowe",
+	"rpc-host-custom": "Własny ({{host}})",
+	"rpc-host-exposed-tips":
+		"Inne urządzenia w Twojej sieci mogą połączyć się z portem RPC oraz z portem PeerBanHelper, gdy jest włączony. Każdy, kto zna sekret, może dodawać pobrania i nimi zarządzać.",
+	"rpc-listen-port": "Port nasłuchu RPC",
+	"rpc-secret": "Sekret RPC",
+	"rpc-secret-tips": "Pokaż instrukcję sekretu RPC",
+	"rpc-allow-any-dir": "Zezwól klientom RPC na dowolną ścieżkę lokalną",
+	"rpc-allow-any-dir-tips":
+		"Gdy wyłączone, pobrania dodane przez RPC można zapisywać tylko w katalogu pobierania, jego podfolderach oraz w folderach kategorii i kierowania. Klienci RPC nie mogą też zmusić aplikacji do odczytu pliku cookie, netrc ani klucza SSH.",
+	pbh: "PeerBanHelper",
+	"pbh-enable": "Włącz API PeerBanHelper",
+	"pbh-enable-tips":
+		"Udostępnia nasłuch JSON-RPC zgodny z Aria2Next, aby PeerBanHelper mógł monitorować i banować peerów BitTorrent",
+	"pbh-listen-port": "Port nasłuchu PeerBanHelper",
+	"pbh-rpc-secret": "Token RPC PeerBanHelper",
+	"generate-pbh-rpc-secret": "Wygeneruj nowy token",
+	"pbh-endpoint-hint":
+		"W PeerBanHelper dodaj downloader Aria2Next wskazujący na http://127.0.0.1:{{port}}/jsonrpc",
+	"randomize-port": "Wybierz losowy port",
+	"generate-rpc-secret": "Wygeneruj nowy sekret RPC",
+	"copy-rpc-url": "Skopiuj URL RPC",
+	"engine-overrides": "Nadpisania silnika (JSON)",
+	"engine-overrides-placeholder":
+		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
+	"engine-overrides-tips":
+		"Zaawansowane: ustaw dowolne klucze opcji silnika jako obiekt JSON. Zmiany zaczną działać po ponownym uruchomieniu.",
+	"engine-overrides-invalid":
+		"Nadpisania silnika muszą być prawidłowym obiektem JSON.",
 	"engine-overrides-reserved-keys":
 		"Zignorowane zastrzeżone klucze nadpisań silnika: {{keys}}",
 	"engine-overrides-too-large":
 		"Nadpisania silnika są zbyt duże: maksymalnie 64 klucze, 64 znaki na klucz i 2048 znaków na wartość.",
-	"external-engine-enable": "Użyj zewnętrznego silnika",
-	"external-engine-enable-tips":
-		"Po włączeniu Risuko nie uruchomi automatycznie wbudowanego silnika.",
-	"external-engine-ip": "IP zewnętrznego silnika",
-	"external-engine-port": "Port zewnętrznego silnika",
-	"external-engine-secret": "Sekret zewnętrznego silnika",
 	developer: "Developer",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Udawaj user-agent'a",
+	cookies: "Pliki cookie",
+	"cookies-tips":
+		"Wczytaj pliki cookie z pliku cookies.txt w formacie Netscape/Mozilla (akceptuje też wyjście curl/wget).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "Zapisane dane uwierzytelniające domen",
+	"saved-cookies-tips":
+		"Pliki cookie i User-Agent zaimportowane z przeglądarki przy omijaniu Cloudflare lub innych zabezpieczeń uwierzytelniania pobrań. Risuko używa ich ponownie przy nowych pobraniach z tej samej domeny, dopóki nie wygasną lub nie przestaną działać.",
+	"saved-cookies-empty": "Brak zapisanych danych uwierzytelniających.",
+	"saved-cookies-host": "Domena",
+	"saved-cookies-browser": "Przeglądarka",
+	"saved-cookies-count": "Pliki cookie",
+	"saved-cookies-imported": "Zaimportowano",
+	"saved-cookies-actions": "Akcje",
+	"saved-cookies-clear": "Wyczyść wszystko",
+	"saved-cookies-confirm-clear":
+		"Usunąć wszystkie zapisane dane uwierzytelniające domen? Przyszłe pobrania z tych witryn mogą się nie udać, dopóki nie zaimportujesz ich ponownie.",
+	"saved-cookies-delete": "Usuń",
+	netrc: "Dane logowania .netrc",
+	"netrc-tips":
+		"Wstrzykuj uwierzytelnianie HTTP Basic z pliku .netrc, gdy URL nie zawiera osadzonych danych logowania. Domyślnie: ~/.netrc (lub %USERPROFILE%/_netrc w systemie Windows).",
+	"netrc-path-placeholder": "Zastąp ścieżkę .netrc (opcjonalne)",
+	"no-netrc": "Wyłącz wyszukiwanie w .netrc",
+	"no-netrc-tips":
+		"Całkowicie pomiń .netrc. Przydatne, gdy plik zawiera dane logowania niezwiązane z pobieraniem.",
 	"app-log-path": "Ścieżka logów",
+	"log-dir-override-placeholder":
+		"Własny katalog dzienników (puste = domyślny)",
+	"log-dir-override-tips":
+		"Dzienniki są obecnie zapisywane w {{path}}. Ustawienie własnego katalogu (np. w Pobranych) udostępnia je w dowolnym menedżerze plików. Zmiany zaczną obowiązywać po następnym ponownym uruchomieniu aplikacji.",
 	"download-session-path": "Ścieżka sesji pobranych",
-	"factory-reset": "Przywróć domyślne ustawiania",
+	"session-reset": "Zresetuj sesję pobierania",
+	"session-reset-confirm": "Czy na pewno chcesz zresetować sesję pobierania?",
+	"factory-reset": "Przywróć domyślne ustawienia",
 	"factory-reset-confirm":
-		"Jesteś pewnien że chcesz przywrócić domyślne ustawienia",
+		"Jesteś pewien że chcesz przywrócić domyślne ustawienia",
 	"download-protocol": "Protokoły",
 	"protocols-default-client": "Ustaw jako domyślny klient dla tych protokołów",
 	"protocols-magnet": "Magnet [ magnet:// ]",
 	"protocols-thunder": "Thunder [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -163,9 +509,6 @@ export default {
 	"auto-update": "Aktualizuj automatycznie",
 	"auto-check-update": "Automatycznie sprawdzaj aktualizacje",
 	"last-check-update-time": "Ostatni raz kiedy sprawdzono aktualizację",
-	"not-saved": "Preferencje nie zostały zapisane",
-	"not-saved-confirm":
-		"Zmienione preferencje zostaną utracone, czy na pewno chcesz wyjść?",
 	"completion-script": "Skrypt po zakończeniu",
 	"completion-script-enabled": "Uruchom skrypt po zakończeniu pobierania",
 	"completion-script-tips":
@@ -183,10 +526,38 @@ export default {
 	"completion-script-test-ok": "Test skryptu zakończony powodzeniem",
 	"completion-script-test-fail": "Test skryptu nie powiódł się",
 	"completion-script-empty": "Najpierw podaj polecenie",
-	"history-directories": "Ostatnie katalogi pobierania",
-	"favorite-directory": "Ulubiony katalog",
-	"unfavorite-directory": "Usuń katalog z ulubionych",
-	"remove-history-directory": "Usuń katalog z historii",
-	"randomize-port": "Wybierz losowy port",
-	"generate-rpc-secret": "Wygeneruj nowy sekret RPC",
+	"completion-script-not-approved":
+		"Skrypt po zakończeniu nie został dozwolony, więc nic nie zapisano.",
+	"not-saved": "Preferencje nie zostały zapisane",
+	"not-saved-confirm":
+		"Zmienione preferencje zostaną utracone, czy na pewno chcesz wyjść?",
+	"saved-credentials": "Zapisane dane logowania",
+	"saved-credentials-description":
+		"Zarządzaj zapisanymi danymi uwierzytelniającymi dla pobrań",
+	"no-saved-credentials": "Brak zapisanych danych logowania",
+	"credential-host": "Host",
+	"credential-label": "Etykieta",
+	"credential-protocol": "Protokół",
+	"credential-last-used": "Ostatnio użyte",
+	"credential-delete": "Usuń dane logowania",
+	"credential-delete-confirm":
+		"Czy na pewno chcesz usunąć te zapisane dane logowania?",
+	"vault-enabled": "Sekrety przechowywane w pęku kluczy systemu",
+	"vault-disabled":
+		"Pęk kluczy systemu niedostępny — sekrety przechowywane jawnym tekstem",
+	"credential-encrypted-badge": "Przechowywane w pęku kluczy systemu",
+	"credential-vault-unavailable":
+		"Pęk kluczy systemu jest nieosiągalny; nowe dane logowania zostaną zapisane jawnym tekstem",
+	"speed-limit-enabled": "Włącz limity prędkości",
+	"speed-limit-enabled-description":
+		"Zastosuj poniższe limity. Gdy wyłączone, pobieranie działa z pełną prędkością; wartości zostają zachowane.",
+	"appearance-theme": "Motyw",
+	"appearance-typography": "Typografia",
+	"appearance-window": "Okno",
+	"task-list-style": "Lista zadań",
+	"task-list-style-description": "Sposób wyświetlania pobrań na liście zadań.",
+	"task-list-style-compact": "Kompaktowa",
+	"task-list-style-card": "Karty",
+	"sidebar-collapsed": "Zwiń pasek boczny",
+	"sidebar-collapsed-description": "Pokazuj w pasku bocznym tylko ikony.",
 };

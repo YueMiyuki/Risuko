@@ -21,13 +21,17 @@ import { useAppStore } from "@/store/app";
 import { usePreferenceStore } from "@/store/preference";
 import { flushDownloadStatsMinute, useTaskStore } from "@/store/task";
 import {
+	hasRetryBudget,
+	isPermanentErrorCode,
+	normalizeMaxAttempts,
+} from "@/utils/autoRetry";
+import {
 	findHttpSourceUrl,
 	getErrorCodeReferenceUrl,
 	openExternalUrl,
 } from "@/utils/external";
 import {
 	finalizeCompletedDownloadPath,
-	getTaskFullPath,
 	showItemInFolder,
 } from "@/utils/native";
 
@@ -115,10 +119,12 @@ export default {
 			autoRetryTimerMap: {} as Record<string, ReturnType<typeof setTimeout>>,
 			autoRetryAttemptMap: {} as Record<string, number>,
 			autoRetryPlanTicketMap: {} as Record<string, number>,
+			autoRetryResumingMap: {} as Record<string, boolean>,
 			lowSpeedStrikeMap: {} as Record<string, number>,
 			lowSpeedRecoverAtMap: {} as Record<string, number>,
 			lowSpeedRecoveringMap: {} as Record<string, boolean>,
 			eventUnlisteners: [] as (() => void)[],
+			sawActiveTask: false,
 			shutdownCountdownTimer: null as ReturnType<typeof setInterval> | null,
 			shutdownCountdownSecondsLeft: 0,
 			shutdownToastId: null as string | number | null,
@@ -181,6 +187,11 @@ export default {
 		autoRetryIntervalSeconds() {
 			const raw = usePreferenceStore().config.autoRetryInterval;
 			return Math.floor(normalizePositiveNumber(raw, 5, 1, 300));
+		},
+		autoRetryMaxAttempts() {
+			return normalizeMaxAttempts(
+				usePreferenceStore().config.autoRetryMaxAttempts,
+			);
 		},
 		autoDetectLowSpeedTasks() {
 			return parseBooleanConfig(
@@ -274,6 +285,7 @@ export default {
 			this.clearAutoRetryTimer(gid);
 			delete this.autoRetryAttemptMap[gid];
 			delete this.autoRetryPlanTicketMap[gid];
+			delete this.autoRetryResumingMap[gid];
 		},
 		clearAllAutoRetryTimers() {
 			for (const gid of Object.keys(this.autoRetryTimerMap)) {
@@ -281,6 +293,7 @@ export default {
 			}
 			this.autoRetryAttemptMap = {};
 			this.autoRetryPlanTicketMap = {};
+			this.autoRetryResumingMap = {};
 		},
 		normalizeAutoRetryAttemptMap(raw: unknown = {}) {
 			const result: Record<string, number> = {};
@@ -303,6 +316,18 @@ export default {
 		async scheduleAutoRetry(gid: string) {
 			const taskGid = `${gid || ""}`.trim();
 			if (!this.autoRetryEnabled || !taskGid) {
+				return;
+			}
+
+			if (
+				!hasRetryBudget(
+					this.autoRetryAttemptMap[taskGid],
+					this.autoRetryMaxAttempts,
+				)
+			) {
+				logger.info(
+					`[Risuko] auto retry gave up for gid: ${taskGid} after ${this.autoRetryAttemptMap[taskGid]} attempts`,
+				);
 				return;
 			}
 
@@ -383,6 +408,7 @@ export default {
 
 			this.autoRetryTimerMap[taskGid] = setTimeout(() => {
 				const taskStore = useTaskStore();
+				this.autoRetryResumingMap[taskGid] = true;
 				taskStore
 					.resumeTask({ gid: taskGid } as DownloadTask)
 					.then(() => {
@@ -391,6 +417,7 @@ export default {
 						);
 					})
 					.catch((err) => {
+						delete this.autoRetryResumingMap[taskGid];
 						logger.warn(
 							`[Risuko] auto retry resume failed for gid: ${taskGid}, attempt: ${nextAttempt}, ${err?.message || err}`,
 						);
@@ -421,7 +448,7 @@ export default {
 
 			this.lowSpeedRecoveringMap[gid] = true;
 			try {
-				await api.forcePauseTask({ gid });
+				await api.pauseTask({ gid });
 				await new Promise((resolve) =>
 					setTimeout(resolve, LOW_SPEED_RESTART_WAIT_MS),
 				);
@@ -567,13 +594,20 @@ export default {
 			});
 		},
 		onDownloadStart(payload: { gid: string }) {
+			const { gid } = payload;
+			if (this.autoRetryResumingMap[gid]) {
+				delete this.autoRetryResumingMap[gid];
+			} else {
+				this.clearAutoRetryState(gid);
+			}
 			const taskStore = useTaskStore();
 			requestListRefresh();
 			useAppStore().resetInterval();
 			this.ensurePolling();
 			requestSessionSave();
-			const { gid } = payload;
-			this.clearAutoRetryState(gid);
+			this.sawActiveTask = true;
+			this.clearAutoRetryTimer(gid);
+			delete this.autoRetryPlanTicketMap[gid];
 			if (taskStore.currentTaskItem?.gid === gid) {
 				taskStore.updateCurrentTaskDetail();
 			}
@@ -622,14 +656,10 @@ export default {
 				logger.error(
 					`[Risuko] download error gid: ${gid}, #${errorCode}, ${errorMessage}`,
 				);
-				this.readCompletionScriptOverrides(gid).then((overrides) => {
-					invoke("run_completion_script", {
-						path: getTaskFullPath(task) || "",
-						hash: task?.infoHash || null,
-						status: "error",
-						overrides,
-					}).catch(() => {});
-				});
+				invoke("run_completion_script", {
+					gid,
+					status: "error",
+				}).catch(() => {});
 
 				if (normalizedErrorCode === "315") {
 					const errorString = String(errorMessage || "");
@@ -663,20 +693,8 @@ export default {
 						String(errorMessage || ""),
 					);
 				const usenetRepairFailure = task.usenetRepairFailure;
-				const isTerminalUsenetError = [
-					"550",
-					"551",
-					"552",
-					"553",
-					"554",
-				].includes(normalizedErrorCode);
 
-				if (
-					!isMissingYtDlp &&
-					!isTerminalUsenetError &&
-					normalizedErrorCode !== "541" &&
-					normalizedErrorCode !== "542"
-				) {
+				if (!isMissingYtDlp && !isPermanentErrorCode(normalizedErrorCode)) {
 					this.scheduleAutoRetry(gid);
 				}
 
@@ -749,6 +767,10 @@ export default {
 				this.handleDownloadComplete(task, true);
 			});
 		},
+		onTaskListChanged() {
+			requestListRefresh();
+			void useAppStore().fetchGlobalStat();
+		},
 		async isSeedingInPlace(gid: string) {
 			const opts = (await api.getOption({ gid }).catch(() => undefined)) as
 				| Record<string, unknown>
@@ -756,60 +778,15 @@ export default {
 			const flag = opts?.risukoSeedInPlace;
 			return flag === true || flag === "true";
 		},
-		async readCompletionScriptOverrides(gid: string) {
-			try {
-				const opts = (await api.getOption({ gid })) as
-					| Record<string, unknown>
-					| undefined;
-				if (!opts) {
-					return null;
-				}
-				const command = opts.risukoCompletionScriptCommand;
-				const args = opts.risukoCompletionScriptArgs;
-				const enabled = opts.risukoCompletionScriptEnabled;
-				const timeoutMs = opts.risukoCompletionScriptTimeoutMs;
-				if (
-					command === undefined &&
-					args === undefined &&
-					enabled === undefined &&
-					timeoutMs === undefined
-				) {
-					return null;
-				}
-				const overrides: Record<string, unknown> = {};
-				if (typeof command === "string") {
-					overrides.command = command;
-				}
-				if (typeof args === "string") {
-					overrides.args = args;
-				}
-				if (enabled !== undefined) {
-					overrides.enabled =
-						enabled === true || enabled === "true" || enabled === 1;
-				}
-				if (timeoutMs !== undefined) {
-					const n = Number(timeoutMs);
-					if (Number.isFinite(n) && n > 0) {
-						overrides.timeoutMs = n;
-					}
-				}
-				return overrides;
-			} catch {
-				return null;
-			}
-		},
 		async handleDownloadComplete(task, isBT) {
 			useTaskStore().saveSession();
 
 			const path = await finalizeCompletedDownloadPath(task);
 			this.showTaskCompleteNotify(task, isBT, path);
 			invoke("on_task_download_complete", { path }).catch(() => {});
-			const overrides = await this.readCompletionScriptOverrides(task.gid);
 			invoke("run_completion_script", {
-				path,
-				hash: task?.infoHash || null,
+				gid: task.gid,
 				status: "complete",
-				overrides,
 			}).catch(() => {});
 		},
 		showTaskCompleteNotify(task, isBT, path) {
@@ -842,15 +819,19 @@ export default {
 
 			if (document.hidden && !is.android()) {
 				this.sendOsNotification(notifyMessage, `${taskName}${tips}`, path);
-			} else {
-				const notify = new Notification(notifyMessage, {
-					body: `${taskName}${tips}`,
-				});
-				notify.onclick = () => {
-					showItemInFolder(path, {
-						errorMsg: this.$t("task.file-not-exist"),
+			} else if (typeof Notification !== "undefined") {
+				try {
+					const notify = new Notification(notifyMessage, {
+						body: `${taskName}${tips}`,
 					});
-				};
+					notify.onclick = () => {
+						showItemInFolder(path, {
+							errorMsg: this.$t("task.file-not-exist"),
+						});
+					};
+				} catch (err) {
+					logger.warn("[Risuko] web notification failed:", err);
+				}
 			}
 		},
 		async sendOsNotification(title: string, body: string, path?: string) {
@@ -870,7 +851,9 @@ export default {
 				}
 				if (!this.notifyActionUnlisten) {
 					this.notifyActionUnlisten = onAction((n) => {
-						const folder = n?.extra?.folderPath as string | undefined;
+						const folder = n?.notification?.extra?.folderPath as
+							| string
+							| undefined;
 						if (folder) {
 							showItemInFolder(folder, {
 								errorMsg: this.$t("task.file-not-exist"),
@@ -909,17 +892,18 @@ export default {
 			}
 		},
 		async bindEngineEvents() {
-			const handlers: [string, (payload: { gid: string }) => void][] = [
+			const handlers: [string, (payload: unknown) => void][] = [
 				["engine:download-start", this.onDownloadStart],
 				["engine:download-stop", this.onDownloadStop],
 				["engine:download-complete", this.onDownloadComplete],
 				["engine:download-error", this.onDownloadError],
 				["engine:bt-download-complete", this.onBtDownloadComplete],
+				["engine:task-list-changed", this.onTaskListChanged],
 			];
 
 			for (const [event, handler] of handlers) {
 				const unlisten = await listen(event, (e: { payload: unknown }) =>
-					handler(e.payload as { gid: string }),
+					handler(e.payload),
 				);
 				if (this.isDestroyed) {
 					unlisten();
@@ -1063,7 +1047,7 @@ export default {
 				];
 
 				if (!document.hidden) {
-					jobs.push(useTaskStore().fetchList());
+					jobs.push(useTaskStore().fetchList({ light: true }));
 				}
 
 				if (!document.hidden && this.taskDetailVisible && this.currentTaskGid) {
@@ -1078,12 +1062,21 @@ export default {
 				this.isPolling = false;
 			}
 
-			const stat = useAppStore().stat;
-			const pending = (stat.numWaiting || 0) - (stat.numPaused || 0);
+			const stat = useAppStore().stat as Record<string, number>;
+			const pending =
+				(stat.numWaiting || 0) -
+				(stat.numPaused || 0) -
+				(stat.numScheduled || 0);
+			if (stat.numActive > 0) {
+				this.sawActiveTask = true;
+			}
 			if (stat.numActive === 0 && pending <= 0) {
 				this.stopPolling();
 				flushDownloadStatsMinute();
-				if (this.shutdownWhenComplete) {
+				const finishedEverything =
+					this.sawActiveTask && (stat.numWaiting || 0) === 0;
+				this.sawActiveTask = false;
+				if (this.shutdownWhenComplete && finishedEverything) {
 					this.armShutdownCountdown();
 				}
 			}

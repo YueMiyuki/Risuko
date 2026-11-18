@@ -14,7 +14,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -219,6 +219,7 @@ impl KadLookup {
 }
 
 const MAX_SHORTLIST: usize = 256;
+const MAX_SHORTLIST_ENTRIES_PER_IP: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeState {
@@ -256,6 +257,16 @@ impl Shortlist {
     fn add(&mut self, contact: routing::Contact) -> bool {
         if !self.known.insert(contact.id) {
             return false;
+        }
+        if routing::is_public_ipv4(*contact.addr.ip()) {
+            let same_ip = self
+                .entries
+                .iter()
+                .filter(|entry| entry.contact.addr.ip() == contact.addr.ip())
+                .count();
+            if same_ip >= MAX_SHORTLIST_ENTRIES_PER_IP {
+                return false;
+            }
         }
         self.entries.push(ShortlistEntry {
             contact,
@@ -533,12 +544,7 @@ struct PendingRequest {
     id: u64,
     target: SocketAddr,
     expectation: RequestExpectation,
-    response: PendingResponse,
-}
-
-enum PendingResponse {
-    Single(oneshot::Sender<KadPacket>),
-    Stream(mpsc::Sender<KadPacket>),
+    response: mpsc::Sender<KadPacket>,
 }
 
 pub struct KadService {
@@ -907,7 +913,7 @@ impl KadService {
                         continue;
                     }
                     let candidate = wire_contact.to_contact();
-                    self.insert_wire_contact(wire_contact).await;
+                    self.insert_wire_contact(wire_contact, false).await;
                     shortlist.add(candidate);
                 }
                 Ok(())
@@ -1138,9 +1144,9 @@ impl KadService {
                     continue;
                 }
                 successful += 1;
-                self.insert_wire_contact(peer).await;
+                self.insert_wire_contact(peer, true).await;
                 for contact in discovered {
-                    self.insert_wire_contact(contact).await;
+                    self.insert_wire_contact(contact, false).await;
                 }
                 hello_targets.push(peer_addr);
                 status.contacts = self.runtime.routing.lock().await.len();
@@ -1203,13 +1209,16 @@ impl KadService {
             .and_then(|value| u16::try_from(value).ok())
             .filter(|port| *port != 0)
             .unwrap_or(target.port());
-        self.insert_wire_contact(KadWireContact {
-            id,
-            ip: *target.ip(),
-            udp_port,
-            tcp_port,
-            version,
-        })
+        self.insert_wire_contact(
+            KadWireContact {
+                id,
+                ip: *target.ip(),
+                udp_port,
+                tcp_port,
+                version,
+            },
+            true,
+        )
         .await;
     }
 
@@ -1414,103 +1423,16 @@ impl KadService {
                 "source request has an unexpected opcode",
             )));
         }
-        let lookup = self.runtime.config.lookup.clone().bounded();
-        let encoded = packet.encode();
-        let mut last_error = None;
-
-        for _ in 0..=lookup.retries {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
-                return Err(KadError::Cancelled);
-            }
-
-            let (request_id, mut response_rx) =
-                self.register_pending_stream(target, expectation).await;
-            let socket = self
-                .runtime
-                .socket
-                .lock()
-                .await
-                .clone()
-                .ok_or(KadError::Cancelled);
-            let socket = match socket {
-                Ok(socket) => socket,
-                Err(error) => {
-                    self.remove_pending(request_id).await;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = socket.send_to(&encoded, SocketAddr::V4(target)).await {
-                self.remove_pending(request_id).await;
-                return Err(KadError::Io(error));
-            }
-
-            let mut packets = Vec::new();
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let wait = if packets.is_empty() {
-                    lookup.request_timeout.min(remaining)
-                } else {
-                    SOURCE_RESPONSE_IDLE.min(remaining)
-                };
-                if wait.is_zero() {
-                    break;
-                }
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        self.remove_pending(request_id).await;
-                        return Err(KadError::Cancelled);
-                    }
-                    _ = self.runtime.shutdown.cancelled() => {
-                        self.remove_pending(request_id).await;
-                        return Err(KadError::Cancelled);
-                    }
-                    result = timeout(wait, response_rx.recv()) => result,
-                };
-                match result {
-                    Ok(Some(response)) => {
-                        packets.push(response);
-                        if packets.len() >= MAX_SOURCE_RESPONSE_PACKETS {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        last_error = Some(KadError::Io(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "Kad response dispatcher stopped",
-                        )));
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-            self.remove_pending(request_id).await;
-            if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
-                return Err(KadError::Cancelled);
-            }
-            if !packets.is_empty() {
-                return Ok(packets);
-            }
-            if last_error.is_none() {
-                last_error = Some(KadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Kad source response timed out",
-                )));
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            KadError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Kad lookup deadline exceeded",
-            ))
-        }))
+        self.exchange(
+            target,
+            &packet,
+            expectation,
+            cancel,
+            deadline,
+            MAX_SOURCE_RESPONSE_PACKETS,
+            "Kad source response timed out",
+        )
+        .await
     }
 
     async fn request(
@@ -1521,79 +1443,78 @@ impl KadService {
         deadline: Instant,
     ) -> Result<KadPacket, KadError> {
         let expectation = RequestExpectation::from_request(&packet)?;
+        let mut packets = self
+            .exchange(
+                target,
+                &packet,
+                expectation,
+                cancel,
+                deadline,
+                1,
+                "Kad request timed out",
+            )
+            .await?;
+        Ok(packets.swap_remove(0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange(
+        &self,
+        target: SocketAddrV4,
+        packet: &KadPacket,
+        expectation: RequestExpectation,
+        cancel: &CancellationToken,
+        deadline: Instant,
+        max_packets: usize,
+        timeout_message: &'static str,
+    ) -> Result<Vec<KadPacket>, KadError> {
         let lookup = self.runtime.config.lookup.clone().bounded();
         let encoded = packet.encode();
-        let mut last_timeout = None;
+        let cancelled = || cancel.is_cancelled() || self.runtime.shutdown.is_cancelled();
+        let mut last_error = None;
+
         for _ in 0..=lookup.retries {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
                 break;
             }
-            if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
+            if cancelled() {
                 return Err(KadError::Cancelled);
-            }
-            let (request_id, mut response_rx) = self.register_pending(target, expectation).await;
-            if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
-                self.remove_pending(request_id).await;
-                return Err(KadError::Cancelled);
-            }
-            let socket = self
-                .runtime
-                .socket
-                .lock()
-                .await
-                .clone()
-                .ok_or(KadError::Cancelled);
-            let socket = match socket {
-                Ok(socket) => socket,
-                Err(error) => {
-                    self.remove_pending(request_id).await;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = socket.send_to(&encoded, SocketAddr::V4(target)).await {
-                self.remove_pending(request_id).await;
-                return Err(KadError::Io(error));
             }
 
-            let attempt_deadline = Instant::now() + lookup.request_timeout.min(remaining);
-            let wait = attempt_deadline
-                .saturating_duration_since(Instant::now())
-                .min(deadline.saturating_duration_since(Instant::now()));
-            let result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    self.remove_pending(request_id).await;
-                    return Err(KadError::Cancelled);
-                }
-                _ = self.runtime.shutdown.cancelled() => {
-                    self.remove_pending(request_id).await;
-                    return Err(KadError::Cancelled);
-                }
-                result = timeout(wait, &mut response_rx) => result,
-            };
-            match result {
-                Ok(Ok(response)) => return Ok(response),
-                Ok(Err(_)) if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() => {
-                    self.remove_pending(request_id).await;
-                    return Err(KadError::Cancelled);
-                }
-                Ok(Err(_)) => {
-                    self.remove_pending(request_id).await;
-                    last_timeout = Some(KadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "Kad response dispatcher stopped",
-                    )));
-                }
-                Err(_) => {
-                    self.remove_pending(request_id).await;
-                    last_timeout = Some(KadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Kad request timed out",
-                    )));
-                }
+            let (request_id, mut response_rx) = self
+                .register_pending(target, expectation, max_packets)
+                .await;
+            let attempt = self
+                .collect_responses(
+                    &encoded,
+                    target,
+                    &mut response_rx,
+                    cancel,
+                    deadline,
+                    lookup.request_timeout,
+                    max_packets,
+                )
+                .await;
+            self.remove_pending(request_id).await;
+
+            let (packets, dispatcher_stopped) = attempt?;
+            if cancelled() {
+                return Err(KadError::Cancelled);
             }
+            if !packets.is_empty() {
+                return Ok(packets);
+            }
+            last_error = Some(KadError::Io(if dispatcher_stopped {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Kad response dispatcher stopped",
+                )
+            } else {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, timeout_message)
+            }));
         }
-        Err(last_timeout.unwrap_or_else(|| {
+
+        Err(last_error.unwrap_or_else(|| {
             KadError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Kad lookup deadline exceeded",
@@ -1601,34 +1522,72 @@ impl KadService {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_responses(
+        &self,
+        encoded: &[u8],
+        target: SocketAddrV4,
+        response_rx: &mut mpsc::Receiver<KadPacket>,
+        cancel: &CancellationToken,
+        deadline: Instant,
+        request_timeout: Duration,
+        max_packets: usize,
+    ) -> Result<(Vec<KadPacket>, bool), KadError> {
+        if cancel.is_cancelled() || self.runtime.shutdown.is_cancelled() {
+            return Err(KadError::Cancelled);
+        }
+        let socket = self
+            .runtime
+            .socket
+            .lock()
+            .await
+            .clone()
+            .ok_or(KadError::Cancelled)?;
+        socket
+            .send_to(encoded, SocketAddr::V4(target))
+            .await
+            .map_err(KadError::Io)?;
+
+        let mut packets = Vec::new();
+        while packets.len() < max_packets {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = if packets.is_empty() {
+                request_timeout.min(remaining)
+            } else {
+                SOURCE_RESPONSE_IDLE.min(remaining)
+            };
+            if wait.is_zero() {
+                break;
+            }
+            let received = tokio::select! {
+                _ = cancel.cancelled() => return Err(KadError::Cancelled),
+                _ = self.runtime.shutdown.cancelled() => return Err(KadError::Cancelled),
+                received = timeout(wait, response_rx.recv()) => received,
+            };
+            match received {
+                Ok(Some(response)) => packets.push(response),
+                Ok(None) => return Ok((packets, true)),
+                Err(_) => break,
+            }
+        }
+        Ok((packets, false))
+    }
+
     async fn register_pending(
         &self,
         target: SocketAddrV4,
         expectation: RequestExpectation,
-    ) -> (u64, oneshot::Receiver<KadPacket>) {
-        let id = self.runtime.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let (response, receiver) = oneshot::channel();
-        self.runtime.pending.lock().await.push(PendingRequest {
-            id,
-            target: SocketAddr::V4(target),
-            expectation,
-            response: PendingResponse::Single(response),
-        });
-        (id, receiver)
-    }
-
-    async fn register_pending_stream(
-        &self,
-        target: SocketAddrV4,
-        expectation: RequestExpectation,
+        capacity: usize,
     ) -> (u64, mpsc::Receiver<KadPacket>) {
         let id = self.runtime.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let (response, receiver) = mpsc::channel(MAX_SOURCE_RESPONSE_PACKETS);
-        self.runtime.pending.lock().await.push(PendingRequest {
+        let (response, receiver) = mpsc::channel(capacity);
+        let mut pending = self.runtime.pending.lock().await;
+        pending.retain(|entry| !entry.response.is_closed());
+        pending.push(PendingRequest {
             id,
             target: SocketAddr::V4(target),
             expectation,
-            response: PendingResponse::Stream(response),
+            response,
         });
         (id, receiver)
     }
@@ -1651,18 +1610,22 @@ impl KadService {
         is_valid_kad_contact(contact, self.runtime.node_id)
     }
 
-    async fn insert_wire_contact(self: &Arc<Self>, contact: KadWireContact) -> bool {
+    async fn insert_wire_contact(self: &Arc<Self>, contact: KadWireContact, direct: bool) -> bool {
         if !self.is_valid_wire_contact(&contact) {
             return false;
         }
         let candidate = contact.to_contact();
         let mut table = self.runtime.routing.lock().await;
         let probe = table.liveness_probe_target(&candidate);
-        let inserted = table.insert(candidate);
+        let inserted = if direct {
+            table.insert(candidate)
+        } else {
+            table.insert_hearsay(candidate)
+        };
         drop(table);
-        if !matches!(
+        if matches!(
             inserted,
-            routing::InsertResult::Rejected | routing::InsertResult::SelfContact
+            routing::InsertResult::Inserted | routing::InsertResult::Updated
         ) {
             let _ = self.runtime.checkpoint_tx.try_send(());
         }
@@ -1803,41 +1766,17 @@ async fn run_dispatcher(
                 .collect::<HashSet<_>>()
         };
 
-        let (oneshot_senders, stream_senders) = {
+        let senders = {
             let mut entries = pending.lock().await;
-            let mut oneshot_senders = Vec::new();
-            let mut stream_senders = Vec::new();
-            let mut index = 0;
-            while index < entries.len() {
-                if matching_ids.contains(&entries[index].id) {
-                    match &entries[index].response {
-                        PendingResponse::Single(_) => {
-                            let entry = entries.swap_remove(index);
-                            if let PendingResponse::Single(sender) = entry.response {
-                                oneshot_senders.push(sender);
-                            }
-                        }
-                        PendingResponse::Stream(sender) if sender.is_closed() => {
-                            entries.swap_remove(index);
-                        }
-                        PendingResponse::Stream(sender) => {
-                            stream_senders.push(sender.clone());
-                            index += 1;
-                        }
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            if oneshot_senders.is_empty() && stream_senders.is_empty() {
-                continue;
-            }
-            (oneshot_senders, stream_senders)
+            entries
+                .retain(|entry| !(matching_ids.contains(&entry.id) && entry.response.is_closed()));
+            entries
+                .iter()
+                .filter(|entry| matching_ids.contains(&entry.id))
+                .map(|entry| entry.response.clone())
+                .collect::<Vec<_>>()
         };
-        for sender in oneshot_senders {
-            let _ = sender.send(packet.clone());
-        }
-        for sender in stream_senders {
+        for sender in senders {
             let _ = sender.try_send(packet.clone());
         }
     }

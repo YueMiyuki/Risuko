@@ -40,6 +40,16 @@ impl UsenetCredentialResolver for AnonymousCredentialResolver {
     }
 }
 
+const WARNING_ARCHIVE_CLEANUP_UNSUPPORTED: &str = "archive-cleanup-unsupported";
+const WARNING_CLEANUP_INCOMPLETE: &str = "cleanup-incomplete";
+const WARNING_PAR2_UNVERIFIED: &str = "par2-unverified";
+
+pub(crate) struct UsenetDownloadOutput {
+    pub(crate) path: PathBuf,
+    pub(crate) outputs: Vec<(usize, PathBuf)>,
+    pub(crate) warning: Option<&'static str>,
+}
+
 #[derive(Debug)]
 pub(crate) struct UsenetDownloadError {
     message: String,
@@ -398,7 +408,9 @@ impl NntpArticleSource {
 
         let mut capacity_waiters = Vec::new();
         let mut last_error = None;
+        let mut tried = Vec::new();
         for profile in candidates {
+            tried.push(profile.id.clone());
             match self
                 .fetch_from_profile(profile.clone(), message_id, ConnectionAdmission::Immediate)
                 .await
@@ -435,6 +447,31 @@ impl NntpArticleSource {
                         return Err(error);
                     }
                     last_error = Some(error);
+                }
+            }
+        }
+
+        if matches!(last_error, Some(NntpError::ArticleUnavailable { .. })) {
+            for profile in self.pool.cooling_down_profiles() {
+                if tried.contains(&profile.id) {
+                    continue;
+                }
+                match self
+                    .fetch_from_profile(profile.clone(), message_id, ConnectionAdmission::Wait)
+                    .await
+                {
+                    Ok(part) => {
+                        self.pool.mark_success(&profile.id);
+                        return Ok((profile.id, part));
+                    }
+                    Err(NntpError::ArticleUnavailable { .. }) => {}
+                    Err(error) => {
+                        let class = error.failover_class();
+                        self.pool.mark_failure(&profile.id, &error);
+                        if class == super::usenet_transport::FailoverClass::Permanent {
+                            return Err(error);
+                        }
+                    }
                 }
             }
         }
@@ -852,29 +889,6 @@ pub fn profiles_from_options(
         .map_err(|error| format!("Invalid Usenet provider profiles: {error}"))
 }
 
-fn http_proxy_from_options(
-    options: &Map<String, Value>,
-) -> Result<Option<risuko_http::ProxyConnector>, String> {
-    let server = options
-        .get("all-proxy")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if server.is_empty() {
-        return Ok(None);
-    }
-    let proxy = risuko_http::Proxy::all(server)
-        .map_err(|error| format!("Invalid HTTP profile proxy: {error}"))?;
-    let bypass = options
-        .get("no-proxy")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    Ok(Some(
-        risuko_http::ProxyConnector::from_proxy(proxy)
-            .with_no_proxy(risuko_http::NoProxy::parse(bypass)),
-    ))
-}
-
 pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     task: &DownloadTask,
     options: &Map<String, Value>,
@@ -885,7 +899,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     connection_capacity: Arc<ProviderConnectionCapacityRegistry>,
     throttle: Throttle,
     stage: Option<StageCallback>,
-) -> Result<(PathBuf, Vec<(usize, PathBuf)>), UsenetDownloadError> {
+) -> Result<UsenetDownloadOutput, UsenetDownloadError> {
     let metadata: &UsenetTaskData = task
         .usenet
         .as_ref()
@@ -899,7 +913,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     }
     let pool = Arc::new(ProviderPool::new(profiles).map_err(|error| error.to_string())?);
     let archive_limits = archive_limits_for_task(metadata, options)?;
-    let proxy = http_proxy_from_options(options)?;
+    let proxy = super::util::http_proxy_from_options(options)?;
     let make_source = || NntpArticleSource {
         pool: pool.clone(),
         resolver: resolver.clone(),
@@ -956,6 +970,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
 
     let mut assembled: Vec<AssembledTaskFile> = Vec::new();
     let mut promoted_outputs = Vec::new();
+    let mut par2_warning = None;
     report_stage(&stage, "fetching");
     let source = make_source();
     for index in fetch_now {
@@ -1112,6 +1127,11 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
                 .await?;
                 continue;
             }
+            Err(Par2Error::UnusableNames(reason)) if !needs_repair => {
+                tracing::warn!("PAR2 verification skipped: {reason}");
+                par2_warning = Some(WARNING_PAR2_UNVERIFIED);
+                break;
+            }
             Err(error) => return Err(UsenetDownloadError::from_par2_error(error, &unavailable)),
         };
         persist_par2_repair_state(&assembled, &repair.promoted_outputs).await?;
@@ -1137,26 +1157,51 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     }
     ensure_usenet_active_time(&active_time, archive_limits.max_active_seconds)?;
     completed.store(total.load(Ordering::Relaxed), Ordering::Relaxed);
-    let cleanup_mode = cleanup_mode_for_task(metadata, options);
+    let (cleanup_mode, downgrade_warning) = cleanup_mode_for_task(metadata, options);
     let (par2_inputs, archive_inputs) = cleanup_inputs(&assembled, false, &promoted_outputs);
-    if let Err(error) = cleanup_after_success(cleanup_mode, true, &par2_inputs, &archive_inputs) {
-        tracing::warn!(
-            mode = ?cleanup_mode,
-            %error,
-            "Usenet cleanup after verified success was incomplete"
-        );
-    }
+    let par2_inputs = if par2_warning.is_some() {
+        Vec::new()
+    } else {
+        par2_inputs
+    };
+    let cleanup_warning = run_cleanup(
+        cleanup_mode,
+        downgrade_warning,
+        &par2_inputs,
+        &archive_inputs,
+    );
+    let warning = par2_warning.or(cleanup_warning);
     report_stage(&stage, "complete");
-    Ok((
-        assembled
+    Ok(UsenetDownloadOutput {
+        path: assembled
             .first()
             .map(|file| file.report.output.clone())
             .unwrap_or_else(|| destination.clone()),
-        assembled
+        outputs: assembled
             .iter()
             .map(|file| (file.index, file.report.output.clone()))
             .collect(),
-    ))
+        warning,
+    })
+}
+
+fn run_cleanup(
+    mode: CleanupMode,
+    downgrade_warning: Option<&'static str>,
+    par2_inputs: &[PathBuf],
+    archive_inputs: &[PathBuf],
+) -> Option<&'static str> {
+    match cleanup_after_success(mode, true, par2_inputs, archive_inputs) {
+        Ok(()) => downgrade_warning,
+        Err(error) => {
+            tracing::warn!(
+                mode = ?mode,
+                %error,
+                "Usenet cleanup after verified success was incomplete"
+            );
+            Some(WARNING_CLEANUP_INCOMPLETE)
+        }
+    }
 }
 
 fn volume_blocks(role: FileRole) -> Option<u32> {
@@ -1303,7 +1348,10 @@ async fn fetch_task_file(
     })
 }
 
-fn cleanup_mode_for_task(metadata: &UsenetTaskData, options: &Map<String, Value>) -> CleanupMode {
+fn cleanup_mode_for_task(
+    metadata: &UsenetTaskData,
+    options: &Map<String, Value>,
+) -> (CleanupMode, Option<&'static str>) {
     let configured = metadata
         .options
         .cleanup_mode
@@ -1314,9 +1362,12 @@ fn cleanup_mode_for_task(metadata: &UsenetTaskData, options: &Map<String, Value>
         tracing::warn!(
             "Usenet archive-volume cleanup is unsupported because this worker does not verify extraction"
         );
-        CleanupMode::DeletePar2
+        (
+            CleanupMode::DeletePar2,
+            Some(WARNING_ARCHIVE_CLEANUP_UNSUPPORTED),
+        )
     } else {
-        mode
+        (mode, None)
     }
 }
 
@@ -2278,6 +2329,125 @@ mod tests {
         backup_server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn cooled_down_backup_is_asked_before_an_article_is_declared_missing() {
+        let primary_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let primary_port = primary_listener.local_addr().unwrap().port();
+        let backup_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let backup_port = backup_listener.local_addr().unwrap().port();
+        let primary_server = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            assert_eq!(read_command(&mut reader).await, "ARTICLE <missing@example>");
+            reader
+                .get_mut()
+                .write_all(b"430 article unavailable\r\n")
+                .await
+                .unwrap();
+        });
+        let backup_server = tokio::spawn(async move {
+            let (stream, _) = backup_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "bob", "secret").await;
+            assert_eq!(read_command(&mut reader).await, "ARTICLE <missing@example>");
+            write_test_article(&mut reader).await;
+        });
+        let resolver = Arc::new(RecordingResolver {
+            credentials: HashMap::from([
+                ("primary".into(), credentials("alice", "secret")),
+                ("backup".into(), credentials("bob", "secret")),
+            ]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let source = source_for_test(
+            vec![
+                profile("primary", primary_port, 0),
+                profile("backup", backup_port, 1),
+            ],
+            resolver,
+        );
+        source.pool.mark_failure(
+            "backup",
+            &NntpError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        );
+        assert_eq!(source.pool.ordered_profiles().len(), 1);
+
+        let part = timeout(Duration::from_secs(3), source.fetch("missing@example"))
+            .await
+            .expect("cooled-down backup fetch timed out")
+            .expect("article was declared missing without asking the cooled-down backup");
+
+        assert_eq!(part.data, b"A");
+        primary_server.await.unwrap();
+        backup_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_error_from_a_cooled_down_backup_is_returned() {
+        let primary_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let primary_port = primary_listener.local_addr().unwrap().port();
+        let backup_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let backup_port = backup_listener.local_addr().unwrap().port();
+        let primary_server = tokio::spawn(async move {
+            let (stream, _) = primary_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "alice", "secret").await;
+            assert_eq!(read_command(&mut reader).await, "ARTICLE <missing@example>");
+            reader
+                .get_mut()
+                .write_all(b"430 article unavailable\r\n")
+                .await
+                .unwrap();
+        });
+        let backup_server = tokio::spawn(async move {
+            let (stream, _) = backup_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            greet_and_authenticate(&mut reader, "bob", "secret").await;
+            assert_eq!(read_command(&mut reader).await, "ARTICLE <missing@example>");
+            reader
+                .get_mut()
+                .write_all(b"500 command not understood\r\n")
+                .await
+                .unwrap();
+        });
+        let resolver = Arc::new(RecordingResolver {
+            credentials: HashMap::from([
+                ("primary".into(), credentials("alice", "secret")),
+                ("backup".into(), credentials("bob", "secret")),
+            ]),
+            calls: Mutex::new(Vec::new()),
+        });
+        let source = source_for_test(
+            vec![
+                profile("primary", primary_port, 0),
+                profile("backup", backup_port, 1),
+            ],
+            resolver,
+        );
+        source.pool.mark_failure(
+            "backup",
+            &NntpError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        );
+
+        let result = timeout(Duration::from_secs(3), source.fetch("missing@example"))
+            .await
+            .expect("permanent backup error fetch timed out");
+
+        assert!(
+            matches!(&result, Err(ArticleFetchError::Failed(message)) if message.contains("500")),
+            "{result:?}"
+        );
+        primary_server.await.unwrap();
+        backup_server.await.unwrap();
+    }
+
     fn single_connection_source(port: u16) -> NntpArticleSource {
         let resolver = Arc::new(RecordingResolver {
             credentials: HashMap::from([("primary".into(), credentials("alice", "secret"))]),
@@ -2934,7 +3104,7 @@ mod tests {
 
         assert_eq!(
             cleanup_mode_for_task(&metadata, &options),
-            CleanupMode::DeletePar2
+            (CleanupMode::DeletePar2, None)
         );
     }
 
@@ -2948,8 +3118,47 @@ mod tests {
         );
         assert_eq!(
             cleanup_mode_for_task(&metadata, &options),
-            CleanupMode::DeletePar2
+            (CleanupMode::DeletePar2, Some("archive-cleanup-unsupported"))
         );
+    }
+
+    #[test]
+    fn cleanup_failure_after_verified_success_is_reported_as_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = dir.path().join("release.par2");
+        fs::create_dir(&stuck).unwrap();
+        let removable = dir.path().join("release.vol00+01.par2");
+        fs::write(&removable, b"x").unwrap();
+
+        assert_eq!(
+            run_cleanup(
+                CleanupMode::DeletePar2,
+                None,
+                &[stuck.clone(), removable.clone()],
+                &[]
+            ),
+            Some("cleanup-incomplete")
+        );
+        assert_eq!(
+            run_cleanup(
+                CleanupMode::DeletePar2,
+                Some("archive-cleanup-unsupported"),
+                &[stuck],
+                &[]
+            ),
+            Some("cleanup-incomplete")
+        );
+        assert_eq!(
+            run_cleanup(
+                CleanupMode::DeletePar2,
+                Some("archive-cleanup-unsupported"),
+                std::slice::from_ref(&removable),
+                &[]
+            ),
+            Some("archive-cleanup-unsupported")
+        );
+        assert!(!removable.exists());
+        assert_eq!(run_cleanup(CleanupMode::KeepAll, None, &[], &[]), None);
     }
 
     #[test]
@@ -3346,10 +3555,79 @@ mod tests {
         }
     }
 
+    fn colliding_names_scenario(dir: &Path, lose_second_half: bool) -> Par2Scenario {
+        let parity = tempfile::tempdir().unwrap();
+        let data = b"ABCDEFGH";
+        let parity_files =
+            crate::engine::usenet_par2::tests::write_fixture(parity.path(), "A.bin", data, false);
+        let index = fs::read(&parity_files[0]).unwrap();
+        let mut articles = HashMap::new();
+        articles.insert(
+            "upper-1@t".to_string(),
+            yenc_article("A.bin", &data[..4], Some((1, 4, 8))),
+        );
+        if !lose_second_half {
+            articles.insert(
+                "upper-2@t".to_string(),
+                yenc_article("A.bin", &data[4..], Some((5, 8, 8))),
+            );
+        }
+        articles.insert("lower-1@t".to_string(), yenc_article("a.bin", data, None));
+        articles.insert(
+            "index-1@t".to_string(),
+            yenc_article("sample.par2", &index, None),
+        );
+        let file = |name: &str, segments: &[(u32, u64, &str)]| UsenetTaskFile {
+            name: name.into(),
+            subject: name.into(),
+            groups: Vec::new(),
+            segments: segments
+                .iter()
+                .map(|(number, bytes, id)| UsenetTaskSegment {
+                    number: *number,
+                    bytes: *bytes,
+                    message_id: (*id).into(),
+                })
+                .collect(),
+        };
+        let metadata = UsenetTaskData {
+            files: vec![
+                file("A.bin", &[(1, 4, "upper-1@t"), (2, 4, "upper-2@t")]),
+                file("a.bin", &[(1, 8, "lower-1@t")]),
+                file("sample.par2", &[(1, index.len() as u64, "index-1@t")]),
+            ],
+            ..Default::default()
+        };
+        Par2Scenario {
+            task: DownloadTask {
+                dir: dir.to_string_lossy().into_owned(),
+                usenet: Some(metadata),
+                ..Default::default()
+            },
+            options: Map::new(),
+            articles,
+            index_bytes: index.len() as u64,
+            volume_bytes: 0,
+        }
+    }
+
     async fn run_scenario(
         lose_second_half: bool,
     ) -> (
-        Result<(PathBuf, Vec<(usize, PathBuf)>), UsenetDownloadError>,
+        Result<UsenetDownloadOutput, UsenetDownloadError>,
+        Vec<String>,
+        u64,
+        tempfile::TempDir,
+        Par2Scenario,
+    ) {
+        run_scenario_with_cleanup(lose_second_half, None).await
+    }
+
+    async fn run_scenario_with_cleanup(
+        lose_second_half: bool,
+        cleanup_mode: Option<&str>,
+    ) -> (
+        Result<UsenetDownloadOutput, UsenetDownloadError>,
         Vec<String>,
         u64,
         tempfile::TempDir,
@@ -3357,6 +3635,24 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut scenario = par2_scenario(dir.path(), lose_second_half, 0);
+        if let Some(mode) = cleanup_mode {
+            scenario
+                .options
+                .insert("usenet-cleanup-mode".into(), Value::String(mode.into()));
+        }
+        run_built_scenario(dir, scenario).await
+    }
+
+    async fn run_built_scenario(
+        dir: tempfile::TempDir,
+        mut scenario: Par2Scenario,
+    ) -> (
+        Result<UsenetDownloadOutput, UsenetDownloadError>,
+        Vec<String>,
+        u64,
+        tempfile::TempDir,
+        Par2Scenario,
+    ) {
         let (port, requested) = spawn_article_server(scenario.articles.clone()).await;
         scenario.options.insert(
             "usenet-profiles".into(),
@@ -3393,7 +3689,10 @@ mod tests {
     #[tokio::test]
     async fn undamaged_downloads_never_request_recovery_volumes() {
         let (result, requested, total, dir, scenario) = run_scenario(false).await;
-        let (_, outputs) = result.unwrap_or_else(|error| panic!("{error}"));
+        let UsenetDownloadOutput {
+            outputs, warning, ..
+        } = result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(warning, None);
 
         assert!(
             !requested.iter().any(|id| id == "volume-1@t"),
@@ -3416,5 +3715,50 @@ mod tests {
         );
         assert_eq!(total, 8 + scenario.index_bytes + scenario.volume_bytes);
         assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), b"ABCDEFGH");
+    }
+
+    #[tokio::test]
+    async fn archive_volume_cleanup_request_surfaces_a_warning_on_success() {
+        let (result, _, _, dir, _) =
+            run_scenario_with_cleanup(false, Some("delete-par2-and-volumes")).await;
+        let output = result.unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(output.warning, Some("archive-cleanup-unsupported"));
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), b"ABCDEFGH");
+    }
+
+    #[tokio::test]
+    async fn a_complete_download_with_colliding_names_finishes_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scenario = colliding_names_scenario(dir.path(), false);
+        scenario.options.insert(
+            "usenet-cleanup-mode".into(),
+            Value::String("delete-par2".into()),
+        );
+
+        let (result, _, _, dir, _) = run_built_scenario(dir, scenario).await;
+        let output = result.unwrap_or_else(|error| panic!("{error}"));
+
+        assert_eq!(output.warning, Some("par2-unverified"));
+        assert_eq!(output.outputs.len(), 3);
+        assert!(dir.path().join("sample.par2").exists());
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_download_with_colliding_names_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let scenario = colliding_names_scenario(dir.path(), true);
+
+        let (result, _, _, _dir, _) = run_built_scenario(dir, scenario).await;
+        let Err(error) = result else {
+            panic!("a download that needs repair must fail when PAR2 cannot run");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("collides on case-insensitive filesystems"),
+            "{error}"
+        );
     }
 }

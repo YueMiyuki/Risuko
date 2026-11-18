@@ -330,7 +330,7 @@ fn direct_datagram_source_allowed(no_proxy: &NoProxy, source: SocketAddr) -> boo
     no_proxy.matches_host_port(&source.ip().to_string(), Some(source.port()))
 }
 
-fn clone_route_error(error: &Error) -> Error {
+pub(crate) fn clone_route_error(error: &Error) -> Error {
     match error {
         Error::Url(message) => Error::Url(message.clone()),
         Error::Header(message) => Error::Header(message.clone()),
@@ -840,11 +840,12 @@ async fn socks5_udp_associate(
     connector: &Connector,
     proxy: &Proxy,
 ) -> HttpResult<(BoxedIo, SocketAddr, bool)> {
-    let phost = proxy
-        .url()
-        .host_str()
-        .ok_or_else(|| Error::Url("proxy missing host".into()))?
-        .to_string();
+    let phost = normalize_target_host(
+        proxy
+            .url()
+            .host_str()
+            .ok_or_else(|| Error::Url("proxy missing host".into()))?,
+    );
     let pport = proxy.url().port().unwrap_or(1080);
     let stream = connector.direct(&phost, pport).await?;
     let control_connector = Connector {
@@ -1647,11 +1648,12 @@ impl Connector {
     ) -> Result<BoxedIo, Error> {
         match proxy.scheme() {
             ProxyScheme::Http => {
-                let phost = proxy
-                    .url()
-                    .host_str()
-                    .ok_or_else(|| Error::Url("proxy missing host".into()))?
-                    .to_string();
+                let phost = normalize_target_host(
+                    proxy
+                        .url()
+                        .host_str()
+                        .ok_or_else(|| Error::Url("proxy missing host".into()))?,
+                );
                 let pport = proxy.url().port().unwrap_or(80);
                 let stream = self.direct_proxy_connection(&phost, pport).await?;
                 if is_https {
@@ -1668,11 +1670,12 @@ impl Connector {
                 } else {
                     host.to_string()
                 };
-                let phost = proxy
-                    .url()
-                    .host_str()
-                    .ok_or_else(|| Error::Url("proxy missing host".into()))?
-                    .to_string();
+                let phost = normalize_target_host(
+                    proxy
+                        .url()
+                        .host_str()
+                        .ok_or_else(|| Error::Url("proxy missing host".into()))?,
+                );
                 let pport = proxy.url().port().unwrap_or(1080);
                 let user_raw = proxy.url().username();
                 let pass_raw = proxy.url().password().unwrap_or("");

@@ -64,11 +64,9 @@ export interface AppConfig {
 	taskListStyle?: "compact" | "card";
 	sidebarCollapsed?: boolean | string;
 	runMode?: number | string;
+	rpcHost?: string;
 	rpcSecret?: string;
-	externalEngineEnabled?: boolean | string;
-	externalEngineHost?: string;
-	externalEnginePort?: number | string;
-	externalEngineSecret?: string;
+	rpcAllowAnyDir?: boolean | string;
 	engineOverrides?: Record<string, string | number | boolean | null>;
 	autoCheckUpdate?: boolean;
 	lastCheckUpdateTime?: number;
@@ -79,6 +77,7 @@ export interface AppConfig {
 	lastSyncTrackerTime?: number;
 	maxOverallDownloadLimit?: number;
 	maxOverallUploadLimit?: number;
+	btUploadRateLimit?: number;
 	historyDirectories?: string[];
 	favoriteDirectories?: string[];
 	savedCredentials?: SavedCredential[];
@@ -129,6 +128,8 @@ export interface AppConfig {
 	cloudSyncLastAt?: number;
 	cloudSyncServerUrl?: string;
 	cloudSyncCategoryTimestamps?: Record<string, number>;
+	cloudSyncCategoryRevs?: Record<string, number>;
+	cloudSyncDirtyKeys?: Record<string, string[]>;
 	[key: string]: unknown;
 }
 
@@ -727,22 +728,35 @@ export const redactProxySettings = (
 		"p2p-udp-proxy",
 		"allProxy",
 		"p2pProxy",
+		"p2PProxy",
 		"p2pUdpProxy",
+		"p2PUdpProxy",
 	]) {
 		if (typeof result[key] === "string") {
 			result[key] = redactProxyUrl(result[key] as string);
 		}
 	}
-	for (const key of [
-		"pbhRpcSecret",
-		"pbh-rpc-secret",
-		"rpcSecret",
-		"rpc-secret",
-		"externalEngineSecret",
-	]) {
+	for (const key of SECRET_SETTING_KEYS) {
 		if (key in result && result[key] != null && result[key] !== "") {
 			result[key] = "[REDACTED]";
 		}
 	}
 	return result;
 };
+
+const SECRET_SETTING_KEYS = [
+	"pbh-rpc-secret",
+	"rpc-secret",
+	"external-engine-secret",
+	"cloud-sync-token",
+	"saved-credentials",
+	"ftp-passwd",
+	"sftp-passwd",
+	"sftp-private-key",
+	"sftp-private-key-passphrase",
+	"cookie",
+	"header",
+].flatMap((key) => [
+	key,
+	key.replace(/-(.)/g, (_, char: string) => char.toUpperCase()),
+]);
