@@ -219,7 +219,13 @@
 
             <TabsContent value="test" class="rss-tab-pane">
               <div class="rss-dry-toolbar">
-                <Button size="sm" variant="outline" :disabled="dryRunBusy || seasonsInvalid" @click="runDryRun">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  :disabled="dryRunBusy || seasonsInvalid"
+                  :aria-describedby="seasonsInvalid ? 'rss-dry-run-seasons-error' : undefined"
+                  @click="runDryRun"
+                >
                   <RefreshCw v-if="dryRunBusy" :size="14" class="animate-spin" />
                   <Play v-else :size="14" />
                   {{ $t('rss.rule-dry-run') }}
@@ -228,6 +234,9 @@
                   {{ $t('rss.rule-dry-run-summary', { matched: matchedCount, total: dryRunResults.length }) }}
                 </span>
               </div>
+              <p v-if="seasonsInvalid" id="rss-dry-run-seasons-error" class="rss-field-error">
+                {{ $t('rss.rule-seasons-invalid') }}
+              </p>
               <div v-if="dryRunDone && dryRunResults.length === 0" class="rss-dry-empty">
                 {{ $t('rss.rule-dry-run-empty') }}
               </div>

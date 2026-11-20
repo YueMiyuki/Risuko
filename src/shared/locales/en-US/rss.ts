@@ -113,9 +113,9 @@ export default {
 	"rule-episodes-specific": "Specific episodes",
 	"rule-placeholder-episodes": "1, 5, 12",
 	"rule-episodes-invalid":
-		"Enter whole episode numbers separated by commas, for example 1, 5, 12",
+		"Enter positive whole episode numbers separated by commas, for example 1, 5, 12",
 	"rule-seasons-invalid":
-		"Enter whole season numbers separated by commas, for example 1, 2, 3",
+		"Enter positive whole season numbers separated by commas, for example 1, 2, 3",
 	"rule-chip-earlier": "Move earlier",
 	"rule-chip-later": "Move later",
 	"rule-chip-remove": "Remove",
