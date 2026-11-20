@@ -56,24 +56,13 @@ fn register_task_limiter(
     limiter
 }
 
+type StartingWorkers = parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>;
+
 fn next_worker_epoch() -> u64 {
     WORKER_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
-fn publish_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-    epoch: u64,
-    token: CancellationToken,
-) {
-    starting.lock().insert(gid.to_string(), (epoch, token));
-}
-
-fn clear_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-    epoch: u64,
-) {
+fn clear_starting_worker(starting: &StartingWorkers, gid: &str, epoch: u64) {
     let mut guard = starting.lock();
     if guard.get(gid).map(|(e, _)| *e) == Some(epoch) {
         guard.remove(gid);
@@ -82,7 +71,7 @@ fn clear_starting_worker(
 
 async fn register_active_download(
     active: &Arc<RwLock<HashMap<String, ActiveDownload>>>,
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
+    starting: &StartingWorkers,
     gid: String,
     ad: ActiveDownload,
 ) {
@@ -91,18 +80,13 @@ async fn register_active_download(
     clear_starting_worker(starting, &gid, epoch);
 }
 
-fn cancel_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-) {
+fn cancel_starting_worker(starting: &StartingWorkers, gid: &str) {
     if let Some((_, token)) = starting.lock().get(gid).cloned() {
         token.cancel();
     }
 }
 
-fn cancel_all_starting_workers(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-) {
+fn cancel_all_starting_workers(starting: &StartingWorkers) {
     let tokens: Vec<_> = starting
         .lock()
         .values()
@@ -634,6 +618,10 @@ impl Counters {
             speed: Arc::new(AtomicU64::new(0)),
             connections: Arc::new(AtomicU32::new(connections)),
         }
+    }
+
+    fn to_active_plain(&self, epoch: u64) -> ActiveDownload {
+        self.to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None)))
     }
 
     fn to_active(
@@ -1254,7 +1242,7 @@ pub struct TaskManager {
     tasks: Arc<RevLock>,
     saved_rev: AtomicU64,
     active_downloads: Arc<RwLock<HashMap<String, ActiveDownload>>>,
-    starting_workers: Arc<parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>>,
+    starting_workers: Arc<StartingWorkers>,
     updating_tasks: Arc<parking_lot::Mutex<HashSet<String>>>,
     stamp_attempts: Arc<parking_lot::Mutex<HashSet<String>>>,
     torrent_ids: Arc<RwLock<HashMap<String, usize>>>,
@@ -2740,24 +2728,14 @@ impl TaskManager {
         };
 
         let counters = Counters::new(task.total_length, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
@@ -2876,24 +2854,14 @@ impl TaskManager {
         let usenet_warning = Arc::new(parking_lot::Mutex::new(None::<&'static str>));
         let usenet_warning_for_worker = usenet_warning.clone();
         let counters = Counters::new(task.total_length, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
             if finish_if_startup_aborted(
@@ -3206,6 +3174,18 @@ impl TaskManager {
         &self.cookie_store
     }
 
+    fn publish_starting_worker(
+        &self,
+        gid: &str,
+        token: CancellationToken,
+    ) -> (u64, Arc<StartingWorkers>) {
+        let epoch = next_worker_epoch();
+        self.starting_workers
+            .lock()
+            .insert(gid.to_string(), (epoch, token));
+        (epoch, self.starting_workers.clone())
+    }
+
     fn task_download_limiter(&self, gid: &str, limit: u64) -> Arc<SpeedLimiter> {
         register_task_limiter(&self.task_limiters, gid, limit)
     }
@@ -3249,14 +3229,8 @@ impl TaskManager {
         let adopted_filename: Arc<parking_lot::Mutex<Option<String>>> =
             Arc::new(parking_lot::Mutex::new(None));
 
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
@@ -3429,15 +3403,9 @@ impl TaskManager {
         let merged_options = Arc::new(merged_options);
         let cookie_store = self.cookie_store.clone();
         let agg = Counters::new(0, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(&self.starting_workers, &gid, worker_epoch, parent.clone());
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) = self.publish_starting_worker(&gid, parent.clone());
         tokio::spawn(async move {
-            let mut ad = agg.to_active(
-                worker_epoch,
-                Vec::new(),
-                Arc::new(parking_lot::Mutex::new(None)),
-            );
+            let mut ad = agg.to_active_plain(worker_epoch);
             ad.cancel_token = parent.clone();
             ad.metalink_files = file_counters.clone();
             register_active_download(&active, &starting, gid.clone(), ad).await;
@@ -3567,20 +3535,10 @@ impl TaskManager {
                 .completed
                 .store(task.total_length, Ordering::Relaxed);
         }
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
-            let mut active_download = counters.to_active(
-                worker_epoch,
-                Vec::new(),
-                Arc::new(parking_lot::Mutex::new(None)),
-            );
+            let mut active_download = counters.to_active_plain(worker_epoch);
             active_download.kad_status = kad_status.clone();
             active_download.ed2k_upload = Some(upload_stats.clone());
             register_active_download(&active, &starting, gid.clone(), active_download).await;
@@ -3804,24 +3762,14 @@ impl TaskManager {
             }
         });
 
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
@@ -3900,24 +3848,14 @@ impl TaskManager {
         let global_limiter = self.global_speed_limiter.clone();
 
         let counters = Counters::new(0, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
@@ -3986,14 +3924,8 @@ impl TaskManager {
         let global_limiter = self.global_speed_limiter.clone();
 
         let counters = Counters::new(0, 1);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         let adopted_filename: Arc<parking_lot::Mutex<Option<String>>> =
             Arc::new(parking_lot::Mutex::new(None));
         tokio::spawn(async move {
@@ -7873,11 +7805,7 @@ mod tests {
         let manager = make_test_manager(vec![task]);
         let counters = Counters::new(1024, 0);
         let worker_epoch = next_worker_epoch();
-        let active_download = counters.to_active(
-            worker_epoch,
-            Vec::new(),
-            Arc::new(parking_lot::Mutex::new(None)),
-        );
+        let active_download = counters.to_active_plain(worker_epoch);
         *active_download.kad_status.lock() = Some(KadLookupStatus {
             state: KadState::Ready,
             queried_nodes: 9,
@@ -9691,10 +9619,10 @@ mod tests {
         let mgr = make_test_manager(vec![make_task("g1", TaskStatus::Active)]);
         let counters = Counters::new(0, 0);
         let epoch = next_worker_epoch();
-        mgr.active_downloads.write().await.insert(
-            "g1".into(),
-            counters.to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None))),
-        );
+        mgr.active_downloads
+            .write()
+            .await
+            .insert("g1".into(), counters.to_active_plain(epoch));
         let finish = || {
             finish_if_startup_aborted(
                 &mgr.tasks,
@@ -9742,11 +9670,7 @@ mod tests {
             .iter()
             .map(|(i, _, _)| (*i, Counters::new(0, 1)))
             .collect();
-        let mut ad = Counters::new(0, 0).to_active(
-            epoch,
-            Vec::new(),
-            Arc::new(parking_lot::Mutex::new(None)),
-        );
+        let mut ad = Counters::new(0, 0).to_active_plain(epoch);
         ad.metalink_files = fc.clone();
         mgr.active_downloads
             .write()
@@ -12015,7 +11939,7 @@ mod tests {
     }
 
     fn fake_worker(epoch: u64) -> ActiveDownload {
-        Counters::new(0, 0).to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None)))
+        Counters::new(0, 0).to_active_plain(epoch)
     }
 
     #[tokio::test]

@@ -541,7 +541,6 @@ html.platform-android .task-pagination {
 	padding: 10px 14px 6px;
 }
 
-html.platform-android .add-task-dialog,
 html.platform-android .add-task-dialog {
 	width: calc(100vw - 24px) !important;
 	max-width: calc(100vw - 24px) !important;

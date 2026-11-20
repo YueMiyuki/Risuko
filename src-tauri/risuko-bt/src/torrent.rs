@@ -1829,6 +1829,33 @@ async fn torrent_loop(
         listen_port,
     };
 
+    macro_rules! drain_backlog {
+        () => {
+            drain_peer_backlog(
+                &mut queues,
+                &mut pending_dials,
+                &mut known_addrs,
+                &useful_peers,
+                &holepunch,
+                &mse_first_addrs,
+                &mut next_pid,
+                peers.len(),
+                &torrent_ctx,
+                &peer_event_tx,
+                encryption,
+                advertise_v2,
+                !private_torrent,
+                &ext_handshake_builder,
+                &outbound_utp,
+                &p2p_proxy,
+                &recv_throttle,
+                &mut outbound_tasks,
+                &mut outbound_aborts,
+                &mut conn_lease,
+            )
+        };
+    }
+
     let stop_ack = 'torrent: loop {
         conn_lease.sync(peers.len() + pending_dials.len());
         tokio::select! {
@@ -1853,28 +1880,7 @@ async fn torrent_loop(
                         &mut known_addrs,
                         &blocklist,
                     ) && !paused {
-                        drain_peer_backlog(
-                            &mut queues,
-                            &mut pending_dials,
-                            &mut known_addrs,
-                            &useful_peers,
-                            &holepunch,
-                            &mse_first_addrs,
-                            &mut next_pid,
-                            peers.len(),
-                            &torrent_ctx,
-                            &peer_event_tx,
-                            encryption,
-                            advertise_v2,
-                            !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &mut conn_lease,
-                        );
+                        drain_backlog!();
                     }
                 }
                 TorrentCommand::AddInboundPeer { addr, cmd_tx, piece_tx, bind, reserved, peer_id, io_abort, encrypted, utp } => {
@@ -2151,28 +2157,7 @@ async fn torrent_loop(
                             ));
                         }
                     }
-                    drain_peer_backlog(
-                        &mut queues,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        &torrent_ctx,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &mut conn_lease,
-                        );
+                    drain_backlog!();
                     let _ = ack.send(());
                 }
                 TorrentCommand::ReconfigureP2p { proxy, replace_proxy, dht: next_dht, ack } => {
@@ -2362,28 +2347,7 @@ async fn torrent_loop(
                     &mut known_addrs,
                     &blocklist,
                 ) && !paused {
-                    drain_peer_backlog(
-                        &mut queues,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        &torrent_ctx,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                        &ext_handshake_builder,
-                        &outbound_utp,
-                        &p2p_proxy,
-                        &recv_throttle,
-                        &mut outbound_tasks,
-                        &mut outbound_aborts,
-                        &mut conn_lease,
-                    );
+                    drain_backlog!();
                 }
             }
             Some(tier_ack) = tracker_tier_rx.recv(), if private_torrent => {
@@ -2476,28 +2440,7 @@ async fn torrent_loop(
                                     &tracker_info_hashes,
                                 );
                             }
-                            drain_peer_backlog(
-                                &mut queues,
-                                &mut pending_dials,
-                                &mut known_addrs,
-                                &useful_peers,
-                                &holepunch,
-                                &mse_first_addrs,
-                                &mut next_pid,
-                                peers.len(),
-                                &torrent_ctx,
-                                &peer_event_tx,
-                                encryption,
-                                advertise_v2,
-                                !private_torrent,
-                                &ext_handshake_builder,
-                                &outbound_utp,
-                                &p2p_proxy,
-                                &recv_throttle,
-                                &mut outbound_tasks,
-                                &mut outbound_aborts,
-                                &mut conn_lease,
-                            );
+                            drain_backlog!();
                         }
                     }
                 }
@@ -2626,28 +2569,7 @@ async fn torrent_loop(
                     }
                 }
                 if !paused {
-                    drain_peer_backlog(
-                        &mut queues,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        &torrent_ctx,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &mut conn_lease,
-                        );
+                    drain_backlog!();
                 }
             }
             _ = tick.tick() => {
@@ -2966,28 +2888,7 @@ async fn torrent_loop(
                 }
                 bytes_this_tick = (0, 0);
                 if !paused {
-                    drain_peer_backlog(
-                        &mut queues,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        &torrent_ctx,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &mut conn_lease,
-                    );
+                    drain_backlog!();
                 }
                 if !(paused || scanning) {
                     piece_tracker.refresh_order();
@@ -12422,11 +12323,72 @@ mod tests {
         assert!(peer_registry::take(torrent_b, 1, &scope_a).is_some());
     }
 
-    #[tokio::test]
-    async fn apply_blocklist_cancels_peers_when_command_channel_is_full() {
+    fn localhost_blocklist() -> RwLock<BlockList> {
         let mut list = BlockList::default();
         list.replace(&["127.0.0.1".into()]);
-        let blocklist = RwLock::new(list);
+        RwLock::new(list)
+    }
+
+    struct BlocklistFixture {
+        peers: HashMap<u32, Peer>,
+        pending_dials: HashMap<u32, SocketAddr>,
+        outbound_aborts: HashMap<u32, AbortHandle>,
+        known_addrs: HashSet<SocketAddr>,
+        queues: PeerQueues,
+        useful_peers: HashMap<SocketAddr, usize>,
+        pex_source: HashMap<SocketAddr, u32>,
+        holepunch: HolepunchState,
+        piece_tracker: PieceTracker,
+        chunk_tracker: ChunkTracker,
+        piece_assemblies: HashMap<u32, PieceAssembly>,
+        lengths: Lengths,
+        registry_scope: Arc<()>,
+    }
+
+    impl BlocklistFixture {
+        fn new(peers: HashMap<u32, Peer>, known_addrs: HashSet<SocketAddr>) -> Self {
+            let (lengths, _) = two_file_layout();
+            Self {
+                peers,
+                pending_dials: HashMap::new(),
+                outbound_aborts: HashMap::new(),
+                known_addrs,
+                queues: PeerQueues::default(),
+                useful_peers: HashMap::new(),
+                pex_source: HashMap::new(),
+                holepunch: HolepunchState::default(),
+                piece_tracker: PieceTracker::new(lengths),
+                chunk_tracker: ChunkTracker::new(lengths),
+                piece_assemblies: HashMap::new(),
+                lengths,
+                registry_scope: Arc::new(()),
+            }
+        }
+
+        fn apply(&mut self, blocklist: &RwLock<BlockList>) -> (u32, u32) {
+            apply_blocklist_to_torrent(
+                blocklist,
+                &mut self.peers,
+                &mut self.pending_dials,
+                &mut self.outbound_aborts,
+                &mut self.known_addrs,
+                &mut self.queues,
+                &mut self.useful_peers,
+                &mut self.pex_source,
+                &mut self.holepunch,
+                &mut self.piece_tracker,
+                &mut self.chunk_tracker,
+                &mut self.piece_assemblies,
+                &self.lengths,
+                42,
+                &self.registry_scope,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_blocklist_cancels_peers_when_command_channel_is_full() {
+        let blocklist = localhost_blocklist();
 
         let live_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let pending_addr: SocketAddr = "127.0.0.1:6882".parse().unwrap();
@@ -12449,63 +12411,38 @@ mod tests {
             pending_extra.closed().await;
         });
 
-        let mut pending_dials = HashMap::new();
-        pending_dials.insert(2, pending_addr);
-        let mut known_addrs = HashSet::from([live_addr, pending_addr]);
-        let mut queues = PeerQueues::default();
-        let mut useful_peers = HashMap::new();
-        let mut pex_source = HashMap::new();
-        let mut holepunch = HolepunchState::default();
-        let (lengths, _) = two_file_layout();
-        let mut piece_tracker = PieceTracker::new(lengths);
-        let mut chunk_tracker = ChunkTracker::new(lengths);
-        let mut piece_assemblies = HashMap::new();
-        let registry_scope = Arc::new(());
+        let mut state = BlocklistFixture::new(peers, HashSet::from([live_addr, pending_addr]));
+        state.pending_dials.insert(2, pending_addr);
         peer_registry::put(
             42,
             2,
-            &registry_scope,
+            &state.registry_scope,
             pending_tx,
             pending_addr,
             Some(pending_io.abort_handle()),
         );
 
         let mut outbound_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        let mut outbound_aborts = HashMap::new();
-        outbound_aborts.insert(
+        state.outbound_aborts.insert(
             1,
             outbound_tasks.spawn(async move {
                 extra.closed().await;
             }),
         );
-        outbound_aborts.insert(2, outbound_tasks.spawn(std::future::pending::<()>()));
+        state
+            .outbound_aborts
+            .insert(2, outbound_tasks.spawn(std::future::pending::<()>()));
 
-        let (disconnected, removed) = apply_blocklist_to_torrent(
-            &blocklist,
-            &mut peers,
-            &mut pending_dials,
-            &mut outbound_aborts,
-            &mut known_addrs,
-            &mut queues,
-            &mut useful_peers,
-            &mut pex_source,
-            &mut holepunch,
-            &mut piece_tracker,
-            &mut chunk_tracker,
-            &mut piece_assemblies,
-            &lengths,
-            42,
-            &registry_scope,
-        );
+        let (disconnected, removed) = state.apply(&blocklist);
 
         assert_eq!(disconnected, 1);
         assert_eq!(removed, 1);
-        assert!(peers.is_empty());
-        assert!(pending_dials.is_empty());
-        assert!(!known_addrs.contains(&live_addr));
-        assert!(!known_addrs.contains(&pending_addr));
-        assert!(outbound_aborts.is_empty());
-        assert!(peer_registry::take(42, 2, &registry_scope).is_none());
+        assert!(state.peers.is_empty());
+        assert!(state.pending_dials.is_empty());
+        assert!(!state.known_addrs.contains(&live_addr));
+        assert!(!state.known_addrs.contains(&pending_addr));
+        assert!(state.outbound_aborts.is_empty());
+        assert!(peer_registry::take(42, 2, &state.registry_scope).is_none());
 
         for _ in 0..2 {
             let joined = tokio::time::timeout(Duration::from_secs(1), outbound_tasks.join_next())
@@ -12523,9 +12460,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_blocklist_aborts_inbound_peer_when_command_channel_is_full() {
-        let mut list = BlockList::default();
-        list.replace(&["127.0.0.1".into()]);
-        let blocklist = RwLock::new(list);
+        let blocklist = localhost_blocklist();
 
         let live_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
@@ -12538,45 +12473,15 @@ mod tests {
         });
         peer.io_abort = Some(io_task.abort_handle());
 
-        let mut peers = HashMap::new();
-        peers.insert(1, peer);
-
-        let mut pending_dials = HashMap::new();
-        let mut known_addrs = HashSet::from([live_addr]);
-        let mut queues = PeerQueues::default();
-        let mut useful_peers = HashMap::new();
-        let mut pex_source = HashMap::new();
-        let mut holepunch = HolepunchState::default();
-        let (lengths, _) = two_file_layout();
-        let mut piece_tracker = PieceTracker::new(lengths);
-        let mut chunk_tracker = ChunkTracker::new(lengths);
-        let mut piece_assemblies = HashMap::new();
-        let registry_scope = Arc::new(());
-        let mut outbound_aborts = HashMap::new();
-
-        let (disconnected, removed) = apply_blocklist_to_torrent(
-            &blocklist,
-            &mut peers,
-            &mut pending_dials,
-            &mut outbound_aborts,
-            &mut known_addrs,
-            &mut queues,
-            &mut useful_peers,
-            &mut pex_source,
-            &mut holepunch,
-            &mut piece_tracker,
-            &mut chunk_tracker,
-            &mut piece_assemblies,
-            &lengths,
-            42,
-            &registry_scope,
-        );
+        let mut state =
+            BlocklistFixture::new(HashMap::from([(1, peer)]), HashSet::from([live_addr]));
+        let (disconnected, removed) = state.apply(&blocklist);
 
         assert_eq!(disconnected, 1);
         assert_eq!(removed, 0);
-        assert!(peers.is_empty());
-        assert!(!known_addrs.contains(&live_addr));
-        assert!(outbound_aborts.is_empty());
+        assert!(state.peers.is_empty());
+        assert!(!state.known_addrs.contains(&live_addr));
+        assert!(state.outbound_aborts.is_empty());
 
         let joined = tokio::time::timeout(Duration::from_secs(1), io_task)
             .await
@@ -15230,11 +15135,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn webseed_batch_fetches_adjacent_pieces_in_one_http_range() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let payload = b"abcdefghijkl";
+    fn four_byte_piece_info(payload: &[u8]) -> (Arc<ValidatedTorrentMetaV1Info>, Vec<u8>) {
         let mut piece_hashes = Vec::new();
         for piece in payload.chunks(4) {
             piece_hashes.extend_from_slice(crate::core::hash::sha1(piece).as_bytes());
@@ -15252,6 +15153,15 @@ mod tests {
             }],
             single_file_mode: true,
         });
+        (info, piece_hashes)
+    }
+
+    #[tokio::test]
+    async fn webseed_batch_fetches_adjacent_pieces_in_one_http_range() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = b"abcdefghijkl";
+        let (info, piece_hashes) = four_byte_piece_info(payload);
         let tmp = tempfile::tempdir().unwrap();
         let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -15308,23 +15218,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(20), async {
             let payload = b"abcdefgh";
-            let mut piece_hashes = Vec::new();
-            for piece in payload.chunks(4) {
-                piece_hashes.extend_from_slice(crate::core::hash::sha1(piece).as_bytes());
-            }
-            let info = Arc::new(ValidatedTorrentMetaV1Info {
-                name: "payload.bin".into(),
-                piece_length: 4,
-                pieces: piece_hashes.clone(),
-                private: false,
-                files: vec![TorrentMetaInfo {
-                    path: vec!["payload.bin".into()],
-                    length: payload.len() as u64,
-                    padding: false,
-                    executable: false,
-                }],
-                single_file_mode: true,
-            });
+            let (info, piece_hashes) = four_byte_piece_info(payload);
             let tmp = tempfile::tempdir().unwrap();
             let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

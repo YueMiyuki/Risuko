@@ -2127,13 +2127,7 @@ mod tests {
         node: ScriptedNode,
         shutdown: CancellationToken,
     ) -> (SocketAddrV4, JoinHandle<()>) {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
+        let (socket, addr) = bind_loopback_udp().await;
         let handle = tokio::spawn(async move {
             let mut buffer = vec![0u8; wire::MAX_DATAGRAM_SIZE];
             loop {
@@ -2204,6 +2198,45 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    async fn bind_loopback_udp() -> (UdpSocket, SocketAddrV4) {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = match socket.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        (socket, addr)
+    }
+
+    async fn spawn_source_node(
+        node_id: KadId,
+        sources: Vec<SocketAddrV4>,
+        events: Arc<LoopbackEvents>,
+    ) -> (SocketAddrV4, CancellationToken, JoinHandle<()>) {
+        let (socket, addr) = bind_loopback_udp().await;
+        let shutdown = CancellationToken::new();
+        let node = tokio::spawn(run_loopback_node(
+            socket,
+            node_id,
+            sources,
+            events,
+            None,
+            None,
+            shutdown.clone(),
+        ));
+        (addr, shutdown, node)
+    }
+
+    fn loopback_lookup() -> LookupConfig {
+        LookupConfig {
+            request_timeout: Duration::from_millis(250),
+            deadline: Duration::from_secs(3),
+            retries: 0,
+            ..LookupConfig::default()
+        }
     }
 
     fn fast_lookup() -> LookupConfig {
@@ -2498,24 +2531,13 @@ mod tests {
 
     #[tokio::test]
     async fn source_lookup_skips_contacts_before_kad_version_three() {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let node_addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let events = Arc::new(LoopbackEvents::default());
-        let node_cancel = CancellationToken::new();
-        let node = tokio::spawn(run_loopback_node(
-            socket,
+        let (node_addr, node_cancel, node) = spawn_source_node(
             [0x80; 16],
             vec![SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662)],
             events.clone(),
-            None,
-            None,
-            node_cancel.clone(),
-        ));
+        )
+        .await;
         let (service, _directory, _) = test_service(LookupConfig {
             request_timeout: Duration::from_millis(250),
             deadline: Duration::from_secs(2),
@@ -2562,13 +2584,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_tries_bundled_seeds_after_an_unusable_cached_response() {
-        let bad_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let bad_addr = match bad_socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
+        let (bad_socket, bad_addr) = bind_loopback_udp().await;
         let bad_requests = Arc::new(AtomicUsize::new(0));
         let bad_shutdown = CancellationToken::new();
         let bad_node = tokio::spawn(run_bootstrap_only_node(
@@ -2580,24 +2596,9 @@ mod tests {
             bad_shutdown.clone(),
         ));
 
-        let seed_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let seed_addr = match seed_socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let seed_events = Arc::new(LoopbackEvents::default());
-        let seed_shutdown = CancellationToken::new();
-        let seed_node = tokio::spawn(run_loopback_node(
-            seed_socket,
-            [0x80; 16],
-            Vec::new(),
-            seed_events.clone(),
-            None,
-            None,
-            seed_shutdown.clone(),
-        ));
+        let (seed_addr, seed_shutdown, seed_node) =
+            spawn_source_node([0x80; 16], Vec::new(), seed_events.clone()).await;
 
         let directory = tempfile::tempdir().unwrap();
         let mut config = KadConfig::new(directory.path(), free_loopback_port(), 4662)
@@ -2639,31 +2640,14 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_lookup_bootstraps_hello_routes_and_delivers_sources() {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let node_addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let events = Arc::new(LoopbackEvents::default());
-        let node_cancel = CancellationToken::new();
-        let node = tokio::spawn(run_loopback_node(
-            socket,
+        let (node_addr, node_cancel, node) = spawn_source_node(
             [0x80; 16],
             vec![SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662)],
             events.clone(),
-            None,
-            None,
-            node_cancel.clone(),
-        ));
-        let (service, _directory, _) = test_service(LookupConfig {
-            request_timeout: Duration::from_millis(250),
-            deadline: Duration::from_secs(3),
-            retries: 0,
-            ..LookupConfig::default()
-        })
+        )
         .await;
+        let (service, _directory, _) = test_service(loopback_lookup()).await;
         add_loopback_contact(&service, [0x80; 16], node_addr).await;
 
         let hash = [0x44; 16];
@@ -2694,31 +2678,14 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_for_client_rejects_its_own_ed2k_source_hash() {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let node_addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let events = Arc::new(LoopbackEvents::default());
-        let node_cancel = CancellationToken::new();
-        let node = tokio::spawn(run_loopback_node(
-            socket,
+        let (node_addr, node_cancel, node) = spawn_source_node(
             [0x80; 16],
             vec![SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662)],
             events.clone(),
-            None,
-            None,
-            node_cancel.clone(),
-        ));
-        let (service, _directory, _) = test_service(LookupConfig {
-            request_timeout: Duration::from_millis(250),
-            deadline: Duration::from_secs(3),
-            retries: 0,
-            ..LookupConfig::default()
-        })
+        )
         .await;
+        let (service, _directory, _) = test_service(loopback_lookup()).await;
         add_loopback_contact(&service, [0x80; 16], node_addr).await;
 
         let lookup = service.lookup_sources_for_client(
@@ -2744,34 +2711,17 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_lookup_collects_split_source_response_datagrams() {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let node_addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let events = Arc::new(LoopbackEvents::default());
-        let node_cancel = CancellationToken::new();
-        let node = tokio::spawn(run_loopback_node(
-            socket,
+        let (node_addr, node_cancel, node) = spawn_source_node(
             [0x90; 16],
             vec![
                 SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662),
                 SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 4662),
             ],
             events.clone(),
-            None,
-            None,
-            node_cancel.clone(),
-        ));
-        let (service, _directory, _) = test_service(LookupConfig {
-            request_timeout: Duration::from_millis(250),
-            deadline: Duration::from_secs(3),
-            retries: 0,
-            ..LookupConfig::default()
-        })
+        )
         .await;
+        let (service, _directory, _) = test_service(loopback_lookup()).await;
         add_loopback_contact(&service, [0x90; 16], node_addr).await;
 
         let lookup = service.lookup_sources([0x55; 16], 1234, CancellationToken::new());
@@ -2795,34 +2745,17 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_cancels_lookup_blocked_on_a_full_source_receiver() {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let node_addr = match socket.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
         let events = Arc::new(LoopbackEvents::default());
-        let node_cancel = CancellationToken::new();
-        let node = tokio::spawn(run_loopback_node(
-            socket,
+        let (node_addr, node_cancel, node) = spawn_source_node(
             [0x80; 16],
             vec![
                 SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4662),
                 SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 4662),
             ],
             events,
-            None,
-            None,
-            node_cancel.clone(),
-        ));
-        let (service, _directory, _) = test_service(LookupConfig {
-            request_timeout: Duration::from_millis(250),
-            deadline: Duration::from_secs(3),
-            retries: 0,
-            ..LookupConfig::default()
-        })
+        )
         .await;
+        let (service, _directory, _) = test_service(loopback_lookup()).await;
         add_loopback_contact(&service, [0x80; 16], node_addr).await;
 
         let lookup = service.lookup_sources_with_capacity_for_test(
@@ -2866,13 +2799,7 @@ mod tests {
         let mut nodes = Vec::new();
         let mut addresses = Vec::new();
         for index in 0..routing::ALPHA {
-            let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let addr = match socket.local_addr().unwrap() {
-                SocketAddr::V4(addr) => addr,
-                SocketAddr::V6(_) => unreachable!(),
-            };
+            let (socket, addr) = bind_loopback_udp().await;
             addresses.push(addr);
             nodes.push(tokio::spawn(run_loopback_node(
                 socket,
@@ -2994,13 +2921,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_timeout_cancellation_and_shutdown_release_the_socket() {
-        let blackhole = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let blackhole_addr = match blackhole.local_addr().unwrap() {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => unreachable!(),
-        };
+        let (blackhole, blackhole_addr) = bind_loopback_udp().await;
         let (service, _directory, port) = test_service(LookupConfig {
             request_timeout: Duration::from_millis(40),
             deadline: Duration::from_millis(150),
