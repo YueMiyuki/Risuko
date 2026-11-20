@@ -35,6 +35,10 @@ pub fn scope_of(key: &str) -> Option<KeyScope> {
     }
 }
 
+pub fn startup_only_keys() -> &'static [String] {
+    &REGISTRY.startup_only
+}
+
 pub fn is_startup_only(key: &str) -> bool {
     contains(&REGISTRY.startup_only, key)
 }
@@ -66,11 +70,19 @@ mod tests {
     }
 
     #[test]
+    fn startup_only_keys_lists_the_registry_names() {
+        let keys = startup_only_keys();
+        assert_eq!(keys, REGISTRY.startup_only.as_slice());
+        assert!(keys.iter().all(|key| is_startup_only(key)));
+    }
+
+    #[test]
     fn scope_of_sorts_names() {
         assert_eq!(scope_of("theme"), Some(KeyScope::User));
         assert_eq!(scope_of("ftp-user"), Some(KeyScope::System));
         assert_eq!(scope_of("no-such-setting"), None);
         assert!(is_startup_only("listen-port"));
+        assert!(is_startup_only("rpc-secret"));
         assert!(!is_startup_only("split"));
         assert!(!is_startup_only("theme"));
     }

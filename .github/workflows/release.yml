@@ -143,7 +143,7 @@ jobs:
             "ndk;27.2.12479018"
 
       - name: Setup Rust Android targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
           targets: ${{ needs.meta.outputs.android_rust_targets }}
 
@@ -277,7 +277,7 @@ jobs:
         run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
           targets: ${{ matrix.target }}
 
@@ -296,7 +296,7 @@ jobs:
           save-if: ${{ github.event_name != 'release' }}
 
       - name: Setup sccache on the R2 build cache
-        if: env.SCCACHE_ENABLED == 'true'
+        if: env.SCCACHE_ENABLED == 'true' && runner.os != 'Windows'
         uses: ./.github/actions/setup-sccache
         with:
           access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}

@@ -493,8 +493,10 @@ export default {
 			this.viewerError = "";
 			this.viewerExternalPath = "";
 		},
-		openLink(url: string) {
-			void openExternalUrl(url);
+		async openLink(url: string) {
+			if (!(await openExternalUrl(url))) {
+				this.$msg.error(this.$t("app.open-url-failed"));
+			}
 		},
 		async openFile(path: string) {
 			try {

@@ -1,42 +1,49 @@
 <template>
   <div class="rss-episode-selector">
-    <select
-      :value="kind"
-      class="rss-episode-select"
-      :aria-label="$t('rss.rule-episode-selector')"
-      @change="changeKind($event.target.value)"
-    >
-      <option value="none">{{ $t('rss.rule-episodes-all') }}</option>
-      <option value="from">{{ $t('rss.rule-episodes-from') }}</option>
-      <option value="range">{{ $t('rss.rule-episodes-range') }}</option>
-      <option value="specific">{{ $t('rss.rule-episodes-specific') }}</option>
-    </select>
-    <NumberInput
-      v-if="kind === 'from'"
-      :model-value="from"
-      :min="1"
-      @update:model-value="publish({ type: 'from', start: $event })"
-    />
-    <template v-else-if="kind === 'range'">
+    <div class="rss-episode-row">
+      <select
+        :value="kind"
+        class="rss-episode-select"
+        :aria-label="$t('rss.rule-episode-selector')"
+        @change="changeKind($event.target.value)"
+      >
+        <option value="none">{{ $t('rss.rule-episodes-all') }}</option>
+        <option value="from">{{ $t('rss.rule-episodes-from') }}</option>
+        <option value="range">{{ $t('rss.rule-episodes-range') }}</option>
+        <option value="specific">{{ $t('rss.rule-episodes-specific') }}</option>
+      </select>
       <NumberInput
-        :model-value="rangeStart"
+        v-if="kind === 'from'"
+        :model-value="from"
         :min="1"
-        @update:model-value="publish({ type: 'range', start: $event, end: Math.max($event, rangeEnd) })"
+        @update:model-value="publish({ type: 'from', start: $event })"
       />
-      <span class="rss-episode-dash" aria-hidden="true">-</span>
-      <NumberInput
-        :model-value="rangeEnd"
-        :min="rangeStart"
-        @update:model-value="publish({ type: 'range', start: rangeStart, end: $event })"
+      <template v-else-if="kind === 'range'">
+        <NumberInput
+          :model-value="rangeStart"
+          :min="1"
+          @update:model-value="publish({ type: 'range', start: $event, end: Math.max($event, rangeEnd) })"
+        />
+        <span class="rss-episode-dash" aria-hidden="true">-</span>
+        <NumberInput
+          :model-value="rangeEnd"
+          :min="rangeStart"
+          @update:model-value="publish({ type: 'range', start: rangeStart, end: $event })"
+        />
+      </template>
+      <Input
+        v-else-if="kind === 'specific'"
+        :model-value="specific"
+        :placeholder="$t('rss.rule-placeholder-episodes')"
+        :aria-label="$t('rss.rule-episodes-specific')"
+        :aria-invalid="specificInvalid"
+        :aria-describedby="specificInvalid ? 'rss-episode-specific-error' : undefined"
+        @update:model-value="updateSpecific(String($event))"
       />
-    </template>
-    <Input
-      v-else-if="kind === 'specific'"
-      :model-value="specific"
-      :placeholder="$t('rss.rule-placeholder-episodes')"
-      :aria-label="$t('rss.rule-episodes-specific')"
-      @update:model-value="updateSpecific(String($event))"
-    />
+    </div>
+    <p v-if="specificInvalid" id="rss-episode-specific-error" class="rss-episode-error">
+      {{ $t('rss.rule-episodes-invalid') }}
+    </p>
   </div>
 </template>
 
@@ -49,7 +56,8 @@ import {
 	defaultEpisodeSelector,
 	type EpisodeKind,
 	episodeKind,
-	parseNumberList,
+	hasEmptyEpisodeList,
+	parseEpisodeList,
 } from "@/utils/rssRule";
 
 export default {
@@ -78,6 +86,9 @@ export default {
 		rangeEnd(): number {
 			return this.selector?.type === "range" ? this.selector.end : 12;
 		},
+		specificInvalid(): boolean {
+			return hasEmptyEpisodeList(this.selector);
+		},
 	},
 	watch: {
 		selector() {
@@ -89,9 +100,12 @@ export default {
 	},
 	methods: {
 		syncSpecific() {
-			const values =
-				this.selector?.type === "specific" ? this.selector.values : [];
-			if (parseNumberList(this.specific).join(",") !== values.join(",")) {
+			if (this.selector?.type !== "specific") {
+				this.specific = "";
+				return;
+			}
+			const values = this.selector.values;
+			if (parseEpisodeList(this.specific).join(",") !== values.join(",")) {
 				this.specific = values.join(", ");
 			}
 		},
@@ -103,7 +117,7 @@ export default {
 		},
 		updateSpecific(text: string) {
 			this.specific = text;
-			this.publish({ type: "specific", values: parseNumberList(text) });
+			this.publish({ type: "specific", values: parseEpisodeList(text) });
 		},
 	},
 };
@@ -112,8 +126,19 @@ export default {
 <style scoped>
 .rss-episode-selector {
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rss-episode-row {
+  display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.rss-episode-error {
+  font-size: 12px;
+  color: var(--destructive);
 }
 
 .rss-episode-select {

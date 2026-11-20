@@ -43,7 +43,7 @@
 
       <div v-else-if="step === 'otp'" class="flex flex-col gap-4">
         <p class="text-sm text-muted-foreground">{{ $t(linkOnly ? 'sync.login-link-only' : 'sync.login-code-sent') }}</p>
-        <div class="flex flex-col gap-2">
+        <div v-if="!linkOnly" class="flex flex-col gap-2">
           <label class="text-sm font-medium">{{ $t('sync.login-verify-code') }}</label>
           <Input
             v-model="code"
@@ -58,7 +58,7 @@
           <Button variant="outline" @click="goBack">
             {{ $t('sync.login-back') }}
           </Button>
-          <Button :disabled="loading" @click="verifyCode">
+          <Button v-if="!linkOnly" :disabled="loading" @click="verifyCode">
             {{ loading ? '...' : $t('sync.login-verify') }}
           </Button>
         </div>

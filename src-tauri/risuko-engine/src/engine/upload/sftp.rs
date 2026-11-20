@@ -18,6 +18,27 @@ use crate::engine::ssh_known_hosts::TofuHandler;
 const COPY_BUF: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+fn sftp_error(context: &str, error: &russh_sftp::client::error::Error) -> UploadError {
+    use russh_sftp::client::error::Error;
+    use russh_sftp::protocol::StatusCode;
+    let message = format!("{context}: {error}");
+    let refused = match error {
+        Error::Status(status) => !matches!(
+            status.status_code,
+            StatusCode::NoConnection | StatusCode::ConnectionLost
+        ),
+        Error::Limited(_) => true,
+        Error::IO(_) | Error::Timeout | Error::UnexpectedPacket | Error::UnexpectedBehavior(_) => {
+            false
+        }
+    };
+    if refused {
+        UploadError::fatal(message)
+    } else {
+        UploadError::transient(message)
+    }
+}
+
 pub struct SftpSink {
     cfg: SftpConfig,
 }
@@ -61,22 +82,25 @@ impl SftpSink {
             }
         };
         let password = (!self.cfg.password.is_empty()).then_some(self.cfg.password.as_str());
-        if !authenticate(&mut session, &self.cfg.username, key, password).await? {
+        if !authenticate(&mut session, &self.cfg.username, key, password)
+            .await
+            .map_err(UploadError::transient)?
+        {
             return Err(UploadError::fatal("SFTP authentication failed"));
         }
 
         let channel = session
             .channel_open_session()
             .await
-            .map_err(|e| format!("SSH channel open failed: {e}"))?;
+            .map_err(|e| UploadError::transient(format!("SSH channel open failed: {e}")))?;
         channel
             .request_subsystem(true, "sftp")
             .await
-            .map_err(|e| format!("SFTP subsystem request failed: {e}"))?;
+            .map_err(|e| UploadError::transient(format!("SFTP subsystem request failed: {e}")))?;
 
         let sftp = SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| format!("SFTP session init failed: {e}"))?;
+            .map_err(|e| sftp_error("SFTP session init failed", &e))?;
         Ok((session, sftp))
     }
 
@@ -134,13 +158,14 @@ impl UploadSink for SftpSink {
 
         let (_ssh, sftp) = tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
             .await
-            .map_err(|_| "SFTP connect timed out".to_string())?
+            .map_err(|_| UploadError::transient("SFTP connect timed out"))?
             .inspect_err(|e| tracing::error!("SFTP connect failed: {e}"))?;
         let remote = self.full_remote_path(&file.remote_relative);
         tracing::debug!("SFTP upload starting: remote={remote}");
         self.ensure_parent_dirs(&sftp, &remote)
             .await
-            .inspect_err(|e| tracing::debug!("SFTP ensure_parent_dirs({remote}) failed: {e}"))?;
+            .inspect_err(|e| tracing::debug!("SFTP ensure_parent_dirs({remote}) failed: {e}"))
+            .map_err(UploadError::fatal)?;
 
         let remote_tmp = format!("{remote}.part");
         let mut remote_file = sftp
@@ -152,7 +177,7 @@ impl UploadSink for SftpSink {
             .map_err(|e| {
                 tracing::debug!("SFTP open {remote_tmp}: {e}");
                 tracing::error!("SFTP open failed: {e}");
-                format!("SFTP open failed: {e}")
+                sftp_error("SFTP open failed", &e)
             })?;
 
         let local: PathBuf = file.local_path.clone();
@@ -205,7 +230,7 @@ impl UploadSink for SftpSink {
             if let Err(re) = sftp.remove_file(&remote_tmp).await {
                 tracing::debug!("SFTP cleanup after close failure ignored: {re}");
             }
-            return Err(format!("SFTP close: {e}").into());
+            return Err(UploadError::transient(format!("SFTP close: {e}")));
         }
 
         // Some servers' SFTPv3 `rename` fails if the destination exists
@@ -216,7 +241,10 @@ impl UploadSink for SftpSink {
             let _ = sftp.remove_file(&remote).await;
             if let Err(e2) = sftp.rename(&remote_tmp, &remote).await {
                 let _ = sftp.remove_file(&remote_tmp).await;
-                return Err(format!("SFTP rename {remote_tmp} -> {remote}: {e2}").into());
+                return Err(sftp_error(
+                    &format!("SFTP rename {remote_tmp} -> {remote}"),
+                    &e2,
+                ));
             }
         }
 
@@ -259,6 +287,42 @@ mod tests {
             private_key: key.into(),
             base_path: base.into(),
         }
+    }
+
+    fn status(code: russh_sftp::protocol::StatusCode) -> russh_sftp::client::error::Error {
+        russh_sftp::client::error::Error::Status(russh_sftp::protocol::Status {
+            id: 1,
+            status_code: code,
+            error_message: "server said".into(),
+            language_tag: "en".into(),
+        })
+    }
+
+    #[test]
+    fn server_refusals_are_fatal_and_dropped_connections_retry() {
+        use russh_sftp::protocol::StatusCode;
+        for code in [
+            StatusCode::PermissionDenied,
+            StatusCode::NoSuchFile,
+            StatusCode::OpUnsupported,
+            StatusCode::Failure,
+        ] {
+            assert!(!sftp_error("x", &status(code)).retryable, "{code:?}");
+        }
+        for code in [StatusCode::ConnectionLost, StatusCode::NoConnection] {
+            assert!(sftp_error("x", &status(code)).retryable, "{code:?}");
+        }
+        use russh_sftp::client::error::Error;
+        for dropped in [
+            Error::Timeout,
+            Error::IO("reset".into()),
+            Error::UnexpectedBehavior("session closed".into()),
+            Error::UnexpectedBehavior("sender dropped".into()),
+            Error::UnexpectedPacket,
+        ] {
+            assert!(sftp_error("x", &dropped).retryable, "{dropped:?}");
+        }
+        assert!(!sftp_error("x", &Error::Limited("too big".into())).retryable);
     }
 
     #[test]

@@ -458,6 +458,58 @@ test("relaunches through the native command so the engine stops first", async ()
 	assert.equal(state.relaunchCalls, 0);
 });
 
+test("restores the engine and logs a failed restart when the Windows install fails", async () => {
+	useDesktop(state);
+	state.platform = "windows";
+	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };
+	state.invokeResult = (command) => {
+		if (command === "is_signed_updater_available") {
+			return true;
+		}
+		if (command === "tell_active") {
+			return [{ gid: "a" }];
+		}
+		if (command === "restart_engine") {
+			throw new Error("engine restart failed");
+		}
+		return null;
+	};
+	state.checkResult = {
+		version: "9.9.9",
+		download: async () => undefined,
+		install: async () => {
+			throw new Error("installer failed");
+		},
+		close: async () => undefined,
+	};
+	state.confirmQueue = [
+		{ confirmed: true, checkboxChecked: false },
+		{ confirmed: true, checkboxChecked: false },
+	];
+
+	await updater.checkForUpdates("manual");
+	assert.deepEqual(
+		state.invokeCalls
+			.map(([command]) => command)
+			.filter((command) =>
+				[
+					"tell_active",
+					"stop_engine_for_update",
+					"restart_engine",
+					"unpause_task",
+				].includes(command),
+			),
+		["tell_active", "stop_engine_for_update", "restart_engine", "unpause_task"],
+	);
+	assert.ok(
+		state.warningEvents.some((args) =>
+			String(args[0]).includes("failed to restart engine"),
+		),
+	);
+	assert.equal(updater.updaterState.status, "error");
+	assert.equal(updater.updaterState.error, "installer failed");
+});
+
 test("coalesces concurrent automatic and manual checks before the signing gate resolves", async () => {
 	useDesktop(state);
 	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };

@@ -51,11 +51,11 @@ pub fn toggle_flyout(app: &AppHandle) {
     }
 
     let step = FLYOUT.with_gate(app, |gate| {
-        (!gate.cancel_pending()).then(|| gate.request_show(window.is_some()))
+        (!gate.cancel_pending()).then(|| FLYOUT.request_show_locked(app, gate))
     });
-    match (step.flatten(), window) {
-        (Some(ShowStep::ShowNow), Some(window)) => present(app, &window),
-        (Some(ShowStep::Build), _) => FLYOUT.spawn_build(app),
+    match step.flatten() {
+        Some((ShowStep::ShowNow, Some(window))) => present(app, &window),
+        Some((ShowStep::Build, _)) => FLYOUT.spawn_build(app),
         _ => {}
     }
 }

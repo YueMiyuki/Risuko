@@ -6,8 +6,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use risuko_http::{Client, ClientBuilder, StatusCode, Url};
 
 use super::sink::{
-    run_with_stall, Heartbeat, UploadControl, UploadError, UploadFile, UploadSink, WebdavConfig,
-    UPLOAD_STALL_TIMEOUT,
+    ensure_local_readable, run_with_stall, Heartbeat, UploadControl, UploadError, UploadFile,
+    UploadSink, WebdavConfig, UPLOAD_STALL_TIMEOUT,
 };
 use crate::engine::util::ERROR_SNIPPET_BYTES;
 
@@ -115,7 +115,7 @@ impl WebdavSink {
         let send_fut = async { req.send().await.map_err(|e| format!("PUT failed: {e}")) };
         let resp = tokio::select! {
             _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
-            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r?,
+            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r.map_err(UploadError::transient)?,
         };
 
         Ok(resp)
@@ -148,7 +148,10 @@ impl WebdavSink {
             if let Some(auth) = self.auth_header() {
                 req = req.header("authorization", auth);
             }
-            let resp = req.send().await.map_err(|e| format!("MKCOL: {e}"))?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| UploadError::transient(format!("MKCOL: {e}")))?;
             let status = resp.status();
             if !matches!(
                 status,
@@ -175,12 +178,13 @@ impl UploadSink for WebdavSink {
         if ctl.cancel.is_cancelled() {
             return Err(UploadError::fatal("cancelled"));
         }
+        ensure_local_readable(&file.local_path).await?;
 
         let mut created_parents = false;
         loop {
             let resp = match self.put_file(&target, file, ctl).await {
                 Ok(r) => r,
-                Err(e) if !created_parents && !ctl.cancel.is_cancelled() => {
+                Err(e) if e.retryable && !created_parents && !ctl.cancel.is_cancelled() => {
                     created_parents = true;
                     if self.ensure_parent_dirs(&target).await.is_err() {
                         return Err(e);
@@ -301,6 +305,28 @@ mod tests {
     fn auth_header_none_when_no_credentials() {
         let s = WebdavSink::new(cfg("https://dav.example.com", "")).unwrap();
         assert!(s.auth_header().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_local_file_fails_the_upload_without_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = WebdavSink::new(cfg("http://127.0.0.1:9", "")).unwrap();
+        let (tx, _rx) = tokio::sync::watch::channel(super::super::sink::UploadProgress {
+            uploaded: 0,
+            total: 0,
+        });
+        let ctl = UploadControl {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: tx,
+        };
+        let file = UploadFile {
+            local_path: dir.path().join("gone.bin"),
+            remote_relative: "gone.bin".into(),
+            size: 10,
+        };
+        let err = sink.upload(&file, &ctl).await.unwrap_err();
+        assert!(!err.retryable, "{err}");
+        assert!(err.message.starts_with("open "), "{err}");
     }
 
     #[test]

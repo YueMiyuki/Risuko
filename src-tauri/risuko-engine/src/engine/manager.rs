@@ -32,7 +32,6 @@ use super::torrent::{self, TorrentEngine};
 use super::upload::UploadFileSnapshot;
 use super::usenet::UsenetProviderProfile;
 use super::usenet_transport::{ProviderConnectionCapacityRegistry, ProviderConnectionLease};
-use super::STARTUP_ONLY_KEYS;
 use std::collections::HashSet;
 
 const MAGNET_METADATA_ATTEMPT_TIMEOUT_SECS: u64 = 60;
@@ -5539,7 +5538,7 @@ impl TaskManager {
 
         if let Some(opts) = patch.options.as_ref() {
             for key in opts.keys() {
-                if STARTUP_ONLY_KEYS.contains(&key.as_str()) {
+                if crate::config::keys::is_startup_only(key) {
                     return Err(format!(
                         "Option '{key}' can only be changed by restarting the engine"
                     ));
@@ -5933,6 +5932,16 @@ impl TaskManager {
                 .any(|key| opts.contains_key(*key));
             for (k, v) in opts {
                 task.options.insert(k, v);
+            }
+            if reselect.is_some()
+                && matches!(task.kind, TaskKind::Torrent | TaskKind::Metalink)
+                && task.status != TaskStatus::Active
+                && !task.files.is_empty()
+            {
+                apply_select_file(&mut task.files, &task.options);
+                if task.files.iter().all(|f| f.length.parse::<u64>().is_ok()) {
+                    metalink_rollup_totals(task);
+                }
             }
             let task_options = touches_limits.then(|| task.options.clone());
             drop(tasks);
@@ -9334,6 +9343,67 @@ mod tests {
         patch.insert("max-download-limit".into(), Value::from("0"));
         mgr.change_option("limited", patch).await.unwrap();
         assert_eq!(limiter.limit_bps(), 0);
+    }
+
+    #[tokio::test]
+    async fn change_option_reselects_the_files_of_a_paused_task() {
+        let mut task = DownloadTask::new_http(
+            "picked".into(),
+            vec!["https://a.example/file.bin".into()],
+            "/dl".into(),
+            None,
+            Map::new(),
+        );
+        task.kind = TaskKind::Torrent;
+        task.status = TaskStatus::Paused;
+        task.files = [(10, 4), (20, 0), (30, 30)]
+            .iter()
+            .enumerate()
+            .map(|(i, (length, done))| DownloadFile {
+                index: (i + 1).to_string(),
+                path: format!("/dl/{i}.bin"),
+                length: length.to_string(),
+                completed_length: done.to_string(),
+                selected: "true".into(),
+                uris: Vec::new(),
+            })
+            .collect();
+        let mgr = make_test_manager(vec![task]);
+        let pick = |selection: &str| {
+            let mut m = Map::new();
+            m.insert("select-file".into(), Value::from(selection));
+            m
+        };
+        async fn snapshot(mgr: &TaskManager) -> (Vec<String>, u64, u64) {
+            let tasks = mgr.tasks.read().await;
+            let t = tasks.iter().find(|t| t.gid == "picked").unwrap();
+            let flags = t.files.iter().map(|f| f.selected.clone()).collect();
+            (flags, t.total_length, t.completed_length)
+        }
+
+        mgr.change_option("picked", pick("1,3")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "false".into(), "true".into()], 40, 34)
+        );
+
+        mgr.change_option("picked", pick("")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "true".into(), "true".into()], 60, 34)
+        );
+
+        {
+            let mut tasks = mgr.tasks.write().await;
+            let t = tasks.iter_mut().find(|t| t.gid == "picked").unwrap();
+            t.kind = TaskKind::Http;
+            t.total_length = 99;
+        }
+        mgr.change_option("picked", pick("2")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "true".into(), "true".into()], 99, 34)
+        );
     }
 
     #[test]

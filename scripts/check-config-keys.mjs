@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const CONFIG_KEYS_FILE = join(ROOT, "src", "shared", "configKeys.ts");
+const CONFIG_KEYS_FILE = join(ROOT, "src", "shared", "configKeys.json");
 const SYNC_CATEGORIES_FILE = join(ROOT, "src", "shared", "syncCategories.ts");
 const DEFAULTS_FILE = join(
 	ROOT,
@@ -131,9 +131,11 @@ export function checkConfigKeys({
 }
 
 async function main() {
-	const { userKeys, systemKeys, startupOnlyKeys } = await import(
-		pathToFileURL(CONFIG_KEYS_FILE).href
-	);
+	const {
+		user: userKeys,
+		system: systemKeys,
+		startupOnly: startupOnlyKeys,
+	} = JSON.parse(readFileSync(CONFIG_KEYS_FILE, "utf8"));
 	const defaults = rustDefaultKeys(readFileSync(DEFAULTS_FILE, "utf8"));
 	const syncKeys = syncCategoryKeys(readFileSync(SYNC_CATEGORIES_FILE, "utf8"));
 	const exceptions = JSON.parse(readFileSync(EXCEPTIONS_FILE, "utf8"));

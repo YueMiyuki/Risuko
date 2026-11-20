@@ -39,8 +39,8 @@
         :placeholder="placeholder"
         :aria-label="label"
         class="rss-tag-input"
-        @keydown.enter.prevent="commit"
-        @keydown.delete="onBackspace"
+        @keydown.enter="onEnter"
+        @keydown.backspace="onBackspace"
         @blur="commit"
       />
     </div>
@@ -50,6 +50,10 @@
 <script lang="ts">
 import { ArrowLeft, ArrowRight, X } from "@lucide/vue";
 import type { PropType } from "vue";
+
+function isComposing(event: KeyboardEvent): boolean {
+	return event.isComposing || event.keyCode === 229;
+}
 
 export default {
 	name: "rss-chip-list",
@@ -86,7 +90,17 @@ export default {
 			}
 			this.$emit("update", next);
 		},
+		onEnter(event: KeyboardEvent) {
+			if (isComposing(event)) {
+				return;
+			}
+			event.preventDefault();
+			this.commit();
+		},
 		onBackspace(event: KeyboardEvent) {
+			if (isComposing(event)) {
+				return;
+			}
 			if (this.draft === "" && this.chips.length > 0) {
 				event.preventDefault();
 				this.$emit("update", this.chips.slice(0, -1));
@@ -117,6 +131,11 @@ export default {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   min-height: 36px;
+}
+
+.rss-tag-list-row:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 50%, transparent);
 }
 
 .rss-tag {

@@ -14,7 +14,7 @@ use sha1::{Digest, Sha1};
 use super::bencode::{encode_to_vec, Value};
 use super::core::hash::{sha1, sha256, Id20, Id32};
 use super::core::merkle::{blocks_root, piece_layer_root, piece_root, BLOCK_SIZE};
-use super::core::metainfo::{is_safe_component, parse_torrent, MetaVersion};
+use super::core::metainfo::{is_parts_dir_name, is_safe_component, parse_torrent, MetaVersion};
 use super::core::peer_id::CLIENT_VERSION;
 use super::tracker::http::QUERY_SAFE;
 
@@ -532,12 +532,13 @@ fn walk(
         let entry = entry.map_err(io_err)?;
         let path = entry.path();
         let file_type = entry.file_type().map_err(io_err)?;
-        if file_type.is_symlink() || exclude.contains(&path) {
+        let name = entry.file_name();
+        let name = name.to_str();
+        if file_type.is_symlink() || exclude.contains(&path) || name.is_some_and(is_parts_dir_name)
+        {
             continue;
         }
-        let name = entry
-            .file_name()
-            .to_str()
+        let name = name
             .filter(|n| is_safe_component(n))
             .ok_or_else(|| CreateError::BadName(path.clone()))?
             .to_string();
@@ -1105,6 +1106,23 @@ mod tests {
                 ..opts(MetaVersion::Hybrid)
             },
         );
+        assert_eq!(created.file_count, 1);
+        assert_eq!(created.total_length, 10);
+    }
+
+    #[test]
+    fn the_internal_parts_directory_is_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pack");
+        write_tree(
+            &root,
+            &[
+                ("keep", 10),
+                (".risuko-parts/0123456789abcdef/0", 20),
+                ("sub/.risuko-parts/1/0", 30),
+            ],
+        );
+        let created = create(&root, &opts(MetaVersion::Hybrid));
         assert_eq!(created.file_count, 1);
         assert_eq!(created.total_length, 10);
     }

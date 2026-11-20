@@ -14,11 +14,10 @@ static PROMPT: Panel = Panel {
 };
 
 pub fn show_clip_prompt(app: &AppHandle, uri: &str) {
-    let window = PROMPT.window(app);
     #[cfg(target_os = "macos")]
     {
-        let already_open = window
-            .as_ref()
+        let already_open = PROMPT
+            .window(app)
             .and_then(|w| w.is_visible().ok())
             .unwrap_or(false);
         if !already_open {
@@ -31,9 +30,9 @@ pub fn show_clip_prompt(app: &AppHandle, uri: &str) {
     if let Ok(mut pending) = state.pending_clip_uri.lock() {
         *pending = Some(uri.to_string());
     }
-    match (PROMPT.request_show(app, window.is_some()), window) {
-        (Some(ShowStep::ShowNow), Some(window)) => present(app, &window, uri),
-        (Some(ShowStep::Build), _) => PROMPT.spawn_build(app),
+    match PROMPT.request_show(app) {
+        Some((ShowStep::ShowNow, Some(window))) => present(app, &window, uri),
+        Some((ShowStep::Build, _)) => PROMPT.spawn_build(app),
         _ => {}
     }
 }

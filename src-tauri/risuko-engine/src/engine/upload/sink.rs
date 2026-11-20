@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,18 +68,6 @@ impl std::fmt::Display for UploadError {
     }
 }
 
-impl From<String> for UploadError {
-    fn from(message: String) -> Self {
-        Self::transient(message)
-    }
-}
-
-impl From<&str> for UploadError {
-    fn from(message: &str) -> Self {
-        Self::transient(message)
-    }
-}
-
 pub(super) const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(180);
 pub(super) const UPLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -88,6 +76,13 @@ fn stalled() -> String {
         "upload stalled: no data moved for {}s",
         UPLOAD_STALL_TIMEOUT.as_secs()
     )
+}
+
+pub(super) async fn ensure_local_readable(path: &Path) -> Result<(), UploadError> {
+    tokio::fs::File::open(path)
+        .await
+        .map(drop)
+        .map_err(|e| UploadError::fatal(format!("open {}: {e}", path.display())))
 }
 
 pub(super) async fn write_or_stall<W>(
@@ -100,13 +95,25 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
+    let write_all = async {
+        let mut sent = 0;
+        while sent < data.len() {
+            match tokio::time::timeout(UPLOAD_STALL_TIMEOUT, writer.write(&data[sent..])).await {
+                Ok(Ok(0)) => {
+                    return Err(UploadError::transient(format!(
+                        "{label} write: failed to write whole buffer"
+                    )))
+                }
+                Ok(Ok(n)) => sent += n,
+                Ok(Err(e)) => return Err(UploadError::transient(format!("{label} write: {e}"))),
+                Err(_) => return Err(UploadError::transient(stalled())),
+            }
+        }
+        Ok(())
+    };
     tokio::select! {
         _ = cancel.cancelled() => Err(UploadError::fatal("cancelled")),
-        written = tokio::time::timeout(UPLOAD_STALL_TIMEOUT, writer.write_all(data)) => match written {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(format!("{label} write: {e}").into()),
-            Err(_) => Err(stalled().into()),
-        },
+        written = write_all => written,
     }
 }
 
@@ -419,6 +426,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn write_or_stall_survives_a_slow_peer_that_keeps_making_progress() {
+        use tokio::io::AsyncReadExt;
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let drain = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4];
+            while got.len() < 64 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let n = reader.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        });
+        let cancel = CancellationToken::new();
+        let data: Vec<u8> = (0..64).collect();
+        let start = tokio::time::Instant::now();
+        write_or_stall(&mut writer, &data, &cancel, "TEST")
+            .await
+            .unwrap();
+        assert!(start.elapsed() > UPLOAD_STALL_TIMEOUT);
+        assert_eq!(drain.await.unwrap(), data);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_with_stall_survives_while_progressing() {
         let hb = Heartbeat::new();
         let hb2 = hb.clone();
@@ -444,12 +475,23 @@ mod tests {
     }
 
     #[test]
-    fn string_errors_are_transient_and_fatal_is_not() {
-        assert!(UploadError::from("x".to_string()).retryable);
-        assert!(UploadError::from("x").retryable);
+    fn transient_and_fatal_errors_are_explicit() {
         assert!(UploadError::transient("x").retryable);
         assert!(!UploadError::fatal("x").retryable);
         assert_eq!(UploadError::fatal("boom").to_string(), "boom");
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unreadable_local_file_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ensure_local_readable(&dir.path().join("gone.bin"))
+            .await
+            .unwrap_err();
+        assert!(!err.retryable);
+        assert!(err.message.starts_with("open "));
+        let present = dir.path().join("here.bin");
+        std::fs::write(&present, b"x").unwrap();
+        ensure_local_readable(&present).await.unwrap();
     }
 
     #[test]

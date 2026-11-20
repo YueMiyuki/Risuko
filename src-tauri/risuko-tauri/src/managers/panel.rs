@@ -64,8 +64,17 @@ impl Panel {
         Some(f(&mut gate))
     }
 
-    pub fn request_show(&self, app: &AppHandle, window_exists: bool) -> Option<ShowStep> {
-        self.with_gate(app, |gate| gate.request_show(window_exists))
+    pub fn request_show_locked(
+        &self,
+        app: &AppHandle,
+        gate: &mut PanelGate,
+    ) -> (ShowStep, Option<WebviewWindow>) {
+        let window = self.window(app);
+        (gate.request_show(window.is_some()), window)
+    }
+
+    pub fn request_show(&self, app: &AppHandle) -> Option<(ShowStep, Option<WebviewWindow>)> {
+        self.with_gate(app, |gate| self.request_show_locked(app, gate))
     }
 
     pub fn page_ready(&self, app: &AppHandle) -> bool {

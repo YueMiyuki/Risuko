@@ -19,6 +19,7 @@ pub async fn fetch_by_urn(
     urn: &str,
     file_size: u64,
     out_path: &Path,
+    auto_rename: bool,
     completed: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) -> Result<PathBuf, GnutellaError> {
@@ -29,6 +30,7 @@ pub async fn fetch_by_urn(
         urn,
         file_size,
         out_path,
+        auto_rename,
         completed,
         cancel,
         risuko_http::ProxyConnector::direct(),
@@ -43,6 +45,7 @@ pub async fn fetch_by_urn_with_proxy(
     urn: &str,
     file_size: u64,
     out_path: &Path,
+    auto_rename: bool,
     completed: Arc<AtomicU64>,
     cancel: CancellationToken,
     proxy: risuko_http::ProxyConnector,
@@ -130,14 +133,28 @@ pub async fn fetch_by_urn_with_proxy(
             return Err(GnutellaError::Network("sha1 mismatch".into()));
         }
     }
-    let final_path = match (out_path.parent(), out_path.file_name()) {
-        (Some(dir), Some(name)) => {
+    finalize_part(&part_path, out_path, auto_rename).await
+}
+
+async fn finalize_part(
+    part_path: &Path,
+    out_path: &Path,
+    auto_rename: bool,
+) -> Result<PathBuf, GnutellaError> {
+    let (final_path, reserved) = match (auto_rename, out_path.parent(), out_path.file_name()) {
+        (true, Some(dir), Some(name)) => (
             crate::engine::util::reserve_unique_path(dir, &name.to_string_lossy())
-                .map_err(GnutellaError::Network)?
-        }
-        _ => out_path.to_path_buf(),
+                .map_err(GnutellaError::Network)?,
+            true,
+        ),
+        _ => (out_path.to_path_buf(), false),
     };
-    tokio::fs::rename(&part_path, &final_path).await?;
+    if let Err(e) = tokio::fs::rename(part_path, &final_path).await {
+        if reserved {
+            let _ = tokio::fs::remove_file(&final_path).await;
+        }
+        return Err(e.into());
+    }
     Ok(final_path)
 }
 
@@ -387,6 +404,7 @@ mod tests {
             urn,
             size,
             out,
+            true,
             Arc::new(AtomicU64::new(0)),
             CancellationToken::new(),
         )
@@ -410,6 +428,56 @@ mod tests {
         assert_eq!(saved, dir.path().join("report.1.docx"));
         assert_eq!(std::fs::read(&out).unwrap(), b"mine");
         assert_eq!(std::fs::read(&saved).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn without_auto_renaming_the_download_replaces_the_existing_file() {
+        let data = b"fresh download".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.docx");
+        std::fs::write(&out, b"mine").unwrap();
+        let mut resp =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", data.len()).into_bytes();
+        resp.extend_from_slice(&data);
+        let (port, srv) = serve(resp).await;
+        let saved = fetch_by_urn(
+            "127.0.0.1",
+            port,
+            "/uri-res/N2R",
+            &urn_of(&data),
+            data.len() as u64,
+            &out,
+            false,
+            Arc::new(AtomicU64::new(0)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        srv.await.unwrap();
+        assert_eq!(saved, out);
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_releases_the_name_it_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.docx");
+        let missing_part = dir.path().join("gone.part");
+        finalize_part(&missing_part, &out, true).await.unwrap_err();
+        assert!(!out.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_leaves_an_existing_file_alone_when_not_reserving() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.docx");
+        std::fs::write(&out, b"mine").unwrap();
+        finalize_part(&dir.path().join("gone.part"), &out, false)
+            .await
+            .unwrap_err();
+        assert_eq!(std::fs::read(&out).unwrap(), b"mine");
     }
 
     #[test]
@@ -481,6 +549,7 @@ mod tests {
             &urn_of(&data),
             16,
             &out,
+            true,
             completed.clone(),
             CancellationToken::new(),
         )

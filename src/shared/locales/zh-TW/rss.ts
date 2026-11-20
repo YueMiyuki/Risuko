@@ -111,6 +111,7 @@ export default {
 	"rule-episodes-range": "集數範圍",
 	"rule-episodes-specific": "指定集數",
 	"rule-placeholder-episodes": "1, 5, 12",
+	"rule-episodes-invalid": "請輸入以逗號分隔的整數集數，例如 1, 5, 12",
 	"rule-chip-earlier": "往前移",
 	"rule-chip-later": "往後移",
 	"rule-chip-remove": "移除",

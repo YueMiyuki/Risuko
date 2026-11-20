@@ -113,6 +113,13 @@ async fn fill_from_vault(
     }
 }
 
+async fn clear_stale_sink_fallback(mgr: &UploadSinkManager, id: &str) -> Result<(), String> {
+    if mgr.remove_sink_secret_fallback(id).await.is_ok() {
+        return Ok(());
+    }
+    mgr.remove_sink_secret_fallback(id).await
+}
+
 async fn persist_sink_secrets(
     vault: &VaultManager,
     mgr: &UploadSinkManager,
@@ -124,15 +131,8 @@ async fn persist_sink_secrets(
             if vault.enabled() {
                 match vault.put_sink(id, &v) {
                     Ok(()) => {
-                        if let Err(e) = mgr.remove_sink_secret_fallback(id).await {
-                            tracing::warn!(
-                                "Failed to clear stale fallback for sink {id}: {e}; replacing it"
-                            );
-                            if let Err(e) = mgr.put_sink_secret_fallback(id, &v).await {
-                                tracing::warn!(
-                                    "Failed to replace stale fallback secrets for sink {id}: {e}"
-                                );
-                            }
+                        if let Err(e) = clear_stale_sink_fallback(mgr, id).await {
+                            tracing::warn!("Failed to clear stale fallback for sink {id}: {e}");
                         }
                         return;
                     }
@@ -431,6 +431,67 @@ mod tests {
             }
             _ => panic!("expected sftp"),
         }
+    }
+
+    struct FlakyStorage {
+        failures: std::sync::atomic::AtomicUsize,
+        saved: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl risuko_engine::traits::StorageBackend for FlakyStorage {
+        fn load(&self, _key: &str) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &str, value: &Value) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err("disk full".into());
+            }
+            self.saved.lock().unwrap().push(value.clone());
+            Ok(())
+        }
+    }
+
+    async fn manager_holding_a_fallback(failures: usize) -> (Arc<FlakyStorage>, UploadSinkManager) {
+        use risuko_engine::traits::NoopEventSink;
+
+        let storage = Arc::new(FlakyStorage {
+            failures: std::sync::atomic::AtomicUsize::new(0),
+            saved: std::sync::Mutex::new(Vec::new()),
+        });
+        let event_sink: Arc<dyn risuko_engine::traits::EventSink> = Arc::new(NoopEventSink);
+        let mgr = UploadSinkManager::new(storage.clone(), event_sink);
+        mgr.put_sink_secret_fallback("sink", &json!({"password": "old"}))
+            .await
+            .unwrap();
+        storage
+            .failures
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        (storage, mgr)
+    }
+
+    #[tokio::test]
+    async fn clearing_a_stale_fallback_retries_a_failed_save() {
+        let (storage, mgr) = manager_holding_a_fallback(1).await;
+
+        clear_stale_sink_fallback(&mgr, "sink").await.unwrap();
+
+        assert!(mgr.get_sink_secret_fallback("sink").await.is_none());
+        let saved = storage.saved.lock().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved[1]["data"]["secret_fallback"].get("sink").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_fallback_that_cannot_be_cleared_is_never_rewritten() {
+        let (storage, mgr) = manager_holding_a_fallback(2).await;
+
+        assert!(clear_stale_sink_fallback(&mgr, "sink").await.is_err());
+
+        assert!(mgr.get_sink_secret_fallback("sink").await.is_none());
+        assert_eq!(storage.saved.lock().unwrap().len(), 1);
     }
 
     fn uuid_like() -> String {

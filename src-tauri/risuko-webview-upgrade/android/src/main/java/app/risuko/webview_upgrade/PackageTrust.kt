@@ -2,6 +2,7 @@ package app.risuko.webview_upgrade
 
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -20,42 +21,42 @@ internal object PackageTrust {
             "DA2E1B4AB9926BC7B081D4E9E57E3C9EC77EE51F5F0F767EE84C131C574E20EE",
     )
 
-    fun isTrusted(context: Context, packageName: String): Boolean = try {
-        isSystemPackage(context, packageName) || hasPinnedSigner(context, packageName)
+    fun verifiedPackageInfo(context: Context, packageName: String): PackageInfo? = try {
+        val packageInfo = context.packageManager.getPackageInfo(packageName, infoFlags())
+        if (isSystemPackage(packageInfo) || hasPinnedSigner(packageInfo)) packageInfo else null
     } catch (t: Throwable) {
         Log.w(LOG_TAG, "trust check failed for $packageName", t)
-        false
+        null
     }
 
-    private fun isSystemPackage(context: Context, packageName: String): Boolean {
-        val flags = context.packageManager.getApplicationInfo(packageName, 0).flags
+    @Suppress("DEPRECATION")
+    private fun infoFlags(): Int {
+        val flags = PackageManager.GET_SHARED_LIBRARY_FILES or PackageManager.GET_META_DATA
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            flags or PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            flags or PackageManager.GET_SIGNATURES
+        }
+    }
+
+    private fun isSystemPackage(packageInfo: PackageInfo): Boolean {
+        val flags = packageInfo.applicationInfo?.flags ?: return false
         val system = ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
         return flags and system != 0
     }
 
-    private fun hasPinnedSigner(context: Context, packageName: String): Boolean {
-        val pin = PINNED_SHA256[packageName] ?: return false
-        val pm = context.packageManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            return pm.hasSigningCertificate(
-                packageName,
-                hexToBytes(pin),
-                PackageManager.CERT_INPUT_SHA256,
-            )
-        }
-        @Suppress("DEPRECATION", "PackageManagerGetSignatures")
-        val signatures = pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES).signatures
-            ?: return false
-        if (signatures.size != 1) return false
-        return sha256Hex(signatures[0].toByteArray()) == pin
+    @Suppress("DEPRECATION")
+    private fun hasPinnedSigner(packageInfo: PackageInfo): Boolean {
+        val pin = PINNED_SHA256[packageInfo.packageName] ?: return false
+        val certificates = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.signingInfo?.signingCertificateHistory
+        } else {
+            packageInfo.signatures?.takeIf { it.size == 1 }
+        } ?: return false
+        return certificates.any { sha256Hex(it.toByteArray()) == pin }
     }
 
     private fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes)
             .joinToString("") { "%02X".format(it) }
-
-    private fun hexToBytes(hex: String): ByteArray =
-        ByteArray(hex.length / 2) { i ->
-            hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-        }
 }

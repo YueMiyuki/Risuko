@@ -329,6 +329,7 @@ pub fn ensure_rpc_secret_on_disk(config_dir: &Path) -> bool {
         .and_then(|data| write_file_atomically(&path, data.as_bytes()));
     if let Err(err) = written {
         tracing::warn!("Failed to persist generated RPC secret: {}", err);
+        return false;
     }
     true
 }

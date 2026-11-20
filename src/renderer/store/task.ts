@@ -786,7 +786,10 @@ export const useTaskStore = defineStore("task", {
 			options: Record<string, string>;
 		}) {
 			const { gid, options } = payload;
-			return api.changeOption({ gid, options });
+			return api.changeOption({ gid, options }).then((result) => {
+				void this.refreshAfterChange();
+				return result;
+			});
 		},
 		removeTask(task: DownloadTask) {
 			const { gid } = task;

@@ -51,6 +51,7 @@ pub async fn run_gnutella_download(
             file_name: &link.file_name,
             default_name: "gnutella-download",
             dir,
+            auto_rename: opts.get_bool("auto-file-renaming").unwrap_or(true),
         },
         completed,
         speed,
@@ -96,6 +97,7 @@ pub(crate) struct UrnFetch<'a> {
     pub file_name: &'a str,
     pub default_name: &'a str,
     pub dir: &'a str,
+    pub auto_rename: bool,
 }
 
 pub(crate) async fn run_urn_fetch(
@@ -115,6 +117,7 @@ pub(crate) async fn run_urn_fetch(
         req.urn,
         req.file_size,
         &fetch_path,
+        req.auto_rename,
         completed.clone(),
         cancel_token,
         proxy,

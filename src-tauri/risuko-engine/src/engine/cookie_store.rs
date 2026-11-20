@@ -205,10 +205,6 @@ pub fn eligible_cookies(cookies: &[StoredCookie]) -> Vec<&StoredCookie> {
         .collect()
 }
 
-pub fn cookies_to_header(cookies: &[StoredCookie]) -> String {
-    cookies_to_header_for(cookies, true)
-}
-
 pub fn cookies_to_header_for(cookies: &[StoredCookie], secure_transport: bool) -> String {
     eligible_cookies(cookies)
         .into_iter()
@@ -329,7 +325,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(cookies_to_header(&cs), "a=1; b=two");
+        assert_eq!(cookies_to_header_for(&cs, true), "a=1; b=two");
     }
 
     #[test]
@@ -349,7 +345,6 @@ mod tests {
         ];
         assert_eq!(cookies_to_header_for(&cs, true), "s=1; p=2");
         assert_eq!(cookies_to_header_for(&cs, false), "p=2");
-        assert_eq!(cookies_to_header(&cs), "s=1; p=2");
     }
 
     #[test]
@@ -379,7 +374,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(cookies_to_header(&cs), "good=ok");
+        assert_eq!(cookies_to_header_for(&cs, true), "good=ok");
         assert_eq!(
             eligible_cookies(&cs)
                 .into_iter()

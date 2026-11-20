@@ -1213,15 +1213,15 @@ fn check_config(
     };
 
     let mut drifted: Vec<String> = Vec::new();
-    for key in engine::STARTUP_ONLY_KEYS {
+    for key in risuko_engine::config::keys::startup_only_keys() {
         let current = system
-            .get(*key)
-            .or_else(|| user.get(*key))
+            .get(key)
+            .or_else(|| user.get(key))
             .cloned()
             .unwrap_or(Value::Null);
-        let prev = snap.get(*key).cloned().unwrap_or(Value::Null);
+        let prev = snap.get(key).cloned().unwrap_or(Value::Null);
         if current != prev {
-            drifted.push((*key).to_string());
+            drifted.push(key.clone());
         }
     }
 

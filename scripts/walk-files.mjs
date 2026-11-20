@@ -1,8 +1,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
-export function walkFiles(root, { skipDirs = [] } = {}) {
-	const files = [];
+export function* iterFiles(root, { skipDirs = [] } = {}) {
 	const entries = readdirSync(root, { withFileTypes: true }).sort((a, b) =>
 		a.name.localeCompare(b.name),
 	);
@@ -10,11 +9,14 @@ export function walkFiles(root, { skipDirs = [] } = {}) {
 		const path = join(root, entry.name);
 		if (entry.isDirectory()) {
 			if (!skipDirs.includes(entry.name)) {
-				files.push(...walkFiles(path, { skipDirs }));
+				yield* iterFiles(path, { skipDirs });
 			}
 		} else if (entry.isFile()) {
-			files.push(path);
+			yield path;
 		}
 	}
-	return files;
+}
+
+export function walkFiles(root, options) {
+	return [...iterFiles(root, options)];
 }

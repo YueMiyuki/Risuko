@@ -2,7 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { walkFiles } from "./walk-files.mjs";
+import { iterFiles } from "./walk-files.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const TAURI = join(ROOT, "src-tauri");
@@ -19,7 +19,11 @@ const skipGradle = args.has("--keep-gradle");
 const removals = [];
 
 function dirSizeBytesRecursive(path) {
-	return walkFiles(path).reduce((total, file) => total + statSync(file).size, 0);
+	let total = 0;
+	for (const file of iterFiles(path)) {
+		total += statSync(file).size;
+	}
+	return total;
 }
 
 function dirSizeBytes(path) {

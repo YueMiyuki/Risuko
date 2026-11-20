@@ -593,6 +593,7 @@ async fn run_receive(
     let hash = ticket.hash();
     let format = ticket.format();
     let total: u64 = files.iter().map(|f| f.size).sum();
+    let limit = announced_limit(files);
 
     let store: Store = FsStore::load(blobs_dir)
         .await
@@ -641,7 +642,7 @@ async fn run_receive(
         }
         match item {
             DownloadProgressItem::Progress(offset) => {
-                if exceeds_announced(offset, total) {
+                if exceeds_announced(offset, limit) {
                     path_handle.abort();
                     anyhow::bail!("sender sent more data than it announced");
                 }
@@ -860,12 +861,22 @@ fn is_valid_transfer_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn exceeds_announced(received: u64, total: u64) -> bool {
-    total != 0
-        && received
-            > total
-                .saturating_add(total / 8)
-                .saturating_add(4 * 1024 * 1024)
+const ANNOUNCED_SLACK: u64 = 4 * 1024 * 1024;
+const COLLECTION_ENTRY_OVERHEAD: u64 = 40;
+
+fn announced_limit(files: &[FileMeta]) -> u64 {
+    let total = files.iter().fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let entries = files.iter().fold(0u64, |sum, f| {
+        sum.saturating_add((f.name.len() as u64).saturating_add(COLLECTION_ENTRY_OVERHEAD))
+    });
+    total
+        .saturating_add(total / 8)
+        .saturating_add(entries)
+        .saturating_add(ANNOUNCED_SLACK)
+}
+
+fn exceeds_announced(received: u64, limit: u64) -> bool {
+    received > limit
 }
 
 #[cfg(test)]
@@ -919,14 +930,47 @@ mod tests {
         }
     }
 
+    fn meta(name: &str, size: u64) -> FileMeta {
+        FileMeta {
+            name: name.to_string(),
+            size,
+        }
+    }
+
     #[test]
     fn announced_size_allowance() {
-        let allowance = 1000 / 8 + 4 * 1024 * 1024;
-        assert!(!exceeds_announced(u64::MAX, 0));
-        assert!(!exceeds_announced(1000, 1000));
-        assert!(!exceeds_announced(1000 + allowance, 1000));
-        assert!(exceeds_announced(1000 + allowance + 1, 1000));
-        assert!(!exceeds_announced(u64::MAX, u64::MAX));
+        let files = [meta("a", 1000)];
+        let limit = announced_limit(&files);
+        let allowance = 1000 / 8 + 4 * 1024 * 1024 + 1 + COLLECTION_ENTRY_OVERHEAD;
+        assert_eq!(limit, 1000 + allowance);
+        assert!(!exceeds_announced(1000, limit));
+        assert!(!exceeds_announced(limit, limit));
+        assert!(exceeds_announced(limit + 1, limit));
+
+        let huge = announced_limit(&[meta("a", u64::MAX)]);
+        assert!(!exceeds_announced(u64::MAX, huge));
+    }
+
+    #[test]
+    fn announced_zero_size_still_has_a_limit() {
+        let limit = announced_limit(&[meta("empty", 0)]);
+        assert!(exceeds_announced(u64::MAX, limit));
+        assert!(exceeds_announced(limit + 1, limit));
+        assert!(exceeds_announced(10 * 1024 * 1024, announced_limit(&[])));
+    }
+
+    #[test]
+    fn announced_limit_covers_collection_metadata_of_many_files() {
+        let name = "photos/2024/holiday/IMG_000000.jpg";
+        let files: Vec<FileMeta> = (0..200_000).map(|_| meta(name, 0)).collect();
+        let count = files.len() as u64;
+        let hash_seq = 32 * (count + 1);
+        let names = 13 + 3 + count * (name.len() as u64 + 1);
+        assert!(hash_seq + names > ANNOUNCED_SLACK);
+        assert!(!exceeds_announced(
+            hash_seq + names,
+            announced_limit(&files)
+        ));
     }
 
     #[test]

@@ -75,7 +75,7 @@ export default {
 		"Antes de empezar, revisa nuestros Términos del servicio y la Política de privacidad.",
 	"legal-terms": "Términos del servicio",
 	"legal-privacy": "Política de privacidad",
-	"legal-agree": "Acepto y continuar",
+	"legal-agree": "Acepto y continúo",
 	"legal-agree-note": "Al continuar, aceptas ambos.",
 	"legal-save-failed": "No se pudo guardar tu elección. Inténtalo de nuevo.",
 };

@@ -274,7 +274,12 @@ async function askToInstall(
 		await invoke("relaunch_app");
 	} catch (error) {
 		if (exitsOnInstall) {
-			await invoke("restart_engine").catch(() => {});
+			await invoke("restart_engine").catch((restartError) => {
+				logger.warn(
+					"[Risuko] failed to restart engine after update failure:",
+					restartError,
+				);
+			});
 			await Promise.all(
 				interrupted.map((gid) =>
 					invoke("unpause_task", { gid }).catch(() => {}),

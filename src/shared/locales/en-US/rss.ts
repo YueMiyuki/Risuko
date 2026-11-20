@@ -112,6 +112,8 @@ export default {
 	"rule-episodes-range": "Episode range",
 	"rule-episodes-specific": "Specific episodes",
 	"rule-placeholder-episodes": "1, 5, 12",
+	"rule-episodes-invalid":
+		"Enter whole episode numbers separated by commas, for example 1, 5, 12",
 	"rule-chip-earlier": "Move earlier",
 	"rule-chip-later": "Move later",
 	"rule-chip-remove": "Remove",

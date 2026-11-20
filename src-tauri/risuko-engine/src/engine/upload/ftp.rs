@@ -12,6 +12,23 @@ use super::sink::{
 const COPY_BUF: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+fn ftp_error(context: &str, error: &suppaftp::FtpError) -> UploadError {
+    use suppaftp::FtpError;
+    let message = format!("{context}: {error}");
+    match error {
+        FtpError::UnexpectedResponse(reply) if reply.status.code() >= 500 => {
+            UploadError::fatal(message)
+        }
+        FtpError::UnexpectedResponse(_)
+        | FtpError::ConnectionError(_)
+        | FtpError::SecureError(_)
+        | FtpError::BadResponse => UploadError::transient(message),
+        FtpError::InvalidAddress(_) | FtpError::DataConnectionAlreadyOpen => {
+            UploadError::fatal(message)
+        }
+    }
+}
+
 pub struct FtpSink {
     cfg: FtpConfig,
 }
@@ -122,7 +139,7 @@ macro_rules! copy_to {
         let mut writer = $ftp
             .put_with_stream(&part_remote)
             .await
-            .map_err(|e| format!("FTP STOR {}: {e}", part_remote))?;
+            .map_err(|e| ftp_error(&format!("FTP STOR {}", part_remote), &e))?;
 
         let mut buf = vec![0u8; COPY_BUF];
         let mut sent: u64 = 0;
@@ -144,8 +161,8 @@ macro_rules! copy_to {
             }
             tokio::time::timeout(UPLOAD_STALL_TIMEOUT, writer.flush())
                 .await
-                .map_err(|_| "FTP flush timed out".to_string())?
-                .map_err(|e| format!("FTP flush: {e}"))?;
+                .map_err(|_| UploadError::transient("FTP flush timed out"))?
+                .map_err(|e| UploadError::transient(format!("FTP flush: {e}")))?;
             Ok(())
         }
         .await;
@@ -161,7 +178,7 @@ macro_rules! copy_to {
         writer
             .finish()
             .await
-            .map_err(|e| format!("FTP finalize: {e}"))?;
+            .map_err(|e| ftp_error("FTP finalize", &e))?;
 
         if $ftp
             .rename(part_remote.as_str(), $remote.as_str())
@@ -171,7 +188,9 @@ macro_rules! copy_to {
             let _ = $ftp.rm($remote.as_str()).await;
             $ftp.rename(part_remote.as_str(), $remote.as_str())
                 .await
-                .map_err(|e| format!("FTP rename {} -> {}: {e}", part_remote, $remote))?;
+                .map_err(|e| {
+                    ftp_error(&format!("FTP rename {} -> {}", part_remote, $remote), &e)
+                })?;
         }
     }};
 }
@@ -193,28 +212,29 @@ impl UploadSink for FtpSink {
         if self.cfg.secure {
             let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, self.connect_secure())
                 .await
-                .map_err(|_| "FTPS connect timed out".to_string())??;
+                .map_err(|_| UploadError::transient("FTPS connect timed out"))?
+                .map_err(UploadError::transient)?;
             ftp.login(&user, &pass)
                 .await
                 .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
-                .map_err(|e| format!("FTP binary mode: {e}"))?;
+                .map_err(|e| ftp_error("FTP binary mode", &e))?;
             ensure_dirs!(ftp, remote);
             copy_to!(ftp, local, remote, size, ctl);
             let _ = ftp.quit().await;
         } else {
             let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, AsyncFtpStream::connect(&addr))
                 .await
-                .map_err(|_| "FTP connect timed out".to_string())?
-                .map_err(|e| format!("FTP connect failed: {e}"))?;
+                .map_err(|_| UploadError::transient("FTP connect timed out"))?
+                .map_err(|e| ftp_error("FTP connect failed", &e))?;
             ftp.set_passive_nat_workaround(true);
             ftp.login(&user, &pass)
                 .await
                 .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
-                .map_err(|e| format!("FTP binary mode: {e}"))?;
+                .map_err(|e| ftp_error("FTP binary mode", &e))?;
             ensure_dirs!(ftp, remote);
             copy_to!(ftp, local, remote, size, ctl);
             let _ = ftp.quit().await;
@@ -269,6 +289,34 @@ mod tests {
             secure,
             insecure: false,
         }
+    }
+
+    fn reply(code: u32) -> suppaftp::FtpError {
+        suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response {
+            status: suppaftp::Status::from(code),
+            body: b"reply".to_vec(),
+        })
+    }
+
+    #[test]
+    fn permanent_replies_are_fatal_and_temporary_ones_retry() {
+        for code in [550, 553, 552, 530] {
+            assert!(!ftp_error("x", &reply(code)).retryable, "{code}");
+        }
+        for code in [421, 425, 426, 451] {
+            assert!(ftp_error("x", &reply(code)).retryable, "{code}");
+        }
+    }
+
+    #[test]
+    fn dropped_connections_retry_and_bad_addresses_do_not() {
+        let dropped = suppaftp::FtpError::ConnectionError(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ));
+        assert!(ftp_error("x", &dropped).retryable);
+        assert!(ftp_error("x", &suppaftp::FtpError::BadResponse).retryable);
+        let invalid = "nope".parse::<std::net::IpAddr>().unwrap_err();
+        assert!(!ftp_error("x", &suppaftp::FtpError::InvalidAddress(invalid)).retryable);
     }
 
     #[test]

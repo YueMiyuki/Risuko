@@ -10,8 +10,8 @@ use risuko_http::{Client, ClientBuilder, Url};
 use sha2::{Digest, Sha256};
 
 use super::sink::{
-    run_with_stall, Heartbeat, S3Config, UploadControl, UploadError, UploadFile, UploadSink,
-    UPLOAD_STALL_TIMEOUT,
+    ensure_local_readable, run_with_stall, Heartbeat, S3Config, UploadControl, UploadError,
+    UploadFile, UploadSink, UPLOAD_STALL_TIMEOUT,
 };
 use crate::engine::util::{ERROR_SNIPPET_BYTES, RESPONSE_BODY_LIMIT};
 
@@ -271,7 +271,7 @@ impl S3Sink {
 
         let resp = tokio::select! {
             _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
-            r = req.send() => r.map_err(|e| format!("S3 initiate multipart: {e}"))?,
+            r = req.send() => r.map_err(|e| UploadError::transient(format!("S3 initiate multipart: {e}")))?,
         };
         let status = resp.status();
         if !status.is_success() {
@@ -284,7 +284,7 @@ impl S3Sink {
         let body = resp
             .text_limited(RESPONSE_BODY_LIMIT)
             .await
-            .map_err(|e| format!("S3 initiate multipart read body: {e}"))?;
+            .map_err(|e| UploadError::transient(format!("S3 initiate multipart read body: {e}")))?;
         parse_upload_id(&body).ok_or_else(|| {
             UploadError::transient(format!(
                 "S3 initiate multipart: missing UploadId in response: {body}"
@@ -457,7 +457,7 @@ impl S3Sink {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("S3 CompleteMultipart: {e}"))?;
+            .map_err(|e| UploadError::transient(format!("S3 CompleteMultipart: {e}")))?;
         let status = resp.status();
         let resp_body = resp
             .text_limited(RESPONSE_BODY_LIMIT)
@@ -470,7 +470,9 @@ impl S3Sink {
             ));
         }
         if resp_body.contains("<Error>") {
-            return Err(format!("S3 CompleteMultipart error body: {resp_body}").into());
+            return Err(UploadError::transient(format!(
+                "S3 CompleteMultipart error body: {resp_body}"
+            )));
         }
         Ok(())
     }
@@ -508,6 +510,7 @@ impl UploadSink for S3Sink {
         if ctl.cancel.is_cancelled() {
             return Err(UploadError::fatal("cancelled"));
         }
+        ensure_local_readable(&file.local_path).await?;
 
         if file.size > MULTIPART_THRESHOLD {
             return self.upload_multipart(file, ctl).await;
@@ -548,7 +551,7 @@ impl UploadSink for S3Sink {
         let send_fut = async { req.send().await.map_err(|e| format!("PUT failed: {e}")) };
         let resp = tokio::select! {
             _ = ctl.cancel.cancelled() => return Err(UploadError::fatal("cancelled")),
-            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r?,
+            r = run_with_stall(send_fut, &hb, UPLOAD_STALL_TIMEOUT) => r.map_err(UploadError::transient)?,
         };
 
         let status = resp.status();

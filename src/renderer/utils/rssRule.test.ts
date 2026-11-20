@@ -7,7 +7,9 @@ import {
 	defaultEpisodeSelector,
 	emptyRule,
 	episodeKind,
+	hasEmptyEpisodeList,
 	mbToBytes,
+	parseEpisodeList,
 	parseNumberList,
 	parseSeasons,
 	sanitizeRule,
@@ -40,6 +42,25 @@ test("number lists keep positive integers separated by commas or spaces", () => 
 	assert.deepEqual(parseNumberList(""), []);
 	assert.equal(parseSeasons("  "), null);
 	assert.deepEqual(parseSeasons("2,4"), [2, 4]);
+});
+
+test("episode lists reject the whole field when any token is not a positive integer", () => {
+	assert.deepEqual(parseEpisodeList("1, 5 12"), [1, 5, 12]);
+	assert.deepEqual(parseEpisodeList(" 3,  4, "), [3, 4]);
+	assert.deepEqual(parseEpisodeList(""), []);
+	assert.deepEqual(parseEpisodeList("1-12"), []);
+	assert.deepEqual(parseEpisodeList("1, 5-7, 12"), []);
+	assert.deepEqual(parseEpisodeList("1, 0"), []);
+	assert.deepEqual(parseEpisodeList("2, 5.5"), []);
+	assert.deepEqual(parseEpisodeList("9007199254740993"), []);
+});
+
+test("only a specific selector with no episodes counts as an empty list", () => {
+	assert.equal(hasEmptyEpisodeList(null), false);
+	assert.equal(hasEmptyEpisodeList({ type: "all" }), false);
+	assert.equal(hasEmptyEpisodeList({ type: "from", start: 1 }), false);
+	assert.equal(hasEmptyEpisodeList({ type: "specific", values: [] }), true);
+	assert.equal(hasEmptyEpisodeList({ type: "specific", values: [2] }), false);
 });
 
 test("size conversion keeps fractional megabytes and maps zero to no limit", () => {
@@ -128,15 +149,44 @@ test("sanitizing repairs episode selectors the engine would reject", () => {
 			.episodes,
 		{ type: "range", start: 5, end: 5 },
 	);
-	assert.equal(
+	assert.deepEqual(
 		sanitizeRule({ ...base, episodes: { type: "specific", values: [] } })
 			.episodes,
-		null,
+		{ type: "specific", values: [] },
+	);
+	assert.deepEqual(
+		sanitizeRule({ ...base, episodes: { type: "specific", values: [0, -1] } })
+			.episodes,
+		{ type: "specific", values: [] },
 	);
 	assert.deepEqual(
 		sanitizeRule({ ...base, episodes: { type: "specific", values: [3, 0, 7] } })
 			.episodes,
 		{ type: "specific", values: [3, 7] },
+	);
+});
+
+test("sanitizing keeps seasons inside the engine's integer range", () => {
+	const base = emptyRule();
+	assert.equal(sanitizeRule({ ...base, seasons: null }).seasons, null);
+	assert.equal(sanitizeRule({ ...base, seasons: [] }).seasons, null);
+	assert.deepEqual(
+		sanitizeRule({ ...base, seasons: [2, 0, -1, 4] }).seasons,
+		[2, 4],
+	);
+	assert.deepEqual(
+		sanitizeRule({
+			...base,
+			seasons: [1, 9_007_199_254_740_991, 4_294_967_296],
+		}).seasons,
+		[1, 2147483647, 2147483647],
+	);
+	assert.deepEqual(
+		sanitizeRule({
+			...base,
+			seasons: parseSeasons("3, 99999999999999"),
+		}).seasons,
+		[3, 2147483647],
 	);
 });
 

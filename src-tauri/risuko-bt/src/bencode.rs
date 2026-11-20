@@ -134,7 +134,7 @@ pub fn decode_all_external(input: &[u8], limits: DecodeLimits) -> Result<Value, 
 }
 
 const MAX_STRICT_DEPTH: usize = 256;
-const MAX_STRICT_VALUES: usize = 2_000_000;
+const MAX_STRICT_VALUES: usize = 4_194_304;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DictMode {
@@ -554,11 +554,25 @@ mod tests {
 
     #[test]
     fn strict_decode_enforces_value_budget() {
-        let over = [b"l".to_vec(), b"i0e".repeat(2_000_001), b"e".to_vec()].concat();
+        let over = [
+            b"l".to_vec(),
+            b"0:".repeat(MAX_STRICT_VALUES),
+            b"e".to_vec(),
+        ]
+        .concat();
         assert!(matches!(
             decode_all(&over),
-            Err(Error::ValueLimit { max: 2_000_000 })
+            Err(Error::ValueLimit {
+                max: MAX_STRICT_VALUES
+            })
         ));
+        let large = [
+            b"l".to_vec(),
+            b"0:".repeat(MAX_STRICT_VALUES - 1),
+            b"e".to_vec(),
+        ]
+        .concat();
+        assert!(decode_all(&large).is_ok());
         let ok = [b"l".to_vec(), b"i0e".repeat(1_000), b"e".to_vec()].concat();
         assert!(decode_all(&ok).is_ok());
     }

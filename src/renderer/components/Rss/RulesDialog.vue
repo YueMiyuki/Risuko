@@ -309,6 +309,7 @@ import {
 	cloneRule,
 	countMatched,
 	emptyRule,
+	hasEmptyEpisodeList,
 	mbToBytes,
 	parseSeasons,
 	sanitizeRule,
@@ -379,7 +380,11 @@ export default {
 			return sortRulesByPriority(useRssStore().rules);
 		},
 		isValid(): boolean {
-			return !!this.form && this.form.name.trim().length > 0;
+			return (
+				!!this.form &&
+				this.form.name.trim().length > 0 &&
+				!hasEmptyEpisodeList(this.form.episodes)
+			);
 		},
 		matchedCount(): number {
 			return countMatched(this.dryRunResults);

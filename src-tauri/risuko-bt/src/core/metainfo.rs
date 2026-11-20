@@ -518,12 +518,17 @@ pub(crate) fn info_private(info: &Value) -> bool {
         .is_some_and(|n| n != 0)
 }
 
+pub(crate) fn is_parts_dir_name(s: &str) -> bool {
+    s.trim_end_matches(['.', ' '])
+        .eq_ignore_ascii_case(crate::storage::PARTS_DIR)
+}
+
 pub(crate) fn is_safe_component(s: &str) -> bool {
     if s.is_empty()
         || s == "."
         || s == ".."
         || s.contains(['/', '\\', '\0'])
-        || s.eq_ignore_ascii_case(crate::storage::PARTS_DIR)
+        || is_parts_dir_name(s)
     {
         return false;
     }
@@ -1073,12 +1078,18 @@ fn parse_piece_layers(top: &Value) -> Result<std::collections::BTreeMap<Id32, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::PARTS_DIR;
 
     #[test]
     fn parts_directory_name_is_not_a_safe_component() {
         assert!(!is_safe_component(".risuko-parts"));
         assert!(!is_safe_component(".Risuko-Parts"));
+        assert!(!is_safe_component(".risuko-parts."));
+        assert!(!is_safe_component(".risuko-parts "));
+        assert!(!is_safe_component(".RISUKO-PARTS. ."));
         assert!(is_safe_component("risuko-parts"));
+        assert!(is_safe_component(".risuko-parts.d"));
+        assert!(sanitize_windows_component(".risuko-parts. ").eq_ignore_ascii_case(PARTS_DIR));
     }
 
     fn validate_info(value: &Value) -> Result<ValidatedTorrentMetaV1Info, MetaError> {

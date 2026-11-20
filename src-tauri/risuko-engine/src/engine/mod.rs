@@ -56,29 +56,6 @@ pub use util::is_windows_device_name;
 pub const CHUNK_META_SUFFIX: &str = ".chunks";
 pub const RESUME_META_SUFFIX: &str = ".resume";
 
-pub const STARTUP_ONLY_KEYS: &[&str] = &[
-    "rpc-listen-port",
-    "rpc-secret",
-    "pbh-enable",
-    "pbh-listen-port",
-    "pbh-rpc-secret",
-    "listen-port",
-    "dht-listen-port",
-    "ed2k-port",
-    "ed2k-enable-kad",
-    "ed2k-enable-upload",
-    "ed2k-kad-port",
-    "bt-max-peers-per-torrent",
-    "bt-max-outstanding-per-peer",
-    "bt-ban-corrupt-peers",
-    "bt-ban-corrupt-strikes",
-    "bt-enable-upnp",
-    "bt-upnp-lease",
-    "bt-enable-lsd",
-    "bt-encryption-policy",
-    "bt-listen-v6",
-];
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -436,13 +413,13 @@ pub async fn start_engine(
 
     if let Ok(mut g) = STARTUP_SNAPSHOT.lock() {
         let mut snap = std::collections::HashMap::new();
-        for key in STARTUP_ONLY_KEYS {
+        for key in crate::config::keys::startup_only_keys() {
             let v = user
-                .get(*key)
-                .or_else(|| system.get(*key))
+                .get(key)
+                .or_else(|| system.get(key))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            snap.insert((*key).to_string(), v);
+            snap.insert(key.clone(), v);
         }
         *g = Some(snap);
     }

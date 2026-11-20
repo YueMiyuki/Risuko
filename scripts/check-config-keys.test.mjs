@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import { test } from "node:test";
 import {
 	checkConfigKeys,
@@ -253,4 +255,21 @@ test("rule 6: an exception that no longer applies fails", () => {
 		checkConfigKeys({ ...agreeing, exceptions: { unknown: "reason" } }),
 		["unknown: listed as an exception but no longer needed"],
 	);
+});
+
+test("the key check runs without native TypeScript support", (t) => {
+	const result = spawnSync(
+		process.execPath,
+		[
+			"--no-experimental-strip-types",
+			resolve(import.meta.dirname, "check-config-keys.mjs"),
+		],
+		{ encoding: "utf8" },
+	);
+	if (/bad option/.test(result.stderr)) {
+		t.skip("this Node cannot turn type stripping off");
+		return;
+	}
+	assert.doesNotMatch(result.stderr, /ERR_UNKNOWN_FILE_EXTENSION/);
+	assert.match(result.stdout, /^\d+ user keys, \d+ system keys/);
 });

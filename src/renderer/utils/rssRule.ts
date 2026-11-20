@@ -52,6 +52,16 @@ export function parseNumberList(text: string): number[] {
 		.filter((value) => Number.isSafeInteger(value) && value > 0);
 }
 
+export function parseEpisodeList(text: string): number[] {
+	const tokens = text.split(/[,\s]+/).filter((token) => token !== "");
+	const values = parseNumberList(text);
+	return values.length === tokens.length ? values : [];
+}
+
+export function hasEmptyEpisodeList(selector: EpisodeSelector | null): boolean {
+	return selector?.type === "specific" && selector.values.length === 0;
+}
+
 export function parseSeasons(text: string): number[] | null {
 	const seasons = parseNumberList(text);
 	return seasons.length > 0 ? seasons : null;
@@ -120,6 +130,16 @@ function cleanPatterns(patterns: Pattern[]): Pattern[] {
 	return patterns.filter((pattern) => pattern.value.trim() !== "");
 }
 
+function cleanSeasons(seasons: number[] | null): number[] | null {
+	if (!seasons) {
+		return null;
+	}
+	const values = seasons
+		.filter((value) => Number.isSafeInteger(value) && value > 0)
+		.map((value) => toInt(value, 1, INT32_MAX));
+	return values.length > 0 ? values : null;
+}
+
 function cleanEpisodes(
 	selector: EpisodeSelector | null,
 ): EpisodeSelector | null {
@@ -141,7 +161,7 @@ function cleanEpisodes(
 			const values = selector.values
 				.filter((value) => Number.isSafeInteger(value) && value > 0)
 				.map((value) => toInt(value, 1, INT32_MAX));
-			return values.length > 0 ? { type: "specific", values } : null;
+			return { type: "specific", values };
 		}
 		default:
 			return null;
@@ -163,6 +183,7 @@ export function sanitizeRule(rule: RssRule): RssRule {
 		series_filter: cleanText(rule.series_filter),
 		download_dir: cleanText(rule.download_dir),
 		filename_template: cleanText(rule.filename_template),
+		seasons: cleanSeasons(rule.seasons),
 		episodes: cleanEpisodes(rule.episodes),
 	};
 }

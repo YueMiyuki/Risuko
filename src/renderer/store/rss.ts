@@ -254,7 +254,14 @@ export const useRssStore = defineStore("rss", {
 			try {
 				const feed = (await api.addRssFeed(url)) as RssFeed;
 				this.feeds.push(feed);
-				await this.fetchItems(feed.id);
+				try {
+					await this.fetchItems(feed.id);
+				} catch (err) {
+					logger.warn(
+						"[Risuko] RSS initial item fetch failed:",
+						(err as Error)?.message || err,
+					);
+				}
 				return feed;
 			} finally {
 				this.loading = false;
