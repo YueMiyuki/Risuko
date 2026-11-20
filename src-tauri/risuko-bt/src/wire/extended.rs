@@ -12,6 +12,7 @@ pub const EXT_HANDSHAKE_ID: u8 = 0;
 const EXTENSION_DECODE_LIMITS: DecodeLimits =
     DecodeLimits::new(super::MAX_MESSAGE_BYTES, 32, 65_536);
 
+const MAX_CLIENT_NAME_CHARS: usize = 64;
 pub const EXT_NAME_UT_METADATA: &[u8] = b"ut_metadata";
 pub const EXT_NAME_UT_PEX: &[u8] = b"ut_pex";
 pub const EXT_NAME_UT_HOLEPUNCH: &[u8] = b"ut_holepunch";
@@ -171,7 +172,8 @@ impl ExtHandshake {
         let client = dict
             .iter()
             .find(|(k, _)| k == b"v")
-            .and_then(|(_, v)| v.as_str().map(String::from));
+            .and_then(|(_, v)| v.as_str())
+            .map(|v| v.chars().take(MAX_CLIENT_NAME_CHARS).collect());
         let yourip = dict
             .iter()
             .find(|(k, _)| k == b"yourip")
@@ -594,6 +596,17 @@ mod tests {
         assert_eq!(parsed.ut_pex_id(), Some(4));
         assert_eq!(parsed.metadata_size, Some(1024));
         assert!(parsed.client.is_some());
+    }
+
+    #[test]
+    fn handshake_truncates_an_oversized_client_name() {
+        let mut hs = ExtHandshake::new_outgoing(3, 4, None);
+        hs.client = Some("\u{6f22}".repeat(5000));
+        let parsed = ExtHandshake::decode(&hs.encode()).unwrap();
+        assert_eq!(
+            parsed.client.unwrap().chars().count(),
+            MAX_CLIENT_NAME_CHARS
+        );
     }
 
     #[test]

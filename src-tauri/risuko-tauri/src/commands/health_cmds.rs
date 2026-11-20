@@ -333,11 +333,8 @@ fn is_loopback(host: &str) -> bool {
 }
 
 fn parse_boolish(v: Option<&Value>, default: bool) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
-        _ => default,
-    }
+    v.and_then(risuko_engine::engine::options::json_bool)
+        .unwrap_or(default)
 }
 
 fn listen_port_checks(options: &EngineOptions, bt: Option<&BtHealthSnapshot>) -> [HealthCheck; 2] {
@@ -927,24 +924,39 @@ async fn check_bittorrent(
             .with_details(serde_json::json!({ "trackers": tracker_urls.len() })),
         );
     } else {
-        out.push(probe_trackers(tracker_urls).await);
+        out.push(probe_trackers(tracker_urls, options).await);
     }
 
     out
 }
 
-async fn probe_trackers(urls: &[String]) -> HealthCheck {
+async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck {
     use risuko_http::{ClientBuilder, Method};
     use tokio::task::JoinSet;
 
     const MAX_CONCURRENCY: usize = 8;
     const PER_TRACKER_TIMEOUT: Duration = Duration::from_secs(3);
 
-    let client = match ClientBuilder::new()
+    let proxy = match options.p2p_proxy_connector() {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            return HealthCheck::skipped(
+                "trackers",
+                format!("P2P proxy is misconfigured ({e}) — tracker probe skipped"),
+            );
+        }
+    };
+    let mut builder = ClientBuilder::new()
         .timeout(PER_TRACKER_TIMEOUT)
-        .connect_timeout(PER_TRACKER_TIMEOUT)
-        .build()
-    {
+        .connect_timeout(PER_TRACKER_TIMEOUT);
+    if let Some(route) = proxy.proxy() {
+        builder = builder.proxy(route);
+    }
+    if let Some(bypass) = proxy.no_proxy() {
+        builder = builder.no_proxy(bypass);
+    }
+
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             return HealthCheck::fail("trackers", format!("Probe client init failed: {e}"), None);
@@ -1201,15 +1213,15 @@ fn check_config(
     };
 
     let mut drifted: Vec<String> = Vec::new();
-    for key in engine::STARTUP_ONLY_KEYS {
+    for key in risuko_engine::config::keys::startup_only_keys() {
         let current = system
-            .get(*key)
-            .or_else(|| user.get(*key))
+            .get(key)
+            .or_else(|| user.get(key))
             .cloned()
             .unwrap_or(Value::Null);
-        let prev = snap.get(*key).cloned().unwrap_or(Value::Null);
+        let prev = snap.get(key).cloned().unwrap_or(Value::Null);
         if current != prev {
-            drifted.push((*key).to_string());
+            drifted.push(key.clone());
         }
     }
 

@@ -23,6 +23,16 @@ import {
 } from "@shared/utils";
 import logger from "@shared/utils/logger";
 import {
+	engineSpeedLimitOptions,
+	touchesEngineSpeedLimits,
+} from "@shared/utils/speedLimit";
+import {
+	changedProfileIds,
+	profileDirtyKey,
+	trackDirtyKey,
+	USENET_PROFILES_KEY,
+} from "@shared/utils/syncConflict";
+import {
 	fetchBtTrackerFromSource,
 	reduceTrackerString,
 } from "@shared/utils/tracker";
@@ -80,16 +90,30 @@ export const usePreferenceStore = defineStore("preference", {
 				const timestamps = {
 					...this.config.cloudSyncCategoryTimestamps,
 				};
+				const dirty = { ...this.config.cloudSyncDirtyKeys };
 				const kebabConfig = changeKeysToKebabCase(config);
 				let touched = false;
 				for (const key of Object.keys(kebabConfig)) {
 					for (const cat of getCategoriesForKey(key)) {
 						timestamps[cat] = Math.floor(Date.now() / 1000);
+						trackDirtyKey(dirty, cat, key);
+						if (key === USENET_PROFILES_KEY) {
+							for (const id of changedProfileIds(
+								this.config.usenetProfiles,
+								kebabConfig[key],
+							)) {
+								trackDirtyKey(dirty, cat, profileDirtyKey(id));
+							}
+						}
 						touched = true;
 					}
 				}
 				if (touched) {
-					config = { ...config, cloudSyncCategoryTimestamps: timestamps };
+					config = {
+						...config,
+						cloudSyncCategoryTimestamps: timestamps,
+						cloudSyncDirtyKeys: dirty,
+					};
 				}
 			}
 
@@ -121,10 +145,7 @@ export const usePreferenceStore = defineStore("preference", {
 				}
 			}
 
-			if (
-				"maxOverallDownloadLimit" in normalized ||
-				"maxOverallUploadLimit" in normalized
-			) {
+			if (touchesEngineSpeedLimits(normalized)) {
 				this.applyEngineMode().catch(() => undefined);
 			}
 		},
@@ -247,10 +268,8 @@ export const usePreferenceStore = defineStore("preference", {
 					} else if (explicitClear) {
 						await api.vaultRemoveCredential(credential.id);
 						meta.vaulted = false;
-					} else if (wasVaulted) {
-						meta.vaulted = true;
 					} else {
-						meta.vaulted = false;
+						meta.vaulted = wasVaulted;
 					}
 					toStore = meta;
 				} catch (err) {
@@ -302,65 +321,6 @@ export const usePreferenceStore = defineStore("preference", {
 			);
 			await this.save({ savedCredentials: updated });
 		},
-		async loadCredentialSecrets(
-			credential: SavedCredential,
-		): Promise<SavedCredential> {
-			if (!credential.vaulted) {
-				return credential;
-			}
-			if (!this.vaultEnabled) {
-				logger.warn(
-					`[Risuko] credential ${credential.id} is vaulted but the OS keychain is unavailable; secrets will not be applied.`,
-				);
-				return credential;
-			}
-			try {
-				const secrets = await api.vaultGetCredential(credential.id);
-				if (!secrets) {
-					logger.warn(
-						`[Risuko] credential ${credential.id} marked vaulted but no entry in OS keychain.`,
-					);
-					return credential;
-				}
-				return { ...credential, ...secrets };
-			} catch (err) {
-				logger.warn(
-					"[Risuko] vaultGetCredential failed:",
-					(err as Error).message,
-				);
-				return credential;
-			}
-		},
-		updateCredentialLastUsed(id: string) {
-			const { savedCredentials = [] } = this.config;
-			const idx = savedCredentials.findIndex(
-				(c: SavedCredential) => c.id === id,
-			);
-			if (idx < 0) {
-				return;
-			}
-			const updated = [...savedCredentials];
-			updated[idx] = { ...updated[idx], lastUsedAt: Date.now() };
-			this.save({ savedCredentials: updated });
-		},
-		findCredentialsByHost(host: string, protocol?: string): SavedCredential[] {
-			const { savedCredentials = [] } = this.config;
-			const lower = host.toLowerCase();
-			return savedCredentials
-				.filter((c: SavedCredential) => {
-					if (c.host && c.host.toLowerCase() === lower) {
-						if (protocol && c.protocol) {
-							return c.protocol === protocol;
-						}
-						return true;
-					}
-					return false;
-				})
-				.sort(
-					(a: SavedCredential, b: SavedCredential) =>
-						(b.lastUsedAt || 0) - (a.lastUsedAt || 0),
-				);
-		},
 		updateAppTheme(theme: string) {
 			this.updatePreference({ theme });
 		},
@@ -383,7 +343,7 @@ export const usePreferenceStore = defineStore("preference", {
 				trackerSource,
 				redactProxySettings({ proxy }),
 			);
-			return fetchBtTrackerFromSource(trackerSource, proxy, undefined, (urls) =>
+			return fetchBtTrackerFromSource(trackerSource, proxy, (urls) =>
 				api.fetchTrackerSources(urls),
 			);
 		},
@@ -419,16 +379,10 @@ export const usePreferenceStore = defineStore("preference", {
 			}
 		},
 		applyEngineMode() {
-			const isMax = this.engineMode === "MAX";
 			return api
-				.changeGlobalOption({
-					"max-overall-download-limit": isMax
-						? 0
-						: (this.config.maxOverallDownloadLimit ?? 0),
-					"max-overall-upload-limit": isMax
-						? 0
-						: (this.config.maxOverallUploadLimit ?? 0),
-				})
+				.changeGlobalOption(
+					engineSpeedLimitOptions(this.config, this.engineMode === "MAX"),
+				)
 				.catch((err) => {
 					logger.warn(
 						"[Risuko] apply engine mode failed:",

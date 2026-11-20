@@ -11,9 +11,9 @@ iroh-blobs = "0.104"
 n0-future = "0.3"
 tokio = { workspace = true }
 serde = { workspace = true }
-anyhow = "1"
+anyhow = { workspace = true }
 irpc = "0.17"
-risuko-engine = { workspace = true }
+risuko-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

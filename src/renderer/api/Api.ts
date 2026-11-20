@@ -35,14 +35,9 @@ import {
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
 import { isEmpty } from "lodash";
+import { fetchAllPages } from "@/utils/taskPages";
 
-const ENGINE_RESTART_USER_KEYS: string[] = [
-	"external-engine-enabled",
-	"external-engine-host",
-	"external-engine-port",
-	"external-engine-secret",
-	"engine-overrides",
-];
+const ENGINE_RESTART_USER_KEYS: string[] = ["engine-overrides", "rpc-host"];
 const P2P_RUNTIME_OPTION_KEYS = new Set([
 	"p2p-proxy",
 	"p2p-no-proxy",
@@ -57,7 +52,23 @@ const PROXY_RUNTIME_OPTION_KEYS = new Set([
 	"p2p-udp-proxy",
 	"p2p-udp-no-proxy",
 ]);
-const TASK_LIST_FETCH_SIZE = 5000;
+
+function fetchTaskPages(
+	command: "tell_waiting" | "tell_stopped" | "tell_scheduled",
+	params: { offset?: number; num?: number; keys?: string[] },
+) {
+	const { offset = 0, num, keys } = params;
+	if (num === undefined) {
+		return fetchAllPages<DownloadTask>((pageOffset, pageSize) =>
+			invoke<DownloadTask[]>(command, {
+				offset: offset + pageOffset,
+				num: pageSize,
+				keys,
+			}),
+		);
+	}
+	return invoke<DownloadTask[]>(command, { offset, num, keys });
+}
 
 export default class Api {
 	config: AppConfig | null;
@@ -452,34 +463,19 @@ export default class Api {
 	fetchWaitingTaskList(
 		params: { offset?: number; num?: number; keys?: string[] } = {},
 	) {
-		const { offset = 0, num = TASK_LIST_FETCH_SIZE, keys } = params;
-		return invoke<DownloadTask[]>("tell_waiting", {
-			offset,
-			num,
-			keys,
-		});
+		return fetchTaskPages("tell_waiting", params);
 	}
 
 	fetchStoppedTaskList(
 		params: { offset?: number; num?: number; keys?: string[] } = {},
 	) {
-		const { offset = 0, num = TASK_LIST_FETCH_SIZE, keys } = params;
-		return invoke<DownloadTask[]>("tell_stopped", {
-			offset,
-			num,
-			keys,
-		});
+		return fetchTaskPages("tell_stopped", params);
 	}
 
 	fetchScheduledTaskList(
 		params: { offset?: number; num?: number; keys?: string[] } = {},
 	) {
-		const { offset = 0, num = TASK_LIST_FETCH_SIZE, keys } = params;
-		return invoke<DownloadTask[]>("tell_scheduled", {
-			offset,
-			num,
-			keys,
-		});
+		return fetchTaskPages("tell_scheduled", params);
 	}
 
 	async fetchActiveTaskList(
@@ -516,12 +512,12 @@ export default class Api {
 	async fetchAllTaskList(
 		params: { offset?: number; num?: number; keys?: string[] } = {},
 	) {
-		const { offset = 0, num = TASK_LIST_FETCH_SIZE, keys } = params;
+		const { keys } = params;
 		const [active, waiting, scheduled, stopped] = await Promise.all([
 			invoke<DownloadTask[]>("tell_active", { keys }),
-			invoke<DownloadTask[]>("tell_waiting", { offset, num, keys }),
-			invoke<DownloadTask[]>("tell_scheduled", { offset, num, keys }),
-			invoke<DownloadTask[]>("tell_stopped", { offset, num, keys }),
+			this.fetchWaitingTaskList(params),
+			this.fetchScheduledTaskList(params),
+			this.fetchStoppedTaskList(params),
 		]);
 		const activeArr = Array.isArray(active) ? active : [];
 		const waitingArr = Array.isArray(waiting) ? waiting : [];
@@ -530,9 +526,9 @@ export default class Api {
 		return [...activeArr, ...waitingArr, ...scheduledArr, ...stoppedArr];
 	}
 
-	fetchTaskItem(params: { gid: string }) {
-		const { gid } = params;
-		return invoke<DownloadTask>("tell_status", { gid });
+	fetchTaskItem(params: { gid: string; keys?: string[] }) {
+		const { gid, keys } = params;
+		return invoke<DownloadTask>("tell_status", { gid, keys });
 	}
 
 	async fetchTaskItemWithPeers(params: {
@@ -561,17 +557,14 @@ export default class Api {
 		return invoke("pause_all_tasks");
 	}
 
-	forcePauseTask(params: { gid: string }) {
-		return this.pauseTask(params);
-	}
-
-	forcePauseAllTask() {
-		return this.pauseAllTask();
-	}
-
 	resumeTask(params: { gid: string }) {
 		const { gid } = params;
 		return invoke("unpause_task", { gid });
+	}
+
+	restartTask(params: { gid: string }) {
+		const { gid } = params;
+		return invoke("restart_task", { gid });
 	}
 
 	resumeAllTask() {
@@ -667,7 +660,7 @@ export default class Api {
 		return invoke("update_rss_feed_settings", { feedId, interval, isActive });
 	}
 
-	addRssRule(rule: Omit<RssRule, "id">) {
+	addRssRule(rule: RssRule) {
 		return invoke("add_rss_rule", { rule });
 	}
 
@@ -790,12 +783,6 @@ export default class Api {
 		return invoke("vault_put_credential", { id, secrets });
 	}
 
-	vaultGetCredential(id: string) {
-		return invoke<Record<string, string> | null>("vault_get_credential", {
-			id,
-		});
-	}
-
 	vaultRemoveCredential(id: string) {
 		return invoke("vault_remove_credential", { id });
 	}
@@ -851,7 +838,6 @@ export interface BrowserInfo {
 
 interface ImportedCookieView {
 	name: string;
-	value: string;
 	domain: string;
 	path: string;
 	secure: boolean;
@@ -862,7 +848,6 @@ interface ImportedCookieView {
 export interface ImportedCookies {
 	host: string;
 	userAgent: string;
-	cookieHeader: string;
 	count: number;
 	hasCfClearance: boolean;
 	cookieNames: string[];

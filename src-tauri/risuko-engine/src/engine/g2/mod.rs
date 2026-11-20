@@ -98,6 +98,7 @@ pub async fn run_g2_download(
             file_name: &link.file_name,
             default_name: "g2-download",
             dir,
+            auto_rename: opts.get_bool("auto-file-renaming").unwrap_or(true),
         },
         completed,
         speed,

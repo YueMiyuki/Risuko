@@ -1,5 +1,5 @@
 export default {
-	undo: "Отказ",
+	undo: "Отмяна",
 	redo: "Повторя",
 	cut: "Нарежа",
 	copy: "Копирам",

@@ -3,7 +3,7 @@
     class="batch-item-card group relative overflow-hidden rounded-md border border-border bg-card/40"
     role="listitem"
   >
-    <AccordionItem :value="item.id" class="border-none">
+    <AccordionItem :value="item.id" :unmount-on-hide="false" class="border-none">
       <div class="flex items-center gap-2 px-3">
         <AccordionTrigger
           class="flex-1 py-3 hover:no-underline"

@@ -105,6 +105,50 @@ pub struct UsenetRepairFailure {
     pub partials_retained: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFileStamp {
+    pub path: Vec<String>,
+    pub length: u64,
+    pub modified_secs: u64,
+    pub modified_nanos: u32,
+}
+
+impl TaskFileStamp {
+    pub fn from_stamps(stamps: &[risuko_bt::create::FileStamp]) -> Vec<Self> {
+        stamps
+            .iter()
+            .map(Self::from_stamp)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    }
+
+    fn from_stamp(stamp: &risuko_bt::create::FileStamp) -> Option<Self> {
+        let since = stamp.modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(Self {
+            path: stamp.path.clone(),
+            length: stamp.length,
+            modified_secs: since.as_secs(),
+            modified_nanos: since.subsec_nanos(),
+        })
+    }
+
+    fn to_stamp(&self) -> Option<risuko_bt::create::FileStamp> {
+        if self.modified_nanos >= 1_000_000_000 {
+            return None;
+        }
+        let modified = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
+            self.modified_secs,
+            self.modified_nanos,
+        ))?;
+        Some(risuko_bt::create::FileStamp {
+            path: self.path.clone(),
+            length: self.length,
+            modified,
+        })
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ed2kKadTaskStatus {
@@ -237,6 +281,10 @@ pub struct DownloadTask {
     pub bt_creation_date: Option<i64>,
     #[serde(default)]
     pub bt_announce_list: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bt_file_stamps: Vec<TaskFileStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bt_flush_failed_boot: Option<String>,
     pub created_at: u64,
     #[serde(default)]
     pub seeding_since: u64,
@@ -278,6 +326,14 @@ pub struct UpdateTaskOutcome {
 impl DownloadTask {
     pub(crate) fn holds_download_slot(&self) -> bool {
         self.kind != TaskKind::Torrent && !self.seeder
+    }
+
+    pub fn verified_files(&self) -> Vec<risuko_bt::create::FileStamp> {
+        self.bt_file_stamps
+            .iter()
+            .map(TaskFileStamp::to_stamp)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
     }
 
     pub fn new_http(
@@ -445,6 +501,20 @@ impl DownloadTask {
     pub fn with_usenet_data(mut self, usenet: UsenetTaskData) -> Self {
         self.usenet = Some(usenet);
         self
+    }
+
+    pub fn drop_usenet_articles(&mut self) {
+        if let Some(usenet) = self.usenet.as_mut() {
+            for file in &mut usenet.files {
+                file.segments = Vec::new();
+            }
+        }
+    }
+
+    pub fn usenet_articles_dropped(&self) -> bool {
+        self.usenet.as_ref().is_some_and(|usenet| {
+            !usenet.files.is_empty() && usenet.files.iter().all(|file| file.segments.is_empty())
+        })
     }
 
     pub fn new_ed2k(
@@ -1194,6 +1264,116 @@ mod tests {
         assert_eq!(restored.usenet_repair_failure, None);
     }
 
+    fn bt_stamp(path: &[&str], modified: std::time::SystemTime) -> risuko_bt::create::FileStamp {
+        risuko_bt::create::FileStamp {
+            path: path.iter().map(|part| part.to_string()).collect(),
+            length: 4096,
+            modified,
+        }
+    }
+
+    #[test]
+    fn file_stamps_round_trip_to_the_nanosecond() {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_794_000_000, 123_456_789);
+        let stamps = vec![bt_stamp(&["pack", "a.bin"], modified)];
+        let stored = TaskFileStamp::from_stamps(&stamps);
+        assert_eq!(
+            stored,
+            [TaskFileStamp {
+                path: vec!["pack".into(), "a.bin".into()],
+                length: 4096,
+                modified_secs: 1_794_000_000,
+                modified_nanos: 123_456_789,
+            }]
+        );
+        let task = DownloadTask {
+            bt_file_stamps: stored,
+            ..Default::default()
+        };
+        assert_eq!(task.verified_files(), stamps);
+    }
+
+    #[test]
+    fn a_stamp_before_the_epoch_stores_no_stamps_at_all() {
+        let stamps = vec![
+            bt_stamp(
+                &["a"],
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(5),
+            ),
+            bt_stamp(
+                &["b"],
+                std::time::UNIX_EPOCH - std::time::Duration::from_secs(5),
+            ),
+        ];
+        assert!(TaskFileStamp::from_stamps(&stamps).is_empty());
+    }
+
+    #[test]
+    fn stamps_with_an_impossible_time_convert_to_none_without_panicking() {
+        let valid = TaskFileStamp {
+            path: vec!["a".into()],
+            length: 1,
+            modified_secs: 1,
+            modified_nanos: 0,
+        };
+        for broken in [
+            TaskFileStamp {
+                modified_nanos: 1_000_000_000,
+                ..valid.clone()
+            },
+            TaskFileStamp {
+                modified_secs: u64::MAX,
+                modified_nanos: 999_999_999,
+                ..valid.clone()
+            },
+        ] {
+            let task = DownloadTask {
+                bt_file_stamps: vec![valid.clone(), broken],
+                ..Default::default()
+            };
+            assert!(task.verified_files().is_empty());
+        }
+    }
+
+    #[test]
+    fn file_stamps_survive_the_session_file_and_old_entries_load_without_them() {
+        let mut task = DownloadTask::new_torrent("tgid".into(), "/dl".into(), None, Map::new());
+        let plain = serde_json::to_value(&task).unwrap();
+        assert!(plain.get("bt_file_stamps").is_none());
+
+        task.bt_file_stamps = vec![TaskFileStamp {
+            path: vec!["a".into()],
+            length: 7,
+            modified_secs: 3,
+            modified_nanos: 4,
+        }];
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            encoded["bt_file_stamps"],
+            json!([{"path": ["a"], "length": 7, "modifiedSecs": 3, "modifiedNanos": 4}])
+        );
+        let restored: DownloadTask = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.bt_file_stamps, task.bt_file_stamps);
+
+        let mut legacy = encoded;
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("bt_file_stamps")
+            .is_some());
+        let restored: DownloadTask = serde_json::from_value(legacy).unwrap();
+        assert!(restored.bt_file_stamps.is_empty());
+    }
+
+    #[test]
+    fn file_stamps_are_not_sent_to_clients() {
+        let mut task = DownloadTask::new_torrent("tgid".into(), "/dl".into(), None, Map::new());
+        task.bt_file_stamps = vec![TaskFileStamp::default()];
+        let status = serde_json::to_string(&task.to_rpc_status(&[])).unwrap();
+        assert!(!status.contains("modifiedSecs"));
+        assert!(!status.contains("bt_file_stamps"));
+    }
+
     #[test]
     fn rpc_status_all_keys() {
         let task = DownloadTask::new_http(
@@ -1229,6 +1409,70 @@ mod tests {
         assert_eq!(obj.len(), 2);
         assert!(obj.contains_key("gid"));
         assert!(obj.contains_key("status"));
+    }
+
+    fn usenet_task_with_segments() -> DownloadTask {
+        let file = |name: &str, count: u32| UsenetTaskFile {
+            name: name.into(),
+            subject: format!("{name} yEnc"),
+            groups: vec!["alt.binaries.example".into()],
+            segments: (1..=count)
+                .map(|number| UsenetTaskSegment {
+                    number,
+                    bytes: 10,
+                    message_id: format!("<{name}-{number}@example>"),
+                })
+                .collect(),
+        };
+        DownloadTask::new_usenet(
+            "ugid".into(),
+            "/dl".into(),
+            None,
+            None,
+            Map::new(),
+            Vec::new(),
+        )
+        .with_usenet_data(UsenetTaskData {
+            options: UsenetTaskOptions::default(),
+            files: vec![file("one.bin", 3), file("two.bin", 2)],
+        })
+    }
+
+    #[test]
+    fn dropping_usenet_articles_keeps_file_names() {
+        let mut task = usenet_task_with_segments();
+        let before = task.usenet.clone().unwrap();
+
+        task.drop_usenet_articles();
+
+        let after = task.usenet.as_ref().unwrap();
+        assert_eq!(after.options, before.options);
+        assert_eq!(after.files.len(), 2);
+        for (kept, original) in after.files.iter().zip(&before.files) {
+            assert_eq!(kept.name, original.name);
+            assert_eq!(kept.subject, original.subject);
+            assert_eq!(kept.groups, original.groups);
+            assert!(kept.segments.is_empty());
+            assert_eq!(kept.segments.capacity(), 0);
+        }
+
+        let mut plain = DownloadTask::default();
+        plain.drop_usenet_articles();
+        assert!(plain.usenet.is_none());
+    }
+
+    #[test]
+    fn usenet_articles_dropped_only_when_files_exist_without_segments() {
+        let mut task = usenet_task_with_segments();
+        assert!(!task.usenet_articles_dropped());
+
+        task.drop_usenet_articles();
+        assert!(task.usenet_articles_dropped());
+
+        assert!(!DownloadTask::default().usenet_articles_dropped());
+
+        task.usenet.as_mut().unwrap().files.clear();
+        assert!(!task.usenet_articles_dropped());
     }
 
     #[test]

@@ -1,8 +1,11 @@
+use std::future::Future;
+
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode, Version};
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
+use tokio::time::Instant;
 use url::Url;
 
 use crate::body::RespBody;
@@ -14,6 +17,14 @@ pub struct Response {
     headers: HeaderMap,
     url: Url,
     body: Option<RespBody>,
+    deadline: Option<Instant>,
+}
+
+async fn with_deadline<F: Future>(deadline: Option<Instant>, fut: F) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, fut).await.ok(),
+        None => Some(fut.await),
+    }
 }
 
 impl Response {
@@ -30,7 +41,12 @@ impl Response {
             headers,
             url,
             body: Some(body),
+            deadline: None,
         }
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
     }
 
     pub fn status(&self) -> StatusCode {
@@ -65,9 +81,9 @@ impl Response {
             .body
             .take()
             .ok_or_else(|| Error::Body("body already consumed".into()))?;
-        let collected = body
-            .collect()
+        let collected = with_deadline(self.deadline, body.collect())
             .await
+            .ok_or(Error::Timeout)?
             .map_err(|e| Error::Body(e.to_string()))?;
         Ok(collected.to_bytes())
     }
@@ -82,15 +98,20 @@ impl Response {
             .take()
             .ok_or_else(|| Error::Body("body already consumed".into()))?;
         let mut stream = body.into_data_stream();
-        let mut out = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if out.len() + chunk.len() > max {
-                return Err(too_big());
+        let collect = async {
+            let mut out = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if out.len() + chunk.len() > max {
+                    return Err(too_big());
+                }
+                out.extend_from_slice(&chunk);
             }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out.into())
+            Ok(out.into())
+        };
+        with_deadline(self.deadline, collect)
+            .await
+            .ok_or(Error::Timeout)?
     }
 
     pub async fn snippet(mut self, max: usize) -> String {
@@ -99,13 +120,16 @@ impl Response {
         };
         let mut stream = body.into_data_stream();
         let mut out = Vec::new();
-        while let Some(Ok(chunk)) = stream.next().await {
-            let room = max - out.len();
-            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            if out.len() >= max {
-                break;
+        let collect = async {
+            while let Some(Ok(chunk)) = stream.next().await {
+                let room = max - out.len();
+                out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if out.len() >= max {
+                    break;
+                }
             }
-        }
+        };
+        with_deadline(self.deadline, collect).await;
         String::from_utf8_lossy(&out).into_owned()
     }
 

@@ -160,6 +160,9 @@ export default {
 	"bt-create-subfolder": "Group multi-file torrents into a subfolder",
 	"bt-create-subfolder-tips":
 		"When enabled, multi-file BitTorrent and magnet downloads are placed inside a folder named after the torrent. When disabled, the files are written directly into the download directory.",
+	"bt-upload-rate-limit": "BitTorrent upload limit",
+	"bt-upload-rate-limit-tips":
+		"Caps BitTorrent uploads in addition to the global upload limit. 0 means no separate cap.",
 	"bt-auto-download-content":
 		"Automatically download magnet and torrent content",
 	"bt-force-encryption": "BT force encryption",
@@ -177,6 +180,7 @@ export default {
 	"auto-retry-strategy-exponential": "Exponential backoff",
 	"auto-retry-interval": "Base retry interval",
 	"auto-retry-interval-unit": "seconds",
+	"auto-retry-max-attempts": "Maximum retry attempts (0 = unlimited)",
 	"worker-max-retries": "Max retries per worker piece",
 	"auto-detect-low-speed-tasks": "Auto detect low speed tasks",
 	"auto-detect-low-speed-tasks-tips":
@@ -364,6 +368,11 @@ export default {
 	"ed2k-kad-port-tips":
 		"UDP port used for Kad discovery. Valid values are 1-65535 (requires engine restart)",
 	"ed2k-kad-port-invalid": "Kad UDP port must be an integer from 1 to 65535",
+	"listen-port-invalid":
+		"BT port must be a port from 1 to 65535, a range such as 6881-6889, or a comma-separated list of those",
+	"dht-listen-port-invalid":
+		"DHT port must be a port from 1 to 65535, a range such as 6881-6889, or a comma-separated list of those",
+	"ed2k-port-invalid": "ED2K port must be an integer from 1 to 65535",
 	"ed2k-enable-upload": "Share files over ED2K",
 	"ed2k-enable-upload-tips":
 		"Upload finished files and verified parts of running ED2K downloads to other peers. Kad can keep listing a file you stopped sharing for up to 5 hours (requires engine restart)",
@@ -395,9 +404,17 @@ export default {
 	security: "Security",
 	rpc: "RPC",
 	"rpc-host": "Server Address",
+	"rpc-host-local": "This device only",
+	"rpc-host-all": "All network interfaces",
+	"rpc-host-custom": "Custom ({{host}})",
+	"rpc-host-exposed-tips":
+		"Other devices on your network can reach the RPC port, and the PeerBanHelper port when it is enabled. Anyone who knows the secret can add and control downloads.",
 	"rpc-listen-port": "RPC Listen Port",
 	"rpc-secret": "RPC Secret",
 	"rpc-secret-tips": "View RPC Secret Manual",
+	"rpc-allow-any-dir": "Let RPC clients use any local path",
+	"rpc-allow-any-dir-tips":
+		"When off, downloads added over RPC can only be saved in the download folder, its subfolders, and your category and routing folders, and RPC clients cannot make the app read a cookie, netrc or SSH key file.",
 	pbh: "PeerBanHelper",
 	"pbh-enable": "Enable PeerBanHelper API",
 	"pbh-enable-tips":
@@ -420,12 +437,6 @@ export default {
 		"Ignored reserved engine override keys: {{keys}}",
 	"engine-overrides-too-large":
 		"Engine Overrides is too large: at most 64 keys, 64 characters per key, and 2048 characters per value.",
-	"external-engine-enable": "Use External Engine",
-	"external-engine-enable-tips":
-		"When enabled, Risuko will not auto-start the embedded engine.",
-	"external-engine-ip": "External Engine IP",
-	"external-engine-port": "External Engine Port",
-	"external-engine-secret": "External Engine Secret",
 	developer: "Developer",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Mock User-Agent",
@@ -502,6 +513,8 @@ export default {
 	"completion-script-test-ok": "Script test succeeded",
 	"completion-script-test-fail": "Script test failed",
 	"completion-script-empty": "Please specify a command first",
+	"completion-script-not-approved":
+		"The completion script was not allowed, so nothing was saved.",
 	"not-saved": "Preferences not saved",
 	"not-saved-confirm":
 		"The modified preferences will be lost, are you sure you want to leave?",

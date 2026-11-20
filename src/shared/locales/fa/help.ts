@@ -1,5 +1,5 @@
 export default {
-	"official-website": "سایت ماتریکس",
+	"official-website": "سایت Risuko",
 	manual: "کتابچهٔ راهنما",
 	"release-notes": "یادداشت‌های انتشار...",
 	"report-problem": "گزارش مشکل",

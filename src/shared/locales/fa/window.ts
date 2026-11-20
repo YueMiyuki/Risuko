@@ -1,5 +1,5 @@
 export default {
-	reload: "بارگزاری مجدد",
+	reload: "بارگذاری مجدد",
 	close: "بستن",
 	minimize: "کمینه",
 	zoom: "بزرگنمایی",

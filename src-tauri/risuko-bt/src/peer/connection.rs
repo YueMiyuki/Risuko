@@ -65,6 +65,27 @@ impl EventOut {
     }
 }
 
+const LOCAL_DISCONNECT: &str = "local disconnect";
+
+struct DisconnectNotice(Option<EventOut>);
+
+impl Drop for DisconnectNotice {
+    fn drop(&mut self) {
+        let event = PeerEvent::Disconnected {
+            reason: LOCAL_DISCONNECT.to_string(),
+        };
+        match self.0.take() {
+            Some(EventOut::Own(tx)) => {
+                let _ = tx.try_send(event);
+            }
+            Some(EventOut::Sink(sink)) => {
+                let _ = sink.tx.try_send((sink.pid, event));
+            }
+            None => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PeerCommand {
     Send(Message),
@@ -1296,21 +1317,22 @@ fn finish_spawn(
         bind = Some(bind_tx);
         IoTarget::Bind(bind_rx)
     } else {
-        IoTarget::Ready(EventOut::Own(event_tx))
+        IoTarget::Ready(DisconnectNotice(Some(EventOut::Own(event_tx))))
     };
 
     let gate = Arc::new(RecvGate::default());
     let reader_gate = gate.clone();
     let io_task = tokio::spawn(async move {
-        let out = match target {
-            IoTarget::Ready(out) => out,
+        let mut notice = match target {
+            IoTarget::Ready(notice) => notice,
             IoTarget::Bind(rx) => match rx.await {
-                Ok(sink) => EventOut::Sink(sink),
+                Ok(sink) => DisconnectNotice(Some(EventOut::Sink(sink))),
                 Err(_) => return,
             },
         };
         let reason = {
-            let reader = reader_task(reader, &out, reader_gate);
+            let out = notice.0.as_ref().expect("event sink is taken only below");
+            let reader = reader_task(reader, out, reader_gate);
             let writer = writer_task(writer, cmd_rx, piece_rx);
             tokio::pin!(reader);
             tokio::pin!(writer);
@@ -1319,7 +1341,10 @@ fn finish_spawn(
                 reason = &mut writer => reason,
             }
         };
-        let _ = out.send(PeerEvent::Disconnected { reason }).await;
+        if let Some(out) = notice.0.as_ref() {
+            let _ = out.send(PeerEvent::Disconnected { reason }).await;
+        }
+        notice.0 = None;
     });
 
     Ok((
@@ -1336,7 +1361,7 @@ fn finish_spawn(
 }
 
 enum IoTarget {
-    Ready(EventOut),
+    Ready(DisconnectNotice),
     Bind(tokio::sync::oneshot::Receiver<PeerEventSink>),
 }
 
@@ -1384,6 +1409,7 @@ struct Rc4WriteHalf {
     cipher: MseRc4,
     pending: Vec<u8>,
     pending_off: usize,
+    in_flight: Option<usize>,
 }
 
 impl Rc4WriteHalf {
@@ -1396,6 +1422,7 @@ impl Rc4WriteHalf {
             cipher,
             pending: Vec::new(),
             pending_off: 0,
+            in_flight: None,
         }
     }
 
@@ -1425,24 +1452,25 @@ impl AsyncWrite for Rc4WriteHalf {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.poll_drain(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+        if self.in_flight.is_none() {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let me = &mut *self;
+            me.pending.clear();
+            me.pending.extend_from_slice(buf);
+            me.cipher.apply_keystream(&mut me.pending);
+            me.pending_off = 0;
+            me.in_flight = Some(buf.len());
         }
-
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let me = &mut *self;
-        me.pending.clear();
-        me.pending.extend_from_slice(buf);
-        me.cipher.apply_keystream(&mut me.pending);
-        me.pending_off = 0;
-        let consumed = buf.len();
+        debug_assert_eq!(self.in_flight, Some(buf.len()));
         match self.poll_drain(cx) {
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(consumed)),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(self.in_flight.take().unwrap_or(0))),
+            Poll::Ready(Err(e)) => {
+                self.in_flight = None;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -1556,7 +1584,7 @@ async fn writer_task(
         }
         if disconnect {
             let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, writer.flush()).await;
-            return "local disconnect".into();
+            return LOCAL_DISCONNECT.into();
         }
     }
 }
@@ -1712,6 +1740,59 @@ mod tests {
         assert!(matches!(
             event,
             PeerEvent::Disconnected { ref reason } if reason == "local disconnect"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), local_rx.recv())
+                .await
+                .expect("event channel did not close after Disconnected")
+                .is_none(),
+            "peer actor emitted more than one terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn rc4_write_finishes_only_after_the_socket_took_every_byte() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let key = [7u8; 20];
+        let mut writer = Rc4WriteHalf::new(client, mse::init_rc4(&key));
+        let write = tokio::spawn(async move {
+            writer.write_all(&[0x5a; 4096]).await.unwrap();
+            writer
+        });
+
+        let mut received = vec![0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(5), server.read_exact(&mut received))
+            .await
+            .expect("the tail of the write was never sent")
+            .unwrap();
+        let _writer = write.await.unwrap();
+
+        let mut expected = vec![0x5a; 4096];
+        mse::init_rc4(&key).apply_keystream(&mut expected);
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn aborted_io_task_still_reports_the_disconnect() {
+        let (local, mut local_rx, _remote, mut remote_rx) = run_pair().await;
+        assert!(matches!(
+            local_rx.recv().await,
+            Some(PeerEvent::Handshook { .. })
+        ));
+        assert!(matches!(
+            remote_rx.recv().await,
+            Some(PeerEvent::Handshook { .. })
+        ));
+
+        local.io_abort.abort();
+
+        let event = tokio::time::timeout(Duration::from_millis(500), local_rx.recv())
+            .await
+            .expect("abort produced no terminal event")
+            .expect("event channel closed before Disconnected");
+        assert!(matches!(
+            event,
+            PeerEvent::Disconnected { ref reason } if reason == LOCAL_DISCONNECT
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), local_rx.recv())

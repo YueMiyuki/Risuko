@@ -19,19 +19,19 @@ use super::events::{EngineEvent, EventBroadcaster};
 use super::http;
 use super::media;
 use super::options::EngineOptions;
+use super::part_claim::RESERVED_PARTS_OPTION;
 use super::routing::{resolve_routing, strip_part_suffix, TaskRoutingRule};
 use super::session::SessionManager;
 use super::speed_limiter::{parse_speed_limit, SpeedLimiter};
 use super::task::{
     generate_gid, ChunkProgress, DownloadFile, DownloadTask, Ed2kKadTaskStatus, FileUri, PeerInfo,
-    TaskKind, TaskPatch, TaskStatus, UpdateTaskOutcome, UsenetRepairFailure, UsenetTaskData,
-    UsenetTaskFile, UsenetTaskOptions, UsenetTaskSegment,
+    TaskFileStamp, TaskKind, TaskPatch, TaskStatus, UpdateTaskOutcome, UsenetRepairFailure,
+    UsenetTaskData, UsenetTaskFile, UsenetTaskOptions, UsenetTaskSegment,
 };
 use super::torrent::{self, TorrentEngine};
 use super::upload::UploadFileSnapshot;
 use super::usenet::UsenetProviderProfile;
 use super::usenet_transport::{ProviderConnectionCapacityRegistry, ProviderConnectionLease};
-use super::STARTUP_ONLY_KEYS;
 use std::collections::HashSet;
 
 const MAGNET_METADATA_ATTEMPT_TIMEOUT_SECS: u64 = 60;
@@ -56,24 +56,13 @@ fn register_task_limiter(
     limiter
 }
 
+type StartingWorkers = parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>;
+
 fn next_worker_epoch() -> u64 {
     WORKER_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
-fn publish_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-    epoch: u64,
-    token: CancellationToken,
-) {
-    starting.lock().insert(gid.to_string(), (epoch, token));
-}
-
-fn clear_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-    epoch: u64,
-) {
+fn clear_starting_worker(starting: &StartingWorkers, gid: &str, epoch: u64) {
     let mut guard = starting.lock();
     if guard.get(gid).map(|(e, _)| *e) == Some(epoch) {
         guard.remove(gid);
@@ -82,7 +71,7 @@ fn clear_starting_worker(
 
 async fn register_active_download(
     active: &Arc<RwLock<HashMap<String, ActiveDownload>>>,
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
+    starting: &StartingWorkers,
     gid: String,
     ad: ActiveDownload,
 ) {
@@ -91,18 +80,13 @@ async fn register_active_download(
     clear_starting_worker(starting, &gid, epoch);
 }
 
-fn cancel_starting_worker(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-    gid: &str,
-) {
+fn cancel_starting_worker(starting: &StartingWorkers, gid: &str) {
     if let Some((_, token)) = starting.lock().get(gid).cloned() {
         token.cancel();
     }
 }
 
-fn cancel_all_starting_workers(
-    starting: &parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>,
-) {
+fn cancel_all_starting_workers(starting: &StartingWorkers) {
     let tokens: Vec<_> = starting
         .lock()
         .values()
@@ -111,6 +95,38 @@ fn cancel_all_starting_workers(
     for token in tokens {
         token.cancel();
     }
+}
+
+fn resource_key(uri: &str) -> &str {
+    uri.split('#').next().unwrap_or(uri)
+}
+
+async fn reserved_part_paths(tasks: &Arc<RevLock>, gid: &str, uri: Option<&str>) -> Vec<Value> {
+    let own = uri.map(resource_key);
+    tasks
+        .read()
+        .await
+        .iter()
+        .filter(|task| {
+            task.gid != gid
+                && task.completed_length > 0
+                && task.uris.first().map(|other| resource_key(other)) != own
+                && matches!(
+                    task.kind,
+                    TaskKind::Http | TaskKind::Ftp | TaskKind::Metalink
+                )
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Removed)
+        })
+        .filter_map(|task| {
+            let uri = task.uris.first()?;
+            let part = if task.kind == TaskKind::Ftp {
+                super::ftp::initial_part_path(&task.dir, &task.out, uri)?
+            } else {
+                http::initial_part_path(&task.dir, &task.out, uri)
+            };
+            Some(Value::String(part.to_string_lossy().into_owned()))
+        })
+        .collect()
 }
 
 async fn worker_startup_aborted(
@@ -132,6 +148,35 @@ async fn worker_startup_aborted(
         cancel_token.cancel();
         true
     }
+}
+
+async fn finish_if_startup_aborted(
+    tasks: &Arc<RevLock>,
+    active: &Arc<RwLock<HashMap<String, ActiveDownload>>>,
+    events: &EventBroadcaster,
+    gid: &str,
+    worker_epoch: u64,
+    proto_label: &'static str,
+    counters: &Counters,
+) -> bool {
+    if !worker_startup_aborted(tasks, gid, &counters.cancel_token).await {
+        return false;
+    }
+    finish_task(
+        tasks,
+        active,
+        events,
+        gid,
+        worker_epoch,
+        proto_label,
+        counters,
+        Err("cancelled".to_string()),
+        |_| {},
+        |task, _| task.total_length,
+        |_, e| classify_error(e, proto_label),
+    )
+    .await;
+    true
 }
 
 async fn replay_magnet_trackers(
@@ -247,12 +292,24 @@ const UPDATE_RESTART_OPTION_KEYS: &[&str] = &[
     "sftp-private-key-passphrase",
 ];
 
+enum RetryCookies {
+    Given(Option<String>),
+    Stored,
+}
+
 struct AppliedTaskPatch {
     path_changed: bool,
     uris_changed: bool,
     primary_uri_changed: bool,
     options_need_restart: bool,
     tracker_urls_to_add: Vec<String>,
+}
+
+struct TaskPatchInputs {
+    uris: Option<Vec<String>>,
+    dir: Option<String>,
+    out: Option<String>,
+    options: Option<Map<String, Value>>,
 }
 
 fn apply_task_patch(
@@ -563,6 +620,10 @@ impl Counters {
         }
     }
 
+    fn to_active_plain(&self, epoch: u64) -> ActiveDownload {
+        self.to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None)))
+    }
+
     fn to_active(
         &self,
         epoch: u64,
@@ -836,6 +897,61 @@ async fn begin_ed2k_seeding(
     true
 }
 
+fn finish_usenet_success(task: &mut DownloadTask, warning: Option<&'static str>) {
+    task.usenet_repair_failure = None;
+    task.usenet_warning = warning.map(str::to_string);
+}
+
+fn complete_usenet_task(
+    task: &mut DownloadTask,
+    path: &Path,
+    warning: Option<&'static str>,
+    output_paths: &HashMap<usize, PathBuf>,
+) -> u64 {
+    finish_usenet_success(task, warning);
+    if let Some(metadata) = task.usenet.as_ref() {
+        task.usenet_stage = Some("complete".to_string());
+        task.files = metadata
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let path = output_paths.get(&index).cloned()?;
+                if !path.exists() {
+                    return None;
+                }
+                Some(DownloadFile {
+                    index: (index + 1).to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    length: file
+                        .segments
+                        .iter()
+                        .map(|segment| segment.bytes)
+                        .sum::<u64>()
+                        .to_string(),
+                    completed_length: file
+                        .segments
+                        .iter()
+                        .map(|segment| segment.bytes)
+                        .sum::<u64>()
+                        .to_string(),
+                    selected: "true".to_string(),
+                    uris: Vec::new(),
+                })
+            })
+            .collect();
+    }
+    task.drop_usenet_articles();
+    if task.files.is_empty() {
+        path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+    } else {
+        task.files
+            .iter()
+            .filter_map(|file| file.completed_length.parse::<u64>().ok())
+            .sum()
+    }
+}
+
 fn finish_usenet_failure(
     task: &mut DownloadTask,
     error: &str,
@@ -843,6 +959,7 @@ fn finish_usenet_failure(
 ) -> super::error_code::ErrorCode {
     task.usenet_stage = Some("error".to_string());
     task.usenet_repair_failure = repair_failure;
+    task.usenet_warning = None;
     classify_error(error, "usenet")
 }
 
@@ -992,6 +1109,21 @@ fn metalink_rollup_totals(task: &mut DownloadTask) {
     task.completed_length = completed;
 }
 
+fn picks_own_dir(options: &Map<String, Value>, default_dir: &str) -> bool {
+    let bare = |dir: &str| dir.trim().trim_end_matches(['/', '\\']).to_string();
+    options
+        .get("dir")
+        .and_then(Value::as_str)
+        .map(bare)
+        .is_some_and(|dir| !dir.is_empty() && dir != bare(default_dir))
+}
+
+fn file_transfer_mirror(uris: &[String]) -> Option<&str> {
+    uris.first()
+        .map(String::as_str)
+        .filter(|uri| super::ftp::is_ftp_uri(uri))
+}
+
 fn metalink_checksums(options: &Map<String, Value>) -> Vec<String> {
     options
         .get("metalink-checksums")
@@ -1110,14 +1242,17 @@ pub struct TaskManager {
     tasks: Arc<RevLock>,
     saved_rev: AtomicU64,
     active_downloads: Arc<RwLock<HashMap<String, ActiveDownload>>>,
-    starting_workers: Arc<parking_lot::Mutex<HashMap<String, (u64, CancellationToken)>>>,
+    starting_workers: Arc<StartingWorkers>,
     updating_tasks: Arc<parking_lot::Mutex<HashSet<String>>>,
+    stamp_attempts: Arc<parking_lot::Mutex<HashSet<String>>>,
     torrent_ids: Arc<RwLock<HashMap<String, usize>>>,
     pending_magnets: Arc<RwLock<HashSet<String>>>,
     options: Arc<RwLock<EngineOptions>>,
     events: EventBroadcaster,
     session: Arc<SessionManager>,
     save_gate: tokio::sync::Mutex<()>,
+    save_requested: tokio::sync::Notify,
+    task_list_changed: tokio::sync::Notify,
     shutting_down: std::sync::atomic::AtomicBool,
     torrent_engine: Arc<RwLock<Option<TorrentEngine>>>,
     global_speed_limiter: Arc<SpeedLimiter>,
@@ -1312,6 +1447,42 @@ fn is_live_magnet(task: &DownloadTask, gid: &str, uri: &str) -> bool {
         && task.uris.iter().any(|u| u == uri)
 }
 
+fn magnet_for_torrent(task: &DownloadTask) -> Option<String> {
+    const QUERY_SAFE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    const MAX_TRACKERS: usize = 20;
+    fn is_hex(hash: &str, len: usize) -> bool {
+        hash.len() == len && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    let topic = if task.meta_version.as_deref() == Some("v2") {
+        let v2 = task.info_hash_v2.as_deref().filter(|h| is_hex(h, 64))?;
+        format!("urn:btmh:1220{}", v2.to_ascii_lowercase())
+    } else {
+        let v1 = task.info_hash.as_deref().filter(|h| is_hex(h, 40))?;
+        format!("urn:btih:{}", v1.to_ascii_lowercase())
+    };
+    let mut magnet = format!("magnet:?xt={topic}");
+    if let Some(name) = task.bt_name.as_deref().filter(|n| !n.is_empty()) {
+        magnet.push_str("&dn=");
+        magnet.extend(percent_encoding::utf8_percent_encode(name, QUERY_SAFE));
+    }
+    let mut seen = HashSet::new();
+    for tracker in task.bt_announce_list.iter().flatten().map(|t| t.trim()) {
+        if seen.len() == MAX_TRACKERS {
+            break;
+        }
+        if tracker.is_empty() || !seen.insert(tracker) {
+            continue;
+        }
+        magnet.push_str("&tr=");
+        magnet.extend(percent_encoding::utf8_percent_encode(tracker, QUERY_SAFE));
+    }
+    Some(magnet)
+}
+
 fn parse_cf_host(msg: &str) -> Option<String> {
     let key = "host=";
     let start = msg.find(key)? + key.len();
@@ -1336,6 +1507,12 @@ impl TaskManager {
 
         if options.purge_record_on_start() {
             saved_tasks.retain(|t| !t.status.is_stopped());
+        }
+        forget_failed_flushes_from_earlier_boots(&mut saved_tasks, super::boot_id::current());
+        for task in &mut saved_tasks {
+            if task.kind == TaskKind::Usenet && task.status == TaskStatus::Complete {
+                task.drop_usenet_articles();
+            }
         }
 
         let output_dir = options.dir();
@@ -1424,12 +1601,15 @@ impl TaskManager {
             active_downloads: Arc::new(RwLock::new(HashMap::new())),
             starting_workers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             updating_tasks: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            stamp_attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             torrent_ids: Arc::new(RwLock::new(HashMap::new())),
             pending_magnets: Arc::new(RwLock::new(HashSet::new())),
             options: Arc::new(RwLock::new(options)),
             events,
             session: Arc::new(session),
             save_gate: tokio::sync::Mutex::new(()),
+            save_requested: tokio::sync::Notify::new(),
+            task_list_changed: tokio::sync::Notify::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             torrent_engine: Arc::new(RwLock::new(torrent_engine)),
             global_speed_limiter,
@@ -1469,9 +1649,13 @@ impl TaskManager {
         }
         let rules = opts_guard.task_routing_rules();
         let file_category_dirs = opts_guard.file_category_dirs();
+        let picked = picks_own_dir(options, &opts_guard.dir());
         drop(opts_guard);
 
         let decision = resolve_routing(&rules, filename_hint, &raw_dir, &file_category_dirs);
+        if picked {
+            return (raw_dir, decision.tag);
+        }
         (decision.dir, decision.tag)
     }
 
@@ -1502,7 +1686,8 @@ impl TaskManager {
         }
 
         self.tasks.write().await.push(task);
-        self.save_session_logged(&gid).await;
+        self.request_save();
+        self.signal_task_list_change();
 
         if scheduled.is_none() && !pause {
             self.try_start_next().await;
@@ -1534,12 +1719,15 @@ impl TaskManager {
                     .ok()
                     .is_some_and(|text| super::metalink::parse(text).is_ok())
                 {
-                    tracing::info!("[metalink] following metalink URL: {}", uris[0]);
+                    tracing::info!(
+                        "[metalink] following metalink URL: {}",
+                        super::util::redact_url(&uris[0])
+                    );
                     match self.add_metalink_task(bytes, options.clone()).await {
                         Ok(gid) => return Ok(gid),
                         Err(e) => tracing::warn!(
                             "[metalink] {} parsed but task creation failed, falling back to HTTP: {e}",
-                            uris[0]
+                            super::util::redact_url(&uris[0])
                         ),
                     }
                 }
@@ -1551,7 +1739,11 @@ impl TaskManager {
         }
 
         let gid = generate_gid();
-        tracing::info!("[task:{}] Adding HTTP task, uris={:?}", gid, uris);
+        tracing::info!(
+            "[task:{}] Adding HTTP task, uris={:?}",
+            gid,
+            super::util::redact_urls(&uris)
+        );
         let out = options
             .get("out")
             .and_then(|v| v.as_str())
@@ -1578,7 +1770,11 @@ impl TaskManager {
         options: Map<String, Value>,
     ) -> Result<String, String> {
         let gid = generate_gid();
-        tracing::info!("[task:{}] Adding media task, uri={}", gid, uri);
+        tracing::info!(
+            "[task:{}] Adding media task, uri={}",
+            gid,
+            super::util::redact_url(uri)
+        );
         let out = options
             .get("out")
             .and_then(|v| v.as_str())
@@ -1745,7 +1941,8 @@ impl TaskManager {
 
         let failed = task.status == TaskStatus::Error;
         self.tasks.write().await.push(task);
-        self.save_session_logged(&gid).await;
+        self.request_save();
+        self.signal_task_list_change();
         if !failed {
             self.send_download_start(&gid);
         }
@@ -2020,7 +2217,8 @@ impl TaskManager {
         let should_start_resolver = should_spawn_resolver && task.status == TaskStatus::Active;
         let failed = task.status == TaskStatus::Error;
         self.tasks.write().await.push(task);
-        self.save_session_logged(&gid).await;
+        self.request_save();
+        self.signal_task_list_change();
         if should_start_resolver {
             self.spawn_magnet_metadata_resolver(
                 gid.clone(),
@@ -2073,6 +2271,7 @@ impl TaskManager {
         let tasks = self.tasks.clone();
         let torrent_ids = self.torrent_ids.clone();
         let torrent_engine = self.torrent_engine.clone();
+        let stamp_attempts = self.stamp_attempts.clone();
         let events = self.events.clone();
         let p2p_route_generation = self.p2p_route_generation.clone();
         let expected_route_generation =
@@ -2124,12 +2323,14 @@ impl TaskManager {
                 }
 
                 let mut resolve_options = options.clone();
+                let mut verified_files = Vec::new();
                 {
                     let guard = tasks.read().await;
                     if let Some(task) = guard
                         .iter()
                         .find(|task| is_live_magnet(task, &gid, &magnet_uri))
                     {
+                        verified_files = task.verified_files();
                         if let Some(trackers) = task.options.get("bt-tracker") {
                             resolve_options.insert("bt-tracker".to_string(), trackers.clone());
                         }
@@ -2153,6 +2354,7 @@ impl TaskManager {
                                 &resolve_options,
                                 MAGNET_METADATA_ATTEMPT_TIMEOUT_SECS,
                                 engine_generation,
+                                verified_files,
                             )
                             .await
                     }
@@ -2216,8 +2418,12 @@ impl TaskManager {
                                         .entry("select-file".to_string())
                                         .or_insert(Value::String(selection));
                                 }
+                                task.bt_file_stamps.clear();
                                 attached = true;
                             }
+                        }
+                        if attached {
+                            stamp_attempts.lock().remove(&gid);
                         }
 
                         if attached {
@@ -2522,24 +2728,14 @@ impl TaskManager {
         };
 
         let counters = Counters::new(task.total_length, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
@@ -2575,19 +2771,7 @@ impl TaskManager {
 
             let c = counters.clone();
             let download_result = match kind {
-                TaskKind::Adc => {
-                    super::adc::run_adc_download(
-                        &uri,
-                        &dir,
-                        &opts_snapshot,
-                        c.total,
-                        c.completed,
-                        c.speed,
-                        c.connections,
-                        c.cancel_token,
-                    )
-                    .await
-                }
+                TaskKind::Adc => super::adc::run_adc_download(&uri, c.total, c.cancel_token).await,
                 TaskKind::Gnutella => {
                     super::gnutella::run_gnutella_download(
                         &uri,
@@ -2667,42 +2851,30 @@ impl TaskManager {
         );
         let output_paths = Arc::new(parking_lot::Mutex::new(HashMap::<usize, PathBuf>::new()));
         let output_paths_for_worker = output_paths.clone();
+        let usenet_warning = Arc::new(parking_lot::Mutex::new(None::<&'static str>));
+        let usenet_warning_for_worker = usenet_warning.clone();
         let counters = Counters::new(task.total_length, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
-            if worker_startup_aborted(&tasks, &gid, &counters.cancel_token).await {
-                finish_task(
-                    &tasks,
-                    &active,
-                    &events,
-                    &gid,
-                    worker_epoch,
-                    "usenet",
-                    &counters,
-                    Err("cancelled".to_string()),
-                    |_| {},
-                    |task, _| task.total_length,
-                    |task, error| finish_usenet_failure(task, error, None),
-                )
-                .await;
+            if finish_if_startup_aborted(
+                &tasks,
+                &active,
+                &events,
+                &gid,
+                worker_epoch,
+                "usenet",
+                &counters,
+            )
+            .await
+            {
                 return;
             }
             let result = super::usenet_worker::run_usenet_download_with_resolver_and_capacity(
@@ -2743,9 +2915,10 @@ impl TaskManager {
                 .err()
                 .and_then(|error| error.repair_failure().cloned());
             let result = result
-                .map(|(path, outputs)| {
-                    *output_paths_for_worker.lock() = outputs.into_iter().collect();
-                    path
+                .map(|output| {
+                    *output_paths_for_worker.lock() = output.outputs.into_iter().collect();
+                    *usenet_warning_for_worker.lock() = output.warning;
+                    output.path
                 })
                 .map_err(|error| error.to_string());
             finish_task(
@@ -2759,48 +2932,9 @@ impl TaskManager {
                 result,
                 |_| {},
                 |task, path| {
-                    task.usenet_repair_failure = None;
+                    let warning = *usenet_warning.lock();
                     let output_paths = output_paths.lock().clone();
-                    if let Some(metadata) = task.usenet.as_ref() {
-                        task.usenet_stage = Some("complete".to_string());
-                        task.files = metadata
-                            .files
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, file)| {
-                                let path = output_paths.get(&index).cloned()?;
-                                if !path.exists() {
-                                    return None;
-                                }
-                                Some(DownloadFile {
-                                    index: (index + 1).to_string(),
-                                    path: path.to_string_lossy().to_string(),
-                                    length: file
-                                        .segments
-                                        .iter()
-                                        .map(|segment| segment.bytes)
-                                        .sum::<u64>()
-                                        .to_string(),
-                                    completed_length: file
-                                        .segments
-                                        .iter()
-                                        .map(|segment| segment.bytes)
-                                        .sum::<u64>()
-                                        .to_string(),
-                                    selected: "true".to_string(),
-                                    uris: Vec::new(),
-                                })
-                            })
-                            .collect();
-                    }
-                    if task.files.is_empty() {
-                        path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
-                    } else {
-                        task.files
-                            .iter()
-                            .filter_map(|file| file.completed_length.parse::<u64>().ok())
-                            .sum()
-                    }
+                    complete_usenet_task(task, path, warning, &output_paths)
                 },
                 |task, error| finish_usenet_failure(task, error, repair_failure),
             )
@@ -2875,7 +3009,8 @@ impl TaskManager {
                 self.send_download_start(&task.gid);
             } else if task.kind == TaskKind::M3u8 && !task.uris.is_empty() {
                 task.status = TaskStatus::Active;
-                let merged = options_snapshot.merge_task_options(&task.options);
+                let mut merged = options_snapshot.merge_task_options(&task.options);
+                self.apply_stored_cookies(&task.uris, &mut merged);
                 self.spawn_m3u8_download(task, merged);
                 self.send_download_start(&task.gid);
             } else if task.kind == TaskKind::Ed2k && !task.uris.is_empty() {
@@ -2999,13 +3134,21 @@ impl TaskManager {
                 .map(header_contains_cookie)
                 .unwrap_or(false);
         if !has_cookie {
-            let cookie_header = super::cookie_store::cookies_to_header(&entry.cookies);
+            let is_https = uri
+                .split_once("://")
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+            let cookie_header =
+                super::cookie_store::cookies_to_header_for(&entry.cookies, is_https);
             if !cookie_header.is_empty() {
                 tracing::debug!(
                     "apply_stored_cookies: injecting cookie header ({} bytes)",
                     cookie_header.len(),
                 );
                 merged.insert("cookie".to_string(), Value::String(cookie_header));
+                merged.insert(
+                    super::http::COOKIE_HOST_OPTION.to_string(),
+                    Value::String(entry.host.clone()),
+                );
             }
         } else {
             tracing::debug!(
@@ -3029,6 +3172,18 @@ impl TaskManager {
 
     pub fn cookie_store(&self) -> &Arc<CookieStore> {
         &self.cookie_store
+    }
+
+    fn publish_starting_worker(
+        &self,
+        gid: &str,
+        token: CancellationToken,
+    ) -> (u64, Arc<StartingWorkers>) {
+        let epoch = next_worker_epoch();
+        self.starting_workers
+            .lock()
+            .insert(gid.to_string(), (epoch, token));
+        (epoch, self.starting_workers.clone())
     }
 
     fn task_download_limiter(&self, gid: &str, limit: u64) -> Arc<SpeedLimiter> {
@@ -3074,14 +3229,8 @@ impl TaskManager {
         let adopted_filename: Arc<parking_lot::Mutex<Option<String>>> =
             Arc::new(parking_lot::Mutex::new(None));
 
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
@@ -3095,22 +3244,25 @@ impl TaskManager {
             )
             .await;
 
-            if worker_startup_aborted(&tasks, &gid, &counters.cancel_token).await {
-                finish_task(
-                    &tasks,
-                    &active,
-                    &events,
-                    &gid,
-                    worker_epoch,
-                    "http",
-                    &counters,
-                    Err("cancelled".to_string()),
-                    |_| {},
-                    |task, _| task.total_length,
-                    |_, e| classify_error(e, "http"),
-                )
-                .await;
+            if finish_if_startup_aborted(
+                &tasks,
+                &active,
+                &events,
+                &gid,
+                worker_epoch,
+                "http",
+                &counters,
+            )
+            .await
+            {
                 return;
+            }
+
+            let mut merged_options = merged_options;
+            let reserved =
+                reserved_part_paths(&tasks, &gid, uris.first().map(String::as_str)).await;
+            if !reserved.is_empty() {
+                merged_options.insert(RESERVED_PARTS_OPTION.into(), Value::Array(reserved));
             }
 
             let c = counters.clone();
@@ -3251,15 +3403,9 @@ impl TaskManager {
         let merged_options = Arc::new(merged_options);
         let cookie_store = self.cookie_store.clone();
         let agg = Counters::new(0, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(&self.starting_workers, &gid, worker_epoch, parent.clone());
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) = self.publish_starting_worker(&gid, parent.clone());
         tokio::spawn(async move {
-            let mut ad = agg.to_active(
-                worker_epoch,
-                Vec::new(),
-                Arc::new(parking_lot::Mutex::new(None)),
-            );
+            let mut ad = agg.to_active_plain(worker_epoch);
             ad.cancel_token = parent.clone();
             ad.metalink_files = file_counters.clone();
             register_active_download(&active, &starting, gid.clone(), ad).await;
@@ -3292,22 +3438,49 @@ impl TaskManager {
                         options.insert("checksum".to_string(), Value::String(cs));
                     }
                     let c = spec.counters;
-                    let r = http::run_http_download_multi(
-                        &spec.uris,
-                        &dir,
-                        &spec.out,
-                        &options,
-                        c.total,
-                        c.completed,
-                        c.speed,
-                        c.connections,
-                        c.cancel_token,
-                        gl,
-                        tl,
-                        spec.chunk,
-                        spec.adopted,
-                    )
-                    .await;
+                    let r = match file_transfer_mirror(&spec.uris) {
+                        Some(uri) => {
+                            let fetched = super::ftp::run_ftp_download(
+                                uri,
+                                &dir,
+                                &spec.out,
+                                &options,
+                                c.total,
+                                c.completed,
+                                c.speed,
+                                c.connections,
+                                c.cancel_token,
+                                gl,
+                                tl,
+                                spec.adopted,
+                            )
+                            .await;
+                            match fetched {
+                                Ok(path) => http::verify_checksum_option(&path, &options)
+                                    .await
+                                    .map(|()| path),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        None => {
+                            http::run_http_download_multi(
+                                &spec.uris,
+                                &dir,
+                                &spec.out,
+                                &options,
+                                c.total,
+                                c.completed,
+                                c.speed,
+                                c.connections,
+                                c.cancel_token,
+                                gl,
+                                tl,
+                                spec.chunk,
+                                spec.adopted,
+                            )
+                            .await
+                        }
+                    };
                     (spec.idx, spec.out, r)
                 }
             });
@@ -3362,20 +3535,10 @@ impl TaskManager {
                 .completed
                 .store(task.total_length, Ordering::Relaxed);
         }
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
-            let mut active_download = counters.to_active(
-                worker_epoch,
-                Vec::new(),
-                Arc::new(parking_lot::Mutex::new(None)),
-            );
+            let mut active_download = counters.to_active_plain(worker_epoch);
             active_download.kad_status = kad_status.clone();
             active_download.ed2k_upload = Some(upload_stats.clone());
             register_active_download(&active, &starting, gid.clone(), active_download).await;
@@ -3599,42 +3762,28 @@ impl TaskManager {
             }
         });
 
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
-            if worker_startup_aborted(&tasks, &gid, &counters.cancel_token).await {
-                finish_task(
-                    &tasks,
-                    &active,
-                    &events,
-                    &gid,
-                    worker_epoch,
-                    "media",
-                    &counters,
-                    Err("cancelled".to_string()),
-                    |_| {},
-                    |task, _| task.total_length,
-                    |_, e| classify_error(e, "media"),
-                )
-                .await;
+            if finish_if_startup_aborted(
+                &tasks,
+                &active,
+                &events,
+                &gid,
+                worker_epoch,
+                "media",
+                &counters,
+            )
+            .await
+            {
                 return;
             }
 
@@ -3699,42 +3848,28 @@ impl TaskManager {
         let global_limiter = self.global_speed_limiter.clone();
 
         let counters = Counters::new(0, 0);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active_plain(worker_epoch),
             )
             .await;
 
-            if worker_startup_aborted(&tasks, &gid, &counters.cancel_token).await {
-                finish_task(
-                    &tasks,
-                    &active,
-                    &events,
-                    &gid,
-                    worker_epoch,
-                    "m3u8",
-                    &counters,
-                    Err("cancelled".to_string()),
-                    |_| {},
-                    |task, _| task.total_length,
-                    |_, e| classify_error(e, "m3u8"),
-                )
-                .await;
+            if finish_if_startup_aborted(
+                &tasks,
+                &active,
+                &events,
+                &gid,
+                worker_epoch,
+                "m3u8",
+                &counters,
+            )
+            .await
+            {
                 return;
             }
 
@@ -3772,7 +3907,7 @@ impl TaskManager {
         });
     }
 
-    fn spawn_ftp_download(&self, task: &DownloadTask, merged_options: Map<String, Value>) {
+    fn spawn_ftp_download(&self, task: &DownloadTask, mut merged_options: Map<String, Value>) {
         let gid = task.gid.clone();
         let uri = task.uris.first().cloned().unwrap_or_default();
         let dir = task.dir.clone();
@@ -3789,43 +3924,36 @@ impl TaskManager {
         let global_limiter = self.global_speed_limiter.clone();
 
         let counters = Counters::new(0, 1);
-        let worker_epoch = next_worker_epoch();
-        publish_starting_worker(
-            &self.starting_workers,
-            &gid,
-            worker_epoch,
-            counters.cancel_token.clone(),
-        );
-        let starting = self.starting_workers.clone();
+        let (worker_epoch, starting) =
+            self.publish_starting_worker(&gid, counters.cancel_token.clone());
+        let adopted_filename: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         tokio::spawn(async move {
             register_active_download(
                 &active,
                 &starting,
                 gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    Vec::new(),
-                    Arc::new(parking_lot::Mutex::new(None)),
-                ),
+                counters.to_active(worker_epoch, Vec::new(), adopted_filename.clone()),
             )
             .await;
 
-            if worker_startup_aborted(&tasks, &gid, &counters.cancel_token).await {
-                finish_task(
-                    &tasks,
-                    &active,
-                    &events,
-                    &gid,
-                    worker_epoch,
-                    "ftp",
-                    &counters,
-                    Err("cancelled".to_string()),
-                    |_| {},
-                    |task, _| task.total_length,
-                    |_, e| classify_error(e, "ftp"),
-                )
-                .await;
+            if finish_if_startup_aborted(
+                &tasks,
+                &active,
+                &events,
+                &gid,
+                worker_epoch,
+                "ftp",
+                &counters,
+            )
+            .await
+            {
                 return;
+            }
+
+            let reserved = reserved_part_paths(&tasks, &gid, Some(&uri)).await;
+            if !reserved.is_empty() {
+                merged_options.insert(RESERVED_PARTS_OPTION.into(), Value::Array(reserved));
             }
 
             let c = counters.clone();
@@ -3841,6 +3969,7 @@ impl TaskManager {
                 c.cancel_token,
                 global_limiter,
                 task_speed_limiter,
+                adopted_filename,
             )
             .await;
 
@@ -3973,7 +4102,11 @@ impl TaskManager {
                             task.chunk_progress.clear();
                         }
 
-                        if let Some(f) = task.files.first_mut() {
+                        if let Some(f) = task
+                            .files
+                            .first_mut()
+                            .filter(|_| task.kind != TaskKind::Usenet)
+                        {
                             f.length = task.total_length.to_string();
                             f.completed_length = task.completed_length.to_string();
                             if looks_like_url(&f.path) {
@@ -4021,6 +4154,8 @@ impl TaskManager {
 
             let mut halted = Vec::new();
             let mut write_halted = Vec::new();
+            let mut to_stamp = Vec::new();
+            let mut flush_marked = false;
             if has_active_torrents {
                 let mut tasks = self.tasks.write().await;
                 let resumed_since_snapshot =
@@ -4152,27 +4287,43 @@ impl TaskManager {
                         }
 
                         if let Some(error) = stats.error.as_ref() {
-                            if task.status == TaskStatus::Active
-                                && !task.seeder
-                                && !resumed_since_snapshot
-                            {
+                            if surfaces_torrent_error(
+                                task,
+                                stats.is_finished,
+                                resumed_since_snapshot,
+                                stats.storage_error,
+                            ) {
                                 write_halted.push(task.gid.clone());
                                 task.status = TaskStatus::Error;
                                 task.error_code =
                                     Some(classify_error(error, "torrent").to_string());
                                 task.error_message = Some(error.clone());
                                 task.download_speed = 0;
+                                clear_seeding(task);
                                 self.events.send(EngineEvent::DownloadError {
                                     gid: task.gid.clone(),
                                 });
                             }
                         }
 
+                        flush_marked |= remember_failed_flush(
+                            task,
+                            stats.flush_failed,
+                            super::boot_id::current(),
+                        );
+                        if wants_file_stamps(
+                            task,
+                            stats.is_finished,
+                            &mut self.stamp_attempts.lock(),
+                        ) {
+                            to_stamp.push(task.gid.clone());
+                        }
+
                         let (keep, seed_time_minutes, seed_ratio) =
                             resolve_seed_goal(&task.options, g_manual, g_seed_time, g_seed_ratio);
                         let downloaded = !seeds_in_place(&task.options);
 
-                        if stats.is_finished && !task.seeder {
+                        if stats.is_finished && !task.seeder && task.status == TaskStatus::Active {
                             if keep {
                                 start_seeding(task);
                                 if downloaded {
@@ -4245,6 +4396,8 @@ impl TaskManager {
                     }
                 }
             }
+            self.save_new_flush_marks(flush_marked).await;
+            self.record_file_stamps(to_stamp).await;
         }
         self.ensure_active_magnet_resolvers().await;
         self.check_scheduled_tasks().await;
@@ -4315,7 +4468,14 @@ impl TaskManager {
                 return;
             }
         }
-        if let Err(e) = tokio::fs::write(&path, data).await {
+        let target = path.clone();
+        let data = data.to_vec();
+        let saved = tokio::task::spawn_blocking(move || {
+            crate::traits::write_file_atomically(&target, &data)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(e) = saved {
             tracing::warn!("could not save {}: {e}", path.display());
         }
     }
@@ -4328,13 +4488,34 @@ impl TaskManager {
                 .find(|t| t.gid == gid && t.kind == TaskKind::Torrent)
                 .and_then(|t| t.info_hash.clone())
         };
-        if let Some(path) = hash.and_then(|h| self.saved_torrent_path(&h)) {
+        let Some(hash) = hash else {
+            return;
+        };
+        let shared = self.tasks.read().await.iter().any(|t| {
+            t.gid != gid
+                && t.kind == TaskKind::Torrent
+                && !matches!(t.status, TaskStatus::Removed)
+                && t.info_hash
+                    .as_deref()
+                    .is_some_and(|other| other.eq_ignore_ascii_case(&hash))
+        });
+        if shared {
+            return;
+        }
+        if let Some(path) = self.saved_torrent_path(&hash) {
             tokio::fs::remove_file(path).await.ok();
         }
     }
 
     async fn restore_saved_torrent_files(&self) {
-        let candidates: Vec<(String, String, Map<String, Value>)> = {
+        type Candidate = (
+            String,
+            String,
+            Map<String, Value>,
+            Vec<risuko_bt::create::FileStamp>,
+            bool,
+        );
+        let candidates: Vec<Candidate> = {
             let torrent_ids = self.torrent_ids.read().await;
             let tasks = self.tasks.read().await;
             let options = self.options.read().await;
@@ -4352,16 +4533,27 @@ impl TaskManager {
                         task.gid.clone(),
                         task.info_hash.clone().unwrap_or_default(),
                         options.merge_task_options(&task.options),
+                        task.verified_files(),
+                        !task.bt_file_stamps.is_empty(),
                     )
                 })
                 .collect()
         };
-        for (gid, info_hash, merged) in candidates {
+        for (gid, info_hash, merged, verified_files, had_stamps) in candidates {
             let Some(path) = self.saved_torrent_path(&info_hash) else {
                 continue;
             };
-            let Ok(data) = tokio::fs::read(&path).await else {
-                continue;
+            let data = match tokio::fs::read(&path).await {
+                Ok(data) => data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.fail_torrent_restore(
+                        &gid,
+                        "Saved torrent file is missing; add the torrent again".to_string(),
+                    )
+                    .await;
+                    continue;
+                }
+                Err(_) => continue,
             };
             let Some(engine) = self.torrent_engine.read().await.clone() else {
                 return;
@@ -4371,13 +4563,24 @@ impl TaskManager {
                 move || torrent::adopt_stripped_v2_layout(&data, &merged)
             })
             .await
-            .unwrap_or(0);
-            if moved > 0 {
+            .ok();
+            if let Some(moved) = moved.filter(|moved| *moved > 0) {
                 tracing::info!("[task:{gid}] moved {moved} file(s) out of the v1.1.0 layout");
             }
-            match engine.add_torrent_bytes(&data, &merged).await {
+            let verified_files = if moved == Some(0) {
+                verified_files
+            } else {
+                Vec::new()
+            };
+            match engine
+                .add_verified_torrent_bytes(&data, &merged, verified_files)
+                .await
+            {
                 Ok(handle) => {
                     tracing::info!("[task:{gid}] re-added saved torrent as id={}", handle.id);
+                    if had_stamps {
+                        self.use_up_file_stamps(&gid).await;
+                    }
                     self.remember_torrent_id(&gid, handle.id).await;
                     let still_active = self
                         .tasks
@@ -4390,27 +4593,70 @@ impl TaskManager {
                         engine.remove(handle.id, false).await.ok();
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("[task:{gid}] re-adding saved torrent failed: {e}");
-                    let mut tasks = self.tasks.write().await;
-                    if let Some(task) = tasks
-                        .iter_mut()
-                        .find(|t| t.gid == gid && t.status == TaskStatus::Active)
-                    {
-                        task.status = TaskStatus::Error;
-                        task.error_code = Some(classify_error(&e, "torrent").to_string());
-                        task.error_message = Some(e);
-                        task.download_speed = 0;
-                        self.events.send(EngineEvent::DownloadError { gid });
-                    }
-                }
+                Err(e) => self.fail_torrent_restore(&gid, e).await,
             }
         }
     }
 
-    async fn save_session_logged(&self, gid: &str) {
-        if let Err(e) = self.save_session().await {
-            tracing::warn!("[task:{gid}] save_session after add failed: {e}");
+    async fn use_up_file_stamps(&self, gid: &str) {
+        self.stamp_attempts.lock().remove(gid);
+        if let Some(task) = self.tasks.write().await.iter_mut().find(|t| t.gid == gid) {
+            task.bt_file_stamps.clear();
+        }
+    }
+
+    async fn record_file_stamps(&self, gids: Vec<String>) {
+        if gids.is_empty() {
+            return;
+        }
+        let targets: Vec<(String, usize)> = {
+            let ids = self.torrent_ids.read().await;
+            gids.into_iter()
+                .filter_map(|gid| {
+                    let tid = *ids.get(&gid)?;
+                    Some((gid, tid))
+                })
+                .collect()
+        };
+        let Some(te) = self.torrent_engine.read().await.clone() else {
+            return;
+        };
+        let tasks = self.tasks.clone();
+        let attempted = self.stamp_attempts.clone();
+        tokio::spawn(async move {
+            for (gid, tid) in targets {
+                let Some(stamps) = te.complete_file_stamps(tid).await else {
+                    continue;
+                };
+                let stored = TaskFileStamp::from_stamps(&stamps);
+                if stored.is_empty() {
+                    continue;
+                }
+                let mut tasks = tasks.write().await;
+                if !attempted.lock().contains(&gid) {
+                    continue;
+                }
+                if let Some(task) = tasks.iter_mut().find(|t| takes_late_file_stamps(t, &gid)) {
+                    task.bt_file_stamps = stored;
+                }
+            }
+        });
+    }
+
+    async fn fail_torrent_restore(&self, gid: &str, error: String) {
+        tracing::warn!("[task:{gid}] re-adding saved torrent failed: {error}");
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks
+            .iter_mut()
+            .find(|t| t.gid == gid && t.status == TaskStatus::Active)
+        {
+            task.status = TaskStatus::Error;
+            task.error_code = Some(classify_error(&error, "torrent").to_string());
+            task.error_message = Some(error);
+            task.download_speed = 0;
+            self.events.send(EngineEvent::DownloadError {
+                gid: gid.to_string(),
+            });
         }
     }
 
@@ -4504,6 +4750,7 @@ impl TaskManager {
             task.error_code = None;
             task.error_message = None;
             task.usenet_repair_failure = None;
+            task.usenet_warning = None;
             task.status = if is_torrent {
                 TaskStatus::Active
             } else {
@@ -4521,6 +4768,124 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+
+    pub async fn restart_task(&self, gid: &str) -> Result<(), String> {
+        tracing::info!("[task:{gid}] Restarting");
+        let (status, is_torrent, articles_gone) = {
+            let tasks = self.tasks.read().await;
+            let task = tasks
+                .iter()
+                .find(|t| t.gid == gid)
+                .ok_or_else(|| format!("Task {gid} not found"))?;
+            (
+                task.status,
+                task.kind == TaskKind::Torrent,
+                task.kind == TaskKind::Usenet && task.usenet_articles_dropped(),
+            )
+        };
+        match status {
+            TaskStatus::Error => return self.unpause(gid).await,
+            TaskStatus::Removed if articles_gone => {
+                return Err(format!(
+                    "Task {gid} cannot be restarted: its article list is gone; add the NZB again"
+                ))
+            }
+            TaskStatus::Removed => {}
+            TaskStatus::Complete => {
+                return Err(format!(
+                    "Task {gid} is complete; add it again to download another copy"
+                ))
+            }
+            _ => return Err(format!("Task {gid} is not stopped")),
+        }
+
+        let rebuilt_magnet = if is_torrent {
+            self.removed_torrent_magnet(gid).await?
+        } else {
+            None
+        };
+
+        if is_torrent {
+            self.torrent_resume_seq.fetch_add(1, Ordering::SeqCst);
+        }
+
+        {
+            let mut tasks = self.tasks.write().await;
+            let task = tasks
+                .iter_mut()
+                .find(|t| t.gid == gid && t.status == TaskStatus::Removed)
+                .ok_or_else(|| format!("Task {gid} is not stopped"))?;
+            if let Some(magnet) = rebuilt_magnet {
+                task.uris = vec![magnet];
+            }
+            task.error_code = None;
+            task.error_message = None;
+            task.usenet_repair_failure = None;
+            task.usenet_warning = None;
+            task.download_speed = 0;
+            task.upload_speed = 0;
+            task.status = if is_torrent {
+                TaskStatus::Active
+            } else {
+                TaskStatus::Waiting
+            };
+        }
+
+        if is_torrent {
+            self.ensure_active_magnet_resolvers().await;
+            self.send_download_start(gid);
+        } else {
+            self.try_start_next().await;
+        }
+
+        Ok(())
+    }
+
+    async fn removed_torrent_magnet(&self, gid: &str) -> Result<Option<String>, String> {
+        let (has_magnet, info_hash, rebuilt) = {
+            let tasks = self.tasks.read().await;
+            let task = tasks
+                .iter()
+                .find(|t| t.gid == gid)
+                .ok_or_else(|| format!("Task {gid} not found"))?;
+            let info_hash = task.info_hash.clone().filter(|h| !h.is_empty());
+            if let Some(hash) = info_hash.as_deref() {
+                let duplicate = tasks.iter().any(|t| {
+                    t.gid != gid
+                        && t.status != TaskStatus::Removed
+                        && t.info_hash
+                            .as_deref()
+                            .is_some_and(|other| other.eq_ignore_ascii_case(hash))
+                });
+                if duplicate {
+                    return Err(format!(
+                        "Task {gid} cannot be restarted: the same torrent is already in the list"
+                    ));
+                }
+            }
+            (
+                task.uris.iter().any(|uri| torrent::is_magnet_uri(uri)),
+                info_hash,
+                magnet_for_torrent(task),
+            )
+        };
+        if has_magnet {
+            return Ok(None);
+        }
+        if let Some(path) = info_hash
+            .as_deref()
+            .and_then(|h| self.saved_torrent_path(h))
+        {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Ok(None);
+            }
+        }
+        rebuilt.map(Some).ok_or_else(|| {
+            format!(
+                "Task {gid} cannot be restarted: its torrent data is gone; add the torrent again"
+            )
+        })
     }
 
     async fn check_scheduled_tasks(&self) {
@@ -4674,6 +5039,26 @@ impl TaskManager {
         user_agent: Option<String>,
     ) -> Result<(), String> {
         tracing::info!("[task:{}] Retrying with imported cookies", gid);
+        self.retry_http_task(gid, RetryCookies::Given(cookie), user_agent)
+            .await
+    }
+
+    pub async fn retry_with_stored_cookies(
+        &self,
+        gid: &str,
+        user_agent: Option<String>,
+    ) -> Result<(), String> {
+        tracing::info!("[task:{}] Retrying with stored cookies", gid);
+        self.retry_http_task(gid, RetryCookies::Stored, user_agent)
+            .await
+    }
+
+    async fn retry_http_task(
+        &self,
+        gid: &str,
+        cookies: RetryCookies,
+        user_agent: Option<String>,
+    ) -> Result<(), String> {
         let was_active;
         {
             let mut tasks = self.tasks.write().await;
@@ -4684,9 +5069,17 @@ impl TaskManager {
             if task.kind != TaskKind::Http {
                 return Err(format!("Task {} is not an HTTP task", gid));
             }
-            if let Some(c) = cookie {
-                if !c.is_empty() {
+            if matches!(task.status, TaskStatus::Complete | TaskStatus::Removed) {
+                return Err(format!("Task {} has already finished", gid));
+            }
+            match cookies {
+                RetryCookies::Given(Some(c)) if !c.is_empty() => {
                     task.options.insert("cookie".to_string(), Value::String(c));
+                }
+                RetryCookies::Given(_) => {}
+                RetryCookies::Stored => {
+                    task.options.remove("cookie");
+                    task.options.remove(super::http::COOKIE_HOST_OPTION);
                 }
             }
             if let Some(ua) = user_agent {
@@ -4747,6 +5140,7 @@ impl TaskManager {
         self.cleanup_ed2k_partials(&[gid.to_string()]).await;
 
         if found {
+            self.signal_task_list_change();
             self.events.send(EngineEvent::DownloadStop {
                 gid: gid.to_string(),
             });
@@ -4962,12 +5356,12 @@ impl TaskManager {
 
         let target_waiting_pos = match how {
             "POS_SET" => pos.max(0) as usize,
-            "POS_CUR" => (current_waiting_pos as i64 + pos).max(0) as usize,
+            "POS_CUR" => (current_waiting_pos as i64).saturating_add(pos).max(0) as usize,
             "POS_END" => {
                 if pos >= 0 {
                     waiting.len().saturating_sub(1)
                 } else {
-                    (waiting.len() as i64 - 1 + pos).max(0) as usize
+                    (waiting.len() as i64 - 1).saturating_add(pos).max(0) as usize
                 }
             }
             _ => return Err("Invalid position mode".to_string()),
@@ -4998,21 +5392,6 @@ impl TaskManager {
         Ok(Value::Number(serde_json::Number::from(
             target_waiting_pos as u64,
         )))
-    }
-
-    pub async fn get_waiting_gids_in_order(
-        &self,
-        filter: &std::collections::HashSet<String>,
-    ) -> Vec<String> {
-        let tasks = self.tasks.read().await;
-        tasks
-            .iter()
-            .filter(|t| {
-                (t.status == TaskStatus::Waiting || t.status == TaskStatus::Paused)
-                    && filter.contains(&t.gid)
-            })
-            .map(|t| t.gid.clone())
-            .collect()
     }
 
     async fn worker_epoch_and_cancel(&self, gid: &str) -> Option<(u64, CancellationToken)> {
@@ -5091,7 +5470,7 @@ impl TaskManager {
 
         if let Some(opts) = patch.options.as_ref() {
             for key in opts.keys() {
-                if STARTUP_ONLY_KEYS.contains(&key.as_str()) {
+                if crate::config::keys::is_startup_only(key) {
                     return Err(format!(
                         "Option '{key}' can only be changed by restarting the engine"
                     ));
@@ -5138,28 +5517,32 @@ impl TaskManager {
             risuko_bt::torrent::split_tracker_lists(patch.trackers.unwrap_or_default());
         let private_torrent = !normalized_trackers.is_empty() && self.torrent_is_private(gid).await;
 
-        let mut pending_apply: Option<DownloadTask> = None;
+        let mut pending_apply: Option<TaskPatchInputs> = None;
         let mut updating_guard: Option<UpdatingGuard> = None;
         let (
             kind,
             was_active,
-            old_dir,
-            old_out,
-            new_dir,
-            new_out,
-            path_changed,
+            mut old_dir,
+            mut old_out,
+            mut new_dir,
+            mut new_out,
+            mut path_changed,
             uris_changed,
-            primary_uri_changed,
+            mut primary_uri_changed,
             options_need_restart,
             tracker_urls_to_add,
-            old_primary_uri,
-            primary_uri,
+            mut old_primary_uri,
+            mut primary_uri,
         ) = {
             let mut tasks = self.tasks.write().await;
             let task = tasks
                 .iter_mut()
                 .find(|t| t.gid == gid)
                 .ok_or_else(|| format!("GID {gid} not found"))?;
+
+            if self.updating_tasks.lock().contains(gid) {
+                return Err(format!("Task {gid} is being updated; try again"));
+            }
 
             if task.status.is_stopped() && task.status != TaskStatus::Error {
                 return Err(format!(
@@ -5217,6 +5600,12 @@ impl TaskManager {
             let old_primary = task.uris.first().cloned().unwrap_or_default();
             let kind = task.kind;
 
+            let inputs = TaskPatchInputs {
+                uris: normalized_uris.clone(),
+                dir: normalized_dir.clone(),
+                out: normalized_out.clone(),
+                options: patch.options.clone(),
+            };
             let mut staged = task.clone();
             let applied = apply_task_patch(
                 &mut staged,
@@ -5262,7 +5651,7 @@ impl TaskManager {
                 self.events.send(EngineEvent::DownloadPause {
                     gid: gid.to_string(),
                 });
-                pending_apply = Some(staged);
+                pending_apply = Some(inputs);
             } else {
                 let status = task.status;
                 *task = staged;
@@ -5318,14 +5707,36 @@ impl TaskManager {
                     ));
                 }
             }
-            if let Some(mut staged) = pending_apply.take() {
+            if let Some(inputs) = pending_apply.take() {
                 let mut tasks = self.tasks.write().await;
-                if let Some(task) = tasks.iter_mut().find(|t| t.gid == gid) {
-                    staged.status = task.status;
-                    staged.download_speed = 0;
-                    staged.upload_speed = 0;
-                    *task = staged;
+                let task = tasks
+                    .iter_mut()
+                    .find(|t| t.gid == gid)
+                    .ok_or_else(|| format!("GID {gid} not found"))?;
+                if task.status.is_stopped() && task.status != TaskStatus::Error {
+                    return Err(format!(
+                        "Task {gid} finished ({}) before the edit could be applied",
+                        task.status.as_str()
+                    ));
                 }
+                old_dir = task.dir.clone();
+                old_out = task.out.clone();
+                old_primary_uri = task.uris.first().cloned().unwrap_or_default();
+                let applied = apply_task_patch(
+                    task,
+                    inputs.uris,
+                    inputs.dir,
+                    inputs.out,
+                    &[],
+                    inputs.options,
+                );
+                task.download_speed = 0;
+                task.upload_speed = 0;
+                new_dir = task.dir.clone();
+                new_out = task.out.clone();
+                primary_uri = task.uris.first().cloned().unwrap_or_default();
+                path_changed = applied.path_changed;
+                primary_uri_changed = applied.primary_uri_changed;
             }
         }
         let mut progress_preserved = true;
@@ -5439,10 +5850,12 @@ impl TaskManager {
                         stop_seeding = true;
                         clear_seeding(task);
                         task.status = TaskStatus::Complete;
-                        self.events.send(EngineEvent::DownloadComplete {
-                            gid: task.gid.clone(),
-                            seeded: !seeds_in_place(&task.options),
-                        });
+                        if !seeds_in_place(&task.options) {
+                            self.events.send(EngineEvent::DownloadComplete {
+                                gid: task.gid.clone(),
+                                seeded: true,
+                            });
+                        }
                     }
                 }
             }
@@ -5451,6 +5864,16 @@ impl TaskManager {
                 .any(|key| opts.contains_key(*key));
             for (k, v) in opts {
                 task.options.insert(k, v);
+            }
+            if reselect.is_some()
+                && matches!(task.kind, TaskKind::Torrent | TaskKind::Metalink)
+                && task.status != TaskStatus::Active
+                && !task.files.is_empty()
+            {
+                apply_select_file(&mut task.files, &task.options);
+                if task.files.iter().all(|f| f.length.parse::<u64>().is_ok()) {
+                    metalink_rollup_totals(task);
+                }
             }
             let task_options = touches_limits.then(|| task.options.clone());
             drop(tasks);
@@ -5899,7 +6322,8 @@ impl TaskManager {
                 task.status = TaskStatus::Paused;
                 task.download_speed = 0;
                 task.upload_speed = 0;
-                task.error_code = Some("P2P_PROXY_RELOAD_FAILED".to_string());
+                task.error_code =
+                    Some(super::error_code::ErrorCode::PROXY_CONNECTION_FAILED.to_string());
                 task.error_message = Some(format!("P2P proxy reload failed: {error}"));
             }
         }
@@ -6192,18 +6616,6 @@ impl TaskManager {
             .filter(|f| f.selected != "false")
             .filter_map(|f| {
                 let local = std::path::PathBuf::from(&f.path);
-                let size: u64 = match f.length.parse::<u64>() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Skipping upload entry with unparseable size: path={} length={:?} err={}",
-                            f.path,
-                            f.length,
-                            e
-                        );
-                        return None;
-                    }
-                };
                 let rel_path = local
                     .strip_prefix(dir)
                     .map(std::path::PathBuf::from)
@@ -6239,7 +6651,6 @@ impl TaskManager {
                 Some(UploadFileSnapshot {
                     local_path: local,
                     remote_relative: rel,
-                    size,
                     category,
                 })
             })
@@ -6275,6 +6686,26 @@ impl TaskManager {
             })
             .collect();
         Ok(Value::Array(servers))
+    }
+
+    pub(crate) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EngineEvent> {
+        self.events.subscribe()
+    }
+
+    fn request_save(&self) {
+        self.save_requested.notify_one();
+    }
+
+    pub(crate) async fn wait_for_save_request(&self) {
+        self.save_requested.notified().await;
+    }
+
+    fn signal_task_list_change(&self) {
+        self.task_list_changed.notify_one();
+    }
+
+    pub(crate) async fn wait_for_task_list_change(&self) {
+        self.task_list_changed.notified().await;
     }
 
     pub async fn save_session(&self) -> Result<(), String> {
@@ -6325,7 +6756,11 @@ impl TaskManager {
 
         let evict: std::collections::HashSet<&str> = to_evict.iter().map(String::as_str).collect();
         let mut tasks = self.tasks.write().await;
+        let len_before = tasks.len();
         tasks.retain(|t| !(t.status.is_stopped() && evict.contains(t.gid.as_str())));
+        if tasks.len() < len_before {
+            self.signal_task_list_change();
+        }
     }
 
     async fn cleanup_m3u8_temp(&self, gid: &str) {
@@ -6442,7 +6877,11 @@ impl TaskManager {
         };
         self.cleanup_ed2k_partials(&stopped_ed2k_gids).await;
         let mut tasks = self.tasks.write().await;
+        let len_before = tasks.len();
         tasks.retain(|t| !t.status.is_stopped());
+        if tasks.len() < len_before {
+            self.signal_task_list_change();
+        }
     }
 
     pub async fn remove_download_result(&self, gid: &str) -> Result<(), String> {
@@ -6478,6 +6917,7 @@ impl TaskManager {
         let len_before = tasks.len();
         tasks.retain(|t| !(t.gid == gid && t.status.is_stopped()));
         if tasks.len() < len_before {
+            self.signal_task_list_change();
             Ok(())
         } else {
             Err(format!("GID {} not found or not stopped", gid))
@@ -6628,7 +7068,13 @@ impl TaskManager {
                 } else if torrent_gids.contains(&task.gid) {
                     task.status = TaskStatus::Active;
                     self.send_download_start(&task.gid);
+                } else {
+                    continue;
                 }
+                task.error_code = None;
+                task.error_message = None;
+                task.usenet_repair_failure = None;
+                task.usenet_warning = None;
             }
         }
         self.try_start_next().await;
@@ -6661,6 +7107,48 @@ impl TaskManager {
         }
     }
 
+    async fn save_new_flush_marks(&self, marked: bool) {
+        if !marked {
+            return;
+        }
+        if let Err(e) = self.save_session().await {
+            tracing::error!("Failed to save session after a failed flush: {e}");
+        }
+    }
+
+    async fn remember_flushes_failed_at_shutdown(&self, failed: &[usize]) {
+        if failed.is_empty() {
+            return;
+        }
+        let gids: HashSet<String> = self
+            .torrent_ids
+            .read()
+            .await
+            .iter()
+            .filter(|(_, tid)| failed.contains(tid))
+            .map(|(gid, _)| gid.clone())
+            .collect();
+        if !self
+            .tasks
+            .read()
+            .await
+            .iter()
+            .any(|task| misses_flush_mark(task, &gids))
+        {
+            return;
+        }
+        let changed = mark_flushes_failed_at_shutdown(
+            &mut self.tasks.write().await,
+            &gids,
+            super::boot_id::current(),
+        );
+        if changed {
+            if let Err(e) = self.save_session().await {
+                tracing::error!("Failed to save session after a failed flush at shutdown: {e}");
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         tracing::info!("Engine shutting down");
         self.shutting_down.store(true, Ordering::Release);
@@ -6686,9 +7174,10 @@ impl TaskManager {
         }
 
         let mut te_guard = self.torrent_engine.write().await;
-        if let Some(mut te) = te_guard.take() {
-            te.shutdown().await;
-        }
+        let failed = match te_guard.take() {
+            Some(mut te) => te.shutdown().await,
+            None => Vec::new(),
+        };
 
         drop(self.stop_uploader().await);
 
@@ -6696,6 +7185,8 @@ impl TaskManager {
         if let KadRuntime::Running(service) = &runtime {
             service.shutdown().await;
         }
+        drop(te_guard);
+        self.remember_flushes_failed_at_shutdown(&failed).await;
     }
 }
 
@@ -6732,6 +7223,72 @@ fn is_retryable_magnet_resolution_error(err: &str) -> bool {
         || lower.contains("no seeds")
 }
 
+fn wants_file_stamps(
+    task: &mut DownloadTask,
+    finished: bool,
+    attempted: &mut HashSet<String>,
+) -> bool {
+    if !finished {
+        attempted.remove(&task.gid);
+        task.bt_file_stamps.clear();
+        return false;
+    }
+    if task.bt_flush_failed_boot.is_some() {
+        return false;
+    }
+    task.bt_file_stamps.is_empty() && attempted.insert(task.gid.clone())
+}
+
+fn remember_failed_flush(task: &mut DownloadTask, flush_failed: bool, boot: Option<&str>) -> bool {
+    if !flush_failed || task.bt_flush_failed_boot.is_some() {
+        return false;
+    }
+    task.bt_flush_failed_boot = Some(boot.unwrap_or(super::boot_id::UNKNOWN).to_string());
+    task.bt_file_stamps.clear();
+    true
+}
+
+fn takes_late_file_stamps(task: &DownloadTask, gid: &str) -> bool {
+    task.gid == gid
+        && task.kind == TaskKind::Torrent
+        && task.bt_file_stamps.is_empty()
+        && task.bt_flush_failed_boot.is_none()
+}
+
+fn misses_flush_mark(task: &DownloadTask, gids: &HashSet<String>) -> bool {
+    task.kind == TaskKind::Torrent
+        && task.bt_flush_failed_boot.is_none()
+        && gids.contains(&task.gid)
+}
+
+fn mark_flushes_failed_at_shutdown(
+    tasks: &mut [DownloadTask],
+    gids: &HashSet<String>,
+    boot: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    for task in tasks
+        .iter_mut()
+        .filter(|task| misses_flush_mark(task, gids))
+    {
+        remember_failed_flush(task, true, boot);
+        changed = true;
+    }
+    changed
+}
+
+fn forget_failed_flushes_from_earlier_boots(tasks: &mut [DownloadTask], boot: Option<&str>) {
+    for task in tasks.iter_mut().filter(|t| t.kind == TaskKind::Torrent) {
+        if task
+            .bt_flush_failed_boot
+            .as_deref()
+            .is_some_and(|mark| !super::boot_id::same_boot(mark, boot))
+        {
+            task.bt_flush_failed_boot = None;
+        }
+    }
+}
+
 fn start_seeding(task: &mut DownloadTask) {
     task.seeder = true;
     task.seeding_since = crate::engine::util::now_ms();
@@ -6742,6 +7299,15 @@ fn clear_seeding(task: &mut DownloadTask) {
     task.seeder = false;
     task.seeding_since = 0;
     task.upload_speed = 0;
+}
+
+fn surfaces_torrent_error(
+    task: &DownloadTask,
+    finished: bool,
+    resumed: bool,
+    storage_error: bool,
+) -> bool {
+    task.status == TaskStatus::Active && (!task.seeder || !finished || storage_error) && !resumed
 }
 
 fn seed_goal_met(task: &DownloadTask, seed_time_minutes: u64, seed_ratio: f64) -> bool {
@@ -7173,12 +7739,15 @@ mod tests {
             active_downloads: Arc::new(RwLock::new(HashMap::new())),
             starting_workers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             updating_tasks: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            stamp_attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             torrent_ids: Arc::new(RwLock::new(HashMap::new())),
             pending_magnets: Arc::new(RwLock::new(HashSet::new())),
             options: Arc::new(RwLock::new(options)),
             events,
             session: Arc::new(session),
             save_gate: tokio::sync::Mutex::new(()),
+            save_requested: tokio::sync::Notify::new(),
+            task_list_changed: tokio::sync::Notify::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             torrent_engine: Arc::new(RwLock::new(None)),
             global_speed_limiter,
@@ -7236,11 +7805,7 @@ mod tests {
         let manager = make_test_manager(vec![task]);
         let counters = Counters::new(1024, 0);
         let worker_epoch = next_worker_epoch();
-        let active_download = counters.to_active(
-            worker_epoch,
-            Vec::new(),
-            Arc::new(parking_lot::Mutex::new(None)),
-        );
+        let active_download = counters.to_active_plain(worker_epoch);
         *active_download.kad_status.lock() = Some(KadLookupStatus {
             state: KadState::Ready,
             queried_nodes: 9,
@@ -7551,6 +8116,116 @@ mod tests {
     }
 
     #[test]
+    fn usenet_success_assigns_or_clears_the_warning() {
+        let mut task = DownloadTask::new_usenet(
+            "ugid".into(),
+            "/dl".into(),
+            None,
+            None,
+            Map::new(),
+            Vec::new(),
+        );
+        task.usenet_repair_failure = Some(UsenetRepairFailure {
+            needed_blocks: 4,
+            available_blocks: 1,
+            partials_retained: true,
+        });
+
+        finish_usenet_success(&mut task, Some("cleanup-incomplete"));
+        assert_eq!(task.usenet_warning.as_deref(), Some("cleanup-incomplete"));
+        assert!(task.usenet_repair_failure.is_none());
+
+        finish_usenet_success(&mut task, None);
+        assert!(task.usenet_warning.is_none());
+    }
+
+    fn usenet_task_with_segments(gid: &str, status: TaskStatus) -> DownloadTask {
+        let file = |name: &str, count: u32| UsenetTaskFile {
+            name: name.into(),
+            subject: format!("{name} yEnc"),
+            groups: vec!["alt.binaries.example".into()],
+            segments: (1..=count)
+                .map(|number| UsenetTaskSegment {
+                    number,
+                    bytes: 10,
+                    message_id: format!("<{name}-{number}@example>"),
+                })
+                .collect(),
+        };
+        let mut task =
+            DownloadTask::new_usenet(gid.into(), "/dl".into(), None, None, Map::new(), Vec::new())
+                .with_usenet_data(UsenetTaskData {
+                    options: UsenetTaskOptions::default(),
+                    files: vec![file("one.bin", 3), file("two.bin", 2)],
+                });
+        task.status = status;
+        task
+    }
+
+    #[test]
+    fn a_completed_usenet_task_has_no_article_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("one.bin");
+        let second = dir.path().join("two.bin");
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"b").unwrap();
+        let output_paths = HashMap::from([(0, first.clone()), (1, second.clone())]);
+        let mut task = usenet_task_with_segments("ugid", TaskStatus::Active);
+
+        let completed = complete_usenet_task(&mut task, &first, None, &output_paths);
+
+        assert_eq!(completed, 50);
+        assert_eq!(task.usenet_stage.as_deref(), Some("complete"));
+        let files: Vec<(String, String, String)> = task
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.length.clone(),
+                    file.completed_length.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                (
+                    first.to_string_lossy().to_string(),
+                    "30".into(),
+                    "30".into()
+                ),
+                (
+                    second.to_string_lossy().to_string(),
+                    "20".into(),
+                    "20".into()
+                ),
+            ]
+        );
+        let usenet = task.usenet.as_ref().expect("usenet data is kept");
+        let names: Vec<&str> = usenet.files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["one.bin", "two.bin"]);
+        assert!(usenet.files.iter().all(|file| file.segments.is_empty()));
+    }
+
+    #[test]
+    fn usenet_failure_clears_the_warning() {
+        let mut task = DownloadTask::new_usenet(
+            "ugid".into(),
+            "/dl".into(),
+            None,
+            None,
+            Map::new(),
+            Vec::new(),
+        );
+        task.usenet_warning = Some("archive-cleanup-unsupported".into());
+
+        finish_usenet_failure(&mut task, "connection refused", None);
+
+        assert!(task.usenet_warning.is_none());
+    }
+
+    #[test]
     fn usenet_stage_updates_cannot_regress() {
         assert!(should_update_usenet_stage(Some("assembling"), "repairing"));
         assert!(!should_update_usenet_stage(Some("verifying"), "assembling"));
@@ -7579,6 +8254,261 @@ mod tests {
         assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
     }
 
+    fn make_test_manager_in(dir: &tempfile::TempDir, tasks: Vec<DownloadTask>) -> TaskManager {
+        let mut mgr = make_test_manager(tasks);
+        mgr.config_dir = dir.path().to_path_buf();
+        mgr.session = Arc::new(SessionManager::new(dir.path()));
+        mgr
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_is_saved_soon_after_a_task_event() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(make_test_manager_in(
+            &dir,
+            vec![make_task("g1", TaskStatus::Complete)],
+        ));
+        let (progress, auto_save) = super::super::spawn_maintenance_loops(&mgr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        mgr.tasks
+            .write()
+            .await
+            .push(make_task("g2", TaskStatus::Complete));
+        mgr.events.send(EngineEvent::DownloadComplete {
+            gid: "g1".into(),
+            seeded: false,
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
+
+        mgr.tasks
+            .write()
+            .await
+            .push(make_task("g3", TaskStatus::Complete));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(mgr.saved_rev.load(Ordering::Relaxed) < mgr.tasks.rev());
+
+        progress.abort();
+        auto_save.abort();
+    }
+
+    fn paused_options() -> Map<String, Value> {
+        let mut options = Map::new();
+        options.insert("pause".into(), Value::from("true"));
+        options
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_add_reaches_the_disk_soon_without_an_engine_event() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(make_test_manager_in(&dir, Vec::new()));
+        let mut events = mgr.subscribe_events();
+        let (progress, auto_save) = super::super::spawn_maintenance_loops(&mgr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let on_disk = |gid: &str| {
+            SessionManager::new(dir.path())
+                .load()
+                .iter()
+                .any(|t| t.gid == gid)
+        };
+
+        let gid = mgr
+            .add_http_task(vec!["http://example.com/f.bin".into()], paused_options())
+            .await
+            .unwrap();
+        assert!(!on_disk(&gid), "the add itself must not write the session");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(on_disk(&gid));
+        assert!(events.try_recv().is_err());
+
+        progress.abort();
+        auto_save.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adds_in_a_row_write_the_session_far_fewer_times_than_they_add() {
+        const ADDS: usize = 30;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(make_test_manager_in(&dir, Vec::new()));
+        let (progress, auto_save) = super::super::spawn_maintenance_loops(&mgr);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut saved = mgr.saved_rev.load(Ordering::Relaxed);
+        let mut writes = 0;
+        let mut count_write = |writes: &mut usize| {
+            let now = mgr.saved_rev.load(Ordering::Relaxed);
+            if now != saved {
+                *writes += 1;
+                saved = now;
+            }
+        };
+        for _ in 0..ADDS {
+            mgr.add_http_task(vec!["http://example.com/f.bin".into()], paused_options())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            count_write(&mut writes);
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        count_write(&mut writes);
+
+        assert!(
+            (2..=5).contains(&writes),
+            "{writes} writes for {ADDS} adds over three seconds"
+        );
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
+        assert_eq!(SessionManager::new(dir.path()).load().len(), ADDS);
+
+        progress.abort();
+        auto_save.abort();
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<(String, Value, tokio::time::Instant)>>);
+
+    impl crate::traits::EventSink for RecordingSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.0
+                .lock()
+                .push((event.to_string(), payload, tokio::time::Instant::now()));
+        }
+    }
+
+    impl RecordingSink {
+        fn count(&self) -> usize {
+            self.0.lock().len()
+        }
+    }
+
+    async fn notified_manager(
+        dir: &tempfile::TempDir,
+        tasks: Vec<DownloadTask>,
+    ) -> (
+        Arc<TaskManager>,
+        Arc<RecordingSink>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mgr = Arc::new(make_test_manager_in(dir, tasks));
+        let sink = Arc::new(RecordingSink::default());
+        let notifier = super::super::spawn_task_list_notifier(&mgr, sink.clone());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (mgr, sink, notifier)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_add_tells_the_host_the_task_list_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, sink, notifier) = notified_manager(&dir, Vec::new()).await;
+        let mut events = mgr.subscribe_events();
+        assert_eq!(sink.count(), 0);
+
+        mgr.add_http_task(vec!["http://example.com/f.bin".into()], paused_options())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let emitted = sink.0.lock().clone();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, "engine:task-list-changed");
+        assert_eq!(emitted[0].1, serde_json::json!({}));
+        assert!(events.try_recv().is_err());
+
+        notifier.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adds_in_a_row_tell_the_host_far_fewer_times_than_they_add() {
+        const ADDS: usize = 50;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, sink, notifier) = notified_manager(&dir, Vec::new()).await;
+
+        for i in 0..ADDS {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            mgr.add_http_task(vec!["http://example.com/f.bin".into()], paused_options())
+                .await
+                .unwrap();
+        }
+        let last_add = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let emitted = sink.0.lock().clone();
+        assert!(
+            (2..=3).contains(&emitted.len()),
+            "{} events for {ADDS} adds",
+            emitted.len()
+        );
+        assert!(emitted.last().unwrap().2 >= last_add);
+        assert_eq!(mgr.tasks.read().await.len(), ADDS);
+
+        notifier.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_tasks_tells_the_host_the_task_list_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, sink, notifier) = notified_manager(
+            &dir,
+            vec![
+                make_task("a", TaskStatus::Paused),
+                make_task("b", TaskStatus::Complete),
+                make_task("c", TaskStatus::Error),
+            ],
+        )
+        .await;
+
+        mgr.remove("a").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sink.count(), 1);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mgr.remove_download_result("b").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sink.count(), 2);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mgr.purge_download_result().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sink.count(), 3);
+        assert!(mgr.tasks.read().await.is_empty());
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mgr.purge_download_result().await;
+        assert!(mgr.remove("missing").await.is_err());
+        assert!(mgr.remove_download_result("missing").await.is_err());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(sink.count(), 3);
+
+        notifier.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cap_on_finished_tasks_tells_the_host_when_it_evicts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let finished = (0..=TaskManager::MAX_STOPPED_RESULTS)
+            .map(|i| make_task(&format!("done-{i}"), TaskStatus::Complete))
+            .collect();
+        let (mgr, sink, notifier) = notified_manager(&dir, finished).await;
+
+        mgr.enforce_result_cap().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sink.count(), 1);
+        assert_eq!(
+            mgr.tasks.read().await.len(),
+            TaskManager::MAX_STOPPED_RESULTS
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        mgr.enforce_result_cap().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(sink.count(), 1);
+
+        notifier.abort();
+    }
+
     fn make_task(gid: &str, status: TaskStatus) -> DownloadTask {
         let mut task = DownloadTask::new_http(
             gid.into(),
@@ -7589,6 +8519,135 @@ mod tests {
         );
         task.status = status;
         task
+    }
+
+    #[tokio::test]
+    async fn only_other_unfinished_downloads_of_another_file_reserve_their_part() {
+        let with_progress = |gid: &str, status, uri: &str| {
+            let mut task = make_task(gid, status);
+            task.uris = vec![uri.into()];
+            task.completed_length = 10;
+            task
+        };
+        let mine = "http://example.com/f.bin?id=2";
+        let mgr = make_test_manager(vec![
+            with_progress(
+                "other-host",
+                TaskStatus::Paused,
+                "http://elsewhere.example/f.bin",
+            ),
+            with_progress(
+                "other-query",
+                TaskStatus::Paused,
+                "http://example.com/f.bin?id=1",
+            ),
+            with_progress(
+                "restarted-from",
+                TaskStatus::Error,
+                "http://example.com/f.bin?id=2#x",
+            ),
+            with_progress("done", TaskStatus::Complete, "http://third.example/f.bin"),
+            make_task("never-started", TaskStatus::Paused),
+            with_progress("me", TaskStatus::Active, mine),
+        ]);
+
+        let reserved = reserved_part_paths(&mgr.tasks, "me", Some(mine)).await;
+        assert_eq!(reserved, vec![Value::String("/dl/f.bin.part".into()); 2]);
+        mgr.tasks
+            .write()
+            .await
+            .retain(|task| !task.gid.starts_with("other-"));
+        assert!(reserved_part_paths(&mgr.tasks, "me", Some(mine))
+            .await
+            .is_empty());
+    }
+
+    #[test]
+    fn only_a_folder_that_differs_from_the_default_counts_as_picked() {
+        let with_dir = |dir: &str| {
+            let mut options = Map::new();
+            options.insert("dir".into(), Value::String(dir.into()));
+            options
+        };
+        assert!(picks_own_dir(&with_dir("/media/films"), "/dl"));
+        assert!(!picks_own_dir(&with_dir("/dl"), "/dl"));
+        assert!(!picks_own_dir(&with_dir("/dl/"), "/dl"));
+        assert!(!picks_own_dir(&with_dir("  "), "/dl"));
+        assert!(!picks_own_dir(&Map::new(), "/dl"));
+    }
+
+    #[tokio::test]
+    async fn a_picked_folder_wins_over_routing_rules_but_keeps_the_tag() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let default_dir = dir.path().join("default").to_string_lossy().into_owned();
+        let routed_dir = dir.path().join("routed").to_string_lossy().into_owned();
+        let picked_dir = dir.path().join("picked").to_string_lossy().into_owned();
+        {
+            let mut options = mgr.options.write().await;
+            options
+                .global
+                .insert("dir".into(), Value::String(default_dir.clone()));
+            options.global.insert(
+                "task-routing-rules".into(),
+                serde_json::json!([{
+                    "id": "all",
+                    "label": "Everything",
+                    "pattern": "*",
+                    "dir": routed_dir,
+                }]),
+            );
+        }
+        let with_dir = |dir: &str| {
+            let mut options = Map::new();
+            options.insert("dir".into(), Value::String(dir.into()));
+            options
+        };
+
+        let picked = mgr
+            .resolve_routing_for_task(&with_dir(&picked_dir), "film.mkv")
+            .await;
+        assert_eq!(picked, (picked_dir, Some("Everything".to_string())));
+        let untouched = mgr
+            .resolve_routing_for_task(&with_dir(&default_dir), "film.mkv")
+            .await;
+        assert_eq!(untouched.0, routed_dir);
+        let unset = mgr.resolve_routing_for_task(&Map::new(), "film.mkv").await;
+        assert_eq!(unset.0, routed_dir);
+    }
+
+    #[test]
+    fn a_metalink_file_with_only_file_transfer_mirrors_uses_the_first_one() {
+        let ftp_only = vec!["sftp://a/f.iso".to_string(), "ftp://b/f.iso".to_string()];
+        assert_eq!(file_transfer_mirror(&ftp_only), Some("sftp://a/f.iso"));
+        let web = vec!["https://a/f.iso".to_string()];
+        assert_eq!(file_transfer_mirror(&web), None);
+        assert_eq!(file_transfer_mirror(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn an_ftp_download_reserves_the_part_its_own_worker_would_write() {
+        let mut paused = make_task("ftp", TaskStatus::Paused);
+        paused.kind = TaskKind::Ftp;
+        paused.uris = vec!["sftp://host/pub/My%20File.iso".into()];
+        paused.completed_length = 10;
+        let mut renamed = paused.clone();
+        renamed.gid = "ftp-renamed".into();
+        renamed.out = "My File.1.iso".into();
+        let mgr = make_test_manager(vec![paused, renamed]);
+
+        let reserved = reserved_part_paths(&mgr.tasks, "me", Some("ftp://other/x.iso")).await;
+        assert_eq!(
+            reserved,
+            vec![
+                Value::String("/dl/My File.iso.part".into()),
+                Value::String("/dl/My File.1.iso.part".into()),
+            ]
+        );
+        assert!(
+            reserved_part_paths(&mgr.tasks, "ftp", Some("sftp://host/pub/My%20File.iso"))
+                .await
+                .is_empty()
+        );
     }
 
     fn make_torrent_task(gid: &str, status: TaskStatus) -> DownloadTask {
@@ -7615,6 +8674,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpause_clears_the_usenet_warning() {
+        let mut paused = make_torrent_task("t", TaskStatus::Paused);
+        paused.usenet_warning = Some("cleanup-incomplete".into());
+        let mut other = make_torrent_task("u", TaskStatus::Paused);
+        other.usenet_warning = Some("cleanup-incomplete".into());
+        let mgr = make_test_manager(vec![paused, other]);
+
+        mgr.unpause("t").await.unwrap();
+        assert!(mgr.tasks.read().await[0].usenet_warning.is_none());
+
+        mgr.unpause_all().await;
+        assert!(mgr.tasks.read().await[1].usenet_warning.is_none());
+    }
+
+    #[tokio::test]
     async fn unpause_all_resumes_paused_torrents_and_leaves_failed_ones() {
         let mgr = make_test_manager(vec![
             make_torrent_task("p", TaskStatus::Paused),
@@ -7627,6 +8701,409 @@ mod tests {
         assert_eq!(tasks[0].status, TaskStatus::Active);
         assert_eq!(tasks[1].status, TaskStatus::Error);
         assert_eq!(mgr.torrent_resume_seq.load(Ordering::SeqCst), 1);
+    }
+
+    fn task_with_options(gid: &str, status: TaskStatus) -> DownloadTask {
+        let mut task = make_task(gid, status);
+        task.options
+            .insert("cookie".into(), Value::String("session=1".into()));
+        task.options
+            .insert("user-agent".into(), Value::String("Agent/1".into()));
+        task.options
+            .insert("split".into(), Value::String("8".into()));
+        task.error_code = Some("403".into());
+        task.error_message = Some("Forbidden".into());
+        task
+    }
+
+    fn removed_torrent(gid: &str, info_hash: Option<&str>) -> DownloadTask {
+        let mut task = DownloadTask::new_torrent(gid.into(), "/dl".into(), None, Map::new());
+        task.status = TaskStatus::Removed;
+        task.info_hash = info_hash.map(str::to_string);
+        task.error_code = Some("1".into());
+        task.error_message = Some("Tracker failed".into());
+        task
+    }
+
+    #[tokio::test]
+    async fn restart_task_resumes_a_failed_task_with_its_options() {
+        let task = task_with_options("f", TaskStatus::Error);
+        let options = task.options.clone();
+        let mgr = make_test_manager(vec![task]);
+        mgr.shutting_down.store(true, Ordering::Release);
+
+        mgr.restart_task("f").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        let t = &tasks[0];
+        assert!(matches!(t.status, TaskStatus::Waiting | TaskStatus::Active));
+        assert!(t.error_code.is_none());
+        assert!(t.error_message.is_none());
+        assert_eq!(t.options, options);
+    }
+
+    #[tokio::test]
+    async fn restart_task_revives_a_removed_task() {
+        let mut task = task_with_options("r", TaskStatus::Removed);
+        task.download_speed = 512;
+        task.upload_speed = 64;
+        let (uris, options) = (task.uris.clone(), task.options.clone());
+        let mgr = make_test_manager(vec![task]);
+        mgr.shutting_down.store(true, Ordering::Release);
+
+        mgr.restart_task("r").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        let t = &tasks[0];
+        assert!(matches!(t.status, TaskStatus::Waiting | TaskStatus::Active));
+        assert!(t.error_code.is_none());
+        assert!(t.error_message.is_none());
+        assert_eq!(t.download_speed, 0);
+        assert_eq!(t.upload_speed, 0);
+        assert_eq!(t.uris, uris);
+        assert_eq!(t.options, options);
+    }
+
+    #[tokio::test]
+    async fn restart_task_refuses_tasks_that_are_not_failed_or_removed() {
+        let statuses = [
+            ("c", TaskStatus::Complete),
+            ("a", TaskStatus::Active),
+            ("p", TaskStatus::Paused),
+            ("w", TaskStatus::Waiting),
+        ];
+        let mgr = make_test_manager(
+            statuses
+                .iter()
+                .map(|(gid, status)| make_task(gid, *status))
+                .collect(),
+        );
+        mgr.shutting_down.store(true, Ordering::Release);
+
+        for (gid, _) in &statuses {
+            assert!(mgr.restart_task(gid).await.is_err(), "{gid}");
+        }
+        assert!(mgr.restart_task("missing").await.is_err());
+        let complete = mgr.restart_task("c").await.unwrap_err();
+        assert!(complete.contains("complete"), "{complete}");
+
+        let tasks = mgr.tasks.read().await;
+        for (task, (_, status)) in tasks.iter().zip(&statuses) {
+            assert_eq!(task.status, *status);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_task_refuses_a_removed_usenet_task_without_articles() {
+        let mut completed = usenet_task_with_segments("done", TaskStatus::Active);
+        complete_usenet_task(
+            &mut completed,
+            Path::new("/dl/one.bin"),
+            None,
+            &HashMap::new(),
+        );
+        completed.status = TaskStatus::Complete;
+        let interrupted = usenet_task_with_segments("cut", TaskStatus::Paused);
+        let mgr = make_test_manager(vec![completed, interrupted]);
+        mgr.shutting_down.store(true, Ordering::Release);
+        mgr.remove("done").await.unwrap();
+        mgr.remove("cut").await.unwrap();
+
+        let err = mgr.restart_task("done").await.unwrap_err();
+        assert!(err.contains("article list is gone"), "{err}");
+        {
+            let tasks = mgr.tasks.read().await;
+            assert_eq!(tasks[0].status, TaskStatus::Removed);
+        }
+
+        mgr.restart_task("cut").await.expect("restart");
+        let tasks = mgr.tasks.read().await;
+        assert!(matches!(
+            tasks[1].status,
+            TaskStatus::Waiting | TaskStatus::Active
+        ));
+        assert!(!tasks[1].usenet_articles_dropped());
+    }
+
+    #[tokio::test]
+    async fn restart_task_revives_a_removed_torrent_task() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let hash = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Example");
+        let mut task = removed_torrent("bt", Some(hash));
+        task.uris = vec![magnet.clone()];
+        task.options
+            .insert("select-file".into(), Value::String("1,3".into()));
+        let options = task.options.clone();
+        mgr.tasks.write().await.push(task);
+
+        mgr.restart_task("bt").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "bt").unwrap();
+        assert_eq!(t.status, TaskStatus::Active);
+        assert!(t.error_code.is_none());
+        assert!(t.error_message.is_none());
+        assert_eq!(t.uris, vec![magnet]);
+        assert_eq!(t.options, options);
+        drop(tasks);
+        assert_eq!(mgr.torrent_resume_seq.load(Ordering::SeqCst), 1);
+        assert!(mgr.pending_magnets.read().await.contains("bt"));
+    }
+
+    #[tokio::test]
+    async fn restart_task_rebuilds_a_magnet_for_a_removed_file_torrent() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let hash = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let mut task = removed_torrent("bt", Some(hash));
+        task.bt_name = Some("My Show & Extras".into());
+        task.bt_announce_list = vec![
+            vec!["udp://tracker.example:6969/announce".into()],
+            vec!["https://t.example/announce?passkey=a&b=c".into()],
+        ];
+        mgr.tasks.write().await.push(task);
+
+        mgr.restart_task("bt").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "bt").unwrap();
+        assert_eq!(t.status, TaskStatus::Active);
+        assert_eq!(t.uris.len(), 1);
+        let uri = &t.uris[0];
+        assert!(
+            uri.starts_with(&format!("magnet:?xt=urn:btih:{hash}")),
+            "{uri}"
+        );
+        assert!(uri.contains("&dn=My%20Show%20%26%20Extras"), "{uri}");
+        assert!(
+            uri.contains("&tr=udp%3A%2F%2Ftracker.example%3A6969%2Fannounce"),
+            "{uri}"
+        );
+        assert!(
+            uri.contains("&tr=https%3A%2F%2Ft.example%2Fannounce%3Fpasskey%3Da%26b%3Dc"),
+            "{uri}"
+        );
+        drop(tasks);
+        assert!(mgr.pending_magnets.read().await.contains("bt"));
+    }
+
+    #[tokio::test]
+    async fn restart_task_keeps_a_removed_torrent_whose_metadata_is_saved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hash = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        std::fs::create_dir_all(dir.path().join("torrents")).unwrap();
+        std::fs::write(
+            dir.path().join("torrents").join(format!("{hash}.torrent")),
+            b"d",
+        )
+        .unwrap();
+        let mgr = make_test_manager_in(&dir, vec![removed_torrent("bt", Some(hash))]);
+
+        mgr.restart_task("bt").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        assert!(tasks[0].uris.is_empty());
+        assert_eq!(tasks[0].status, TaskStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn restart_task_refuses_a_removed_torrent_without_hash_or_magnet() {
+        let mgr = make_test_manager(vec![
+            removed_torrent("none", None),
+            removed_torrent("empty", Some("")),
+            removed_torrent("long", Some(&"ab".repeat(32))),
+        ]);
+
+        for gid in ["none", "empty", "long"] {
+            let err = mgr.restart_task(gid).await.unwrap_err();
+            assert!(err.contains("gone"), "{gid}: {err}");
+        }
+
+        let tasks = mgr.tasks.read().await;
+        assert!(tasks.iter().all(|t| t.status == TaskStatus::Removed));
+        assert!(tasks.iter().all(|t| t.uris.is_empty()));
+        assert_eq!(mgr.torrent_resume_seq.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_task_refuses_a_duplicate_of_a_live_torrent() {
+        let hash = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let mut live = removed_torrent("live", Some(&hash.to_ascii_uppercase()));
+        live.status = TaskStatus::Active;
+        let mut removed = removed_torrent("old", Some(hash));
+        removed.uris = vec![format!("magnet:?xt=urn:btih:{hash}")];
+        let mgr = make_test_manager(vec![live, removed]);
+
+        let err = mgr.restart_task("old").await.unwrap_err();
+        assert!(err.contains("already in the list"), "{err}");
+
+        let tasks = mgr.tasks.read().await;
+        assert_eq!(tasks[1].status, TaskStatus::Removed);
+        assert_eq!(tasks[1].error_message.as_deref(), Some("Tracker failed"));
+    }
+
+    fn torrent_record(
+        info_hash: Option<&str>,
+        name: Option<&str>,
+        tiers: Vec<Vec<String>>,
+    ) -> DownloadTask {
+        DownloadTask {
+            kind: TaskKind::Torrent,
+            info_hash: info_hash.map(str::to_string),
+            bt_name: name.map(str::to_string),
+            bt_announce_list: tiers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn magnet_for_torrent_encodes_the_name_and_distinct_trackers() {
+        let hash = Some("CAB507494D02EBB1178B38F2E9D7BE299C86B862");
+        let tiers = vec![
+            vec![
+                "udp://a.example:80".to_string(),
+                " udp://a.example:80 ".into(),
+            ],
+            vec![String::new(), "http://b.example/announce?k=1&x=y".into()],
+        ];
+
+        assert_eq!(
+            magnet_for_torrent(&torrent_record(
+                hash,
+                Some("Ünï code/ä b.txt"),
+                tiers.clone()
+            ))
+            .as_deref(),
+            Some(
+                "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862\
+                 &dn=%C3%9Cn%C3%AF%20code%2F%C3%A4%20b.txt\
+                 &tr=udp%3A%2F%2Fa.example%3A80\
+                 &tr=http%3A%2F%2Fb.example%2Fannounce%3Fk%3D1%26x%3Dy"
+            )
+        );
+        assert_eq!(
+            magnet_for_torrent(&torrent_record(hash, Some(""), Vec::new())).as_deref(),
+            Some("magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862")
+        );
+
+        let magnet = magnet_for_torrent(&torrent_record(hash, Some("A & B"), tiers)).unwrap();
+        let parsed = risuko_bt::Magnet::parse(&magnet).unwrap();
+        assert_eq!(parsed.display_name.as_deref(), Some("A & B"));
+        assert_eq!(
+            parsed.trackers,
+            vec![
+                "udp://a.example:80".to_string(),
+                "http://b.example/announce?k=1&x=y".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn magnet_for_torrent_caps_trackers_and_rejects_other_hashes() {
+        let tiers: Vec<Vec<String>> = (0..30)
+            .map(|i| vec![format!("udp://t{i}.example:80")])
+            .collect();
+        let hash = "ab".repeat(20);
+        let magnet = magnet_for_torrent(&torrent_record(Some(&hash), None, tiers)).unwrap();
+        assert_eq!(magnet.matches("&tr=").count(), 20);
+        assert!(magnet.ends_with("&tr=udp%3A%2F%2Ft19.example%3A80"));
+        assert!(!magnet.contains("&dn="));
+
+        for bad in [
+            Some("ab".repeat(32)),
+            Some("zz".repeat(20)),
+            Some(String::new()),
+            None,
+        ] {
+            let record = torrent_record(bad.as_deref(), None, Vec::new());
+            assert!(magnet_for_torrent(&record).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn magnet_for_torrent_uses_btmh_only_for_v2_only_torrents() {
+        let v1 = "cab507494d02ebb1178b38f2e9d7be299c86b862";
+        let v2 = "0123456789abcdef".repeat(4);
+        let tiers = vec![vec!["udp://a.example:80".to_string()]];
+
+        let mut v2_only = torrent_record(Some(&v2[..40]), Some("Name"), tiers.clone());
+        v2_only.meta_version = Some("v2".into());
+        v2_only.info_hash_v2 = Some(v2.to_ascii_uppercase());
+        let magnet = magnet_for_torrent(&v2_only).unwrap();
+        assert_eq!(
+            magnet,
+            format!("magnet:?xt=urn:btmh:1220{v2}&dn=Name&tr=udp%3A%2F%2Fa.example%3A80")
+        );
+        let parsed = risuko_bt::Magnet::parse(&magnet).unwrap();
+        assert_eq!(parsed.info_hash_v2().map(|h| h.to_hex()), Some(v2.clone()));
+        assert!(parsed.info_hash_v1().is_none());
+
+        let mut hybrid = torrent_record(Some(v1), Some("Name"), tiers);
+        hybrid.meta_version = Some("hybrid".into());
+        hybrid.info_hash_v2 = Some(v2.clone());
+        let magnet = magnet_for_torrent(&hybrid).unwrap();
+        assert!(
+            magnet.starts_with(&format!("magnet:?xt=urn:btih:{v1}&")),
+            "{magnet}"
+        );
+        assert!(!magnet.contains("btmh"), "{magnet}");
+
+        v2_only.info_hash_v2 = None;
+        assert!(magnet_for_torrent(&v2_only).is_none());
+        v2_only.info_hash_v2 = Some(v2[..40].to_string());
+        assert!(magnet_for_torrent(&v2_only).is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_task_rebuilds_a_v2_magnet_for_a_removed_v2_only_torrent() {
+        let (mgr, _dir) = make_test_manager_with_engine().await;
+        let v2 = "0123456789abcdef".repeat(4);
+        let mut task = removed_torrent("bt", Some(&v2[..40]));
+        task.meta_version = Some("v2".into());
+        task.info_hash_v2 = Some(v2.clone());
+        task.bt_name = Some("Only V2".into());
+        task.bt_announce_list = vec![vec!["udp://tracker.example:6969/announce".into()]];
+        mgr.tasks.write().await.push(task);
+
+        mgr.restart_task("bt").await.expect("restart");
+
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "bt").unwrap();
+        assert_eq!(t.status, TaskStatus::Active);
+        assert_eq!(t.uris.len(), 1);
+        let parsed = risuko_bt::Magnet::parse(&t.uris[0]).unwrap();
+        assert_eq!(parsed.info_hash_v2().map(|h| h.to_hex()), Some(v2));
+        assert!(parsed.info_hash_v1().is_none());
+        assert_eq!(parsed.display_name.as_deref(), Some("Only V2"));
+        assert_eq!(
+            parsed.trackers,
+            vec!["udp://tracker.example:6969/announce".to_string()]
+        );
+        drop(tasks);
+        assert!(mgr.pending_magnets.read().await.contains("bt"));
+    }
+
+    #[tokio::test]
+    async fn restart_task_refuses_a_removed_v2_only_torrent_without_its_full_hash() {
+        let v2 = "0123456789abcdef".repeat(4);
+        let mut missing = removed_torrent("missing", Some(&v2[..40]));
+        missing.meta_version = Some("v2".into());
+        let mut short = removed_torrent("short", Some(&v2[..40]));
+        short.meta_version = Some("v2".into());
+        short.info_hash_v2 = Some(v2[..40].to_string());
+        let mgr = make_test_manager(vec![missing, short]);
+
+        for gid in ["missing", "short"] {
+            let err = mgr.restart_task(gid).await.unwrap_err();
+            assert!(
+                err.contains("its torrent data is gone; add the torrent again"),
+                "{gid}: {err}"
+            );
+        }
+
+        let tasks = mgr.tasks.read().await;
+        assert!(tasks.iter().all(|t| t.status == TaskStatus::Removed));
+        assert!(tasks.iter().all(|t| t.uris.is_empty()));
     }
 
     #[tokio::test]
@@ -7796,6 +9273,67 @@ mod tests {
         assert_eq!(limiter.limit_bps(), 0);
     }
 
+    #[tokio::test]
+    async fn change_option_reselects_the_files_of_a_paused_task() {
+        let mut task = DownloadTask::new_http(
+            "picked".into(),
+            vec!["https://a.example/file.bin".into()],
+            "/dl".into(),
+            None,
+            Map::new(),
+        );
+        task.kind = TaskKind::Torrent;
+        task.status = TaskStatus::Paused;
+        task.files = [(10, 4), (20, 0), (30, 30)]
+            .iter()
+            .enumerate()
+            .map(|(i, (length, done))| DownloadFile {
+                index: (i + 1).to_string(),
+                path: format!("/dl/{i}.bin"),
+                length: length.to_string(),
+                completed_length: done.to_string(),
+                selected: "true".into(),
+                uris: Vec::new(),
+            })
+            .collect();
+        let mgr = make_test_manager(vec![task]);
+        let pick = |selection: &str| {
+            let mut m = Map::new();
+            m.insert("select-file".into(), Value::from(selection));
+            m
+        };
+        async fn snapshot(mgr: &TaskManager) -> (Vec<String>, u64, u64) {
+            let tasks = mgr.tasks.read().await;
+            let t = tasks.iter().find(|t| t.gid == "picked").unwrap();
+            let flags = t.files.iter().map(|f| f.selected.clone()).collect();
+            (flags, t.total_length, t.completed_length)
+        }
+
+        mgr.change_option("picked", pick("1,3")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "false".into(), "true".into()], 40, 34)
+        );
+
+        mgr.change_option("picked", pick("")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "true".into(), "true".into()], 60, 34)
+        );
+
+        {
+            let mut tasks = mgr.tasks.write().await;
+            let t = tasks.iter_mut().find(|t| t.gid == "picked").unwrap();
+            t.kind = TaskKind::Http;
+            t.total_length = 99;
+        }
+        mgr.change_option("picked", pick("2")).await.unwrap();
+        assert_eq!(
+            snapshot(&mgr).await,
+            (vec!["true".into(), "true".into(), "true".into()], 99, 34)
+        );
+    }
+
     #[test]
     fn finished_workers_drop_out_of_the_limiter_registry() {
         let registry = parking_lot::Mutex::new(HashMap::new());
@@ -7811,6 +9349,11 @@ mod tests {
 
     async fn make_test_manager_with_engine() -> (TaskManager, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
+        let manager = make_test_manager_with_engine_in(&dir).await;
+        (manager, dir)
+    }
+
+    async fn make_test_manager_with_engine_in(dir: &tempfile::TempDir) -> TaskManager {
         let mut system = Map::new();
         system.insert(
             "dir".to_string(),
@@ -7819,10 +9362,42 @@ mod tests {
         system.insert("bt-enable-upnp".to_string(), Value::Bool(false));
         system.insert("bt-enable-lsd".to_string(), Value::Bool(false));
         let options = EngineOptions::from_config(&system, &Map::new());
-        let manager = TaskManager::new(dir.path(), options, EventBroadcaster::new(16))
+        TaskManager::new(dir.path(), options, EventBroadcaster::new(16))
             .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn loading_a_session_trims_completed_usenet_tasks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        SessionManager::new(dir.path())
+            .save(&[
+                usenet_task_with_segments("done", TaskStatus::Complete),
+                usenet_task_with_segments("paused", TaskStatus::Paused),
+                usenet_task_with_segments("failed", TaskStatus::Error),
+            ])
             .unwrap();
-        (manager, dir)
+
+        let mgr = make_test_manager_with_engine_in(&dir).await;
+
+        let tasks = mgr.tasks.read().await;
+        let segments = |gid: &str| -> Vec<usize> {
+            tasks
+                .iter()
+                .find(|task| task.gid == gid)
+                .and_then(|task| task.usenet.as_ref())
+                .expect(gid)
+                .files
+                .iter()
+                .map(|file| file.segments.len())
+                .collect()
+        };
+        assert_eq!(segments("done"), [0, 0]);
+        assert_eq!(segments("paused"), [3, 2]);
+        assert_eq!(segments("failed"), [3, 2]);
+        let done = tasks.iter().find(|task| task.gid == "done").unwrap();
+        assert_eq!(done.status, TaskStatus::Complete);
+        assert_eq!(done.usenet.as_ref().unwrap().files[0].name, "one.bin");
     }
 
     #[tokio::test]
@@ -8039,6 +9614,38 @@ mod tests {
         assert!(starting_token.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn finish_if_startup_aborted_parks_a_worker_cancelled_before_it_started() {
+        let mgr = make_test_manager(vec![make_task("g1", TaskStatus::Active)]);
+        let counters = Counters::new(0, 0);
+        let epoch = next_worker_epoch();
+        mgr.active_downloads
+            .write()
+            .await
+            .insert("g1".into(), counters.to_active_plain(epoch));
+        let finish = || {
+            finish_if_startup_aborted(
+                &mgr.tasks,
+                &mgr.active_downloads,
+                &mgr.events,
+                "g1",
+                epoch,
+                "http",
+                &counters,
+            )
+        };
+
+        assert!(!finish().await);
+        assert_eq!(mgr.tasks.read().await[0].status, TaskStatus::Active);
+        assert!(mgr.active_downloads.read().await.contains_key("g1"));
+
+        counters.cancel_token.cancel();
+
+        assert!(finish().await);
+        assert_eq!(mgr.tasks.read().await[0].status, TaskStatus::Paused);
+        assert!(mgr.active_downloads.read().await.is_empty());
+    }
+
     fn mk_metalink_file(index: &str, len: u64, done: u64) -> DownloadFile {
         DownloadFile {
             index: index.to_string(),
@@ -8063,11 +9670,7 @@ mod tests {
             .iter()
             .map(|(i, _, _)| (*i, Counters::new(0, 1)))
             .collect();
-        let mut ad = Counters::new(0, 0).to_active(
-            epoch,
-            Vec::new(),
-            Arc::new(parking_lot::Mutex::new(None)),
-        );
+        let mut ad = Counters::new(0, 0).to_active_plain(epoch);
         ad.metalink_files = fc.clone();
         mgr.active_downloads
             .write()
@@ -8361,6 +9964,32 @@ mod tests {
         assert_eq!(arr[0].get("gid").unwrap(), "w2");
         assert_eq!(arr[1].get("gid").unwrap(), "w3");
         assert_eq!(arr[2].get("gid").unwrap(), "w1");
+    }
+
+    #[tokio::test]
+    async fn change_position_saturates_extreme_offsets() {
+        let mgr = make_test_manager(vec![
+            make_task("w1", TaskStatus::Waiting),
+            make_task("w2", TaskStatus::Waiting),
+            make_task("w3", TaskStatus::Waiting),
+        ]);
+        let order = || async {
+            let waiting = mgr.tell_waiting(0, 10, &[]).await;
+            waiting
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.get("gid").unwrap().as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let result = mgr.change_position("w2", i64::MAX, "POS_CUR").await;
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(order().await, ["w1", "w3", "w2"]);
+
+        let result = mgr.change_position("w2", i64::MIN, "POS_END").await;
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(order().await, ["w2", "w1", "w3"]);
     }
 
     #[tokio::test]
@@ -8779,6 +10408,759 @@ mod tests {
             }
         }
         assert_eq!(completed, [gids[1].clone()]);
+
+        for gid in &gids {
+            let mut stop = Map::new();
+            stop.insert("seed-time".into(), serde_json::json!(0));
+            mgr.change_option(gid, stop).await.unwrap();
+        }
+        let mut stopped = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::DownloadComplete { gid, seeded } = event {
+                stopped.push((gid, seeded));
+            }
+        }
+        assert_eq!(stopped, [(gids[1].clone(), true)]);
+    }
+
+    const STAMPED_PIECE: usize = 16 * 1024;
+
+    async fn add_complete_torrent(mgr: &TaskManager, dir: &Path) -> (String, PathBuf) {
+        use risuko_bt::create::{create_torrent, CreateOptions};
+        let source = dir.join("source");
+        let pack = source.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("a.bin"), vec![1u8; 40_000]).unwrap();
+        std::fs::write(pack.join("b.bin"), vec![2u8; 30_000]).unwrap();
+        let created = create_torrent(
+            &pack,
+            &CreateOptions {
+                piece_length: Some(STAMPED_PIECE as u32),
+                ..Default::default()
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut options = TaskManager::seed_in_place_options(&source.to_string_lossy());
+        options.remove(SEED_IN_PLACE_KEY);
+        let gid = mgr.add_torrent_task(created.bytes, options).await.unwrap();
+        (gid, pack)
+    }
+
+    async fn task_stamps(mgr: &TaskManager, gid: &str) -> Vec<TaskFileStamp> {
+        mgr.tasks
+            .read()
+            .await
+            .iter()
+            .find(|t| t.gid == gid)
+            .map(|t| t.bt_file_stamps.clone())
+            .unwrap_or_default()
+    }
+
+    async fn tick_until_stamped(mgr: &TaskManager, gid: &str) -> Vec<TaskFileStamp> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            mgr.update_progress().await;
+            let stamps = task_stamps(mgr, gid).await;
+            if !stamps.is_empty() {
+                return stamps;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never recorded file stamps"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn forget_torrent_like_a_restart(mgr: &TaskManager, gid: &str) {
+        let (te, tid) = mgr.torrent_target(gid).await.unwrap();
+        te.remove(tid, false).await.unwrap();
+        mgr.torrent_ids.write().await.remove(gid);
+    }
+
+    async fn restored_stats(
+        mgr: &TaskManager,
+        gid: &str,
+        what: &str,
+        settled: impl Fn(&torrent::TorrentStats) -> bool,
+    ) -> torrent::TorrentStats {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((te, tid)) = mgr.torrent_target(gid).await {
+                if let Some(stats) = te.get_torrent_stats(tid).filter(|stats| settled(stats)) {
+                    return stats;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    fn stamped_time(stamps: &[TaskFileStamp], name: &str) -> std::time::SystemTime {
+        let task = DownloadTask {
+            bt_file_stamps: stamps.to_vec(),
+            ..Default::default()
+        };
+        task.verified_files()
+            .into_iter()
+            .find(|stamp| stamp.path == [name])
+            .unwrap()
+            .modified
+    }
+
+    fn set_modified(file: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn file_stamps_are_asked_for_once_per_finish() {
+        let mut task = DownloadTask::new_torrent("t".into(), "/dl".into(), None, Map::new());
+        let mut attempted = HashSet::new();
+        assert!(wants_file_stamps(&mut task, true, &mut attempted));
+        assert!(!wants_file_stamps(&mut task, true, &mut attempted));
+
+        task.bt_file_stamps = vec![TaskFileStamp::default()];
+        assert!(!wants_file_stamps(&mut task, false, &mut attempted));
+        assert!(task.bt_file_stamps.is_empty());
+        assert!(attempted.is_empty());
+        assert!(wants_file_stamps(&mut task, true, &mut attempted));
+
+        attempted.clear();
+        task.bt_file_stamps = vec![TaskFileStamp::default()];
+        assert!(!wants_file_stamps(&mut task, true, &mut attempted));
+    }
+
+    #[test]
+    fn a_failed_flush_marks_the_task_once_and_drops_its_stamps() {
+        let mut task = make_torrent_task("t", TaskStatus::Active);
+        task.bt_file_stamps = vec![TaskFileStamp::default()];
+        assert!(!remember_failed_flush(&mut task, false, Some("boot-a")));
+        assert_eq!(task.bt_flush_failed_boot, None);
+        assert_eq!(task.bt_file_stamps.len(), 1);
+
+        assert!(remember_failed_flush(&mut task, true, Some("boot-a")));
+        assert_eq!(task.bt_flush_failed_boot.as_deref(), Some("boot-a"));
+        assert!(task.bt_file_stamps.is_empty());
+
+        task.bt_file_stamps = vec![TaskFileStamp::default()];
+        assert!(!remember_failed_flush(&mut task, true, Some("boot-b")));
+        assert!(!remember_failed_flush(&mut task, false, Some("boot-b")));
+        assert_eq!(task.bt_flush_failed_boot.as_deref(), Some("boot-a"));
+        assert_eq!(task.bt_file_stamps.len(), 1);
+
+        let mut unknown = make_torrent_task("u", TaskStatus::Active);
+        assert!(remember_failed_flush(&mut unknown, true, None));
+        assert_eq!(unknown.bt_flush_failed_boot.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn a_task_marked_by_a_failed_flush_is_never_asked_for_stamps() {
+        let mut task = make_torrent_task("t", TaskStatus::Active);
+        task.bt_flush_failed_boot = Some("boot-a".into());
+        let mut attempted = HashSet::new();
+        assert!(!wants_file_stamps(&mut task, true, &mut attempted));
+        assert!(!wants_file_stamps(&mut task, false, &mut attempted));
+        assert!(!wants_file_stamps(&mut task, true, &mut attempted));
+        assert!(attempted.is_empty());
+        assert!(!takes_late_file_stamps(&task, "t"));
+
+        task.bt_flush_failed_boot = None;
+        assert!(takes_late_file_stamps(&task, "t"));
+        assert!(wants_file_stamps(&mut task, true, &mut attempted));
+    }
+
+    #[test]
+    fn a_flush_failed_at_shutdown_marks_only_the_named_torrent_tasks() {
+        let mut failed = make_torrent_task("failed", TaskStatus::Paused);
+        failed.bt_file_stamps = vec![TaskFileStamp::default()];
+        let mut marked = make_torrent_task("marked", TaskStatus::Active);
+        marked.bt_flush_failed_boot = Some("boot-a".into());
+        let mut healthy = make_torrent_task("healthy", TaskStatus::Complete);
+        healthy.bt_file_stamps = vec![TaskFileStamp::default()];
+        let http = make_task("http", TaskStatus::Active);
+        let mut tasks = vec![failed, marked, healthy, http];
+        let named: HashSet<String> = ["failed", "marked", "http"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert!(mark_flushes_failed_at_shutdown(
+            &mut tasks,
+            &named,
+            Some("boot-b")
+        ));
+        assert_eq!(tasks[0].bt_flush_failed_boot.as_deref(), Some("boot-b"));
+        assert!(tasks[0].bt_file_stamps.is_empty());
+        assert_eq!(tasks[1].bt_flush_failed_boot.as_deref(), Some("boot-a"));
+        assert_eq!(tasks[2].bt_flush_failed_boot, None);
+        assert_eq!(tasks[2].bt_file_stamps.len(), 1);
+        assert_eq!(tasks[3].bt_flush_failed_boot, None);
+        assert!(!tasks.iter().any(|task| misses_flush_mark(task, &named)));
+
+        assert!(!mark_flushes_failed_at_shutdown(
+            &mut tasks,
+            &named,
+            Some("boot-c")
+        ));
+        assert_eq!(tasks[0].bt_flush_failed_boot.as_deref(), Some("boot-b"));
+        assert!(!mark_flushes_failed_at_shutdown(
+            &mut tasks,
+            &HashSet::new(),
+            Some("boot-b")
+        ));
+
+        let mut unknown = vec![make_torrent_task("failed", TaskStatus::Error)];
+        assert!(misses_flush_mark(&unknown[0], &named));
+        assert!(mark_flushes_failed_at_shutdown(&mut unknown, &named, None));
+        assert_eq!(unknown[0].bt_flush_failed_boot.as_deref(), Some("unknown"));
+    }
+
+    fn flush_marks_after_loading(
+        saved: &[(&str, Option<&str>)],
+        boot: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = SessionManager::new(dir.path());
+        let tasks: Vec<DownloadTask> = saved
+            .iter()
+            .map(|(gid, mark)| {
+                let mut task = make_torrent_task(gid, TaskStatus::Paused);
+                task.bt_flush_failed_boot = mark.map(str::to_string);
+                task
+            })
+            .collect();
+        session.save(&tasks).unwrap();
+        let mut loaded = session.load();
+        forget_failed_flushes_from_earlier_boots(&mut loaded, boot);
+        loaded
+            .into_iter()
+            .map(|task| (task.gid, task.bt_flush_failed_boot))
+            .collect()
+    }
+
+    #[test]
+    fn loading_on_the_same_boot_keeps_the_flush_mark() {
+        assert_eq!(
+            flush_marks_after_loading(&[("t", Some("boot-a"))], Some("boot-a")),
+            [("t".to_string(), Some("boot-a".to_string()))]
+        );
+        assert_eq!(
+            flush_marks_after_loading(&[("t", Some("1794000000"))], Some("1794000060")),
+            [("t".to_string(), Some("1794000000".to_string()))]
+        );
+    }
+
+    #[test]
+    fn loading_after_a_restart_of_the_machine_clears_the_flush_mark() {
+        assert_eq!(
+            flush_marks_after_loading(&[("t", Some("boot-a"))], Some("boot-b")),
+            [("t".to_string(), None)]
+        );
+        assert_eq!(
+            flush_marks_after_loading(&[("t", Some("1794000000"))], Some("1794086400")),
+            [("t".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_boot_keeps_the_flush_mark() {
+        assert_eq!(
+            flush_marks_after_loading(
+                &[("unknown", Some("unknown")), ("known", Some("boot-a"))],
+                Some("boot-b")
+            )[0],
+            ("unknown".to_string(), Some("unknown".to_string()))
+        );
+        assert_eq!(
+            flush_marks_after_loading(&[("t", Some("boot-a"))], None),
+            [("t".to_string(), Some("boot-a".to_string()))]
+        );
+    }
+
+    #[test]
+    fn a_session_file_without_the_flush_mark_loads_unmarked() {
+        let task = make_torrent_task("t", TaskStatus::Paused);
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("bt_flush_failed_boot").is_none());
+        assert_eq!(
+            flush_marks_after_loading(&[("t", None)], Some("boot-a")),
+            [("t".to_string(), None)]
+        );
+
+        let mut marked = task;
+        marked.bt_flush_failed_boot = Some("boot-a".into());
+        let encoded = serde_json::to_value(&marked).unwrap();
+        assert_eq!(encoded["bt_flush_failed_boot"], serde_json::json!("boot-a"));
+        let restored: DownloadTask = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.bt_flush_failed_boot.as_deref(), Some("boot-a"));
+    }
+
+    #[test]
+    fn the_flush_mark_is_not_sent_to_clients() {
+        let mut task = make_torrent_task("t", TaskStatus::Active);
+        task.bt_flush_failed_boot = Some("boot-mark-7f3a".into());
+        let status = serde_json::to_string(&task.to_rpc_status(&[])).unwrap();
+        assert!(!status.contains("boot-mark-7f3a"));
+        assert!(!status.contains("bt_flush_failed_boot"));
+        assert!(!status.to_ascii_lowercase().contains("flushfailed"));
+    }
+
+    #[tokio::test]
+    async fn the_manager_forgets_flush_marks_from_an_earlier_boot_when_it_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marked = |gid: &str, mark: &str| {
+            let mut task = make_torrent_task(gid, TaskStatus::Paused);
+            task.bt_flush_failed_boot = Some(mark.to_string());
+            task
+        };
+        let current = super::super::boot_id::current();
+        let mut saved = vec![
+            marked("earlier", "a-boot-before-this-one"),
+            marked("unknown", super::super::boot_id::UNKNOWN),
+        ];
+        if let Some(current) = current {
+            saved.push(marked("current", current));
+        }
+        SessionManager::new(dir.path()).save(&saved).unwrap();
+
+        let mgr = make_test_manager_with_engine_in(&dir).await;
+
+        let tasks = mgr.tasks.read().await;
+        let mark = |gid: &str| {
+            tasks
+                .iter()
+                .find(|task| task.gid == gid)
+                .unwrap()
+                .bt_flush_failed_boot
+                .clone()
+        };
+        assert_eq!(mark("unknown").as_deref(), Some("unknown"));
+        if let Some(current) = current {
+            assert_eq!(mark("earlier"), None);
+            assert_eq!(mark("current").as_deref(), Some(current));
+        } else {
+            assert_eq!(mark("earlier").as_deref(), Some("a-boot-before-this-one"));
+        }
+    }
+
+    #[test]
+    fn a_torrent_error_fails_a_seeder_once_unfinished_or_on_a_storage_failure() {
+        let downloading = make_torrent_task("d", TaskStatus::Active);
+        let mut seeding = make_torrent_task("s", TaskStatus::Active);
+        seeding.seeder = true;
+        seeding.seeding_since = 1;
+
+        assert!(surfaces_torrent_error(&downloading, false, false, false));
+        assert!(surfaces_torrent_error(&downloading, true, false, false));
+        assert!(surfaces_torrent_error(&seeding, false, false, false));
+        assert!(!surfaces_torrent_error(&seeding, true, false, false));
+        assert!(!surfaces_torrent_error(&downloading, false, true, false));
+        assert!(!surfaces_torrent_error(&seeding, false, true, false));
+        assert!(surfaces_torrent_error(&seeding, true, false, true));
+        assert!(surfaces_torrent_error(&downloading, true, false, true));
+        assert!(!surfaces_torrent_error(&seeding, true, true, true));
+        for status in [TaskStatus::Paused, TaskStatus::Error, TaskStatus::Complete] {
+            for storage_error in [false, true] {
+                assert!(!surfaces_torrent_error(
+                    &make_torrent_task("x", status),
+                    false,
+                    false,
+                    storage_error
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seeding_torrent_whose_files_cannot_be_prepared_fails() {
+        use risuko_bt::create::{create_torrent, CreateOptions};
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (healthy, _) = add_complete_torrent(&mgr, dir.path()).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !mgr
+            .tasks
+            .read()
+            .await
+            .iter()
+            .any(|t| t.gid == healthy && t.seeder)
+        {
+            assert!(std::time::Instant::now() < deadline, "never seeded");
+            mgr.update_progress().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let source = dir.path().join("blocked");
+        let pack = source.join("pack");
+        std::fs::create_dir_all(pack.join("sub")).unwrap();
+        std::fs::write(pack.join("a.bin"), vec![1u8; 40_000]).unwrap();
+        std::fs::write(pack.join("sub").join("b.bin"), vec![2u8; 30_000]).unwrap();
+        let created = create_torrent(
+            &pack,
+            &CreateOptions {
+                version: risuko_bt::core::MetaVersion::V1,
+                piece_length: Some(STAMPED_PIECE as u32),
+                ..Default::default()
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(pack.join("sub")).unwrap();
+        std::fs::write(pack.join("sub"), b"").unwrap();
+        let parts =
+            risuko_bt::storage::parts_dir_for(&pack, &created.info_hash_v1.unwrap().to_hex());
+        std::fs::create_dir_all(&parts).unwrap();
+        for idx in 0..created.file_count {
+            std::fs::write(parts.join(idx.to_string()), b"").unwrap();
+        }
+        let mut options = TaskManager::seed_in_place_options(&source.to_string_lossy());
+        options.remove(SEED_IN_PLACE_KEY);
+        let gid = mgr.add_torrent_task(created.bytes, options).await.unwrap();
+        {
+            let mut tasks = mgr.tasks.write().await;
+            let task = tasks.iter_mut().find(|t| t.gid == gid).unwrap();
+            task.seeder = true;
+            task.seeding_since = 1;
+        }
+        let stats = restored_stats(&mgr, &gid, "the storage error", |stats| {
+            stats.error.is_some()
+        })
+        .await;
+        let blocked = pack.join("sub").join("b.bin").display().to_string();
+        let error = stats.error.unwrap();
+        assert!(error.contains(&blocked), "{error}");
+        assert!(!stats.is_finished);
+
+        let mut events = mgr.events.subscribe();
+        mgr.update_progress().await;
+
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.status, TaskStatus::Error);
+            assert_eq!(task.error_message.as_deref(), Some(error.as_str()));
+            assert!(!task.seeder);
+            assert_eq!(task.seeding_since, 0);
+            assert_eq!((task.download_speed, task.upload_speed), (0, 0));
+            let other = tasks.iter().find(|t| t.gid == healthy).unwrap();
+            assert_eq!((other.status, other.seeder), (TaskStatus::Active, true));
+            assert!(other.error_message.is_none());
+        }
+        let mut failed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::DownloadError { gid } = event {
+                failed.push(gid);
+            }
+        }
+        assert_eq!(failed, [gid]);
+    }
+
+    #[tokio::test]
+    async fn a_finished_seeder_fails_on_a_storage_error_but_not_a_hash_disagreement() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _) = add_complete_torrent(&mgr, dir.path()).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !mgr
+            .tasks
+            .read()
+            .await
+            .iter()
+            .any(|t| t.gid == gid && t.seeder)
+        {
+            assert!(std::time::Instant::now() < deadline, "never seeded");
+            mgr.update_progress().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let root = restored_stats(&mgr, &gid, "the seeder to finish", |stats| {
+            stats.is_finished
+        })
+        .await
+        .resolved_root
+        .map(PathBuf::from)
+        .unwrap();
+        let force = |error: &str, storage: bool| {
+            let mut forced = torrent::FORCED_ERRORS.lock();
+            forced.retain(|(dir, ..)| *dir != root);
+            forced.push((root.clone(), error.to_string(), storage));
+        };
+        let mut events = mgr.events.subscribe();
+
+        force(
+            "Piece 1 matches its v1 hash but not its v2 hash; the torrent's hashes disagree",
+            false,
+        );
+        mgr.update_progress().await;
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!((task.status, task.seeder), (TaskStatus::Active, true));
+            assert!(task.error_message.is_none());
+        }
+
+        let error = "Disk write failed: No space left on device";
+        force(error, true);
+        mgr.update_progress().await;
+        torrent::FORCED_ERRORS
+            .lock()
+            .retain(|(dir, ..)| *dir != root);
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.status, TaskStatus::Error);
+            assert_eq!(task.error_message.as_deref(), Some(error));
+            assert!(!task.seeder);
+            assert_eq!(task.seeding_since, 0);
+            assert_eq!((task.download_speed, task.upload_speed), (0, 0));
+        }
+        let mut failed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EngineEvent::DownloadError { gid } = event {
+                failed.push(gid);
+            }
+        }
+        assert_eq!(failed, [gid]);
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_records_its_file_stamps() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, pack) = add_complete_torrent(&mgr, dir.path()).await;
+        let stamps = tick_until_stamped(&mgr, &gid).await;
+        let mut recorded: Vec<(Vec<String>, u64)> = stamps
+            .iter()
+            .map(|stamp| (stamp.path.clone(), stamp.length))
+            .collect();
+        recorded.sort();
+        assert_eq!(
+            recorded,
+            [
+                (vec!["a.bin".to_string()], 40_000),
+                (vec!["b.bin".to_string()], 30_000),
+            ]
+        );
+        assert_eq!(
+            stamped_time(&stamps, "a.bin"),
+            std::fs::metadata(pack.join("a.bin"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_torrent_with_unchanged_files_does_not_rehash() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, pack) = add_complete_torrent(&mgr, dir.path()).await;
+        let stored = tick_until_stamped(&mgr, &gid).await;
+        let stamped = stamped_time(&stored, "a.bin");
+        let a = pack.join("a.bin");
+
+        forget_torrent_like_a_restart(&mgr, &gid).await;
+        let mut bytes = std::fs::read(&a).unwrap();
+        bytes[..STAMPED_PIECE].fill(0);
+        std::fs::write(&a, &bytes).unwrap();
+        set_modified(&a, stamped);
+        mgr.restore_saved_torrent_files().await;
+        let stats = restored_stats(&mgr, &gid, "the restored torrent to finish", |stats| {
+            stats.is_finished
+        })
+        .await;
+        assert_eq!(stats.downloaded_bytes, stats.total_bytes);
+
+        forget_torrent_like_a_restart(&mgr, &gid).await;
+        set_modified(&a, stamped + std::time::Duration::from_secs(5));
+        mgr.tasks
+            .write()
+            .await
+            .iter_mut()
+            .find(|t| t.gid == gid)
+            .unwrap()
+            .bt_file_stamps = stored;
+        mgr.restore_saved_torrent_files().await;
+        restored_stats(&mgr, &gid, "the recheck to find the damage", |stats| {
+            stats.total_bytes > 0
+                && stats.downloaded_bytes == stats.total_bytes - STAMPED_PIECE as u64
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (te, tid) = mgr.torrent_target(&gid).await.unwrap();
+        assert!(!te.get_torrent_stats(tid).unwrap().is_finished);
+        mgr.update_progress().await;
+        assert!(task_stamps(&mgr, &gid).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_uses_the_stamps_up_and_the_tick_records_new_ones() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _pack) = add_complete_torrent(&mgr, dir.path()).await;
+        let stored = tick_until_stamped(&mgr, &gid).await;
+
+        forget_torrent_like_a_restart(&mgr, &gid).await;
+        mgr.restore_saved_torrent_files().await;
+        assert!(task_stamps(&mgr, &gid).await.is_empty());
+        assert!(!mgr.stamp_attempts.lock().contains(&gid));
+        restored_stats(&mgr, &gid, "the restored torrent to finish", |stats| {
+            stats.is_finished
+        })
+        .await;
+        assert_eq!(tick_until_stamped(&mgr, &gid).await, stored);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_shutdown_leaves_no_flush_mark() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _pack) = add_complete_torrent(&mgr, dir.path()).await;
+        let stamps = tick_until_stamped(&mgr, &gid).await;
+
+        mgr.shutdown().await;
+
+        assert!(mgr.torrent_ids.read().await.contains_key(&gid));
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
+        {
+            let tasks = mgr.tasks.read().await;
+            let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+            assert_eq!(task.bt_flush_failed_boot, None);
+            assert_eq!(task.bt_file_stamps, stamps);
+        }
+        let saved = SessionManager::new(dir.path()).load();
+        let saved = saved.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(saved.bt_flush_failed_boot, None);
+        assert_eq!(saved.bt_file_stamps, stamps);
+    }
+
+    #[tokio::test]
+    async fn a_paused_torrent_is_still_in_the_engine_when_it_shuts_down() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _pack) = add_complete_torrent(&mgr, dir.path()).await;
+        restored_stats(&mgr, &gid, "the torrent to finish", |stats| {
+            stats.is_finished
+        })
+        .await;
+        mgr.pause(&gid).await.unwrap();
+
+        let (te, tid) = mgr.torrent_target(&gid).await.unwrap();
+        assert!(te.get_torrent_stats(tid).is_some());
+        mgr.shutdown().await;
+        assert_eq!(mgr.torrent_ids.read().await.get(&gid), Some(&tid));
+    }
+
+    #[tokio::test]
+    async fn a_flush_failed_at_shutdown_is_saved_once_more_only_when_it_marks_a_task() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let mut failed = make_torrent_task("failed", TaskStatus::Paused);
+        failed.bt_file_stamps = vec![TaskFileStamp::default()];
+        let other = make_torrent_task("other", TaskStatus::Complete);
+        mgr.tasks.write().await.extend([failed, other]);
+        mgr.torrent_ids
+            .write()
+            .await
+            .extend([("failed".to_string(), 5), ("other".to_string(), 6)]);
+        mgr.save_session().await.unwrap();
+        let rev = mgr.tasks.rev();
+
+        mgr.remember_flushes_failed_at_shutdown(&[7]).await;
+        assert_eq!(mgr.tasks.rev(), rev);
+
+        mgr.remember_flushes_failed_at_shutdown(&[5]).await;
+        assert_ne!(mgr.tasks.rev(), rev);
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
+        let saved = SessionManager::new(dir.path()).load();
+        let task = |gid: &str| saved.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(
+            task("failed").bt_flush_failed_boot.as_deref(),
+            Some(super::super::boot_id::current().unwrap_or("unknown"))
+        );
+        assert!(task("failed").bt_file_stamps.is_empty());
+        assert_eq!(task("other").bt_flush_failed_boot, None);
+
+        let rev = mgr.tasks.rev();
+        mgr.remember_flushes_failed_at_shutdown(&[5]).await;
+        assert_eq!(mgr.tasks.rev(), rev);
+    }
+
+    #[tokio::test]
+    async fn a_flush_mark_is_saved_at_once_only_when_it_is_new() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager_in(&dir, vec![make_torrent_task("t", TaskStatus::Active)]);
+        mgr.save_session().await.unwrap();
+
+        let rev = mgr.saved_rev.load(Ordering::Relaxed);
+        let marked = remember_failed_flush(&mut mgr.tasks.write().await[0], false, Some("boot-a"));
+        mgr.save_new_flush_marks(marked).await;
+        assert_ne!(mgr.tasks.rev(), rev);
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), rev);
+
+        let marked = remember_failed_flush(&mut mgr.tasks.write().await[0], true, Some("boot-a"));
+        mgr.save_new_flush_marks(marked).await;
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), mgr.tasks.rev());
+        let saved = SessionManager::new(dir.path()).load();
+        assert_eq!(saved[0].bt_flush_failed_boot.as_deref(), Some("boot-a"));
+
+        let rev = mgr.saved_rev.load(Ordering::Relaxed);
+        let marked = remember_failed_flush(&mut mgr.tasks.write().await[0], true, Some("boot-b"));
+        mgr.save_new_flush_marks(marked).await;
+        assert_ne!(mgr.tasks.rev(), rev);
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), rev);
+    }
+
+    #[tokio::test]
+    async fn a_progress_update_without_a_new_flush_mark_does_not_save() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _pack) = add_complete_torrent(&mgr, dir.path()).await;
+        tick_until_stamped(&mgr, &gid).await;
+        mgr.save_session().await.unwrap();
+        let rev = mgr.saved_rev.load(Ordering::Relaxed);
+
+        mgr.update_progress().await;
+
+        assert_ne!(mgr.tasks.rev(), rev);
+        assert_eq!(mgr.saved_rev.load(Ordering::Relaxed), rev);
+    }
+
+    async fn set_flush_mark(mgr: &TaskManager, gid: &str, mark: Option<&str>) {
+        mgr.tasks
+            .write()
+            .await
+            .iter_mut()
+            .find(|t| t.gid == gid)
+            .unwrap()
+            .bt_flush_failed_boot = mark.map(str::to_string);
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_marked_by_a_failed_flush_records_no_stamps() {
+        let (mgr, dir) = make_test_manager_with_engine().await;
+        let (gid, _pack) = add_complete_torrent(&mgr, dir.path()).await;
+        set_flush_mark(&mgr, &gid, Some("boot-a")).await;
+        restored_stats(&mgr, &gid, "the torrent to finish", |stats| {
+            stats.is_finished
+        })
+        .await;
+        for _ in 0..10 {
+            mgr.update_progress().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(task_stamps(&mgr, &gid).await.is_empty());
+        assert!(!mgr.stamp_attempts.lock().contains(&gid));
+
+        mgr.stamp_attempts.lock().insert(gid.clone());
+        mgr.record_file_stamps(vec![gid.clone()]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(task_stamps(&mgr, &gid).await.is_empty());
+
+        set_flush_mark(&mgr, &gid, None).await;
+        mgr.stamp_attempts.lock().clear();
+        assert!(!tick_until_stamped(&mgr, &gid).await.is_empty());
     }
 
     async fn paused_torrent_task(mgr: &TaskManager, name: &str, private: bool) -> String {
@@ -9129,6 +11511,155 @@ mod tests {
         assert!(t.options.get("all-proxy").is_none());
     }
 
+    async fn make_manager_with_slow_exiting_worker(
+        gid: &str,
+        dl_dir: &tempfile::TempDir,
+    ) -> TaskManager {
+        let mut task = DownloadTask::new_http(
+            gid.into(),
+            vec!["https://a.example/file.bin".into()],
+            dl_dir.path().to_string_lossy().into_owned(),
+            None,
+            Map::new(),
+        );
+        task.out = "file.bin".into();
+        task.status = TaskStatus::Active;
+        let mgr = make_test_manager(vec![task]);
+        spawn_mock_worker(&mgr, gid, async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .await;
+        mgr
+    }
+
+    #[tokio::test]
+    async fn update_task_refuses_a_second_edit_while_the_first_restarts() {
+        let dl_dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_manager_with_slow_exiting_worker("busy1", &dl_dir).await;
+
+        let (first, second) = tokio::join!(
+            mgr.update_task(
+                "busy1",
+                TaskPatch {
+                    out: Some("first.bin".into()),
+                    ..Default::default()
+                },
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut opts = Map::new();
+                opts.insert("split".into(), Value::from(8));
+                mgr.update_task(
+                    "busy1",
+                    TaskPatch {
+                        out: Some("second.bin".into()),
+                        options: Some(opts),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        );
+
+        let err = second.expect_err("second edit must be refused");
+        assert!(err.contains("is being updated"), "err={err}");
+        assert!(first.expect("first edit").restarted);
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "busy1").unwrap();
+        assert_eq!(t.out, "first.bin");
+        assert!(t.options.get("split").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_task_restart_keeps_changes_made_while_the_worker_stops() {
+        let dl_dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_manager_with_slow_exiting_worker("keep1", &dl_dir).await;
+
+        let (outcome, ()) = tokio::join!(
+            mgr.update_task(
+                "keep1",
+                TaskPatch {
+                    out: Some("renamed.bin".into()),
+                    ..Default::default()
+                },
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut opts = Map::new();
+                opts.insert("max-download-limit".into(), Value::String("12345".into()));
+                mgr.change_option("keep1", opts)
+                    .await
+                    .expect("change option");
+                let mut tasks = mgr.tasks.write().await;
+                let t = tasks.iter_mut().find(|t| t.gid == "keep1").unwrap();
+                t.completed_length = 4242;
+            }
+        );
+
+        assert!(outcome.expect("edit").restarted);
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "keep1").unwrap();
+        assert_eq!(t.out, "renamed.bin");
+        assert_eq!(
+            t.options.get("max-download-limit"),
+            Some(&Value::String("12345".into()))
+        );
+        assert_eq!(t.completed_length, 4242);
+    }
+
+    #[tokio::test]
+    async fn update_task_restart_reports_a_task_that_finished_meanwhile() {
+        let dl_dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_manager_with_slow_exiting_worker("done1", &dl_dir).await;
+
+        let (outcome, ()) = tokio::join!(
+            mgr.update_task(
+                "done1",
+                TaskPatch {
+                    out: Some("renamed.bin".into()),
+                    ..Default::default()
+                },
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut tasks = mgr.tasks.write().await;
+                let t = tasks.iter_mut().find(|t| t.gid == "done1").unwrap();
+                t.status = TaskStatus::Complete;
+            }
+        );
+
+        let err = outcome.expect_err("finished task must not be edited");
+        assert!(err.contains("finished"), "err={err}");
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "done1").unwrap();
+        assert_eq!(t.out, "file.bin");
+        assert_eq!(t.status, TaskStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn update_task_restart_reports_a_task_removed_meanwhile() {
+        let dl_dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_manager_with_slow_exiting_worker("gone1", &dl_dir).await;
+
+        let (outcome, ()) = tokio::join!(
+            mgr.update_task(
+                "gone1",
+                TaskPatch {
+                    out: Some("renamed.bin".into()),
+                    ..Default::default()
+                },
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                mgr.tasks.write().await.retain(|t| t.gid != "gone1");
+            }
+        );
+
+        let err = outcome.expect_err("removed task must not be edited");
+        assert!(err.contains("not found"), "err={err}");
+        assert!(mgr.tasks.read().await.iter().all(|t| t.gid != "gone1"));
+    }
+
     #[tokio::test]
     async fn nzb_total_leaves_out_unrequested_recovery_volumes() {
         let file = |name: &str, id: &str, bytes: u64| {
@@ -9152,6 +11683,159 @@ mod tests {
         let task = tasks.iter().find(|t| t.gid == gid).unwrap();
         assert_eq!(task.total_length, 1050);
         assert_eq!(task.files.len(), 3);
+    }
+
+    #[test]
+    fn stored_secure_cookies_are_sent_only_over_https() {
+        use super::super::cookie_store::{CookieEntry, StoredCookie};
+        let dir = tempfile::tempdir().unwrap();
+        let store = CookieStore::new(dir.path());
+        let cookie = |name: &str, value: &str, secure: bool| StoredCookie {
+            name: name.into(),
+            value: value.into(),
+            secure,
+            ..Default::default()
+        };
+        store
+            .upsert(CookieEntry {
+                host: "site.example".into(),
+                cookies: vec![cookie("s", "1", true), cookie("p", "2", false)],
+                ..Default::default()
+            })
+            .unwrap();
+        let header = |uri: &str| {
+            let mut merged = Map::new();
+            TaskManager::apply_stored_cookies_from(&store, &[uri.to_string()], &mut merged);
+            merged
+                .get("cookie")
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+
+        assert_eq!(
+            header("https://site.example/f").as_deref(),
+            Some("s=1; p=2")
+        );
+        assert_eq!(
+            header("HTTPS://site.example/f").as_deref(),
+            Some("s=1; p=2")
+        );
+        assert_eq!(header("http://site.example/f").as_deref(), Some("p=2"));
+    }
+
+    #[tokio::test]
+    async fn retry_with_stored_cookies_drops_the_tasks_own_cookie() {
+        let mut task = make_task("cf1", TaskStatus::Error);
+        task.options
+            .insert("cookie".into(), Value::String("old=1".into()));
+        task.options.insert(
+            crate::engine::http::COOKIE_HOST_OPTION.into(),
+            Value::String("example.com".into()),
+        );
+        task.options
+            .insert("user-agent".into(), Value::String("Old/1".into()));
+        task.error_code = Some("403".into());
+        task.error_message = Some("Forbidden".into());
+        let mgr = make_test_manager(vec![task]);
+        mgr.shutting_down.store(true, Ordering::Release);
+
+        mgr.retry_with_stored_cookies("cf1", Some("New/2".into()))
+            .await
+            .expect("retry");
+
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "cf1").unwrap();
+        assert!(!t.options.contains_key("cookie"));
+        assert!(!t
+            .options
+            .contains_key(crate::engine::http::COOKIE_HOST_OPTION));
+        assert_eq!(
+            t.options.get("user-agent").and_then(Value::as_str),
+            Some("New/2")
+        );
+        assert!(t.error_code.is_none());
+        assert!(t.error_message.is_none());
+        assert_eq!(t.status, TaskStatus::Waiting);
+    }
+
+    #[tokio::test]
+    async fn retry_with_stored_cookies_rejects_finished_and_non_http_tasks() {
+        let mut done = make_task("done", TaskStatus::Complete);
+        done.options
+            .insert("cookie".into(), Value::String("kept=1".into()));
+        let mut torrent = DownloadTask::new_torrent("bt".into(), "/dl".into(), None, Map::new());
+        torrent.status = TaskStatus::Error;
+        let mgr = make_test_manager(vec![done, make_task("gone", TaskStatus::Removed), torrent]);
+
+        for (gid, expected) in [
+            ("done", "Task done has already finished"),
+            ("gone", "Task gone has already finished"),
+            ("bt", "Task bt is not an HTTP task"),
+            ("missing", "Task missing not found"),
+        ] {
+            let stored = mgr
+                .retry_with_stored_cookies(gid, None)
+                .await
+                .expect_err(gid);
+            let given = mgr
+                .retry_with_cookies(gid, None, None)
+                .await
+                .expect_err(gid);
+            assert_eq!(stored, expected);
+            assert_eq!(stored, given);
+        }
+
+        let tasks = mgr.tasks.read().await;
+        let t = tasks.iter().find(|t| t.gid == "done").unwrap();
+        assert_eq!(
+            t.options.get("cookie").and_then(Value::as_str),
+            Some("kept=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn usenet_progress_leaves_per_file_entries_alone() {
+        let file = |name: &str, id: &str, bytes: u64| {
+            format!(
+                r#"<file poster="p" date="1" subject="&quot;{name}&quot; yEnc (1/1)"><groups><group>a.b</group></groups><segments><segment bytes="{bytes}" number="1">{id}</segment></segments></file>"#
+            )
+        };
+        let nzb = format!(
+            r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">{}{}</nzb>"#,
+            file("one.bin", "o@t", 1000),
+            file("two.bin", "t@t", 500),
+        );
+        let mgr = make_test_manager(Vec::new());
+        let mut options = Map::new();
+        options.insert("pause".into(), Value::String("true".into()));
+        let gid = mgr.add_nzb_task(nzb.into_bytes(), options).await.unwrap();
+        mgr.tasks
+            .write()
+            .await
+            .iter_mut()
+            .find(|t| t.gid == gid)
+            .unwrap()
+            .status = TaskStatus::Active;
+        let worker = fake_worker(next_worker_epoch());
+        worker.total.store(1500, Ordering::Relaxed);
+        worker.completed.store(700, Ordering::Relaxed);
+        mgr.active_downloads
+            .write()
+            .await
+            .insert(gid.clone(), worker);
+
+        mgr.update_progress().await;
+
+        let tasks = mgr.tasks.read().await;
+        let task = tasks.iter().find(|t| t.gid == gid).unwrap();
+        assert_eq!(task.total_length, 1500);
+        assert_eq!(task.completed_length, 700);
+        let lengths: Vec<_> = task
+            .files
+            .iter()
+            .map(|f| (f.length.as_str(), f.completed_length.as_str()))
+            .collect();
+        assert_eq!(lengths, [("1000", "0"), ("500", "0")]);
     }
 
     #[tokio::test]
@@ -9255,7 +11939,7 @@ mod tests {
     }
 
     fn fake_worker(epoch: u64) -> ActiveDownload {
-        Counters::new(0, 0).to_active(epoch, Vec::new(), Arc::new(parking_lot::Mutex::new(None)))
+        Counters::new(0, 0).to_active_plain(epoch)
     }
 
     #[tokio::test]
@@ -9639,5 +12323,24 @@ mod tests {
         assert!(mgr.saved_torrent_path("../evil").is_none());
         let p = mgr.saved_torrent_path("ABCDEF0123").unwrap();
         assert!(p.ends_with("torrents/abcdef0123.torrent"));
+    }
+
+    #[tokio::test]
+    async fn saved_torrent_files_are_written_atomically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = make_test_manager_in(&dir, vec![]);
+        let info_hash = "0123456789abcdef0123456789abcdef01234567";
+        let data = b"d4:infod4:name4:testee".to_vec();
+
+        mgr.persist_torrent_file(info_hash, &data).await;
+
+        let path = mgr.saved_torrent_path(info_hash).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries, vec![path]);
     }
 }

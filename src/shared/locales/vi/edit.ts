@@ -1,6 +1,6 @@
 export default {
 	undo: "Hoàn tác",
-	redo: "Redo",
+	redo: "Làm lại",
 	cut: "Cắt",
 	copy: "Sao chép",
 	paste: "Dán",

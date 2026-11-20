@@ -2,12 +2,6 @@
 pub enum AdcError {
     #[error("invalid URI: {0}")]
     InvalidUri(String),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("protocol: {0}")]
-    Protocol(String),
-    #[error("peer error: {0}")]
-    Peer(String),
     #[error("no source has the requested file")]
     NoSource,
 }

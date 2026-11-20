@@ -1,15 +1,156 @@
 export default {
 	basic: "Cơ bản",
 	advanced: "Nâng cao",
+	cloudSinks: "Đích đám mây",
+	usenet: "Usenet",
+	search: "Tìm kiếm",
+	"search-placeholder": "Tìm trong tất cả cài đặt",
+	"search-all-tabs": "Tất cả cài đặt",
+	"search-results": "{{count}} cài đặt khớp",
+	"search-no-results": "Không tìm thấy cài đặt nào khớp",
+	"search-clear": "Xóa tìm kiếm",
+	"search-go-to-tab": "Mở cài đặt",
+	"search-more-results": "Hãy thu hẹp tìm kiếm để xem thêm kết quả",
+	"usenet-tips":
+		"Quản lý các nhà cung cấp NNTP và mặc định dọn dẹp lưu trữ an toàn.",
+	"usenet-profiles": "Hồ sơ nhà cung cấp",
+	"usenet-profiles-tips":
+		"Cấu hình độ ưu tiên, bảo mật, xác thực và giới hạn kết nối của nhà cung cấp.",
+	"usenet-add-profile": "Thêm hồ sơ",
+	"usenet-no-profiles": "Chưa cấu hình hồ sơ nhà cung cấp nào.",
+	"usenet-no-profiles-tips":
+		"Hãy thêm ít nhất một nhà cung cấp trước khi nhập một bản tải xuống NZB.",
+	"usenet-edit-profile": "Sửa hồ sơ",
+	"usenet-profile-dialog-tips":
+		"Cài đặt hồ sơ có thể được đồng bộ giữa các thiết bị. Thông tin đăng nhập chỉ lưu cục bộ trên thiết bị này.",
+	"usenet-profile-dialog-tips-vault":
+		"Cài đặt hồ sơ có thể được đồng bộ giữa các thiết bị. Thông tin đăng nhập được giữ trong chuỗi khóa bảo mật của thiết bị này.",
+	"usenet-profile-name": "Tên hồ sơ",
+	"usenet-profile-name-placeholder": "Nhà cung cấp chính",
+	"usenet-profile-host": "Máy chủ NNTP",
+	"usenet-profile-port": "Cổng",
+	"usenet-security": "Bảo mật kết nối",
+	"usenet-tls": "TLS ngầm định",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "NNTP thuần",
+	"usenet-authentication": "Xác thực",
+	"usenet-auth-credentials": "Tên người dùng và mật khẩu",
+	"usenet-auth-anonymous": "Ẩn danh",
+	"usenet-username": "Tên người dùng",
+	"usenet-password": "Mật khẩu",
+	"usenet-credentials-saved": "Đã lưu thông tin đăng nhập",
+	"usenet-credentials-unavailable":
+		"Trạng thái thông tin đăng nhập không khả dụng",
+	"usenet-credentials-saved-tips":
+		"Thông tin đăng nhập đã được lưu. Để trống cả hai trường để giữ nguyên.",
+	"usenet-plain-warning-title": "Kết nối không được mã hóa",
+	"usenet-plain-opt-in": "Tôi hiểu và muốn cho phép NNTP thuần cho hồ sơ này.",
+	"usenet-plain-warning":
+		"NNTP thuần không mã hóa thông tin đăng nhập và dữ liệu tải xuống. Chỉ dùng khi nhà cung cấp của bạn yêu cầu rõ ràng.",
+	"usenet-enabled": "Đã bật",
+	"usenet-enabled-tips":
+		"Hồ sơ bị tắt vẫn được giữ lại nhưng không dùng để tải xuống.",
+	"usenet-disabled": "Đã tắt",
+	"usenet-priority": "Độ ưu tiên",
+	"usenet-priority-tips":
+		"Giá trị thấp hơn được thử trước. Các độ ưu tiên bằng nhau sẽ chia sẻ tải.",
+	"usenet-priority-value": "Độ ưu tiên {{value}}",
+	"usenet-max-connections": "Số kết nối tối đa",
+	"usenet-max-connections-tips": "Giới hạn kết nối cho hồ sơ nhà cung cấp này.",
+	"usenet-connections-value": "{{value}} kết nối",
+	"usenet-test": "Kiểm tra",
+	"usenet-edit": "Sửa hồ sơ",
+	"usenet-remove": "Xóa",
+	"usenet-remove-title": "Xóa hồ sơ nhà cung cấp?",
+	"usenet-remove-confirm":
+		"{{name}} sẽ không còn khả dụng để tải xuống. Thông tin đăng nhập đã lưu của nó cũng sẽ bị xóa khỏi thiết bị này.",
+	"usenet-profile-saved": "Đã lưu hồ sơ nhà cung cấp.",
+	"usenet-profile-removed": "Đã xóa {{name}}.",
+	"usenet-test-success": "Đã kết nối tới {{name}}.",
+	"usenet-test-failed": "Kết nối thất bại: {{message}}",
+	"usenet-validation-name": "Hãy nhập tên hồ sơ.",
+	"usenet-validation-host": "Hãy nhập máy chủ NNTP.",
+	"usenet-validation-port": "Cổng phải nằm trong khoảng từ 1 đến 65535.",
+	"usenet-validation-plain": "Hãy xác nhận cảnh báo NNTP thuần trước khi lưu.",
+	"usenet-validation-priority": "Độ ưu tiên phải lớn hơn hoặc bằng 0.",
+	"usenet-validation-connections":
+		"Số kết nối phải nằm trong khoảng từ 1 đến 128.",
+	"usenet-validation-credentials":
+		"Hãy nhập cả tên người dùng và mật khẩu, hoặc chọn xác thực ẩn danh.",
+	"usenet-validation-credential-status":
+		"Trạng thái thông tin đăng nhập không khả dụng. Hãy thử lại trước khi thay đổi hồ sơ này.",
+	"usenet-cleanup": "Dọn dẹp khi thành công",
+	"usenet-cleanup-tips":
+		"Việc dọn dẹp chỉ chạy sau khi ghép hoàn chỉnh và giải nén thành công.",
+	"usenet-cleanup-action": "Sau khi xác minh thành công",
+	"usenet-cleanup-keep": "Giữ tất cả đầu vào",
+	"usenet-cleanup-keep-tips": "Giữ lại các tệp PAR2 và mọi tập lưu trữ.",
+	"usenet-cleanup-par2": "Xóa các tệp PAR2",
+	"usenet-cleanup-par2-tips":
+		"Xóa các tệp khôi phục nhưng giữ lại các tập lưu trữ đã tải xuống.",
+	"usenet-cleanup-all": "Xóa PAR2 và các tập lưu trữ",
+	"usenet-cleanup-all-tips":
+		"Xóa các tệp khôi phục và các tập lưu trữ sau khi giải nén thành công.",
+	"usenet-archive-safety": "An toàn lưu trữ",
+	"usenet-limits-defaults":
+		"Các giới hạn áp dụng cho toàn tác vụ bảo vệ dung lượng lưu trữ và việc xử lý trong quá trình xác minh và giải nén.",
+	"usenet-desktop-limits": "Giới hạn trên máy tính",
+	"usenet-android-limits": "Giới hạn trên Android",
+	"usenet-limits-summary":
+		"{{entries}} mục · tổng dung lượng giải nén {{total}} · {{perEntry}} mỗi mục",
+	"usenet-limits-secondary-summary":
+		"tỷ lệ {{ratio}}:1 · {{depth}} cấp lồng nhau · dự trữ dung lượng trống {{reserve}} · {{hours}} giờ hoạt động",
+	"usenet-customize-limits": "Tùy chỉnh giới hạn",
+	"usenet-hide-limits": "Ẩn giới hạn",
+	"usenet-limits-adjusted": "Các giới hạn đã đồng bộ đã được điều chỉnh",
+	"usenet-limits-adjusted-tips":
+		"Một hoặc nhiều giá trị vượt quá mức trần cứng của nền tảng này và đã bị giảm.",
+	"usenet-max-entries": "Số mục tối đa",
+	"usenet-max-expanded": "Tổng dung lượng sau giải nén",
+	"usenet-max-entry": "Dung lượng mỗi mục",
+	"usenet-max-depth": "Độ sâu lồng nhau",
+	"usenet-max-ratio": "Tỷ lệ nén",
+	"usenet-free-space-reserve": "Dung lượng trống dự trữ",
+	"usenet-max-active-time": "Thời gian xử lý hoạt động",
+	"usenet-unit-entries": "mục",
+	"usenet-unit-levels": "cấp",
+	"usenet-unit-hours": "giờ",
+	"usenet-limits-hard-cap":
+		"Giá trị không được vượt quá bốn lần mặc định của nền tảng. Các ghi đè theo từng tác vụ vẫn được xác nhận riêng.",
+	"usenet-restore-limits": "Khôi phục mặc định của nền tảng",
+	"usenet-limits-restored":
+		"Đã khôi phục giới hạn lưu trữ về mặc định của nền tảng.",
 	save: "Lưu & Áp dụng",
 	"save-success-message": "Lưu cài đặt thành công",
 	"save-fail-message": "Lưu cài đặt thất bại",
 	discard: "Loại bỏ",
+	"history-directories": "Thư mục tải xuống gần đây",
+	"favorite-directory": "Thư mục yêu thích",
+	"unfavorite-directory": "Xóa thư mục khỏi yêu thích",
+	"remove-history-directory": "Xóa thư mục khỏi lịch sử",
 	startup: "Khởi động",
 	"open-at-login": "Mở khi đăng nhập",
 	"keep-window-state": "Giữ kích thước và vị trí của cửa sổ khi thoát",
 	"auto-resume-all": "Tự động tiếp tục tất cả các tác vụ chưa hoàn thành",
 	"default-dir": "Đường dẫn mặc định",
+	"file-category-dirs": "Đường dẫn theo danh mục",
+	"file-category-dirs-tips":
+		"Ghi đè đường dẫn tải xuống mặc định cho các loại tệp cụ thể. Để trống để dùng đường dẫn mặc định.",
+	"task-routing-rules": "Quy tắc định tuyến tác vụ",
+	"task-routing-rules-tips":
+		"Định tuyến tác vụ tới các thư mục dựa trên mẫu tên tệp. Quy tắc khớp đầu tiên được áp dụng.",
+	"task-routing-rule-pattern-placeholder": "Mẫu (ví dụ *.mkv)",
+	"task-routing-rule-label-placeholder": "Thẻ",
+	"task-routing-rule-dir-placeholder": "Thư mục",
+	"task-routing-rule-add": "Thêm quy tắc",
+	"file-category-music": "Nhạc",
+	"file-category-video": "Video",
+	"file-category-image": "Hình ảnh",
+	"file-category-document": "Tài liệu",
+	"file-category-compressed": "Tệp nén",
+	"file-category-program": "Chương trình",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Do các hạn chế cấp phép sandbox của App Store, thư mục tải xuống mặc định được khuyến nghị đặt tại ~/Downloads",
 	"transfer-settings": "Tốc độ truyền",
@@ -18,6 +159,12 @@ export default {
 	"transfer-speed-unlimited": "Không giới hạn",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "Lưu liên kết magnet dưới dạng tệp torrent",
+	"bt-create-subfolder": "Gom torrent nhiều tệp vào một thư mục con",
+	"bt-create-subfolder-tips":
+		"Khi bật, các bản tải xuống BitTorrent và magnet có nhiều tệp được đặt trong một thư mục mang tên torrent. Khi tắt, các tệp được ghi trực tiếp vào thư mục tải xuống.",
+	"bt-upload-rate-limit": "Giới hạn tải lên BitTorrent",
+	"bt-upload-rate-limit-tips":
+		"Giới hạn tốc độ tải lên BitTorrent, bổ sung cho giới hạn tải lên chung. 0 nghĩa là không có giới hạn riêng.",
 	"bt-auto-download-content": "Tự động tải xuống nam châm và nội dung torrent",
 	"bt-force-encryption": "Bắt BT mã hóa đầy đủ",
 	"keep-seeding": "Tiếp tục seed cho đến khi dừng lại theo cách thủ công",
@@ -26,15 +173,74 @@ export default {
 	"seed-time-unit": "phút",
 	"task-manage": "Quản lý Tác vụ",
 	"max-concurrent-downloads": "Số tác vụ đang hoạt động tối đa",
+	"connections-per-task": "Số kết nối mỗi tác vụ",
 	"max-connection-per-server": "Số kết nối tối đa trên mỗi máy chủ",
+	"auto-retry": "Tự động thử lại các tác vụ thất bại",
+	"auto-retry-strategy": "Chế độ khoảng thời gian thử lại",
+	"auto-retry-strategy-static": "Cố định",
+	"auto-retry-strategy-exponential": "Lùi theo cấp số nhân",
+	"auto-retry-interval": "Khoảng thời gian thử lại cơ sở",
+	"auto-retry-interval-unit": "giây",
+	"auto-retry-max-attempts": "Số lần thử lại tối đa (0 = không giới hạn)",
+	"worker-max-retries": "Số lần thử lại tối đa cho mỗi mảnh của worker",
+	"auto-detect-low-speed-tasks": "Tự động phát hiện tác vụ tốc độ thấp",
+	"auto-detect-low-speed-tasks-tips":
+		"Nếu một tác vụ đang chạy liên tục dưới ngưỡng tốc độ, tự động tạm dừng và khởi động lại nó.",
+	"low-speed-threshold": "Ngưỡng tốc độ thấp",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "Độ tin cậy HTTP / mạng",
+	"http-reliability-tips":
+		"Tinh chỉnh thời gian chờ kết nối và phát hiện truyền bị đình trệ cho các bản tải xuống HTTP/HTTPS/FTP.",
+	"connect-timeout": "Thời gian chờ kết nối",
+	"nzb-body-timeout": "Thời gian chờ nội dung NZB",
+	"lowest-speed-limit": "Giới hạn tốc độ thấp nhất",
+	"lowest-speed-limit-timeout": "Thời gian chờ đình trệ",
+	"lowest-speed-limit-help":
+		"Nếu một bản tải xuống liên tục dưới giới hạn tốc độ thấp nhất trong suốt thời gian chờ đình trệ, worker sẽ bị hủy và (nếu bật tự động thử lại) được khởi động lại. Đặt giới hạn bằng 0 để tắt.",
+	"uri-selector": "Chọn máy chủ gương",
+	"uri-selector-feedback": "Phản hồi (loại bỏ máy chủ gương chậm/lỗi)",
+	"uri-selector-inorder": "Theo thứ tự (thử máy chủ gương từ trái sang phải)",
+	"uri-selector-adaptive": "Thích ứng (ưu tiên nhanh nhất)",
+	"unit-seconds": "giây",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "Lưu trữ",
+	"storage-tips": "Cách engine dự trữ dung lượng đĩa trước khi tải xuống.",
+	"file-allocation": "Cấp phát tệp",
+	"file-allocation-falloc": "Cấp phát trước (falloc)",
+	"file-allocation-trunc": "Cắt ngắn (chỉ đặt độ dài)",
+	"file-allocation-none": "Không (tăng dần khi cần)",
+	"file-allocation-tips":
+		"Cấp phát trước sẽ dự trữ các khối đĩa thật ngay từ đầu để tránh lỗi ENOSPC giữa chừng và giảm phân mảnh. Quay về cắt ngắn trên các hệ thống tệp không hỗ trợ.",
 	"new-task-show-downloading": "Tự động hiển thị tải xuống sau khi thêm tác vụ",
 	"no-confirm-before-delete-task": "Không cần xác nhận trước khi xóa tác vụ",
+	"auto-file-renaming": "Tự động đổi tên tệp trùng",
+	"auto-file-renaming-tips":
+		'Khi đã có tệp cùng tên, lưu thành "file.1.ext" thay vì ghi đè lên nó',
+	"use-remote-file-time": "Dùng thời gian sửa đổi của tệp từ xa khi lưu",
+	"use-remote-file-time-tips":
+		"Đặt thời gian sửa đổi của tệp theo dấu thời gian từ máy chủ từ xa",
 	continue: "Tiếp tục",
 	"task-completed-notify": "Thông báo sau khi tải xuống hoàn tất",
+	"clipboard-watch": "Theo dõi bộ nhớ tạm để tìm liên kết tải xuống",
+	"clipboard-watch-tips":
+		"Khi bạn sao chép liên kết magnet hoặc liên kết tệp ở bất kỳ đâu, Risuko sẽ đề nghị tải xuống.",
+	"clipboard-watch-ext": "Phần mở rộng tệp được theo dõi",
+	"clipboard-watch-ext-tips":
+		"Chỉ các liên kết http(s) kết thúc bằng những phần mở rộng này mới kích hoạt lời nhắc. Liên kết magnet, ed2k và torrent luôn kích hoạt. Phân tách bằng dấu cách hoặc dấu phẩy.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"Risuko hiện theo dõi bộ nhớ tạm của bạn để tìm liên kết tải xuống. Tắt trong Cài đặt → Cơ bản.",
 	"prevent-sleep-while-downloading": "Ngăn hệ thống ngủ khi đang tải xuống",
 	"prevent-sleep-while-downloading-tips":
 		"Giữ máy tính luôn thức khi có tác vụ đang hoạt động",
+	"shutdown-when-complete": "Tắt máy tính khi tất cả tác vụ hoàn tất",
+	"shutdown-when-complete-tips":
+		"Một lần: tắt máy tính khi hàng đợi tải xuống trống",
+	"shutdown-countdown-title": "Tắt máy sau {{seconds}} giây…",
+	"shutdown-countdown-cancel": "Hủy",
+	"shutdown-failed": "Tắt máy thất bại. Hãy kiểm tra quyền.",
 	"auto-purge-record": "Tự động xoá hồ sơ tải xuống khi thoát khỏi ứng dụng",
+	"purge-record-on-start": "Xóa hồ sơ tải xuống khi ứng dụng khởi động",
 	ui: "UI",
 	appearance: "Giao diện",
 	"theme-auto": "Tự động",
@@ -66,7 +272,16 @@ export default {
 	"change-language": "Thay đổi Ngôn ngữ",
 	"hide-app-menu": "Ẩn thanh Menu (Chỉ Windows & Linux)",
 	proxy: "Proxy",
+	"proxy-http-profile": "Proxy HTTP / FTP / Usenet",
+	"proxy-p2p-profile": "Proxy P2P",
 	"enable-proxy": "Bật Proxy",
+	"enable-p2p-proxy": "Bật Proxy P2P",
+	"proxy-p2p-tcp-server": "Máy chủ proxy TCP",
+	"proxy-p2p-tcp-bypass": "Bỏ qua proxy TCP",
+	"proxy-p2p-udp-server": "Máy chủ proxy UDP",
+	"proxy-p2p-udp-server-placeholder":
+		"Không bắt buộc; để trống để dùng proxy P2P TCP",
+	"proxy-p2p-udp-bypass": "Bỏ qua proxy UDP",
 	"proxy-bypass-input-tips":
 		"Bỏ qua cài đặt proxy cho các Máy chủ và tên miền này, mỗi cái một dòng",
 	"proxy-scope-label": "Dùng cho",
@@ -77,20 +292,129 @@ export default {
 	"proxy-scope-update-trackers": "Cập nhật theo dõi",
 	"proxy-scope-update-trackers-desc":
 		"Lấy danh sách trình theo dõi BT qua proxy",
-	"proxy-tips": "Xem Proxy Thủ Công",
+	"proxy-tips": "Xem hướng dẫn Proxy",
+	"proxy-p2p-tips":
+		"Cần SOCKS5 hoặc SOCKS5H cho DHT, tracker UDP và uTP. Proxy HTTP chỉ được dùng cho các kết nối P2P TCP.",
+	"proxy-p2p-udp-tips":
+		"Để trống proxy UDP để dùng lại tuyến P2P TCP. Proxy UDP cần SOCKS5 hoặc SOCKS5H; proxy HTTP không thể truyền UDP.",
+	"proxy-p2p-restart-title": "Khởi động lại các bản tải xuống P2P?",
+	"proxy-p2p-restart-confirm":
+		"Thay đổi proxy P2P sẽ khởi động lại các bản tải xuống ngang hàng đang hoạt động. Các bản tải xuống HTTP, FTP và Usenet vẫn tiếp tục chạy.",
+	doh: "DNS over HTTPS",
+	"doh-tips":
+		"Phân giải tên máy chủ qua một điểm cuối DNS được mã hóa thay vì trình phân giải của hệ thống",
+	"doh-enable": "Bật DNS over HTTPS",
+	"doh-provider": "Nhà cung cấp",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "Tùy chỉnh",
+	"doh-url": "URL điểm cuối",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "Điểm cuối DoH phải bắt đầu bằng https://",
+	"doh-bootstrap": "IP khởi tạo",
+	"doh-bootstrap-placeholder":
+		"IP để truy cập điểm cuối, phân tách bằng dấu phẩy (không bắt buộc)",
+	"doh-fallback": "Quay về DNS hệ thống",
+	"doh-fallback-tips":
+		"Nếu truy vấn DoH thất bại, phân giải qua trình phân giải của hệ thống thay vì để bản tải xuống thất bại",
 	"bt-tracker": "Máy Chủ Tracker",
 	"bt-tracker-input-tips": "Máy chủ theo dõi, mỗi thông tin trên một dòng",
 	"bt-tracker-tips": "Khuyên dùng: ",
+	"bt-max-peers-per-torrent": "Số peer tối đa mỗi torrent",
+	"bt-max-peers-per-torrent-tips":
+		"Số kết nối peer đồng thời tối đa cho mỗi torrent. Giá trị cao hơn giúp tìm thấy nhiều peer hơn trong swarm (cần khởi động lại engine)",
+	"bt-max-outstanding-per-peer": "Số yêu cầu chờ xử lý tối đa mỗi peer",
+	"bt-max-outstanding-per-peer-tips":
+		"Số yêu cầu chunk đồng thời tối đa được xếp chồng tới mỗi peer (giới hạn, tối đa 500). 0 dùng mặc định thích ứng 6–500; ngân sách yêu cầu cho toàn torrent được chia sẻ giữa các peer đang hoạt động. Cần khởi động lại engine",
+	"bt-max-connections": "Số kết nối peer tối đa",
+	"bt-max-connections-tips":
+		"Tổng số kết nối peer trên tất cả torrent, từ 20 đến 5000. Giảm giá trị này không bao giờ ngắt các kết nối đang mở, chỉ chặn các kết nối mới. Trên Linux, macOS và Android, giá trị hiệu lực còn bị giới hạn ở một nửa giới hạn bộ mô tả tệp của hệ thống",
+	"bt-ban-corrupt-peers": "Cấm peer gửi dữ liệu hỏng",
+	"bt-ban-corrupt-peers-tips":
+		"Chặn một địa chỉ IP trong phần còn lại của phiên khi các mảnh mà nó góp phần gửi liên tục không qua được bước kiểm tra hash. Nhiều người dùng có thể dùng chung một IP (nhà mạng di động, mạng dùng chung), nên việc cấm có thể chặn nhầm cả những peer vô tội (cần khởi động lại engine)",
+	"bt-ban-corrupt-strikes": "Số mảnh lỗi trước khi cấm",
+	"bt-ban-corrupt-strikes-tips":
+		"Một địa chỉ IP được phép góp phần vào bao nhiêu mảnh lỗi trước khi bị cấm. Giá trị cao hơn chấp nhận được thỉnh thoảng có dữ liệu hỏng (cần khởi động lại engine)",
+	"bt-enable-upnp": "Chuyển tiếp cổng UPnP / NAT-PMP",
+	"bt-enable-upnp-tips":
+		"Tự động mở cổng lắng nghe BitTorrent trên router qua UPnP IGD, NAT-PMP hoặc PCP (cần khởi động lại engine)",
+	"bt-upnp-lease": "Thời hạn ánh xạ cổng (giây)",
+	"bt-upnp-lease-tips":
+		"Thời hạn của các ánh xạ cổng UPnP và NAT-PMP. Thời hạn ngắn hơn giúp phục hồi nhanh hơn sau các ánh xạ cũ (cần khởi động lại engine)",
+	"bt-enable-lsd": "Khám phá dịch vụ cục bộ",
+	"bt-enable-lsd-tips":
+		"Tìm peer trên mạng cục bộ qua multicast BEP-14 (cần khởi động lại engine)",
+	"bt-encryption-policy": "Mã hóa giao thức",
+	"bt-encryption-policy-tips":
+		"Chính sách MSE/PE cho các kết nối peer. 'Ưu tiên mã hóa' thử mã hóa trước rồi quay về văn bản thuần (cần khởi động lại engine)",
+	"bt-encryption-plaintext": "Chỉ văn bản thuần",
+	"bt-encryption-prefer": "Ưu tiên mã hóa",
+	"bt-encryption-require": "Bắt buộc mã hóa",
+	"bt-listen-v6": "Lắng nghe trên IPv6",
+	"bt-listen-v6-tips":
+		"Gắn thêm một trình lắng nghe TCP IPv6 trên cùng cổng (cần khởi động lại engine)",
 	"sync-tracker-tips": "Đồng bộ",
 	"auto-sync-tracker": "Tự động cập nhật danh sách tracker mỗi ngày",
+	"ed2k-server": "Máy chủ eDonkey",
+	"ed2k-server-input-tips": "Máy chủ eDonkey, mỗi dòng một máy chủ (ip:port)",
+	"ed2k-server-tips": "Sẽ dùng các máy chủ mặc định nếu để trống",
+	"ed2k-kad": "eMule Kad",
+	"ed2k-enable-kad": "Bật tìm kiếm nguồn qua Kad",
+	"ed2k-enable-kad-tips":
+		"Tìm nguồn ED2K qua mạng eMule Kad (cần khởi động lại engine)",
+	"ed2k-kad-port": "Cổng UDP Kad",
+	"ed2k-kad-port-tips":
+		"Cổng UDP dùng để tìm nguồn qua Kad. Giá trị hợp lệ là 1-65535 (cần khởi động lại engine)",
+	"ed2k-kad-port-invalid": "Cổng UDP Kad phải là số nguyên từ 1 đến 65535",
+	"listen-port-invalid":
+		"Cổng BT phải là một cổng từ 1 đến 65535, một dải như 6881-6889, hoặc danh sách các giá trị đó phân tách bằng dấu phẩy",
+	"dht-listen-port-invalid":
+		"Cổng DHT phải là một cổng từ 1 đến 65535, một dải như 6881-6889, hoặc danh sách các giá trị đó phân tách bằng dấu phẩy",
+	"ed2k-port-invalid": "Cổng ED2K phải là số nguyên từ 1 đến 65535",
+	"ed2k-enable-upload": "Chia sẻ tệp qua ED2K",
+	"ed2k-enable-upload-tips":
+		"Tải lên cho các peer khác các tệp đã hoàn tất và các phần đã xác minh của lượt tải ED2K đang chạy. Kad có thể vẫn liệt kê tệp bạn đã ngừng chia sẻ trong tối đa 5 giờ (cần khởi động lại engine)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"Thông tin đăng nhập mặc định cho các bản tải xuống FTP, FTPS và SFTP",
+	"ftp-username": "Tên người dùng FTP",
+	"ftp-password": "Mật khẩu FTP",
+	"sftp-private-key": "Đường dẫn khóa riêng SSH",
+	"sftp-private-key-content": "Nội dung khóa riêng SSH",
+	"sftp-private-key-tips":
+		"Đường dẫn tới tệp khóa riêng PEM, ví dụ ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips": "Dán nội dung khóa riêng PEM vào đây",
+	"sftp-key-passphrase": "Cụm mật khẩu của khóa",
+	"sftp-key-passphrase-tips": "Để trống nếu khóa không có cụm mật khẩu",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "Định dạng đầu ra",
+	"media-settings": "Trang phương tiện (yt-dlp)",
+	"media-settings-tips":
+		"Cài đặt mặc định cho các bản tải xuống từ trang phương tiện (YouTube, Vimeo, Bilibili và nhiều trang khác). Yêu cầu yt-dlp trong PATH; cần ffmpeg để ghép các luồng video và âm thanh riêng biệt.",
+	"media-format": "Định dạng ưu tiên",
+	"media-format-placeholder":
+		"ví dụ bestvideo+bestaudio/best (chuỗi định dạng yt-dlp)",
+	"media-format-tips":
+		"Bộ chọn định dạng yt-dlp. Để trống để có chất lượng tốt nhất. Ví dụ: bestvideo[height<=1080]+bestaudio/best, 137+140",
 	port: "Cổng giao tiếp cuối",
 	"bt-port": "Cổng giao tiếp BT cuối",
 	"dht-port": "Cổng giao tiếp DHT cuối",
+	"ed2k-port": "Cổng lắng nghe ed2k",
 	security: "Bảo mật",
 	rpc: "RPC",
+	"rpc-host": "Địa chỉ máy chủ",
+	"rpc-host-local": "Chỉ thiết bị này",
+	"rpc-host-all": "Mọi giao diện mạng",
+	"rpc-host-custom": "Tùy chỉnh ({{host}})",
+	"rpc-host-exposed-tips":
+		"Các thiết bị khác trong mạng của bạn có thể truy cập cổng RPC, và cổng PeerBanHelper khi nó được bật. Bất kỳ ai biết bí mật đều có thể thêm và điều khiển các bản tải xuống.",
 	"rpc-listen-port": "Cổng Nghe RPC",
 	"rpc-secret": "RPC bí mật",
-	"rpc-secret-tips": "Xem RPC bí mật thủ công",
+	"rpc-secret-tips": "Xem hướng dẫn về bí mật RPC",
+	"rpc-allow-any-dir": "Cho phép máy khách RPC dùng mọi đường dẫn cục bộ",
+	"rpc-allow-any-dir-tips":
+		"Khi tắt, các bản tải xuống được thêm qua RPC chỉ có thể được lưu trong thư mục tải xuống, các thư mục con của nó, cùng các thư mục danh mục và định tuyến của bạn; máy khách RPC cũng không thể khiến ứng dụng đọc tệp cookie, netrc hoặc khóa SSH.",
 	pbh: "PeerBanHelper",
 	"pbh-enable": "Bật API PeerBanHelper",
 	"pbh-enable-tips":
@@ -100,6 +424,9 @@ export default {
 	"generate-pbh-rpc-secret": "Tạo token mới",
 	"pbh-endpoint-hint":
 		"Trong PeerBanHelper, thêm trình tải Aria2Next trỏ tới http://127.0.0.1:{{port}}/jsonrpc",
+	"randomize-port": "Chọn cổng ngẫu nhiên",
+	"generate-rpc-secret": "Tạo bí mật RPC mới",
+	"copy-rpc-url": "Sao chép URL RPC",
 	"engine-overrides": "Ghi đè engine (JSON)",
 	"engine-overrides-placeholder":
 		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
@@ -107,33 +434,46 @@ export default {
 		"Nâng cao: đặt các khóa tùy chọn engine bất kỳ dưới dạng đối tượng JSON. Các thay đổi sẽ có hiệu lực sau khi khởi động lại.",
 	"engine-overrides-invalid":
 		"Ghi đè engine phải là một đối tượng JSON hợp lệ.",
-	"ed2k-kad": "eMule Kad",
-	"ed2k-enable-kad": "Bật tìm kiếm nguồn qua Kad",
-	"ed2k-enable-kad-tips":
-		"Tìm nguồn ED2K qua mạng eMule Kad (cần khởi động lại engine)",
-	"ed2k-kad-port": "Cổng UDP Kad",
-	"ed2k-kad-port-tips":
-		"Cổng UDP dùng để tìm nguồn qua Kad. Giá trị hợp lệ là 1-65535 (cần khởi động lại engine)",
-	"ed2k-kad-port-invalid": "Cổng UDP Kad phải là số nguyên từ 1 đến 65535",
-	"ed2k-enable-upload": "Chia sẻ tệp qua ED2K",
-	"ed2k-enable-upload-tips":
-		"Tải lên cho các peer khác các tệp đã hoàn tất và các phần đã xác minh của lượt tải ED2K đang chạy. Kad có thể vẫn liệt kê tệp bạn đã ngừng chia sẻ trong tối đa 5 giờ (cần khởi động lại engine)",
 	"engine-overrides-reserved-keys":
 		"Đã bỏ qua các khóa ghi đè engine dành riêng: {{keys}}",
 	"engine-overrides-too-large":
 		"Ghi đè engine quá lớn: tối đa 64 khóa, 64 ký tự cho mỗi khóa và 2048 ký tự cho mỗi giá trị.",
-	"external-engine-enable": "Sử dụng engine bên ngoài",
-	"external-engine-enable-tips":
-		"Khi bật, Risuko sẽ không tự động khởi động engine tích hợp.",
-	"external-engine-ip": "IP engine bên ngoài",
-	"external-engine-port": "Cổng engine bên ngoài",
-	"external-engine-secret": "Mã bí mật engine bên ngoài",
 	developer: "Lập trình viên",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Mock User-Agent",
+	cookies: "Cookie",
+	"cookies-tips":
+		"Tải cookie từ tệp cookies.txt định dạng Netscape/Mozilla (cũng chấp nhận đầu ra của curl/wget).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "Thông tin đăng nhập theo tên miền đã lưu",
+	"saved-cookies-tips":
+		"Cookie và User-Agent được nhập từ trình duyệt khi vượt qua Cloudflare hoặc các bản tải xuống khác có bảo vệ xác thực. Risuko dùng lại chúng cho các bản tải xuống mới trên cùng tên miền cho đến khi chúng hết hạn hoặc ngừng hoạt động.",
+	"saved-cookies-empty": "Chưa có thông tin đăng nhập nào được lưu.",
+	"saved-cookies-host": "Tên miền",
+	"saved-cookies-browser": "Trình duyệt",
+	"saved-cookies-count": "Cookie",
+	"saved-cookies-imported": "Đã nhập",
+	"saved-cookies-actions": "Thao tác",
+	"saved-cookies-clear": "Xóa tất cả",
+	"saved-cookies-confirm-clear":
+		"Xóa tất cả thông tin đăng nhập theo tên miền đã lưu? Các bản tải xuống sau này trên những trang đó có thể thất bại cho đến khi bạn nhập lại.",
+	"saved-cookies-delete": "Xóa",
+	netrc: "Thông tin đăng nhập .netrc",
+	"netrc-tips":
+		"Chèn xác thực HTTP Basic từ tệp .netrc khi URL không nhúng sẵn thông tin đăng nhập. Mặc định: ~/.netrc (hoặc %USERPROFILE%/_netrc trên Windows).",
+	"netrc-path-placeholder": "Ghi đè đường dẫn .netrc (không bắt buộc)",
+	"no-netrc": "Tắt tra cứu .netrc",
+	"no-netrc-tips":
+		"Bỏ qua hoàn toàn .netrc. Hữu ích khi tệp chứa thông tin đăng nhập không dành cho tải xuống.",
 	"app-log-path": "Đường dẫn nhật ký ứng dụng",
+	"log-dir-override-placeholder":
+		"Thư mục nhật ký tùy chỉnh (để trống để dùng mặc định)",
+	"log-dir-override-tips":
+		"Nhật ký hiện được ghi vào {{path}}. Đặt một thư mục tùy chỉnh (ví dụ trong Downloads) giúp mọi trình quản lý tệp đều thấy chúng. Thay đổi có hiệu lực sau lần khởi động lại ứng dụng tiếp theo.",
 	"download-session-path": "Đường dẫn phiên tải về",
 	"session-reset": "Đặt lại phiên tải xuống",
+	"session-reset-confirm":
+		"Bạn có chắc chắn muốn đặt lại phiên tải xuống không?",
 	"factory-reset": "Khôi phục cài đặt gốc",
 	"factory-reset-confirm": "Bạn có chắc chắn muốn khôi phục cài đặt gốc?",
 	"download-protocol": "Các giao thức",
@@ -141,6 +481,7 @@ export default {
 		"Đặt làm máy khách mặc định cho các giao thức sau",
 	"protocols-magnet": "Magnet [ magnet:// ]",
 	"protocols-thunder": "Thunder [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -157,9 +498,6 @@ export default {
 	"auto-update": "Tự động cập nhật",
 	"auto-check-update": "Tự động kiểm tra cập nhật",
 	"last-check-update-time": "Kiểm tra cập nhật lần cuối",
-	"not-saved": "Tùy chọn chưa được lưu",
-	"not-saved-confirm":
-		"Các tùy chọn đã sửa đổi sẽ bị mất, bạn có chắc chắn thoát không?",
 	"completion-script": "Script khi hoàn tất",
 	"completion-script-enabled": "Chạy script khi tải xuống hoàn tất",
 	"completion-script-tips":
@@ -177,10 +515,39 @@ export default {
 	"completion-script-test-ok": "Kiểm tra script thành công",
 	"completion-script-test-fail": "Kiểm tra script thất bại",
 	"completion-script-empty": "Vui lòng chỉ định lệnh trước",
-	"history-directories": "Thư mục tải xuống gần đây",
-	"favorite-directory": "Thư mục yêu thích",
-	"unfavorite-directory": "Xóa thư mục khỏi yêu thích",
-	"remove-history-directory": "Xóa thư mục khỏi lịch sử",
-	"randomize-port": "Chọn cổng ngẫu nhiên",
-	"generate-rpc-secret": "Tạo bí mật RPC mới",
+	"completion-script-not-approved":
+		"Script khi hoàn tất không được cho phép nên chưa lưu gì.",
+	"not-saved": "Tùy chọn chưa được lưu",
+	"not-saved-confirm":
+		"Các tùy chọn đã sửa đổi sẽ bị mất, bạn có chắc chắn thoát không?",
+	"saved-credentials": "Thông tin đăng nhập đã lưu",
+	"saved-credentials-description":
+		"Quản lý thông tin xác thực đã lưu cho các bản tải xuống",
+	"no-saved-credentials": "Chưa lưu thông tin đăng nhập nào",
+	"credential-host": "Máy chủ",
+	"credential-label": "Nhãn",
+	"credential-protocol": "Giao thức",
+	"credential-last-used": "Dùng gần nhất",
+	"credential-delete": "Xóa thông tin đăng nhập",
+	"credential-delete-confirm":
+		"Bạn có chắc chắn muốn xóa thông tin đăng nhập đã lưu này không?",
+	"vault-enabled": "Bí mật được lưu trong chuỗi khóa của hệ điều hành",
+	"vault-disabled":
+		"Chuỗi khóa của hệ điều hành không khả dụng — bí mật được lưu dưới dạng văn bản thuần",
+	"credential-encrypted-badge": "Lưu trong chuỗi khóa của hệ điều hành",
+	"credential-vault-unavailable":
+		"Không truy cập được chuỗi khóa của hệ điều hành; thông tin đăng nhập mới sẽ được lưu dưới dạng văn bản thuần",
+	"speed-limit-enabled": "Bật giới hạn tốc độ",
+	"speed-limit-enabled-description":
+		"Áp dụng các giới hạn bên dưới. Khi tắt, các bản tải xuống chạy hết tốc độ; các giá trị vẫn được giữ lại.",
+	"appearance-theme": "Chủ đề",
+	"appearance-typography": "Kiểu chữ",
+	"appearance-window": "Cửa sổ",
+	"task-list-style": "Danh sách tác vụ",
+	"task-list-style-description":
+		"Cách hiển thị các bản tải xuống trong danh sách tác vụ.",
+	"task-list-style-compact": "Thu gọn",
+	"task-list-style-card": "Thẻ",
+	"sidebar-collapsed": "Thu gọn thanh bên",
+	"sidebar-collapsed-description": "Chỉ hiển thị biểu tượng trong thanh bên.",
 };

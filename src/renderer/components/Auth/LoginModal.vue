@@ -42,8 +42,8 @@
       </div>
 
       <div v-else-if="step === 'otp'" class="flex flex-col gap-4">
-        <p class="text-sm text-muted-foreground">{{ $t('sync.login-code-sent') }}</p>
-        <div class="flex flex-col gap-2">
+        <p class="text-sm text-muted-foreground">{{ $t(linkOnly ? 'sync.login-link-only' : 'sync.login-code-sent') }}</p>
+        <div v-if="!linkOnly" class="flex flex-col gap-2">
           <label class="text-sm font-medium">{{ $t('sync.login-verify-code') }}</label>
           <Input
             v-model="code"
@@ -58,7 +58,7 @@
           <Button variant="outline" @click="goBack">
             {{ $t('sync.login-back') }}
           </Button>
-          <Button :disabled="loading" @click="verifyCode">
+          <Button v-if="!linkOnly" :disabled="loading" @click="verifyCode">
             {{ loading ? '...' : $t('sync.login-verify') }}
           </Button>
         </div>
@@ -104,6 +104,7 @@ export default defineComponent({
 		const step = ref<"email" | "otp">("email");
 		const transitionName = ref("slide-left");
 		const loading = ref(false);
+		const linkOnly = ref(false);
 		const error = ref("");
 
 		const sendCode = async () => {
@@ -114,7 +115,8 @@ export default defineComponent({
 			}
 			loading.value = true;
 			try {
-				await authStore.requestOTP(email.value);
+				const sent = await authStore.requestOTP(email.value);
+				linkOnly.value = sent.linkOnly;
 				transitionName.value = "slide-left";
 				step.value = "otp";
 			} catch (err) {
@@ -162,6 +164,7 @@ export default defineComponent({
 			code.value = "";
 			step.value = "email";
 			transitionName.value = "slide-left";
+			linkOnly.value = false;
 			error.value = "";
 		};
 
@@ -189,7 +192,9 @@ export default defineComponent({
 			() => authStore.serverConfig?.email !== false,
 		);
 		const githubEnabled = computed(
-			() => authStore.serverConfig?.github === true,
+			() =>
+				authStore.serverConfig?.github === true &&
+				authStore.serverConfig.loginHandoff,
 		);
 
 		return {
@@ -198,6 +203,7 @@ export default defineComponent({
 			step,
 			transitionName,
 			loading,
+			linkOnly,
 			error,
 			emailEnabled,
 			githubEnabled,

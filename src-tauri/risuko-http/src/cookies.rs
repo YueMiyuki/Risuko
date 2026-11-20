@@ -1,7 +1,8 @@
 use std::io::{BufRead, BufReader, Read};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use http::HeaderValue;
+use publicsuffix::Psl;
 use url::Url;
 
 pub trait CookieStore: Send + Sync {
@@ -125,6 +126,12 @@ impl CookieStore for Jar {
             let Ok(parsed) = cookie::Cookie::parse(s) else {
                 continue;
             };
+            if parsed
+                .domain()
+                .is_some_and(|domain| spans_unrelated_sites(domain, url))
+            {
+                continue;
+            }
             let _ = store.insert_raw(&parsed, url);
         }
     }
@@ -144,6 +151,26 @@ impl CookieStore for Jar {
     }
 }
 
+static PUBLIC_SUFFIXES: LazyLock<Option<publicsuffix::List>> =
+    LazyLock::new(|| include_str!("../data/public_suffix_list.dat").parse().ok());
+
+fn spans_unrelated_sites(domain: &str, url: &Url) -> bool {
+    let domain = domain.trim_matches('.').to_ascii_lowercase();
+    if url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(&domain))
+    {
+        return false;
+    }
+    if !domain.contains('.') {
+        return true;
+    }
+    PUBLIC_SUFFIXES.as_ref().is_some_and(|list| {
+        list.suffix(domain.as_bytes())
+            .is_some_and(|suffix| suffix.is_known() && suffix.as_bytes() == domain.as_bytes())
+    })
+}
+
 pub(crate) type SharedJar = Arc<dyn CookieStore>;
 
 #[cfg(test)]
@@ -157,6 +184,50 @@ mod tests {
         jar.add_cookie_str("session=abc; Path=/; Domain=example.com", &url);
         let header = CookieStore::cookies(&jar, &url).expect("cookie should match");
         assert_eq!(header.to_str().unwrap(), "session=abc");
+    }
+
+    #[test]
+    fn response_cookies_cannot_claim_a_whole_registry() {
+        let jar = Jar::new();
+        let origin = Url::parse("https://a.example.com/").unwrap();
+        let set = |value: &'static str, url: &Url| {
+            let header = HeaderValue::from_static(value);
+            CookieStore::set_cookies(&jar, &mut std::iter::once(&header), url);
+        };
+        set("wide=1; Domain=com", &origin);
+        set("ok=1; Domain=example.com", &origin);
+        let other = Url::parse("https://victim.com/").unwrap();
+        assert!(CookieStore::cookies(&jar, &other).is_none());
+        let sibling = Url::parse("https://b.example.com/").unwrap();
+        assert_eq!(CookieStore::cookies(&jar, &sibling).unwrap(), "ok=1");
+
+        let uk = Url::parse("https://shop.co.uk/").unwrap();
+        set("wide=1; Domain=co.uk", &uk);
+        assert!(CookieStore::cookies(&jar, &Url::parse("https://bank.co.uk/").unwrap()).is_none());
+
+        let local = Url::parse("http://localhost/").unwrap();
+        set("dev=1; Domain=localhost", &local);
+        assert_eq!(CookieStore::cookies(&jar, &local).unwrap(), "dev=1");
+    }
+
+    #[test]
+    fn the_bundled_suffix_list_covers_shared_hosting_and_wildcard_rules() {
+        assert!(PUBLIC_SUFFIXES.is_some());
+        let page = Url::parse("https://mallory.github.io/").unwrap();
+        for domain in ["github.io", "co.uk", "pvt.k12.ma.us", "anything.ck", "COM."] {
+            assert!(spans_unrelated_sites(domain, &page), "{domain}");
+        }
+        for domain in [
+            "mallory.github.io",
+            "example.co.uk",
+            "www.ck",
+            "example.com",
+        ] {
+            assert!(!spans_unrelated_sites(domain, &page), "{domain}");
+        }
+        let apex = Url::parse("https://github.io/").unwrap();
+        assert!(!spans_unrelated_sites("github.io", &apex));
+        assert!(spans_unrelated_sites("intranet", &page));
     }
 
     #[test]

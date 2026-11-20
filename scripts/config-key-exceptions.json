@@ -1,0 +1,3 @@
+{
+	"rpc-secret-initialized": "Internal marker the engine sets once it has ensured an RPC secret exists (config/mod.rs ensure_rpc_secret), never edited in the window."
+}

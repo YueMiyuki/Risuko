@@ -1,6 +1,7 @@
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { walkFiles } from "./walk-files.mjs";
 
 const SEMVER =
 	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -39,16 +40,9 @@ function updateJson(path, version, changes) {
 }
 
 function packageJsonsUnder(dir) {
-	const found = [];
-	for (const entry of readdirSync(dir)) {
-		const full = join(dir, entry);
-		if (entry === "package.json") {
-			found.push(full);
-		} else if (entry !== "node_modules" && statSync(full).isDirectory()) {
-			found.push(...packageJsonsUnder(full));
-		}
-	}
-	return found;
+	return walkFiles(dir, { skipDirs: ["node_modules"] }).filter(
+		(path) => basename(path) === "package.json",
+	);
 }
 
 function replaceOnce(path, pattern, replacement, changes) {

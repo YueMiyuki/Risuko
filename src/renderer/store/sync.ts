@@ -13,6 +13,26 @@ import {
 } from "@shared/types/usenet";
 import { changeKeysToKebabCase, getApiErrorMessage } from "@shared/utils";
 import logger from "@shared/utils/logger";
+import {
+	conflictKeys,
+	dirtyProfileIds,
+	isAuthFailure,
+	mergeProfiles,
+	mergeSyncConflict,
+	nextPushDelayMs,
+	PUSH_DELAY_MS,
+	planCategorySync,
+	remainingDirtyKeys,
+	sameSyncData,
+	USENET_PROFILES_KEY,
+} from "@shared/utils/syncConflict";
+import { pickDeclaredKeys } from "@shared/utils/syncFilter";
+import {
+	keepLocalSyncSecrets,
+	RETIRED_SYNC_CATEGORIES,
+	remoteNeedsScrub,
+	withoutSyncSecrets,
+} from "@shared/utils/syncSecrets";
 import axios from "axios";
 import { defineStore } from "pinia";
 import api from "@/api";
@@ -29,51 +49,68 @@ interface SyncState {
 }
 
 let pushTimer: ReturnType<typeof setTimeout> | null = null;
+let pushRetryAttempt = 0;
+let syncGeneration = 0;
 const pendingCategories = new Set<string>();
 const STATS_CATEGORY = "stats";
+const MAX_PUSH_ATTEMPTS = 3;
+const scrubbedRevs = new Map<string, number>();
+const purgedRetired = new Set<string>();
+
+interface SyncedMark {
+	timestamp: number;
+	rev?: number;
+	pushedKeys?: readonly string[] | null;
+	pulledKeys?: readonly string[] | null;
+}
+
+interface PushConflict {
+	rev: number;
+	data: Record<string, unknown> | null;
+}
+
+function pushConflict(err: unknown): PushConflict | null {
+	const response = (
+		err as { response?: { status?: number; data?: Partial<PushConflict> } }
+	).response;
+	if (response?.status !== 409 || typeof response.data?.rev !== "number") {
+		return null;
+	}
+	return { rev: response.data.rev, data: response.data.data ?? null };
+}
+
+function responseStatus(err: unknown): unknown {
+	return (err as { response?: { status?: unknown } } | null)?.response?.status;
+}
+
+function assertSyncGeneration(generation: number): void {
+	if (generation !== syncGeneration) {
+		throw new Error("Sync was reset");
+	}
+}
 
 const shouldApplyCategoryData = (categoryId: string): boolean =>
 	categoryId === STATS_CATEGORY ||
 	categoryId === "usenet" ||
-	categoryId === "network";
+	categoryId === "network" ||
+	categoryId === "engine" ||
+	categoryId === "tracker";
 
-function mergeUsenetProfiles(
-	localValue: unknown,
-	remoteValue: unknown,
-): unknown[] {
-	const local = Array.isArray(localValue) ? localValue : [];
-	const remote = Array.isArray(remoteValue) ? remoteValue : [];
-	const byId = new Map<string, Record<string, unknown>>();
-	for (const value of [...local, ...remote]) {
-		if (!value || typeof value !== "object" || Array.isArray(value)) {
-			continue;
-		}
-		const profile = value as Record<string, unknown>;
-		const id = typeof profile.id === "string" ? profile.id : "";
-		if (!id) {
-			continue;
-		}
-		const previous = byId.get(id);
-		const currentAt =
-			typeof profile.updatedAt === "number" &&
-			Number.isFinite(profile.updatedAt)
-				? profile.updatedAt
-				: 0;
-		const previousAt =
-			typeof previous?.updatedAt === "number" &&
-			Number.isFinite(previous.updatedAt)
-				? previous.updatedAt
-				: 0;
-		if (!previous || currentAt > previousAt) {
-			byId.set(id, { ...profile });
-		}
+function declaredCategoryData(
+	categoryId: string,
+	data: Record<string, unknown>,
+): Record<string, unknown> {
+	if (categoryId === STATS_CATEGORY) {
+		return data;
 	}
-	return [...byId.values()];
+	const category = syncCategories.find((c) => c.id === categoryId);
+	return pickDeclaredKeys(category?.keys ?? [], data);
 }
 
 function mergeUsenetCategory(
 	localData: Record<string, unknown>,
 	remoteData: Record<string, unknown>,
+	dirtyIds: ReadonlySet<string> | null,
 ): Record<string, unknown> {
 	const defaults: Record<string, number> = is.android()
 		? { ...ANDROID_USENET_ARCHIVE_LIMITS }
@@ -102,9 +139,10 @@ function mergeUsenetCategory(
 	}
 	return {
 		...remoteData,
-		"usenet-profiles": mergeUsenetProfiles(
-			localData["usenet-profiles"],
-			remoteData["usenet-profiles"],
+		[USENET_PROFILES_KEY]: mergeProfiles(
+			localData[USENET_PROFILES_KEY],
+			remoteData[USENET_PROFILES_KEY],
+			dirtyIds,
 		),
 		"usenet-limits-adjusted":
 			adjusted || remoteData["usenet-limits-adjusted"] === true,
@@ -137,14 +175,9 @@ export const useSyncStore = defineStore("sync", {
 			);
 		},
 
-		async extractCategoryData(
-			categoryId: string,
-		): Promise<Record<string, unknown>> {
+		localCategoryData(categoryId: string): Record<string, unknown> {
 			if (categoryId === STATS_CATEGORY) {
-				return (await api.exportDownloadStats()) as unknown as Record<
-					string,
-					unknown
-				>;
+				return {};
 			}
 
 			const cat = syncCategories.find((c) => c.id === categoryId);
@@ -166,6 +199,18 @@ export const useSyncStore = defineStore("sync", {
 			return data;
 		},
 
+		async extractCategoryData(
+			categoryId: string,
+		): Promise<Record<string, unknown>> {
+			if (categoryId === STATS_CATEGORY) {
+				return (await api.exportDownloadStats()) as unknown as Record<
+					string,
+					unknown
+				>;
+			}
+			return withoutSyncSecrets(categoryId, this.localCategoryData(categoryId));
+		},
+
 		async applyCategoryData(
 			categoryId: string,
 			data: Record<string, unknown>,
@@ -174,9 +219,24 @@ export const useSyncStore = defineStore("sync", {
 				await api.mergeDownloadStats(data);
 				return;
 			}
+			if (
+				categoryId === "network" ||
+				categoryId === "engine" ||
+				categoryId === "tracker"
+			) {
+				data = keepLocalSyncSecrets(
+					categoryId,
+					this.localCategoryData(categoryId),
+					data,
+				);
+			}
 			if (categoryId === "usenet") {
 				const localData = await this.extractCategoryData(categoryId);
-				data = mergeUsenetCategory(localData, data);
+				data = mergeUsenetCategory(
+					localData,
+					data,
+					dirtyProfileIds(this.getDirtyKeys(categoryId)),
+				);
 			}
 			if (categoryId === "network") {
 				data = normalizeNetworkCategory(data);
@@ -190,6 +250,21 @@ export const useSyncStore = defineStore("sync", {
 				| Record<string, number>
 				| undefined;
 			return timestamps?.[categoryId];
+		},
+
+		getCategoryRev(categoryId: string): number {
+			return (
+				usePreferenceStore().config.cloudSyncCategoryRevs?.[categoryId] ?? 0
+			);
+		},
+
+		getDirtyKeys(categoryId: string): readonly string[] | null {
+			if (categoryId === STATS_CATEGORY) {
+				return null;
+			}
+			return (
+				usePreferenceStore().config.cloudSyncDirtyKeys?.[categoryId] ?? null
+			);
 		},
 
 		async setCategoryTimestamp(
@@ -207,23 +282,91 @@ export const useSyncStore = defineStore("sync", {
 			);
 		},
 
-		async pushCategory(categoryId: string): Promise<number | undefined> {
+		async markSynced(marks: Record<string, SyncedMark>): Promise<void> {
+			if (Object.keys(marks).length === 0) {
+				return;
+			}
+			const preferenceStore = usePreferenceStore();
+			const timestamps = {
+				...preferenceStore.config.cloudSyncCategoryTimestamps,
+			};
+			const revs = { ...preferenceStore.config.cloudSyncCategoryRevs };
+			const dirty = { ...preferenceStore.config.cloudSyncDirtyKeys };
+			for (const [categoryId, mark] of Object.entries(marks)) {
+				timestamps[categoryId] = mark.timestamp;
+				if (typeof mark.rev === "number") {
+					revs[categoryId] = mark.rev;
+				}
+				dirty[categoryId] = remainingDirtyKeys(dirty[categoryId] ?? [], mark);
+			}
+			await preferenceStore.save(
+				{
+					cloudSyncCategoryTimestamps: timestamps,
+					cloudSyncCategoryRevs: revs,
+					cloudSyncDirtyKeys: dirty,
+				},
+				{ skipSync: true },
+			);
+		},
+
+		async pushCategory(
+			categoryId: string,
+			baseRev = this.getCategoryRev(categoryId),
+		): Promise<void> {
 			const authStore = useAuthStore();
 			if (!authStore.isLoggedIn || !authStore.token) {
 				return;
 			}
 
-			const data = await this.extractCategoryData(categoryId);
-			if (Object.keys(data).length === 0) {
-				return;
+			const generation = syncGeneration;
+			const dirtyKeys = this.getDirtyKeys(categoryId);
+			for (let attempt = 0; attempt < MAX_PUSH_ATTEMPTS; attempt += 1) {
+				const data = await this.extractCategoryData(categoryId);
+				if (Object.keys(data).length === 0 || generation !== syncGeneration) {
+					return;
+				}
+				try {
+					const { data: resp } = await axios.put(
+						`${authStore.serverUrl}/settings`,
+						{ category: categoryId, data, baseRev },
+						{ headers: authStore.getAuthHeaders() },
+					);
+					if (generation !== syncGeneration) {
+						return;
+					}
+					await this.markSynced({
+						[categoryId]: {
+							timestamp: resp.updatedAt as number,
+							rev: resp.rev as number | undefined,
+							pushedKeys: dirtyKeys,
+						},
+					});
+					return;
+				} catch (err) {
+					const conflict = pushConflict(err);
+					if (!conflict) {
+						throw err;
+					}
+					if (generation !== syncGeneration) {
+						return;
+					}
+					if (conflict.data) {
+						const remoteData = declaredCategoryData(categoryId, conflict.data);
+						await this.applyCategoryData(
+							categoryId,
+							categoryId === STATS_CATEGORY
+								? remoteData
+								: mergeSyncConflict(
+										data,
+										remoteData,
+										conflictKeys(categoryId, data, dirtyKeys),
+									),
+						);
+					}
+					baseRev = conflict.rev;
+				}
 			}
-
-			const { data: resp } = await axios.put(
-				`${authStore.serverUrl}/settings`,
-				{ category: categoryId, data },
-				{ headers: authStore.getAuthHeaders() },
-			);
-			return resp.updatedAt as number;
+			throw new Error("Settings kept changing on another device");
 		},
 
 		async pullAll(): Promise<void> {
@@ -232,6 +375,7 @@ export const useSyncStore = defineStore("sync", {
 				throw new Error("Not logged in");
 			}
 
+			const generation = syncGeneration;
 			this.syncing = true;
 			try {
 				const { data } = await axios.get(`${authStore.serverUrl}/settings`, {
@@ -242,13 +386,18 @@ export const useSyncStore = defineStore("sync", {
 				const selectedCategories = this.getSelectedCategories();
 				const settings = data.settings || {};
 				const timestamps = data.timestamps || {};
+				const revs = data.revs || {};
 				const merged: Record<string, unknown> = {};
-				const pulledTimestamps: Record<string, number> = {};
+				const pulled: Record<string, SyncedMark> = {};
 
 				for (const categoryId of selectedCategories) {
-					const remoteData = settings[categoryId] as
+					assertSyncGeneration(generation);
+					const rawRemoteData = settings[categoryId] as
 						| Record<string, unknown>
 						| undefined;
+					const remoteData = rawRemoteData
+						? declaredCategoryData(categoryId, rawRemoteData)
+						: undefined;
 					if (remoteData) {
 						if (shouldApplyCategoryData(categoryId)) {
 							await this.applyCategoryData(categoryId, remoteData);
@@ -256,19 +405,24 @@ export const useSyncStore = defineStore("sync", {
 							Object.assign(merged, remoteData);
 						}
 						if (timestamps[categoryId]) {
-							pulledTimestamps[categoryId] = timestamps[categoryId] as number;
+							pulled[categoryId] = {
+								timestamp: timestamps[categoryId] as number,
+								rev: revs[categoryId] as number | undefined,
+								pulledKeys: Object.keys(remoteData),
+							};
 						}
 					}
 				}
 
+				assertSyncGeneration(generation);
 				if (Object.keys(merged).length > 0) {
 					await preferenceStore.save(merged, { skipSync: true });
 				}
 
-				for (const [cat, ts] of Object.entries(pulledTimestamps)) {
-					await this.setCategoryTimestamp(cat, ts);
-				}
+				assertSyncGeneration(generation);
+				await this.markSynced(pulled);
 
+				assertSyncGeneration(generation);
 				this.lastSyncAt = Date.now();
 				await preferenceStore.save({ cloudSyncLastAt: this.lastSyncAt });
 				logger.info("[Risuko] sync pullAll done");
@@ -287,6 +441,7 @@ export const useSyncStore = defineStore("sync", {
 				throw new Error("Not logged in");
 			}
 
+			const generation = syncGeneration;
 			this.syncing = true;
 			try {
 				const { data } = await axios.get(`${authStore.serverUrl}/settings`, {
@@ -297,79 +452,154 @@ export const useSyncStore = defineStore("sync", {
 				const selectedCategories = this.getSelectedCategories();
 				const remoteSettings = data.settings || {};
 				const remoteTimestamps = data.timestamps || {};
+				const remoteRevs = data.revs || {};
 
 				const toPull: Record<string, unknown> = {};
-				const toPullTimestamps: Record<string, number> = {};
+				const pulled: Record<string, SyncedMark> = {};
+				const toScrub: string[] = [];
 
 				for (const categoryId of selectedCategories) {
-					const localTimestamp = this.getCategoryTimestamp(categoryId);
 					const remoteTimestamp = remoteTimestamps[categoryId] as
 						| number
 						| undefined;
+					const remoteRev = remoteRevs[categoryId] as number | undefined;
 					const localData = await this.extractCategoryData(categoryId);
-					const remoteData = remoteSettings[categoryId] as
+					assertSyncGeneration(generation);
+					const rawRemoteData = remoteSettings[categoryId] as
 						| Record<string, unknown>
 						| undefined;
-					const hasLocal = Object.keys(localData).length > 0;
-					const hasRemote = remoteTimestamp !== undefined;
-
-					if (!hasLocal && !hasRemote) {
+					const remoteData = rawRemoteData
+						? declaredCategoryData(categoryId, rawRemoteData)
+						: undefined;
+					const scrubbedAt = scrubbedRevs.get(categoryId);
+					const alreadyScrubbed =
+						scrubbedAt !== undefined && scrubbedAt === (remoteRev ?? 0);
+					const needsScrub =
+						categoryId !== STATS_CATEGORY &&
+						!!rawRemoteData &&
+						!!remoteData &&
+						!alreadyScrubbed &&
+						remoteNeedsScrub(categoryId, remoteData, rawRemoteData);
+					if (
+						categoryId === STATS_CATEGORY &&
+						remoteData &&
+						remoteTimestamp !== undefined &&
+						Object.keys(localData).length > 0
+					) {
+						await this.applyCategoryData(categoryId, remoteData);
+						const merged = await this.extractCategoryData(categoryId);
+						if (sameSyncData(merged, remoteData)) {
+							pulled[categoryId] = {
+								timestamp: remoteTimestamp,
+								rev: remoteRev,
+							};
+						} else {
+							assertSyncGeneration(generation);
+							await this.pushCategory(categoryId, remoteRev ?? 0);
+						}
 						continue;
 					}
+					const dirtyKeys = this.getDirtyKeys(categoryId);
+					const step = planCategorySync(
+						{
+							hasData: Object.keys(localData).length > 0,
+							timestamp: this.getCategoryTimestamp(categoryId),
+							rev: this.getCategoryRev(categoryId),
+						},
+						{
+							hasData: !!remoteData,
+							timestamp: remoteTimestamp,
+							rev: remoteRev,
+						},
+						dirtyKeys,
+					);
+					if (needsScrub && (step === "skip" || step === "pull")) {
+						toScrub.push(categoryId);
+					}
 
-					if (!hasLocal && hasRemote && remoteData) {
+					if (step === "pull" && remoteData && remoteTimestamp !== undefined) {
 						if (shouldApplyCategoryData(categoryId)) {
 							await this.applyCategoryData(categoryId, remoteData);
 						} else {
 							Object.assign(toPull, remoteData);
 						}
-						toPullTimestamps[categoryId] = remoteTimestamp;
-						continue;
-					}
-
-					if (hasLocal && !hasRemote) {
-						const updatedAt = await this.pushCategory(categoryId);
-						if (updatedAt) {
-							await this.setCategoryTimestamp(categoryId, updatedAt);
+						pulled[categoryId] = {
+							timestamp: remoteTimestamp,
+							rev: remoteRev,
+							pulledKeys: Object.keys(remoteData),
+						};
+					} else if (step === "push" || step === "merge") {
+						if (step === "merge" && remoteData) {
+							await this.applyCategoryData(
+								categoryId,
+								categoryId === STATS_CATEGORY
+									? remoteData
+									: mergeSyncConflict(
+											localData,
+											remoteData,
+											conflictKeys(categoryId, localData, dirtyKeys),
+										),
+							);
 						}
-						continue;
-					}
-
-					if (localTimestamp === undefined && hasRemote && remoteData) {
-						if (shouldApplyCategoryData(categoryId)) {
-							await this.applyCategoryData(categoryId, remoteData);
-						} else {
-							Object.assign(toPull, remoteData);
-						}
-						toPullTimestamps[categoryId] = remoteTimestamp;
-						continue;
-					}
-
-					if (localTimestamp && remoteTimestamp) {
-						if (localTimestamp > remoteTimestamp) {
-							const updatedAt = await this.pushCategory(categoryId);
-							if (updatedAt) {
-								await this.setCategoryTimestamp(categoryId, updatedAt);
-							}
-						} else if (remoteTimestamp > localTimestamp && remoteData) {
-							if (shouldApplyCategoryData(categoryId)) {
-								await this.applyCategoryData(categoryId, remoteData);
-							} else {
-								Object.assign(toPull, remoteData);
-							}
-							toPullTimestamps[categoryId] = remoteTimestamp;
-						}
+						assertSyncGeneration(generation);
+						await this.pushCategory(categoryId, remoteRev ?? 0);
 					}
 				}
 
+				assertSyncGeneration(generation);
 				if (Object.keys(toPull).length > 0) {
 					await preferenceStore.save(toPull, { skipSync: true });
 				}
 
-				for (const [cat, ts] of Object.entries(toPullTimestamps)) {
-					await this.setCategoryTimestamp(cat, ts);
+				assertSyncGeneration(generation);
+				await this.markSynced(pulled);
+
+				for (const categoryId of toScrub) {
+					assertSyncGeneration(generation);
+					try {
+						await this.pushCategory(categoryId);
+						scrubbedRevs.set(categoryId, this.getCategoryRev(categoryId));
+					} catch (err) {
+						logger.warn(
+							"[Risuko] sync scrub failed:",
+							categoryId,
+							(err as Error).message,
+						);
+					}
 				}
 
+				for (const categoryId of RETIRED_SYNC_CATEGORIES) {
+					const stale = remoteSettings[categoryId];
+					if (
+						purgedRetired.has(categoryId) ||
+						!stale ||
+						typeof stale !== "object" ||
+						Object.keys(stale).length === 0
+					) {
+						continue;
+					}
+					assertSyncGeneration(generation);
+					purgedRetired.add(categoryId);
+					try {
+						await axios.put(
+							`${authStore.serverUrl}/settings`,
+							{
+								category: categoryId,
+								data: {},
+								baseRev: (remoteRevs[categoryId] as number | undefined) ?? 0,
+							},
+							{ headers: authStore.getAuthHeaders() },
+						);
+					} catch (err) {
+						logger.warn(
+							"[Risuko] sync purge failed:",
+							categoryId,
+							(err as Error).message,
+						);
+					}
+				}
+
+				assertSyncGeneration(generation);
 				this.lastSyncAt = Date.now();
 				await preferenceStore.save({ cloudSyncLastAt: this.lastSyncAt });
 				logger.info("[Risuko] sync bidirectional done");
@@ -406,6 +636,12 @@ export const useSyncStore = defineStore("sync", {
 		},
 
 		async markCategoryChanged(categoryId: string): Promise<void> {
+			if (
+				!this.isAutoSyncEnabled() ||
+				!this.getSelectedCategories().includes(categoryId)
+			) {
+				return;
+			}
 			await this.setCategoryTimestamp(
 				categoryId,
 				Math.floor(Date.now() / 1000),
@@ -428,7 +664,7 @@ export const useSyncStore = defineStore("sync", {
 			}
 		},
 
-		schedulePendingPush(): void {
+		schedulePendingPush(delayMs = PUSH_DELAY_MS): void {
 			if (pendingCategories.size === 0) {
 				return;
 			}
@@ -439,21 +675,70 @@ export const useSyncStore = defineStore("sync", {
 
 			pushTimer = setTimeout(async () => {
 				pushTimer = null;
+				if (!this.isAutoSyncEnabled()) {
+					pendingCategories.clear();
+					pushRetryAttempt = 0;
+					return;
+				}
+				const generation = syncGeneration;
 				const categories = [...pendingCategories];
 				pendingCategories.clear();
-				try {
-					for (const categoryId of categories) {
-						const updatedAt = await this.pushCategory(categoryId);
-						if (updatedAt) {
-							await this.setCategoryTimestamp(categoryId, updatedAt);
+				const failed: string[] = [];
+				const retry: string[] = [];
+				let firstError: Error | null = null;
+				for (const categoryId of categories) {
+					if (generation !== syncGeneration) {
+						break;
+					}
+					try {
+						await this.pushCategory(categoryId);
+					} catch (err) {
+						failed.push(categoryId);
+						firstError ??= err as Error;
+						if (!isAuthFailure(responseStatus(err))) {
+							retry.push(categoryId);
 						}
 					}
+				}
+				if (generation !== syncGeneration) {
+					return;
+				}
+				if (failed.length > 0) {
+					logger.warn("[Risuko] syncOnChange failed:", firstError?.message);
+					if (retry.length === 0) {
+						return;
+					}
+					const queued = [...pendingCategories];
+					for (const categoryId of retry) {
+						pendingCategories.add(categoryId);
+					}
+					pushRetryAttempt += 1;
+					this.schedulePendingPush(
+						nextPushDelayMs(failed, queued, pushRetryAttempt),
+					);
+					return;
+				}
+				pushRetryAttempt = 0;
+				try {
 					this.lastSyncAt = Date.now();
 					await api.savePreference({ cloudSyncLastAt: this.lastSyncAt });
 				} catch (err) {
 					logger.warn("[Risuko] syncOnChange failed:", (err as Error).message);
 				}
-			}, 500);
+			}, delayMs);
+		},
+
+		resetLocalState(): void {
+			syncGeneration += 1;
+			pendingCategories.clear();
+			if (pushTimer) {
+				clearTimeout(pushTimer);
+				pushTimer = null;
+			}
+			pushRetryAttempt = 0;
+			this.lastSyncAt = null;
+			scrubbedRevs.clear();
+			purgedRetired.clear();
 		},
 	},
 });

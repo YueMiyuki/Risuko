@@ -467,20 +467,10 @@ impl TorrentEngine {
         data: &[u8],
         options: &Map<String, Value>,
     ) -> Result<TorrentHandle, String> {
-        self.add_torrent_bytes_with_peers(data, options, Vec::new())
-            .await
-    }
-
-    pub async fn add_torrent_bytes_with_peers(
-        &self,
-        data: &[u8],
-        options: &Map<String, Value>,
-        initial_peers: Vec<std::net::SocketAddr>,
-    ) -> Result<TorrentHandle, String> {
         self.add_torrent_bytes_with_peer_sources(
             data,
             options,
-            initial_peers,
+            Vec::new(),
             Vec::new(),
             None,
             Vec::new(),
@@ -582,28 +572,13 @@ impl TorrentEngine {
         Ok(handle)
     }
 
-    pub async fn resolve_and_add_magnet(
-        &self,
-        magnet_uri: &str,
-        options: &Map<String, Value>,
-        timeout_secs: u64,
-    ) -> Result<TorrentHandle, String> {
-        let (_, cancellation) = self.magnet_cache.route_snapshot().await;
-        self.resolve_and_add_magnet_with_cancellation(
-            magnet_uri,
-            options,
-            timeout_secs,
-            cancellation,
-        )
-        .await
-    }
-
     pub async fn resolve_and_add_magnet_at_generation(
         &self,
         magnet_uri: &str,
         options: &Map<String, Value>,
         timeout_secs: u64,
         expected_generation: u64,
+        verified_files: Vec<bt::create::FileStamp>,
     ) -> Result<TorrentHandle, String> {
         let cancellation = self
             .magnet_cache
@@ -614,6 +589,7 @@ impl TorrentEngine {
             options,
             timeout_secs,
             cancellation,
+            verified_files,
         )
         .await
     }
@@ -628,6 +604,7 @@ impl TorrentEngine {
         options: &Map<String, Value>,
         timeout_secs: u64,
         cancellation: CancellationToken,
+        verified_files: Vec<bt::create::FileStamp>,
     ) -> Result<TorrentHandle, String> {
         let saved = load_saved_torrent_metadata(magnet_uri, options, &self.output_dir).await;
         let loaded = saved.is_some();
@@ -677,20 +654,9 @@ impl TorrentEngine {
             initial_peers,
             tracker_peers,
             magnet_select.as_deref(),
-            Vec::new(),
+            verified_files,
         )
         .await
-    }
-
-    pub async fn resolve_magnet(
-        &self,
-        magnet_uri: &str,
-        options: &Map<String, Value>,
-        timeout_secs: u64,
-    ) -> Result<Vec<TorrentFileInfo>, String> {
-        let (_, cancellation) = self.magnet_cache.route_snapshot().await;
-        self.resolve_magnet_with_cancellation(magnet_uri, options, timeout_secs, cancellation)
-            .await
     }
 
     pub async fn resolve_magnet_at_generation(
@@ -729,7 +695,10 @@ impl TorrentEngine {
             }
         }
 
-        tracing::info!("Resolving magnet metadata: {}", magnet_uri);
+        tracing::info!(
+            "Resolving magnet metadata: {}",
+            super::util::redact_url(magnet_uri)
+        );
         let start = std::time::Instant::now();
         let (torrent_bytes, _, _) = self
             .resolve_magnet_bytes_with_cancellation(
@@ -810,31 +779,14 @@ impl TorrentEngine {
             .await
         };
 
-        let resolved = if task_proxy_override {
-            tokio::select! {
-                result = resolve() => {
-                    let result = result?;
-                    if cancellation.is_cancelled() {
-                        return Err(MAGNET_ROUTE_CHANGED.to_string());
-                    }
-                    Arc::new(result)
-                },
-                _ = cancellation.cancelled() => return Err(MAGNET_ROUTE_CHANGED.to_string()),
+        let resolved = match info_hash_key {
+            Some(key) if !task_proxy_override => {
+                self.magnet_cache.get_or_resolve(key, resolve).await?
             }
-        } else {
-            match info_hash_key {
-                Some(key) => self.magnet_cache.get_or_resolve(key, resolve).await?,
-                None => {
-                    tokio::select! {
-                        result = resolve() => {
-                            let result = result?;
-                            if cancellation.is_cancelled() {
-                                return Err(MAGNET_ROUTE_CHANGED.to_string());
-                            }
-                            Arc::new(result)
-                        },
-                        _ = cancellation.cancelled() => return Err(MAGNET_ROUTE_CHANGED.to_string()),
-                    }
+            _ => {
+                tokio::select! {
+                    result = resolve() => Arc::new(result?),
+                    _ = cancellation.cancelled() => return Err(MAGNET_ROUTE_CHANGED.to_string()),
                 }
             }
         };
@@ -930,6 +882,8 @@ impl TorrentEngine {
         let session = self.session.as_ref()?;
         let handle = session.get(bt::TorrentIdOrHash::Id(torrent_id))?;
         let stats = handle.stats();
+        #[cfg(test)]
+        let stats = with_forced_error(stats, &handle.root_dir);
 
         let (download_speed, upload_speed, num_peers, num_seeders) = match &stats.live {
             Some(live) => {
@@ -988,7 +942,20 @@ impl TorrentEngine {
             peers_seq: stats.peers_seq,
             metadata,
             error: stats.error,
+            storage_error: stats.storage_error,
+            flush_failed: stats.flush_failed,
         })
+    }
+
+    pub async fn complete_file_stamps(
+        &self,
+        torrent_id: usize,
+    ) -> Option<Vec<bt::create::FileStamp>> {
+        let handle = self
+            .session
+            .as_ref()?
+            .get(bt::TorrentIdOrHash::Id(torrent_id))?;
+        handle.complete_file_stamps().await
     }
 
     pub async fn pause(&self, torrent_id: usize) -> Result<(), String> {
@@ -1074,11 +1041,19 @@ impl TorrentEngine {
             .map_err(|e| format!("Failed to remove torrent: {}", e))
     }
 
-    pub async fn shutdown(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.shutdown().await;
-            drop(session);
-        }
+    pub async fn shutdown(&mut self) -> Vec<usize> {
+        let Some(session) = self.session.take() else {
+            return Vec::new();
+        };
+        let handles: Vec<(usize, Arc<bt::ManagedTorrent>)> =
+            session.with_torrents(|iter| iter.collect());
+        session.shutdown().await;
+        drop(session);
+        handles
+            .into_iter()
+            .filter(|(_, handle)| handle.stats().flush_failed)
+            .map(|(id, _)| id)
+            .collect()
     }
 }
 
@@ -1199,6 +1174,10 @@ fn initial_file_selection(
             Some(selectable) => display_to_torrent_indices(&display, selectable),
             None => display,
         };
+        if only_files.is_empty() && selectable.is_some() {
+            tracing::warn!("select-file matches none of the torrent's files; selecting everything");
+            return (None, None);
+        }
         return (Some(only_files), None);
     }
     if options.contains_key("select-file") {
@@ -1332,6 +1311,8 @@ pub struct TorrentStats {
     pub peers_seq: u64,
     pub metadata: Option<TorrentMetadataInfo>,
     pub error: Option<String>,
+    pub storage_error: bool,
+    pub flush_failed: bool,
 }
 
 pub use bt::PeerSnapshot;
@@ -1596,6 +1577,19 @@ pub(crate) fn p2p_proxy_from_options(
     Ok(Some(super::options::build_p2p_proxy_connector(
         tcp_server, tcp_bypass, udp_server, udp_bypass,
     )?))
+}
+
+#[cfg(test)]
+pub(crate) static FORCED_ERRORS: parking_lot::Mutex<Vec<(PathBuf, String, bool)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn with_forced_error(mut stats: bt::TorrentStats, root: &Path) -> bt::TorrentStats {
+    if let Some((_, error, storage)) = FORCED_ERRORS.lock().iter().find(|(dir, ..)| dir == root) {
+        stats.error = Some(error.clone());
+        stats.storage_error = *storage;
+    }
+    stats
 }
 
 #[cfg(test)]
@@ -1915,6 +1909,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn select_file_matching_no_file_selects_everything() {
+        let selectable = [0, 1, 2];
+        let mut opts = Map::new();
+        opts.insert("select-file".into(), json!("99"));
+        assert_eq!(
+            initial_file_selection(&opts, None, Some(&selectable)),
+            (None, None)
+        );
+        opts.insert("select-file".into(), json!("2,99"));
+        assert_eq!(
+            initial_file_selection(&opts, None, Some(&selectable)),
+            (Some(vec![1]), None)
+        );
+    }
+
     fn resolved_meta(byte: u8) -> ResolvedMagnetMeta {
         ResolvedMagnetMeta {
             bytes: Arc::from(vec![byte].into_boxed_slice()),
@@ -2154,6 +2164,48 @@ mod tests {
         engine.remove(handle.id, false).await.unwrap();
         assert!(engine.file_details_cache.lock().is_empty());
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_healthy_shutdown_reports_no_failed_flushes() {
+        use bt::bencode::{encode_to_vec, Value};
+        use sha1::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![7u8; 1024];
+        std::fs::write(dir.path().join("healthy.bin"), &payload).unwrap();
+        let tuning = BtTuning {
+            enable_upnp: Some(false),
+            enable_lsd: Some(false),
+            ..Default::default()
+        };
+        let mut engine = TorrentEngine::new_with_tuning(dir.path(), tuning)
+            .await
+            .unwrap();
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(1024)),
+            (b"name".to_vec(), Value::Bytes(b"healthy.bin".to_vec())),
+            (b"piece length".to_vec(), Value::Int(1024)),
+            (
+                b"pieces".to_vec(),
+                Value::Bytes(sha1::Sha1::digest(&payload).to_vec()),
+            ),
+        ]);
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let mut options = Map::new();
+        options.insert("dir".into(), json!(dir.path().to_string_lossy()));
+        let handle = engine.add_torrent_bytes(&bytes, &options).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !engine
+            .get_torrent_stats(handle.id)
+            .is_some_and(|stats| stats.is_finished)
+        {
+            assert!(Instant::now() < deadline, "the torrent never verified");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!engine.get_torrent_stats(handle.id).unwrap().flush_failed);
+
+        assert_eq!(engine.shutdown().await, Vec::<usize>::new());
+        assert_eq!(engine.shutdown().await, Vec::<usize>::new());
     }
 
     #[test]

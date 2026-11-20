@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tokio::sync::Notify;
@@ -8,6 +7,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::defaults;
 use crate::engine::events::EventBroadcaster;
+use crate::engine::headless_policy::PolicyTask;
 use crate::engine::manager::TaskManager;
 use crate::engine::options::EngineOptions;
 use crate::engine::rpc::{RpcCompatMode, RpcServer};
@@ -66,11 +66,40 @@ pub fn load_engine_options(config_dir: &Path) -> EngineOptions {
     EngineOptions::from_config(&system, &user)
 }
 
+fn require_rpc_secret(options: &mut EngineOptions) {
+    if options.rpc_secret().is_empty() {
+        tracing::warn!(
+            "system.json could not be read or updated; using a temporary RPC secret for this run"
+        );
+        options.set(
+            "rpc-secret".into(),
+            Value::from(crate::config::generate_rpc_secret()),
+        );
+    }
+}
+
+fn load_options_with_rpc_secret(config_dir: &Path, enable_rpc: bool) -> EngineOptions {
+    let secret_settled = crate::config::ensure_rpc_secret_on_disk(config_dir);
+    let mut options = load_engine_options(config_dir);
+    if enable_rpc && !secret_settled {
+        require_rpc_secret(&mut options);
+    }
+    options
+}
+
+async fn abort_start(policy_task: Option<PolicyTask>, manager: &TaskManager) {
+    if let Some(policy) = policy_task {
+        policy.stop().await;
+    }
+    manager.shutdown().await;
+}
+
 pub struct StandaloneConfig {
     pub config_dir: PathBuf,
     pub rpc_port: Option<u16>,
     pub enable_rpc: bool,
     pub require_download_dir: bool,
+    pub headless_policies: bool,
 }
 
 pub struct StandaloneEngine {
@@ -82,6 +111,7 @@ pub struct StandaloneEngine {
     pbh_rpc_server: Option<RpcServer>,
     progress_task: JoinHandle<()>,
     auto_save_task: JoinHandle<()>,
+    policy_task: Option<PolicyTask>,
 }
 
 impl StandaloneEngine {
@@ -91,9 +121,8 @@ impl StandaloneEngine {
             .map_err(|e| format!("Failed to create config dir: {e}"))?;
         tracing::debug!("Config directory: {}", config_dir.display());
         crate::engine::set_file_usenet_credential_resolver(config_dir.clone()).await;
-        crate::config::ensure_rpc_secret_on_disk(&config_dir);
 
-        let mut options = load_engine_options(&config_dir);
+        let mut options = load_options_with_rpc_secret(&config_dir, cfg.enable_rpc);
         if let Some(port) = cfg.rpc_port {
             options.set("rpc-listen-port".into(), Value::from(port));
         }
@@ -125,6 +154,13 @@ impl StandaloneEngine {
                 .map_err(|e| format!("Failed to create task manager: {e}"))?,
         );
 
+        let policy_task = cfg.headless_policies.then(|| {
+            tracing::info!(
+                "headless policies: auto-retry and completion script are handled by the engine"
+            );
+            crate::engine::headless_policy::spawn(manager.clone(), &events, &config_dir)
+        });
+
         let (rpc_shutdown_tx, mut rpc_shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         let mut rpc_server = RpcServer::new(
@@ -138,7 +174,7 @@ impl StandaloneEngine {
         let mut pbh_rpc_server = None;
         if cfg.enable_rpc {
             if let Err(e) = rpc_server.start().await {
-                manager.shutdown().await;
+                abort_start(policy_task, &manager).await;
                 return Err(format!("Failed to start RPC server: {e}"));
             }
             tracing::info!("RPC server listening on {}:{}", rpc_host, rpc_port);
@@ -154,7 +190,7 @@ impl StandaloneEngine {
                 );
                 if let Err(e) = server.start().await {
                     rpc_server.stop();
-                    manager.shutdown().await;
+                    abort_start(policy_task, &manager).await;
                     return Err(format!("Failed to start PeerBanHelper RPC server: {e}"));
                 }
                 tracing::info!(
@@ -167,27 +203,7 @@ impl StandaloneEngine {
         }
         drop(rpc_shutdown_tx);
 
-        let mgr = manager.clone();
-        let progress_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                mgr.update_progress().await;
-            }
-        });
-
-        let mgr = manager.clone();
-        let auto_save_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(e) = mgr.save_session().await {
-                    tracing::warn!("Auto-save session failed: {}", e);
-                }
-            }
-        });
+        let (progress_task, auto_save_task) = crate::engine::spawn_maintenance_loops(&manager);
 
         // notify_one stores a permit so a late waiter still wakes
         let shutdown_notify = Arc::new(Notify::new());
@@ -208,6 +224,7 @@ impl StandaloneEngine {
             pbh_rpc_server,
             progress_task,
             auto_save_task,
+            policy_task,
         })
     }
 
@@ -222,6 +239,9 @@ impl StandaloneEngine {
         if let Some(mut pbh) = self.pbh_rpc_server.take() {
             pbh.stop();
         }
+        if let Some(policy) = self.policy_task.take() {
+            policy.stop().await;
+        }
         self.manager.shutdown().await;
     }
 }
@@ -229,6 +249,112 @@ impl StandaloneEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_system_config_never_leaves_rpc_without_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("system.json"), "{").unwrap();
+        assert!(!crate::config::ensure_rpc_secret_on_disk(dir.path()));
+
+        let mut options = load_engine_options(dir.path());
+        assert!(options.rpc_secret().is_empty());
+        require_rpc_secret(&mut options);
+        let secret = options.rpc_secret();
+        assert!(!secret.is_empty());
+        require_rpc_secret(&mut options);
+        assert_eq!(options.rpc_secret(), secret);
+
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(crate::config::ensure_rpc_secret_on_disk(fresh.path()));
+        assert!(!load_engine_options(fresh.path()).rpc_secret().is_empty());
+    }
+
+    #[test]
+    fn rpc_gets_a_secret_unless_the_user_cleared_it() {
+        let fresh = tempfile::tempdir().unwrap();
+        let options = load_options_with_rpc_secret(fresh.path(), true);
+        assert_eq!(options.rpc_secret().len(), 64);
+        assert_eq!(
+            load_engine_options(fresh.path()).rpc_secret(),
+            options.rpc_secret()
+        );
+
+        let corrupt = tempfile::tempdir().unwrap();
+        std::fs::write(corrupt.path().join("system.json"), "{").unwrap();
+        assert!(!load_options_with_rpc_secret(corrupt.path(), true)
+            .rpc_secret()
+            .is_empty());
+        assert!(load_options_with_rpc_secret(corrupt.path(), false)
+            .rpc_secret()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(corrupt.path().join("system.json")).unwrap(),
+            "{"
+        );
+
+        let cleared = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cleared.path().join("system.json"),
+            r#"{"rpc-secret": "", "rpc-secret-initialized": true}"#,
+        )
+        .unwrap();
+        assert!(load_options_with_rpc_secret(cleared.path(), true)
+            .rpc_secret()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_that_cannot_be_saved_still_protects_rpc() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        std::os::unix::fs::symlink(root.path().join("missing"), &config_dir).unwrap();
+        assert!(!crate::config::ensure_rpc_secret_on_disk(&config_dir));
+
+        let guarded = load_options_with_rpc_secret(&config_dir, true).rpc_secret();
+        assert_eq!(guarded.len(), 64);
+        assert!(load_options_with_rpc_secret(&config_dir, false)
+            .rpc_secret()
+            .is_empty());
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[tokio::test]
+    async fn a_start_that_fails_on_the_rpc_port_returns_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut system = Map::new();
+        system.insert(
+            "dir".into(),
+            Value::from(dir.path().join("downloads").to_string_lossy().to_string()),
+        );
+        for key in [
+            "bt-enable-upnp",
+            "bt-enable-lsd",
+            "ed2k-enable-kad",
+            "ed2k-enable-upload",
+        ] {
+            system.insert(key.into(), Value::from(false));
+        }
+        std::fs::write(
+            dir.path().join("system.json"),
+            Value::Object(system).to_string(),
+        )
+        .unwrap();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+
+        let started = StandaloneEngine::start(StandaloneConfig {
+            config_dir: dir.path().to_path_buf(),
+            rpc_port: Some(port),
+            enable_rpc: true,
+            require_download_dir: true,
+            headless_policies: true,
+        })
+        .await;
+
+        let error = started.err().expect("the RPC port is taken");
+        assert!(error.contains("Failed to start RPC server"), "{error}");
+    }
 
     #[test]
     fn app_identifier_matches_tauri_config() {

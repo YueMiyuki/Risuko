@@ -45,6 +45,8 @@ export default {
 	privateKeyHint: "Optional. Used when password is empty.",
 	sftpBasePath: "Base path",
 	sftpBasePathPlaceholder: "/home/user/uploads",
+	ftpBasePathHint:
+		"Empty or / uploads into the folder you land in after signing in. A path such as /uploads starts at the server root.",
 
 	ftpSecure: "FTPS (TLS)",
 	ftpSecureHint: "Negotiate explicit TLS (FTPS) on the control channel.",
@@ -100,7 +102,7 @@ export default {
 	ruleMatchSection: "Match when",
 	rulePreview: "Preview",
 	unnamedRule: "Untitled rule",
-	removed: "Removed “{label}”",
+	removed: "Removed “{{label}}”",
 	deleteRule: "Delete rule",
 	cancelJob: "Cancel upload",
 	disabled: "Disabled",

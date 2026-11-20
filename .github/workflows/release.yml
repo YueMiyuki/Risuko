@@ -143,7 +143,7 @@ jobs:
             "ndk;27.2.12479018"
 
       - name: Setup Rust Android targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
           targets: ${{ needs.meta.outputs.android_rust_targets }}
 
@@ -155,28 +155,12 @@ jobs:
           cache-targets: false
           save-if: ${{ github.event_name != 'release' }}
 
-      - name: Setup sccache
+      - name: Setup sccache on the R2 build cache
         if: env.SCCACHE_ENABLED == 'true'
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+        uses: ./.github/actions/setup-sccache
         with:
-          version: v0.18.0
-
-      - name: Start sccache on the R2 build cache
-        if: env.SCCACHE_ENABLED == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          SCCACHE_BUCKET: risuko-build-cache
-          SCCACHE_ENDPOINT: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
-          SCCACHE_REGION: auto
-          SCCACHE_IDLE_TIMEOUT: "0"
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          sccache --start-server
-          sccache --show-stats
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -293,7 +277,7 @@ jobs:
         run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
           targets: ${{ matrix.target }}
 
@@ -311,28 +295,12 @@ jobs:
           cache-targets: false
           save-if: ${{ github.event_name != 'release' }}
 
-      - name: Setup sccache
-        if: env.SCCACHE_ENABLED == 'true'
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      - name: Setup sccache on the R2 build cache
+        if: env.SCCACHE_ENABLED == 'true' && runner.os != 'Windows'
+        uses: ./.github/actions/setup-sccache
         with:
-          version: v0.18.0
-
-      - name: Start sccache on the R2 build cache
-        if: env.SCCACHE_ENABLED == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          SCCACHE_BUCKET: risuko-build-cache
-          SCCACHE_ENDPOINT: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
-          SCCACHE_REGION: auto
-          SCCACHE_IDLE_TIMEOUT: "0"
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          sccache --start-server
-          sccache --show-stats
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          access-key-id: ${{ secrets.R2_CACHE_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_CACHE_SECRET_ACCESS_KEY }}
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.os, 'ubuntu')

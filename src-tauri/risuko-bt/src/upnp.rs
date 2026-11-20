@@ -124,6 +124,7 @@ pub(crate) struct ActiveMapping {
     service_type: String,
     port: u16,
     proto: MapProto,
+    internal_ip: Ipv4Addr,
 }
 
 async fn run_forever(
@@ -160,11 +161,16 @@ async fn run_forever(
     }
     let snapshot: Vec<ActiveMapping> = active.lock().drain(..).collect();
     for m in snapshot {
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            delete_port_mapping(&m.control_url, &m.service_type, m.port, m.proto),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), release_mapping(&m)).await;
+    }
+}
+
+async fn release_mapping(m: &ActiveMapping) {
+    match get_specific_port_mapping(&m.control_url, &m.service_type, m.port, m.proto).await {
+        Ok(Some(owner)) if owner == m.internal_ip => {
+            let _ = delete_port_mapping(&m.control_url, &m.service_type, m.port, m.proto).await;
+        }
+        _ => {}
     }
 }
 
@@ -235,6 +241,7 @@ async fn discover_and_map(
                         service_type: service_type.clone(),
                         port,
                         proto,
+                        internal_ip: local_ip,
                     });
                 }
                 Err(e) => {
@@ -270,6 +277,13 @@ struct DiscoverResponse {
     received_from: SocketAddrV4,
 }
 
+const MAX_DISCOVERED_ENDPOINTS: usize = 8;
+
+fn location_belongs_to_responder(location: &Url, responder: Ipv4Addr) -> bool {
+    let on_lan = crate::net::is_lan(responder.into()) || crate::net::is_shared_cgnat(responder);
+    on_lan && location.scheme() == "http" && location.host() == Some(url::Host::Ipv4(responder))
+}
+
 async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverResponse>> {
     let sock = bind_ssdp_socket()?;
     let sock = UdpSocket::from_std(sock.into())?;
@@ -295,8 +309,14 @@ async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverRespons
                 let Ok(parsed) = parse_ssdp_response(&buf[..n], from) else {
                     continue;
                 };
+                if !location_belongs_to_responder(&parsed.location, *from.ip()) {
+                    continue;
+                }
                 if seen.insert(parsed.location.to_string()) {
                     responses.push(parsed);
+                    if responses.len() >= MAX_DISCOVERED_ENDPOINTS {
+                        break;
+                    }
                 }
             }
             Ok(Err(_)) | Err(_) => break,
@@ -395,6 +415,7 @@ fn upnp_http_client() -> std::io::Result<&'static risuko_http::Client> {
     }
     let client = risuko_http::Client::builder()
         .timeout(Duration::from_secs(5))
+        .redirect(risuko_http::Policy::limited(0))
         .build()
         .map_err(io_other)?;
     let _ = CLIENT.set(client);
@@ -428,7 +449,9 @@ fn find_wan_service(root: &RootDesc, base: &Url) -> Option<(Url, String)> {
         for s in &all {
             if s.service_type == target {
                 if let Ok(url) = base.join(&s.control_url) {
-                    return Some((url, s.service_type.clone()));
+                    if url.scheme() == "http" && url.host() == base.host() {
+                        return Some((url, s.service_type.clone()));
+                    }
                 }
             }
         }
@@ -455,7 +478,13 @@ fn pick_local_ipv4(ifaces: &[NetworkInterface], gateway: Ipv4Addr) -> Option<Ipv
                     continue;
                 }
                 let ip_bits = u32::from_be_bytes(ip.octets());
-                if (ip_bits & 0xffff_ff00) == (gw_bits & 0xffff_ff00) {
+                let mask = match addr.netmask() {
+                    Some(std::net::IpAddr::V4(mask)) if !mask.is_unspecified() => {
+                        u32::from_be_bytes(mask.octets())
+                    }
+                    _ => 0xffff_ff00,
+                };
+                if (ip_bits & mask) == (gw_bits & mask) {
                     return Some(ip);
                 }
                 fallback.get_or_insert(ip);
@@ -767,6 +796,27 @@ mod tests {
         let ctrl = find_wan_service(&root, &base).unwrap();
         assert_eq!(ctrl.0.as_str(), "http://192.168.1.1:5000/ctl/IPConn");
         assert_eq!(ctrl.1, ST_WAN_IP);
+
+        let elsewhere = xml.replace("/ctl/IPConn", "http://10.0.0.5:8080/ctl");
+        let root: RootDesc = quick_xml::de::from_str(&elsewhere).unwrap();
+        assert!(find_wan_service(&root, &base).is_none());
+    }
+
+    #[test]
+    fn discovery_only_trusts_locations_on_the_lan_responder() {
+        let router = Ipv4Addr::new(192, 168, 1, 1);
+        let at = |location: &str, responder| {
+            location_belongs_to_responder(&Url::parse(location).unwrap(), responder)
+        };
+        assert!(at("http://192.168.1.1:5000/rootDesc.xml", router));
+        assert!(!at("http://127.0.0.1:8080/x", router));
+        assert!(!at("http://192.168.1.2:5000/rootDesc.xml", router));
+        assert!(!at("https://192.168.1.1/rootDesc.xml", router));
+        assert!(!at("http://router.lan/rootDesc.xml", router));
+        assert!(!at(
+            "http://8.8.8.8/rootDesc.xml",
+            Ipv4Addr::new(8, 8, 8, 8)
+        ));
     }
 
     #[test]
@@ -921,6 +971,44 @@ mod tests {
                 "AddPortMapping"
             ]
         );
+    }
+
+    fn mapping_for(igd: &FakeIgd, internal_ip: Ipv4Addr) -> ActiveMapping {
+        ActiveMapping {
+            control_url: igd.url.clone(),
+            service_type: ST_WAN_IP.to_string(),
+            port: 6881,
+            proto: MapProto::Tcp,
+            internal_ip,
+        }
+    }
+
+    #[tokio::test]
+    async fn release_leaves_a_mapping_another_host_now_owns() {
+        let other = (Ipv4Addr::new(192, 168, 1, 50), 6881);
+        let igd = fake_igd(Some(other)).await;
+        release_mapping(&mapping_for(&igd, Ipv4Addr::new(192, 168, 1, 10))).await;
+        assert_eq!(*igd.owner.lock(), Some(other));
+        assert_eq!(*igd.calls.lock(), ["GetSpecificPortMappingEntry"]);
+    }
+
+    #[tokio::test]
+    async fn release_deletes_a_mapping_that_is_still_ours() {
+        let ours = Ipv4Addr::new(192, 168, 1, 10);
+        let igd = fake_igd(Some((ours, 6881))).await;
+        release_mapping(&mapping_for(&igd, ours)).await;
+        assert_eq!(*igd.owner.lock(), None);
+        assert_eq!(
+            *igd.calls.lock(),
+            ["GetSpecificPortMappingEntry", "DeletePortMapping"]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_does_nothing_when_the_mapping_is_gone() {
+        let igd = fake_igd(None).await;
+        release_mapping(&mapping_for(&igd, Ipv4Addr::new(192, 168, 1, 10))).await;
+        assert_eq!(*igd.calls.lock(), ["GetSpecificPortMappingEntry"]);
     }
 
     #[tokio::test]

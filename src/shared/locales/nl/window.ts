@@ -1,5 +1,5 @@
 export default {
-	reload: "Vervesen",
+	reload: "Verversen",
 	close: "Sluiten",
 	minimize: "Minimaliseren",
 	zoom: "Zoomen",

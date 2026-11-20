@@ -1,5 +1,5 @@
 export default {
-	app: "ماتریکس",
+	app: "Risuko",
 	file: "پرونده",
 	task: "وظیفه",
 	edit: "ویرایش",

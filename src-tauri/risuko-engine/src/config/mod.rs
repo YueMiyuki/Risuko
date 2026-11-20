@@ -1,4 +1,5 @@
 pub mod defaults;
+pub mod keys;
 
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -139,6 +140,87 @@ pub fn proxy_p2p_profile_is_explicit(value: &Value) -> bool {
         }))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyHttpProfile {
+    pub enabled: bool,
+    pub server: String,
+    pub bypass: String,
+    pub scope: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyP2pProfile {
+    pub enabled: bool,
+    pub server: String,
+    pub bypass: String,
+    pub udp_override_server: String,
+    pub udp_override_bypass: String,
+}
+
+impl ProxyP2pProfile {
+    pub fn udp_server(&self) -> &str {
+        if self.udp_override_server.is_empty() {
+            &self.server
+        } else {
+            &self.udp_override_server
+        }
+    }
+
+    pub fn udp_bypass(&self) -> &str {
+        if self.udp_override_server.is_empty() {
+            &self.bypass
+        } else {
+            &self.udp_override_bypass
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyProfiles {
+    pub http: Option<ProxyHttpProfile>,
+    pub p2p: Option<ProxyP2pProfile>,
+}
+
+pub fn proxy_profiles(normalized: &Value) -> ProxyProfiles {
+    let http = normalized
+        .get("http")
+        .and_then(Value::as_object)
+        .map(|http| ProxyHttpProfile {
+            enabled: value_as_bool(http.get("enable")),
+            server: profile_str(Some(http), "server").trim().to_string(),
+            bypass: profile_str(Some(http), "bypass").to_string(),
+            scope: http
+                .get("scope")
+                .and_then(Value::as_array)
+                .map(|scope| {
+                    scope
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+    let p2p = normalized.get("p2p").and_then(Value::as_object).map(|p2p| {
+        let udp = p2p.get("udp").and_then(Value::as_object);
+        ProxyP2pProfile {
+            enabled: value_as_bool(p2p.get("enable")),
+            server: profile_str(Some(p2p), "server").trim().to_string(),
+            bypass: profile_str(Some(p2p), "bypass").to_string(),
+            udp_override_server: profile_str(udp, "server").trim().to_string(),
+            udp_override_bypass: profile_str(udp, "bypass").to_string(),
+        }
+    });
+    ProxyProfiles { http, p2p }
+}
+
+fn profile_str<'a>(profile: Option<&'a Map<String, Value>>, key: &str) -> &'a str {
+    profile
+        .and_then(|profile| profile.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
 fn value_as_bool(value: Option<&Value>) -> bool {
     value
         .and_then(crate::engine::options::json_bool)
@@ -228,18 +310,18 @@ pub fn ensure_rpc_secret(system: &mut Map<String, Value>) -> bool {
     true
 }
 
-pub fn ensure_rpc_secret_on_disk(config_dir: &Path) {
+pub fn ensure_rpc_secret_on_disk(config_dir: &Path) -> bool {
     let path = config_dir.join("system.json");
     let mut map = match fs::read_to_string(&path) {
         Ok(data) => match serde_json::from_str::<Value>(&data) {
             Ok(Value::Object(map)) => map,
-            _ => return,
+            _ => return false,
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => defaults::system_defaults(),
-        Err(_) => return,
+        Err(_) => return false,
     };
     if !ensure_rpc_secret(&mut map) {
-        return;
+        return true;
     }
     let written = fs::create_dir_all(config_dir)
         .map_err(|e| e.to_string())
@@ -247,7 +329,9 @@ pub fn ensure_rpc_secret_on_disk(config_dir: &Path) {
         .and_then(|data| write_file_atomically(&path, data.as_bytes()));
     if let Err(err) = written {
         tracing::warn!("Failed to persist generated RPC secret: {}", err);
+        return false;
     }
+    true
 }
 
 pub struct ConfigManager {
@@ -456,9 +540,9 @@ impl ConfigManager {
 }
 
 fn load_or_default(path: &Path, defaults: Map<String, Value>) -> Map<String, Value> {
-    match fs::read_to_string(path) {
-        Ok(data) => {
-            if let Ok(Value::Object(mut map)) = serde_json::from_str(&data) {
+    let problem = match fs::read_to_string(path) {
+        Ok(data) => match serde_json::from_str(&data) {
+            Ok(Value::Object(mut map)) => {
                 for (k, v) in &defaults {
                     if !map.contains_key(k) {
                         map.insert(k.clone(), v.clone());
@@ -466,28 +550,25 @@ fn load_or_default(path: &Path, defaults: Map<String, Value>) -> Map<String, Val
                 }
                 return map;
             }
-            let backup = path.with_extension("json.bak");
-            match fs::rename(path, &backup) {
-                Ok(()) => tracing::warn!(
-                    "Config file {} is corrupt; backed up to {} and using defaults",
-                    path.display(),
-                    backup.display()
-                ),
-                Err(err) => tracing::warn!(
-                    "Config file {} is corrupt and could not be backed up ({}); using defaults",
-                    path.display(),
-                    err
-                ),
-            }
-        }
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                "Failed to read config {}: {}; using defaults",
-                path.display(),
-                err
-            );
-        }
-        Err(_) => {}
+            _ => "is corrupt".to_string(),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return defaults,
+        Err(err) => format!("could not be read ({err})"),
+    };
+    let backup = path.with_extension("json.bak");
+    match fs::rename(path, &backup) {
+        Ok(()) => tracing::warn!(
+            "Config file {} {}; backed up to {} and using defaults",
+            path.display(),
+            problem,
+            backup.display()
+        ),
+        Err(err) => tracing::warn!(
+            "Config file {} {} and could not be backed up ({}); using defaults",
+            path.display(),
+            problem,
+            err
+        ),
     }
     defaults
 }
@@ -725,6 +806,120 @@ mod tests {
     }
 
     #[test]
+    fn proxy_profiles_trims_servers_and_keeps_bypass_and_scope_as_stored() {
+        let profiles = proxy_profiles(&json!({
+            "http": {
+                "enable": "on",
+                "server": " http://proxy.example:8080 ",
+                "bypass": " a.example\na.example ",
+                "scope": [" download ", "update-app", 1]
+            },
+            "p2p": {
+                "enable": true,
+                "server": " socks5://tcp.example:1080 ",
+                "bypass": " tcp.example ",
+                "udp": {
+                    "server": " socks5h://udp.example:1080 ",
+                    "bypass": " udp.example "
+                }
+            }
+        }));
+
+        assert_eq!(
+            profiles,
+            ProxyProfiles {
+                http: Some(ProxyHttpProfile {
+                    enabled: true,
+                    server: "http://proxy.example:8080".into(),
+                    bypass: " a.example\na.example ".into(),
+                    scope: vec![" download ".into(), "update-app".into()],
+                }),
+                p2p: Some(ProxyP2pProfile {
+                    enabled: true,
+                    server: "socks5://tcp.example:1080".into(),
+                    bypass: " tcp.example ".into(),
+                    udp_override_server: "socks5h://udp.example:1080".into(),
+                    udp_override_bypass: " udp.example ".into(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_profiles_reads_a_normalized_proxy() {
+        let profiles = proxy_profiles(&normalize_proxy_config(&json!({
+            "enable": "false",
+            "server": "http://legacy.example:8080"
+        })));
+
+        assert_eq!(
+            profiles,
+            ProxyProfiles {
+                http: Some(ProxyHttpProfile {
+                    enabled: false,
+                    server: "http://legacy.example:8080".into(),
+                    bypass: String::new(),
+                    scope: vec![
+                        "download".into(),
+                        "update-app".into(),
+                        "update-trackers".into()
+                    ],
+                }),
+                p2p: Some(ProxyP2pProfile::default()),
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_profiles_are_present_only_for_object_profiles() {
+        assert_eq!(proxy_profiles(&Value::Null), ProxyProfiles::default());
+        assert_eq!(
+            proxy_profiles(&json!({ "http": "http://proxy.example:8080", "p2p": null })),
+            ProxyProfiles::default()
+        );
+        assert_eq!(
+            proxy_profiles(&json!({ "http": {}, "p2p": { "udp": "ignored" } })),
+            ProxyProfiles {
+                http: Some(ProxyHttpProfile::default()),
+                p2p: Some(ProxyP2pProfile::default()),
+            }
+        );
+        assert_eq!(
+            proxy_profiles(&json!({ "p2p": {} })),
+            ProxyProfiles {
+                http: None,
+                p2p: Some(ProxyP2pProfile::default()),
+            }
+        );
+    }
+
+    #[test]
+    fn p2p_udp_route_uses_the_override_only_when_it_has_a_server() {
+        let mut p2p = ProxyP2pProfile {
+            enabled: true,
+            server: "socks5://tcp.example:1080".into(),
+            bypass: "tcp.example".into(),
+            udp_override_server: "socks5h://udp.example:1080".into(),
+            udp_override_bypass: "udp.example".into(),
+        };
+        assert_eq!(p2p.udp_server(), "socks5h://udp.example:1080");
+        assert_eq!(p2p.udp_bypass(), "udp.example");
+
+        p2p.udp_override_bypass.clear();
+        assert_eq!(p2p.udp_server(), "socks5h://udp.example:1080");
+        assert_eq!(p2p.udp_bypass(), "");
+
+        p2p.udp_override_server.clear();
+        p2p.udp_override_bypass = "ignored.example".into();
+        assert_eq!(p2p.udp_server(), "socks5://tcp.example:1080");
+        assert_eq!(p2p.udp_bypass(), "tcp.example");
+
+        p2p.server.clear();
+        assert_eq!(p2p.udp_server(), "");
+        assert_eq!(p2p.udp_bypass(), "tcp.example");
+    }
+
+    #[test]
     fn config_manager_persists_legacy_proxy_migration() {
         let dir = TempDir::new().unwrap();
         let legacy = json!({
@@ -857,6 +1052,21 @@ mod tests {
         let merged = mgr.get_merged_config();
         let map = merged.as_object().unwrap();
         assert_eq!(map.get("locale"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn unreadable_config_is_backed_up_before_defaults_replace_it() {
+        let dir = TempDir::new().unwrap();
+        let user_path = dir.path().join("user.json");
+        fs::write(&user_path, [0xff, 0xfe, b'{', b'}']).unwrap();
+
+        let loaded = load_or_default(&user_path, defaults::user_defaults());
+        assert!(loaded.contains_key("theme"));
+        assert_eq!(
+            fs::read(dir.path().join("user.json.bak")).unwrap(),
+            [0xff, 0xfe, b'{', b'}']
+        );
+        assert!(!user_path.exists());
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub async fn start_engine(config: Option<EngineConfig>) -> Result<()> {
         rpc_port: config.as_ref().and_then(|c| c.rpc_port),
         enable_rpc: config.as_ref().and_then(|c| c.enable_rpc).unwrap_or(true),
         require_download_dir: false,
+        headless_policies: false,
     })
     .await
     .map_err(Error::from_reason)?;

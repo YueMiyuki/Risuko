@@ -4,5 +4,5 @@ export default {
 	task: "Feladat",
 	edit: "Szerkesztés",
 	window: "Ablak",
-	help: "Segitség",
+	help: "Segítség",
 };

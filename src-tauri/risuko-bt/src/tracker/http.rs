@@ -6,7 +6,9 @@ use std::time::Duration;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 
 use super::super::bencode::{decode_all_external, DecodeLimits, Value};
-use super::{is_valid_endpoint, AnnounceRequest, AnnounceResponse, RetryIn, TrackerError};
+use super::{
+    is_announce_path, is_valid_endpoint, AnnounceRequest, AnnounceResponse, RetryIn, TrackerError,
+};
 
 const TRACKER_RESPONSE_LIMITS: DecodeLimits = DecodeLimits::new(2 * 1024 * 1024, 64, 262_144);
 const MAX_RETRY_IN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -20,36 +22,77 @@ pub(crate) const QUERY_SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-fn client_builder() -> risuko_http::ClientBuilder {
-    risuko_http::Client::builder()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Destination {
+    Announce,
+    PublicOnly,
+}
+
+impl Destination {
+    fn of(url: &str) -> Self {
+        if is_announce_path(url) {
+            Self::Announce
+        } else {
+            Self::PublicOnly
+        }
+    }
+}
+
+fn redirect_stays_on_announce(url: &url::Url) -> bool {
+    url.path().ends_with("/announce")
+}
+
+fn client_builder(destination: Destination) -> risuko_http::ClientBuilder {
+    let builder = risuko_http::Client::builder()
         .user_agent(crate::core::peer_id::CLIENT_VERSION)
         .timeout(Duration::from_secs(15))
         .connect_timeout(Duration::from_secs(5))
-        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(4);
+    match destination {
+        Destination::Announce => {
+            builder.redirect(risuko_http::Policy::limited(3).allow_only(redirect_stays_on_announce))
+        }
+        Destination::PublicOnly => {
+            builder.direct_address_filter(crate::webseed::is_allowed_destination)
+        }
+    }
 }
 
-fn client() -> &'static risuko_http::Client {
-    static CLIENT: OnceLock<risuko_http::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| client_builder().build().expect("build risuko-http client"))
+fn client(destination: Destination) -> &'static risuko_http::Client {
+    static ANNOUNCE: OnceLock<risuko_http::Client> = OnceLock::new();
+    static PUBLIC_ONLY: OnceLock<risuko_http::Client> = OnceLock::new();
+    let cell = match destination {
+        Destination::Announce => &ANNOUNCE,
+        Destination::PublicOnly => &PUBLIC_ONLY,
+    };
+    cell.get_or_init(|| {
+        client_builder(destination)
+            .build()
+            .expect("build risuko-http client")
+    })
 }
 
-fn source_client(source: SocketAddr) -> Result<risuko_http::Client, TrackerError> {
-    static CLIENTS: OnceLock<Mutex<HashMap<SocketAddr, risuko_http::Client>>> = OnceLock::new();
+fn source_client(
+    source: SocketAddr,
+    destination: Destination,
+) -> Result<risuko_http::Client, TrackerError> {
+    type Clients = HashMap<(SocketAddr, Destination), risuko_http::Client>;
+    static CLIENTS: OnceLock<Mutex<Clients>> = OnceLock::new();
 
-    let source = tracker_source_addr(source);
+    let key = (tracker_source_addr(source), destination);
     let mut clients = CLIENTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| TrackerError::Http("source client cache lock poisoned".into()))?;
-    if let Some(client) = clients.get(&source) {
+    if let Some(client) = clients.get(&key) {
         return Ok(client.clone());
     }
 
-    let client = client_builder()
-        .local_socket_address(source)
+    let client = client_builder(destination)
+        .local_socket_address(key.0)
         .build()
         .map_err(|e| TrackerError::Http(e.to_string()))?;
-    clients.insert(source, client.clone());
+    clients.insert(key, client.clone());
     Ok(client)
 }
 
@@ -65,10 +108,11 @@ pub async fn announce_with_proxy_and_source(
     source: Option<SocketAddr>,
 ) -> Result<AnnounceResponse, TrackerError> {
     let source = source.filter(|source| !source.ip().is_unspecified());
+    let destination = Destination::of(url);
     let client = match (proxy, source) {
-        (Some(proxy), _) => proxy_client(proxy, source)?,
-        (None, Some(source)) => source_client(source)?,
-        (None, None) => client().clone(),
+        (Some(proxy), _) => proxy_client(proxy, source, destination)?,
+        (None, Some(source)) => source_client(source, destination)?,
+        (None, None) => client(destination).clone(),
     };
     fetch_announce(&client, url, req).await
 }
@@ -79,9 +123,10 @@ pub async fn announce_for_family(
     family: super::AddressFamily,
     proxy: Option<&risuko_http::ProxyConnector>,
 ) -> Result<AnnounceResponse, TrackerError> {
+    let destination = Destination::of(url);
     let client = match proxy.filter(|proxy| proxy.proxy().is_some()) {
-        Some(proxy) => proxy_client(proxy, Some(family.unspecified()))?,
-        None => source_client(family.unspecified())?,
+        Some(proxy) => proxy_client(proxy, Some(family.unspecified()), destination)?,
+        None => source_client(family.unspecified(), destination)?,
     };
     fetch_announce(&client, url, req).await
 }
@@ -98,8 +143,9 @@ pub(super) fn routes_via_proxy(url: &str, proxy: &risuko_http::ProxyConnector) -
 fn proxy_client(
     proxy: &risuko_http::ProxyConnector,
     source: Option<SocketAddr>,
+    destination: Destination,
 ) -> Result<risuko_http::Client, TrackerError> {
-    let mut builder = client_builder();
+    let mut builder = client_builder(destination);
     if let Some(route) = proxy.proxy() {
         builder = builder.proxy(route);
     }
@@ -834,10 +880,11 @@ mod tests {
     async fn every_tracker_client_sends_a_user_agent() {
         let (url, task) = record_requests(3).await;
         let source: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let destination = Destination::of(&url);
         let clients = [
-            client().clone(),
-            source_client(source).unwrap(),
-            proxy_client(&risuko_http::ProxyConnector::direct(), None).unwrap(),
+            client(destination).clone(),
+            source_client(source, destination).unwrap(),
+            proxy_client(&risuko_http::ProxyConnector::direct(), None, destination).unwrap(),
         ];
         for client in &clients {
             fetch_announce(client, &url, &req()).await.unwrap();
@@ -847,5 +894,88 @@ mod tests {
         for head in task.await.unwrap() {
             assert!(head.to_ascii_lowercase().contains(&expected), "{head}");
         }
+    }
+
+    fn probe(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<bool> {
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_ok()
+        })
+    }
+
+    #[tokio::test]
+    async fn non_announce_paths_cannot_reach_loopback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/admin", listener.local_addr().unwrap());
+        let reached = probe(listener);
+        let direct = risuko_http::ProxyConnector::direct();
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+        let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+        for (index, (proxy, source)) in [
+            (None, None),
+            (None, Some(loopback)),
+            (None, Some(unspecified)),
+            (Some(&direct), Some(loopback)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let announced = super::super::announce_with_proxy_and_source(
+                &url,
+                &req(),
+                Duration::from_secs(2),
+                proxy,
+                source,
+            )
+            .await;
+            assert!(announced.is_err(), "route {index}");
+        }
+        assert!(
+            !reached.await.unwrap(),
+            "a non-announce URL reached loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_redirects_must_stay_on_an_announce_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let allowed = |raw: &str| redirect_stays_on_announce(&url::Url::parse(raw).unwrap());
+        assert!(allowed("http://127.0.0.1:1/announce?info_hash=x"));
+        assert!(allowed("https://t.example/v2/announce"));
+        assert!(!allowed("http://127.0.0.1:1/admin?next=/announce"));
+        assert!(!allowed("http://127.0.0.1:1/announce.php"));
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/admin?x=1", target.local_addr().unwrap());
+        let reached = probe(target);
+        let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = tracker.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+            }
+        });
+
+        let announced = super::super::announce_with_proxy_and_source(
+            &url,
+            &req(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !reached.await.unwrap(),
+            "the redirect left the announce path"
+        );
+        assert!(announced.is_err());
+        server.abort();
     }
 }

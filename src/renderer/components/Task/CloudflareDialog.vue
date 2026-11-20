@@ -133,13 +133,11 @@
                   <thead class="sticky top-0 bg-muted/60 text-muted-foreground">
                     <tr>
                       <th class="px-1.5 py-1">name</th>
-                      <th class="px-1.5 py-1">value</th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr v-for="c in imported.cookies" :key="c.name" class="border-t border-border/40 align-top">
                       <td class="px-1.5 py-1 whitespace-nowrap">{{ c.name }}</td>
-                      <td class="px-1.5 py-1 break-all text-muted-foreground">{{ c.value }}</td>
                     </tr>
                   </tbody>
                 </table>
@@ -227,6 +225,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useAppStore } from "@/store/app";
 import { usePreferenceStore } from "@/store/preference";
+import { cookieImportErrorKey } from "@/utils/cookieImport";
 import { openExternalUrl } from "@/utils/external";
 
 let cachedBrowsers: BrowserInfo[] | null = null;
@@ -446,9 +445,7 @@ export default {
 				}
 			} catch (e) {
 				logger.error(`[Risuko] CF dialog: preview failed: ${String(e)}`);
-				toast.error(
-					this.$t("task.task-cookie-import-failed", { error: String(e) }),
-				);
+				toast.error(this.$t(cookieImportErrorKey(e), { error: String(e) }));
 			} finally {
 				this.importing = false;
 			}
@@ -474,7 +471,6 @@ export default {
 				const appStore = useAppStore();
 				await api.retryWithCookies({
 					gid: this.gid,
-					cookie: imported.cookieHeader,
 					userAgent: imported.userAgent || ua,
 				});
 				appStore.markCloudflareRetried(this.gid, imported.cookieNames || []);
@@ -492,9 +488,7 @@ export default {
 				appStore.hideCloudflareDialog();
 			} catch (e) {
 				logger.error(`[Risuko] CF dialog: retry failed: ${String(e)}`);
-				toast.error(
-					this.$t("task.task-cookie-import-failed", { error: String(e) }),
-				);
+				toast.error(this.$t(cookieImportErrorKey(e), { error: String(e) }));
 			} finally {
 				this.retrying = false;
 			}

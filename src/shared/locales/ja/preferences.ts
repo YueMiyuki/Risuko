@@ -1,15 +1,159 @@
 export default {
 	basic: "基本設定",
 	advanced: "詳細設定",
+	cloudSinks: "クラウド転送先",
+	usenet: "Usenet",
+	search: "検索",
+	"search-placeholder": "すべての環境設定を検索",
+	"search-all-tabs": "すべての環境設定",
+	"search-results": "{{count}} 件の設定が見つかりました",
+	"search-no-results": "一致する設定は見つかりませんでした",
+	"search-clear": "検索をクリア",
+	"search-go-to-tab": "設定を開く",
+	"search-more-results": "検索を絞り込むと、さらに結果が表示されます",
+	"usenet-tips":
+		"NNTP プロバイダーと、アーカイブの安全なクリーンアップの既定値を管理します。",
+	"usenet-profiles": "プロバイダープロファイル",
+	"usenet-profiles-tips":
+		"プロバイダーの優先度、セキュリティ、認証、接続数の上限を設定します。",
+	"usenet-add-profile": "プロファイルを追加",
+	"usenet-no-profiles": "プロバイダープロファイルが設定されていません。",
+	"usenet-no-profiles-tips":
+		"NZB ダウンロードをインポートする前に、プロバイダーを少なくとも 1 つ追加してください。",
+	"usenet-edit-profile": "プロファイルを編集",
+	"usenet-profile-dialog-tips":
+		"プロファイルの設定はデバイス間で同期される場合があります。認証情報はこのデバイスにのみ保存されます。",
+	"usenet-profile-dialog-tips-vault":
+		"プロファイルの設定はデバイス間で同期される場合があります。認証情報はこのデバイスの安全なキーチェーンに保存されます。",
+	"usenet-profile-name": "プロファイル名",
+	"usenet-profile-name-placeholder": "メインプロバイダー",
+	"usenet-profile-host": "NNTP ホスト",
+	"usenet-profile-port": "ポート",
+	"usenet-security": "接続のセキュリティ",
+	"usenet-tls": "暗黙的 TLS",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "平文 NNTP",
+	"usenet-authentication": "認証",
+	"usenet-auth-credentials": "ユーザー名とパスワード",
+	"usenet-auth-anonymous": "匿名",
+	"usenet-username": "ユーザー名",
+	"usenet-password": "パスワード",
+	"usenet-credentials-saved": "認証情報は保存済み",
+	"usenet-credentials-unavailable": "認証情報の状態を確認できません",
+	"usenet-credentials-saved-tips":
+		"認証情報はすでに保存されています。変更しない場合は、両方の欄を空のままにしてください。",
+	"usenet-plain-warning-title": "暗号化されていない接続",
+	"usenet-plain-opt-in":
+		"内容を理解したうえで、このプロファイルで平文 NNTP を許可します。",
+	"usenet-plain-warning":
+		"平文 NNTP では、認証情報とダウンロードデータが暗号化されません。プロバイダーが明示的に要求する場合にのみ使用してください。",
+	"usenet-enabled": "有効",
+	"usenet-enabled-tips":
+		"無効にしたプロファイルは保持されますが、ダウンロードには使用されません。",
+	"usenet-disabled": "無効",
+	"usenet-priority": "優先度",
+	"usenet-priority-tips":
+		"値が小さいほど先に試行されます。優先度が同じ場合は負荷を分散します。",
+	"usenet-priority-value": "優先度 {{value}}",
+	"usenet-max-connections": "最大接続数",
+	"usenet-max-connections-tips":
+		"このプロバイダープロファイルの接続数の上限です。",
+	"usenet-connections-value": "{{value}} 接続",
+	"usenet-test": "テスト",
+	"usenet-edit": "プロファイルを編集",
+	"usenet-remove": "削除",
+	"usenet-remove-title": "プロバイダープロファイルを削除しますか？",
+	"usenet-remove-confirm":
+		"{{name}} はダウンロードに使用できなくなります。保存されている認証情報もこのデバイスから削除されます。",
+	"usenet-profile-saved": "プロバイダープロファイルを保存しました。",
+	"usenet-profile-removed": "{{name}} を削除しました。",
+	"usenet-test-success": "{{name}} に接続しました。",
+	"usenet-test-failed": "接続に失敗しました: {{message}}",
+	"usenet-validation-name": "プロファイル名を入力してください。",
+	"usenet-validation-host": "NNTP ホストを入力してください。",
+	"usenet-validation-port": "ポートは 1 から 65535 の間で指定してください。",
+	"usenet-validation-plain":
+		"保存する前に、平文 NNTP の警告を確認してください。",
+	"usenet-validation-priority": "優先度は 0 以上にしてください。",
+	"usenet-validation-connections":
+		"接続数は 1 から 128 の間で指定してください。",
+	"usenet-validation-credentials":
+		"ユーザー名とパスワードの両方を入力するか、匿名認証を選択してください。",
+	"usenet-validation-credential-status":
+		"認証情報の状態を確認できません。このプロファイルを変更する前に、もう一度お試しください。",
+	"usenet-cleanup": "成功後のクリーンアップ",
+	"usenet-cleanup-tips":
+		"クリーンアップは、組み立てが完全に完了し、展開に成功した後にのみ実行されます。",
+	"usenet-cleanup-action": "検証成功後の動作",
+	"usenet-cleanup-keep": "すべて保持",
+	"usenet-cleanup-keep-tips":
+		"PAR2 ファイルとすべてのアーカイブボリュームを保持します。",
+	"usenet-cleanup-par2": "PAR2 ファイルを削除",
+	"usenet-cleanup-par2-tips":
+		"パリティファイルを削除し、ダウンロードしたアーカイブボリュームは保持します。",
+	"usenet-cleanup-all": "PAR2 とアーカイブボリュームを削除",
+	"usenet-cleanup-all-tips":
+		"展開に成功した後、パリティファイルとアーカイブボリュームを削除します。",
+	"usenet-archive-safety": "アーカイブの安全性",
+	"usenet-limits-defaults":
+		"タスク全体の制限により、検証と展開中のストレージと処理を保護します。",
+	"usenet-desktop-limits": "デスクトップの制限",
+	"usenet-android-limits": "Android の制限",
+	"usenet-limits-summary":
+		"{{entries}} エントリ · 展開合計 {{total}} · 1 エントリあたり {{perEntry}}",
+	"usenet-limits-secondary-summary":
+		"圧縮率 {{ratio}}:1 · ネスト {{depth}} 階層 · 空き容量の確保 {{reserve}} · 稼働 {{hours}} 時間",
+	"usenet-customize-limits": "制限をカスタマイズ",
+	"usenet-hide-limits": "制限を隠す",
+	"usenet-limits-adjusted": "同期された制限が調整されました",
+	"usenet-limits-adjusted-tips":
+		"1 つ以上の値がこのプラットフォームの上限を超えていたため、引き下げられました。",
+	"usenet-max-entries": "最大エントリ数",
+	"usenet-max-expanded": "展開後の合計サイズ",
+	"usenet-max-entry": "単一エントリのサイズ",
+	"usenet-max-depth": "ネストの深さ",
+	"usenet-max-ratio": "圧縮率",
+	"usenet-free-space-reserve": "空き容量の確保",
+	"usenet-max-active-time": "処理のアクティブ時間",
+	"usenet-unit-entries": "エントリ",
+	"usenet-unit-levels": "階層",
+	"usenet-unit-hours": "時間",
+	"usenet-limits-hard-cap":
+		"値はプラットフォームの既定値の 4 倍を超えることはできません。タスクごとの上書きは別途確認されます。",
+	"usenet-restore-limits": "プラットフォームの既定値に戻す",
+	"usenet-limits-restored":
+		"アーカイブの制限をプラットフォームの既定値に戻しました。",
 	save: "保存して適用",
 	"save-success-message": "設定を保存します",
 	"save-fail-message": "設定を保存できませんでした",
 	discard: "放棄",
+	"history-directories": "最近のダウンロードフォルダー",
+	"favorite-directory": "お気に入りフォルダー",
+	"unfavorite-directory": "お気に入りから削除",
+	"remove-history-directory": "履歴からフォルダーを削除",
 	startup: "起動",
 	"open-at-login": "自動的に起動します",
-	"auto-resume-all": "起動後自動的に未完了タスクを再開",
 	"keep-window-state": "ウィンドウのサイズと位置を元に戻します",
+	"auto-resume-all": "起動後自動的に未完了タスクを再開",
 	"default-dir": "既定の保存先",
+	"file-category-dirs": "カテゴリ別パス",
+	"file-category-dirs-tips":
+		"特定のファイルタイプについて、既定のダウンロード先を上書きします。空欄の場合は既定のパスを使用します。",
+	"task-routing-rules": "タスク振り分けルール",
+	"task-routing-rules-tips":
+		"ファイル名のパターンに基づいて、タスクをフォルダーに振り分けます。最初に一致したルールが適用されます。",
+	"task-routing-rule-pattern-placeholder": "パターン（例: *.mkv）",
+	"task-routing-rule-label-placeholder": "タグ",
+	"task-routing-rule-dir-placeholder": "フォルダー",
+	"task-routing-rule-add": "ルールを追加",
+	"file-category-music": "音楽",
+	"file-category-video": "動画",
+	"file-category-image": "画像",
+	"file-category-document": "ドキュメント",
+	"file-category-compressed": "圧縮ファイル",
+	"file-category-program": "プログラム",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store の Sandbox 制限のため，デフォルトディレクトリ設定は「Download」を推奨します。",
 	"transfer-settings": "転送設定",
@@ -18,8 +162,14 @@ export default {
 	"transfer-speed-unlimited": "無制限",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "マグネットリンクをトレントファイルとして保存",
+	"bt-create-subfolder": "複数ファイルの torrent をサブフォルダーにまとめる",
+	"bt-create-subfolder-tips":
+		"有効にすると、複数ファイルの BitTorrent およびマグネットのダウンロードは、torrent 名のフォルダーの中に配置されます。無効にすると、ファイルはダウンロード先に直接書き込まれます。",
+	"bt-upload-rate-limit": "BitTorrent のアップロード制限",
+	"bt-upload-rate-limit-tips":
+		"全体のアップロード制限に加えて、BitTorrent のアップロードを制限します。0 の場合は個別の上限を設けません。",
 	"bt-auto-download-content":
-		"自動的に磁石と急流のコンテンツをダウンロードします",
+		"マグネットと torrent のコンテンツを自動的にダウンロードします",
 	"bt-force-encryption": "BT 強制暗号化",
 	"keep-seeding": "手動で停止するまでシードを続けます",
 	"seed-ratio": "シード比率",
@@ -27,15 +177,75 @@ export default {
 	"seed-time-unit": "分",
 	"task-manage": "タスク管理",
 	"max-concurrent-downloads": "最大同時タスク数",
+	"connections-per-task": "タスクあたりの接続数",
 	"max-connection-per-server": "最大サーバ接続数",
+	"auto-retry": "失敗したタスクを自動的に再試行",
+	"auto-retry-strategy": "再試行間隔のモード",
+	"auto-retry-strategy-static": "固定",
+	"auto-retry-strategy-exponential": "指数バックオフ",
+	"auto-retry-interval": "基本の再試行間隔",
+	"auto-retry-interval-unit": "秒",
+	"auto-retry-max-attempts": "最大再試行回数（0 = 無制限）",
+	"worker-max-retries": "ワーカーのピースごとの最大再試行回数",
+	"auto-detect-low-speed-tasks": "低速タスクを自動検出",
+	"auto-detect-low-speed-tasks-tips":
+		"実行中のタスクの速度がしきい値を下回り続ける場合、自動的に一時停止して再起動します。",
+	"low-speed-threshold": "低速のしきい値",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "HTTP / ネットワークの信頼性",
+	"http-reliability-tips":
+		"HTTP/HTTPS/FTP ダウンロードの接続タイムアウトと転送の停滞検出を調整します。",
+	"connect-timeout": "接続タイムアウト",
+	"nzb-body-timeout": "NZB 本文のタイムアウト",
+	"lowest-speed-limit": "最低速度の制限",
+	"lowest-speed-limit-timeout": "停滞タイムアウト",
+	"lowest-speed-limit-help":
+		"ダウンロードが停滞タイムアウトの間、最低速度の制限を下回り続けると、ワーカーは中止され、（自動再試行が有効な場合は）再起動されます。無効にするには、制限を 0 に設定してください。",
+	"uri-selector": "ミラーの選択",
+	"uri-selector-feedback": "フィードバック（遅い/失敗するミラーを除外）",
+	"uri-selector-inorder": "順番どおり（ミラーを左から順に試行）",
+	"uri-selector-adaptive": "適応型（最速を優先）",
+	"unit-seconds": "秒",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "ストレージ",
+	"storage-tips": "ダウンロード前にエンジンがディスク容量を確保する方法です。",
+	"file-allocation": "ファイル割り当て",
+	"file-allocation-falloc": "事前割り当て（falloc）",
+	"file-allocation-trunc": "切り詰め（長さのみ設定）",
+	"file-allocation-none": "なし（必要に応じて拡張）",
+	"file-allocation-tips":
+		"事前割り当てでは、ダウンロード中の ENOSPC を避け、断片化を減らすため、実際のディスクブロックを先に確保します。非対応のファイルシステムでは切り詰めにフォールバックします。",
 	"new-task-show-downloading": "新規タスクを作成後自動的にタスク画面に移る",
 	"no-confirm-before-delete-task": "タスクを削除する前に確認は必要ありません",
+	"auto-file-renaming": "重複ファイルを自動的にリネーム",
+	"auto-file-renaming-tips":
+		"同名のファイルがすでにある場合、上書きせずに「file.1.ext」のように保存します",
+	"use-remote-file-time": "保存時にリモートファイルの更新日時を使用",
+	"use-remote-file-time-tips":
+		"ファイルの更新日時を、リモートサーバーのタイムスタンプに設定します",
 	continue: "続ける",
 	"task-completed-notify": "タスク完了後に通知する",
+	"clipboard-watch": "クリップボードのダウンロードリンクを監視",
+	"clipboard-watch-tips":
+		"どこかでマグネットやファイルのリンクをコピーすると、Risuko がダウンロードを提案します。",
+	"clipboard-watch-ext": "監視するファイル拡張子",
+	"clipboard-watch-ext-tips":
+		"これらの拡張子で終わる http(s) リンクのみ、確認が表示されます。マグネット、ed2k、torrent のリンクは常に表示されます。スペースまたはカンマで区切ってください。",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"Risuko はクリップボードのダウンロードリンクを監視するようになりました。設定 → 基本設定 でオフにできます。",
 	"prevent-sleep-while-downloading": "ダウンロード中はシステムのスリープを防止",
 	"prevent-sleep-while-downloading-tips":
 		"アクティブなタスクがある間はコンピューターをスリープさせません",
+	"shutdown-when-complete":
+		"すべてのタスクの完了時にコンピューターをシャットダウン",
+	"shutdown-when-complete-tips":
+		"1 回限り: ダウンロードキューが空になったらコンピューターをシャットダウンします",
+	"shutdown-countdown-title": "{{seconds}} 秒後にシャットダウンします…",
+	"shutdown-countdown-cancel": "キャンセル",
+	"shutdown-failed": "シャットダウンに失敗しました。権限を確認してください。",
 	"auto-purge-record": "アプリケーション終了後自動的にタスク履歴を削除",
+	"purge-record-on-start": "アプリ起動時にタスク履歴を削除",
 	ui: "UI",
 	appearance: "テーマ",
 	"theme-auto": "自動",
@@ -67,7 +277,16 @@ export default {
 	"change-language": "言語を切り替え",
 	"hide-app-menu": "メニューバーを隠す（Windows と Linux のみサポート）",
 	proxy: "プロキシ",
+	"proxy-http-profile": "HTTP / FTP / Usenet プロキシ",
+	"proxy-p2p-profile": "P2P プロキシ",
 	"enable-proxy": "プロキシを使う",
+	"enable-p2p-proxy": "P2P プロキシを有効にする",
+	"proxy-p2p-tcp-server": "TCP プロキシサーバー",
+	"proxy-p2p-tcp-bypass": "TCP プロキシのバイパス",
+	"proxy-p2p-udp-server": "UDP プロキシサーバー",
+	"proxy-p2p-udp-server-placeholder":
+		"省略可。空欄の場合は TCP の P2P プロキシを使用します",
+	"proxy-p2p-udp-bypass": "UDP プロキシのバイパス",
 	"proxy-bypass-input-tips":
 		"これらのホストおよびドメインのプロキシ設定を1行に1つずつバイパスします",
 	"proxy-scope-label": "使用先",
@@ -79,35 +298,72 @@ export default {
 	"proxy-scope-update-trackers-desc":
 		"BTトラッカー一覧をプロキシ経由で取得する",
 	"proxy-tips": "プロキシマニュアルを表示",
+	"proxy-p2p-tips":
+		"DHT、UDP トラッカー、uTP には SOCKS5 または SOCKS5H が必要です。HTTP プロキシは TCP の P2P 接続にのみ使用されます。",
+	"proxy-p2p-udp-tips":
+		"UDP プロキシを空欄にすると、TCP の P2P 経路を再利用します。UDP のプロキシには SOCKS5 または SOCKS5H が必要で、HTTP プロキシは UDP を中継できません。",
+	"proxy-p2p-restart-title": "P2P ダウンロードを再起動しますか？",
+	"proxy-p2p-restart-confirm":
+		"P2P プロキシを変更すると、実行中のピアツーピアのダウンロードが再起動されます。HTTP、FTP、Usenet のダウンロードは継続されます。",
+	doh: "DNS over HTTPS",
+	"doh-tips":
+		"システムのリゾルバーではなく、暗号化された DNS エンドポイント経由でホスト名を解決します",
+	"doh-enable": "DNS over HTTPS を有効にする",
+	"doh-provider": "プロバイダー",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "カスタム",
+	"doh-url": "エンドポイント URL",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "DoH エンドポイントは https:// で始まる必要があります",
+	"doh-bootstrap": "ブートストラップ IP",
+	"doh-bootstrap-placeholder":
+		"エンドポイントに到達するための IP（カンマ区切り、省略可）",
+	"doh-fallback": "システム DNS にフォールバック",
+	"doh-fallback-tips":
+		"DoH クエリが失敗した場合、ダウンロードを失敗させずにシステムのリゾルバーで解決します",
 	"bt-tracker": "トラッカーサーバー",
 	"bt-tracker-input-tips": "トラッカーサーバ、一行に一つ",
 	"bt-tracker-tips": "お勧め：",
+	"bt-max-peers-per-torrent": "torrent あたりの最大ピア数",
+	"bt-max-peers-per-torrent-tips":
+		"torrent ごとの同時ピア接続数の上限です。値を大きくするとスウォームの検出が向上します（エンジンの再起動が必要）",
+	"bt-max-outstanding-per-peer": "ピアあたりの最大未処理リクエスト数",
+	"bt-max-outstanding-per-peer-tips":
+		"各ピアにパイプライン処理される同時チャンクリクエスト数の上限です（最大 500）。0 は 6〜500 の適応型の既定値を使用します。torrent 全体のリクエスト予算は、アクティブなピア間で共有されます。エンジンの再起動が必要です",
+	"bt-max-connections": "最大ピア接続数",
+	"bt-max-connections-tips":
+		"すべての torrent を合わせたピア接続の総数で、20 から 5000 です。下げても、すでに開いている接続は切断されず、新しい接続が抑制されるだけです。Linux、macOS、Android では、実効値がシステムのファイルディスクリプタ上限の半分にも制限されます",
+	"bt-ban-corrupt-peers": "破損データを送信するピアを禁止",
+	"bt-ban-corrupt-peers-tips":
+		"送信に関与したピースがハッシュチェックに失敗し続けた IP アドレスを、セッションの残りの間ブロックします。1 つの IP を多くのユーザーが共有している場合（モバイル回線や共有ネットワーク）があるため、無関係なピアも遮断される可能性があります（エンジンの再起動が必要）",
+	"bt-ban-corrupt-strikes": "禁止までの失敗ピース数",
+	"bt-ban-corrupt-strikes-tips":
+		"禁止されるまでに、1 つの IP アドレスが関与してよい失敗ピースの数です。値を大きくすると、たまに発生する破損を許容します（エンジンの再起動が必要）",
+	"bt-enable-upnp": "UPnP / NAT-PMP ポート転送",
+	"bt-enable-upnp-tips":
+		"UPnP IGD、NAT-PMP、または PCP を使って、ルーターの BitTorrent リッスンポートを自動的に開きます（エンジンの再起動が必要）",
+	"bt-upnp-lease": "ポートマッピングのリース（秒）",
+	"bt-upnp-lease-tips":
+		"UPnP と NAT-PMP のポートマッピングのリース期間です。短いほど、古いマッピングからの回復が速くなります（エンジンの再起動が必要）",
+	"bt-enable-lsd": "ローカルサービスディスカバリ",
+	"bt-enable-lsd-tips":
+		"BEP-14 のマルチキャストでローカルネットワーク上のピアを検出します（エンジンの再起動が必要）",
+	"bt-encryption-policy": "プロトコル暗号化",
+	"bt-encryption-policy-tips":
+		"ピア接続の MSE/PE ポリシーです。「暗号化を優先」は、まず暗号化を試し、失敗すると平文にフォールバックします（エンジンの再起動が必要）",
+	"bt-encryption-plaintext": "平文のみ",
+	"bt-encryption-prefer": "暗号化を優先",
+	"bt-encryption-require": "暗号化を必須にする",
+	"bt-listen-v6": "IPv6 でリッスン",
+	"bt-listen-v6-tips":
+		"同じポートで、追加の IPv6 TCP リスナーをバインドします（エンジンの再起動が必要）",
 	"sync-tracker-tips": "同期する",
 	"auto-sync-tracker": "トラッカーリストを毎日自動的に更新します",
-	port: "リスンポート",
-	"bt-port": "BT リスンポート",
-	"dht-port": "DHT リスンポート",
-	security: "セキュリティ",
-	rpc: "RPC",
-	"rpc-listen-port": "RPCリッスンポート",
-	"rpc-secret": "RPCシークレット",
-	"rpc-secret-tips": "RPCシークレットマニュアルの閲覧",
-	pbh: "PeerBanHelper",
-	"pbh-enable": "PeerBanHelper API を有効にする",
-	"pbh-enable-tips":
-		"PeerBanHelper が BitTorrent ピアを監視して禁止できるよう、Aria2Next 互換の JSON-RPC リスナーを公開します",
-	"pbh-listen-port": "PeerBanHelper 待ち受けポート",
-	"pbh-rpc-secret": "PeerBanHelper RPC トークン",
-	"generate-pbh-rpc-secret": "新しいトークンを生成",
-	"pbh-endpoint-hint":
-		"PeerBanHelper で、http://127.0.0.1:{{port}}/jsonrpc を指す Aria2Next ダウンローダーを追加してください",
-	"engine-overrides": "エンジン上書き設定（JSON）",
-	"engine-overrides-placeholder":
-		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
-	"engine-overrides-tips":
-		"高度な設定: 任意のエンジンオプションキーを JSON オブジェクトで指定します。変更は再起動後に反映されます。",
-	"engine-overrides-invalid":
-		"エンジン上書き設定は有効な JSON オブジェクトである必要があります。",
+	"ed2k-server": "eDonkey サーバー",
+	"ed2k-server-input-tips": "eDonkey サーバー（1 行に 1 つ、ip:port）",
+	"ed2k-server-tips": "空の場合は既定のサーバーを使用します",
 	"ed2k-kad": "eMule Kad",
 	"ed2k-enable-kad": "Kad によるソース検出を有効にする",
 	"ed2k-enable-kad-tips":
@@ -117,31 +373,121 @@ export default {
 		"Kad のソース検出に使用する UDP ポート。有効な値は 1-65535 です（エンジンの再起動が必要です）",
 	"ed2k-kad-port-invalid":
 		"Kad UDP ポートは 1 から 65535 までの整数である必要があります",
+	"listen-port-invalid":
+		"BT ポートは、1 から 65535 のポート、6881-6889 のような範囲、またはそれらのカンマ区切りリストで指定してください",
+	"dht-listen-port-invalid":
+		"DHT ポートは、1 から 65535 のポート、6881-6889 のような範囲、またはそれらのカンマ区切りリストで指定してください",
+	"ed2k-port-invalid": "ED2K ポートは 1 から 65535 の整数である必要があります",
 	"ed2k-enable-upload": "ED2K でファイルを共有",
 	"ed2k-enable-upload-tips":
 		"完了したファイルと、ダウンロード中の ED2K タスクの検証済みパートを他のピアにアップロードします。共有をやめたファイルも、Kad 上には最大 5 時間掲載されたままになることがあります（エンジンの再起動が必要です）",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips": "FTP、FTPS、SFTP ダウンロードの既定の認証情報",
+	"ftp-username": "FTP ユーザー名",
+	"ftp-password": "FTP パスワード",
+	"sftp-private-key": "SSH 秘密鍵のパス",
+	"sftp-private-key-content": "SSH 秘密鍵の内容",
+	"sftp-private-key-tips":
+		"PEM 形式の秘密鍵ファイルへのパス（例: ~/.ssh/id_rsa）",
+	"sftp-private-key-paste-tips": "PEM 秘密鍵の内容をここに貼り付け",
+	"sftp-key-passphrase": "鍵のパスフレーズ",
+	"sftp-key-passphrase-tips":
+		"鍵にパスフレーズがない場合は空欄のままにしてください",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "出力形式",
+	"media-settings": "メディアサイト（yt-dlp）",
+	"media-settings-tips":
+		"メディアサイト（YouTube、Vimeo、Bilibili など）のダウンロードの既定設定です。PATH に yt-dlp が必要で、映像と音声のストリームが別々の場合は結合のために ffmpeg が必要です。",
+	"media-format": "優先する形式",
+	"media-format-placeholder":
+		"例: bestvideo+bestaudio/best（yt-dlp の形式文字列）",
+	"media-format-tips":
+		"yt-dlp の形式セレクターです。空欄の場合は最高画質になります。例: bestvideo[height<=1080]+bestaudio/best、137+140",
+	port: "リスンポート",
+	"bt-port": "BT リスンポート",
+	"dht-port": "DHT リスンポート",
+	"ed2k-port": "ed2k リッスンポート",
+	security: "セキュリティ",
+	rpc: "RPC",
+	"rpc-host": "サーバーアドレス",
+	"rpc-host-local": "このデバイスのみ",
+	"rpc-host-all": "すべてのネットワークインターフェース",
+	"rpc-host-custom": "カスタム ({{host}})",
+	"rpc-host-exposed-tips":
+		"ネットワーク上の他のデバイスから RPC ポートにアクセスでき、PeerBanHelper ポートが有効な場合はそのポートにもアクセスできます。シークレットを知っている人は誰でもダウンロードの追加と操作ができます。",
+	"rpc-listen-port": "RPCリッスンポート",
+	"rpc-secret": "RPCシークレット",
+	"rpc-secret-tips": "RPCシークレットマニュアルの閲覧",
+	"rpc-allow-any-dir": "RPC クライアントに任意のローカルパスの使用を許可",
+	"rpc-allow-any-dir-tips":
+		"無効の場合、RPC 経由で追加したダウンロードは、ダウンロード先フォルダー、そのサブフォルダー、およびカテゴリ別パスと振り分けルールのフォルダーにしか保存できず、RPC クライアントがアプリに Cookie、netrc、SSH 鍵ファイルを読み込ませることもできません。",
+	pbh: "PeerBanHelper",
+	"pbh-enable": "PeerBanHelper API を有効にする",
+	"pbh-enable-tips":
+		"PeerBanHelper が BitTorrent ピアを監視して禁止できるよう、Aria2Next 互換の JSON-RPC リスナーを公開します",
+	"pbh-listen-port": "PeerBanHelper 待ち受けポート",
+	"pbh-rpc-secret": "PeerBanHelper RPC トークン",
+	"generate-pbh-rpc-secret": "新しいトークンを生成",
+	"pbh-endpoint-hint":
+		"PeerBanHelper で、http://127.0.0.1:{{port}}/jsonrpc を指す Aria2Next ダウンローダーを追加してください",
+	"randomize-port": "ランダムなポートを選択",
+	"generate-rpc-secret": "新しいRPCシークレットを生成",
+	"copy-rpc-url": "RPC URL をコピー",
+	"engine-overrides": "エンジン上書き設定（JSON）",
+	"engine-overrides-placeholder":
+		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
+	"engine-overrides-tips":
+		"高度な設定: 任意のエンジンオプションキーを JSON オブジェクトで指定します。変更は再起動後に反映されます。",
+	"engine-overrides-invalid":
+		"エンジン上書き設定は有効な JSON オブジェクトである必要があります。",
 	"engine-overrides-reserved-keys":
 		"次の予約済みエンジン上書きキーは無視されました: {{keys}}",
 	"engine-overrides-too-large":
 		"エンジン上書き設定が大きすぎます。キーは最大 64 個、キーあたり 64 文字、値あたり 2048 文字です。",
-	"external-engine-enable": "外部エンジンを使用",
-	"external-engine-enable-tips":
-		"有効にすると、Risuko は内蔵エンジンを自動起動しません。",
-	"external-engine-ip": "外部エンジン IP",
-	"external-engine-port": "外部エンジンポート",
-	"external-engine-secret": "外部エンジンシークレット",
 	developer: "開発者",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "偽装ユーザーエージェント（UA）",
-	"app-log-path": "ログディレクトリを適用",
-	"download-session-path": "セッションパスをダウンロード",
+	cookies: "クッキー",
+	"cookies-tips":
+		"Netscape/Mozilla 形式の cookies.txt ファイルからクッキーを読み込みます（curl/wget の出力にも対応）。",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "保存済みのドメイン認証情報",
+	"saved-cookies-tips":
+		"Cloudflare やその他の認証で保護されたダウンロードを回避する際に、ブラウザーからインポートしたクッキーと User-Agent です。Risuko は、有効期限が切れるか使えなくなるまで、同じドメインの新しいダウンロードでこれらを再利用します。",
+	"saved-cookies-empty": "保存済みの認証情報はまだありません。",
+	"saved-cookies-host": "ドメイン",
+	"saved-cookies-browser": "ブラウザー",
+	"saved-cookies-count": "クッキー",
+	"saved-cookies-imported": "インポート日時",
+	"saved-cookies-actions": "操作",
+	"saved-cookies-clear": "すべて削除",
+	"saved-cookies-confirm-clear":
+		"保存済みのドメイン認証情報をすべて削除しますか？再度インポートするまで、それらのサイトでの今後のダウンロードが失敗する可能性があります。",
+	"saved-cookies-delete": "削除",
+	netrc: ".netrc 認証情報",
+	"netrc-tips":
+		"URL に認証情報が埋め込まれていない場合、.netrc ファイルから HTTP Basic 認証を挿入します。既定: ~/.netrc（Windows では %USERPROFILE%/_netrc）。",
+	"netrc-path-placeholder": ".netrc のパスを上書き（省略可）",
+	"no-netrc": ".netrc の参照を無効にする",
+	"no-netrc-tips":
+		".netrc を完全にスキップします。ファイルにダウンロード以外の認証情報が含まれている場合に便利です。",
+	"app-log-path": "アプリのログパス",
+	"log-dir-override-placeholder":
+		"カスタムのログフォルダー（空欄の場合は既定）",
+	"log-dir-override-tips":
+		"ログは現在 {{path}} に書き込まれています。カスタムフォルダー（例: ダウンロード内）を指定すると、任意のファイルマネージャーから確認できます。変更は次回のアプリ再起動後に反映されます。",
+	"download-session-path": "ダウンロードセッションのパス",
+	"session-reset": "ダウンロードセッションをリセット",
+	"session-reset-confirm":
+		"ダウンロードセッションをリセットしてもよろしいですか？",
 	"factory-reset": "初期設定に戻す",
 	"factory-reset-confirm": "本当に初期設定に戻しますか?",
 	"download-protocol": "プロトコル",
 	"protocols-default-client":
 		"以下のプロトコルのデフォルトクライアントとして設定",
-	"protocols-magnet": "磁石 [ magnet:// ]",
+	"protocols-magnet": "マグネット [ magnet:// ]",
 	"protocols-thunder": "サンダー [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc://, adcs://, dchub://, nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -159,8 +505,6 @@ export default {
 	"auto-update": "自動更新",
 	"auto-check-update": "更新を自動で確認する",
 	"last-check-update-time": "前回更新確認時間",
-	"not-saved": "設定が保存されていません",
-	"not-saved-confirm": "変更された設定は失われます、よろしいですか？",
 	"completion-script": "完了時スクリプト",
 	"completion-script-enabled": "ダウンロード完了時にスクリプトを実行",
 	"completion-script-tips":
@@ -178,10 +522,37 @@ export default {
 	"completion-script-test-ok": "スクリプトテストに成功しました",
 	"completion-script-test-fail": "スクリプトテストに失敗しました",
 	"completion-script-empty": "先にコマンドを指定してください",
-	"history-directories": "最近のダウンロードフォルダー",
-	"favorite-directory": "お気に入りフォルダー",
-	"unfavorite-directory": "お気に入りから削除",
-	"remove-history-directory": "履歴からフォルダーを削除",
-	"randomize-port": "ランダムなポートを選択",
-	"generate-rpc-secret": "新しいRPCシークレットを生成",
+	"completion-script-not-approved":
+		"完了時スクリプトが許可されなかったため、何も保存されませんでした。",
+	"not-saved": "設定が保存されていません",
+	"not-saved-confirm": "変更された設定は失われます、よろしいですか？",
+	"saved-credentials": "保存済みの認証情報",
+	"saved-credentials-description":
+		"ダウンロードで使用する保存済みの認証情報を管理します",
+	"no-saved-credentials": "保存済みの認証情報はありません",
+	"credential-host": "ホスト",
+	"credential-label": "ラベル",
+	"credential-protocol": "プロトコル",
+	"credential-last-used": "最終使用",
+	"credential-delete": "認証情報を削除",
+	"credential-delete-confirm":
+		"この保存済みの認証情報を削除してもよろしいですか？",
+	"vault-enabled": "シークレットは OS のキーチェーンに保存されています",
+	"vault-disabled":
+		"OS のキーチェーンを利用できません — シークレットは平文で保存されます",
+	"credential-encrypted-badge": "OS のキーチェーンに保存済み",
+	"credential-vault-unavailable":
+		"OS のキーチェーンに接続できません。新しい認証情報は平文で保存されます",
+	"speed-limit-enabled": "速度制限を有効にする",
+	"speed-limit-enabled-description":
+		"以下の制限を適用します。オフの場合、ダウンロードは全速力で実行されます。値は保持されます。",
+	"appearance-theme": "テーマ",
+	"appearance-typography": "タイポグラフィ",
+	"appearance-window": "ウィンドウ",
+	"task-list-style": "タスクリスト",
+	"task-list-style-description": "タスクリストでのダウンロードの表示方法です。",
+	"task-list-style-compact": "コンパクト",
+	"task-list-style-card": "カード",
+	"sidebar-collapsed": "サイドバーを折りたたむ",
+	"sidebar-collapsed-description": "サイドバーにアイコンのみを表示します。",
 };

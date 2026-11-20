@@ -83,19 +83,17 @@ function onInput(e: Event) {
 		return;
 	}
 	const num = parseFloat(raw);
-	if (!Number.isNaN(num)) {
+	if (!Number.isNaN(num) && num >= props.min) {
 		emit("update:modelValue", clamp(num));
 	}
 }
 
 function onBlur(e: Event) {
-	const raw = (e.target as HTMLInputElement).value;
-	const num = parseFloat(raw);
-	if (Number.isNaN(num)) {
-		emit("update:modelValue", props.min);
-	} else {
-		emit("update:modelValue", clamp(num));
-	}
+	const input = e.target as HTMLInputElement;
+	const num = parseFloat(input.value);
+	const next = Number.isNaN(num) ? props.min : clamp(num);
+	input.value = String(next);
+	emit("update:modelValue", next);
 }
 
 function increment() {

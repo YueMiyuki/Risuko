@@ -18,6 +18,7 @@ pub struct Ed2kSource {
 }
 
 pub const ED2K_CHUNK_SIZE: u64 = 9_728_000;
+pub const MAX_ED2K_FILE_SIZE: u64 = 256 * 1024 * 1024 * 1024;
 
 pub const PROTO_EDONKEY: u8 = 0xe3;
 pub const PROTO_EMULE: u8 = 0xc5;

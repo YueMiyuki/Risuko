@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use super::peer::{
 };
 use super::peer_priority::PeerRanker;
 use super::piece::{ChunkTracker, PieceTracker};
-use super::storage::{FileSet, FilesystemStorage};
+use super::storage::{FileSet, FilesystemStorage, StorageError};
 use super::tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse, RetryIn, TrackerError};
 use super::utp::UtpSocket;
 use super::wire::extended::{
@@ -51,6 +51,7 @@ const TORRENT_REQUEST_BUDGET: usize = 2048;
 const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_PENDING_DIALS: usize = 48;
 const PRIORITY_DIAL_RESERVE: usize = 12;
+const MAX_BITFIELD_MESSAGES: u8 = 4;
 const MAX_PEER_BACKLOG: usize = 1024;
 const MAX_PEX_BACKLOG: usize = MAX_PEER_BACKLOG * 3 / 4;
 const DIAL_RETRY_DELAY: Duration = Duration::from_secs(20);
@@ -292,6 +293,7 @@ pub enum TorrentCommand {
     ApplyBlocklist {
         ack: oneshot::Sender<(u32, u32)>,
     },
+    FileStamps(oneshot::Sender<Option<Vec<super::create::FileStamp>>>),
     Stop(oneshot::Sender<()>),
 }
 
@@ -307,6 +309,8 @@ pub struct ManagedTorrent {
     pub p2p_proxy_is_task_override: bool,
     pub(crate) cmd_tx: mpsc::Sender<TorrentCommand>,
     pub(crate) stats: Arc<Mutex<TorrentStats>>,
+    #[cfg(test)]
+    pub(crate) upload_read_failures: Arc<AtomicU32>,
     pub(crate) limits: TorrentLimits,
 }
 
@@ -352,6 +356,15 @@ impl ManagedTorrent {
             .await
             .map_err(|e| e.to_string())?;
         done.await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn complete_file_stamps(&self) -> Option<Vec<super::create::FileStamp>> {
+        let (ack, reply) = oneshot::channel();
+        self.cmd_tx
+            .send(TorrentCommand::FileStamps(ack))
+            .await
+            .ok()?;
+        reply.await.ok().flatten()
     }
 }
 
@@ -467,6 +480,7 @@ pub async fn spawn(
         })
     };
     let advertise_v2_flag = Arc::new(AtomicBool::new(init.advertise_v2));
+    let upload_read_failures = Arc::new(AtomicU32::new(0));
     let handle = Arc::new(ManagedTorrent {
         id,
         info_hash,
@@ -479,6 +493,8 @@ pub async fn spawn(
         p2p_proxy_is_task_override: init.p2p_proxy_is_task_override,
         cmd_tx,
         stats: stats.clone(),
+        #[cfg(test)]
+        upload_read_failures: Arc::clone(&upload_read_failures),
         limits: init.limits.clone(),
     });
     tokio::spawn(torrent_loop(
@@ -488,6 +504,7 @@ pub async fn spawn(
         listen_port,
         cmd_rx,
         stats,
+        upload_read_failures,
         advertise_v2_flag,
         upload_only_flag,
         handle.ext_handshake_builder.clone(),
@@ -858,6 +875,7 @@ struct Peer {
     outbound: bool,
     supports_fast: bool,
     initial_availability: Option<InitialAvailability>,
+    bitfield_messages: u8,
     suggested_pieces: HashSet<u32>,
     remote_allowed_fast: HashSet<u32>,
     choke_rejected: HashSet<(u32, u32)>,
@@ -879,6 +897,10 @@ enum InitialAvailability {
 }
 
 impl Peer {
+    fn has_addr(&self, addr: SocketAddr) -> bool {
+        self.addr == addr || self.listen_addr == Some(addr)
+    }
+
     fn pex_flags(&self, total_pieces: usize) -> u8 {
         let mut flags = 0;
         if self.link.encrypted || self.prefers_encryption {
@@ -962,6 +984,7 @@ impl Peer {
             outbound,
             supports_fast,
             initial_availability: None,
+            bitfield_messages: 0,
             suggested_pieces: HashSet::new(),
             remote_allowed_fast: HashSet::new(),
             choke_rejected: HashSet::new(),
@@ -1083,6 +1106,39 @@ impl Drop for LiveUpload {
     }
 }
 
+#[derive(Default)]
+struct PeerQueues {
+    priority: VecDeque<SocketAddr>,
+    backlog: VecDeque<SocketAddr>,
+    dial_retries: VecDeque<(SocketAddr, Instant)>,
+    useful_redials: VecDeque<(SocketAddr, Instant)>,
+}
+
+impl PeerQueues {
+    fn remove(&mut self, addr: SocketAddr) {
+        self.priority.retain(|queued| *queued != addr);
+        self.backlog.retain(|queued| *queued != addr);
+        self.dial_retries.retain(|(queued, _)| *queued != addr);
+        self.useful_redials.retain(|(queued, _)| *queued != addr);
+    }
+
+    fn evict_last(&mut self) -> Option<SocketAddr> {
+        self.backlog
+            .pop_back()
+            .or_else(|| self.dial_retries.pop_back().map(|(addr, _)| addr))
+            .or_else(|| self.useful_redials.pop_back().map(|(addr, _)| addr))
+            .or_else(|| self.priority.pop_back())
+    }
+
+    fn len(&self) -> usize {
+        self.priority.len()
+            + self.backlog.len()
+            + self.dial_retries.len()
+            + self.useful_redials.len()
+    }
+}
+
+#[derive(Default)]
 struct VerifyResult {
     piece_index: u32,
     write_error: Option<String>,
@@ -1231,6 +1287,13 @@ fn disk_queue_limit(piece_length: u32) -> u64 {
 }
 
 const MAX_WRITE_FAILURES: u32 = 3;
+const MAX_READ_FAILURES: u32 = 3;
+
+#[derive(Debug, PartialEq)]
+struct WriteHalt {
+    error: String,
+    storage: bool,
+}
 
 impl DiskQueue {
     fn new(limit: u64) -> Self {
@@ -1244,28 +1307,41 @@ impl DiskQueue {
         }
     }
 
-    fn record_write(&mut self, result: &VerifyResult) -> Option<String> {
+    fn record_write(&mut self, result: &VerifyResult) -> Option<WriteHalt> {
         let halt = match &result.write_error {
             Some(error) => {
                 self.write_failures = self.write_failures.saturating_add(1);
-                (self.write_failures >= MAX_WRITE_FAILURES)
-                    .then(|| format!("Disk write failed: {error}"))
+                (self.write_failures >= MAX_WRITE_FAILURES).then(|| WriteHalt {
+                    error: format!("Disk write failed: {error}"),
+                    storage: true,
+                })
             }
-            None if result.hash_conflict => Some(format!(
-                "Piece {} matches its v1 hash but not its v2 hash; the torrent's hashes disagree",
-                result.piece_index
-            )),
+            None if result.hash_conflict => Some(WriteHalt {
+                error: format!(
+                    "Piece {} matches its v1 hash but not its v2 hash; the torrent's hashes disagree",
+                    result.piece_index
+                ),
+                storage: false,
+            }),
             None if result.verify_ok => {
                 self.write_failures = 0;
                 None
             }
             None => None,
         };
-        if halt.is_some() && self.halted.is_none() {
-            self.halted = halt;
-            return self.halted.clone();
+        match halt {
+            Some(halt) if self.halted.is_none() => {
+                self.halted = Some(halt.error.clone());
+                Some(halt)
+            }
+            _ => None,
         }
-        None
+    }
+
+    fn halt(&mut self, error: String) {
+        if self.halted.is_none() {
+            self.halted = Some(error);
+        }
     }
 
     fn resume(&mut self) {
@@ -1337,6 +1413,33 @@ struct WebSeedContext {
 }
 
 impl WebSeedContext {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        client: risuko_http::Client,
+        bases: Vec<String>,
+        info: Arc<super::core::ValidatedTorrentMetaV1Info>,
+        storage: Arc<FilesystemStorage>,
+        verifier: PieceVerifier,
+        lengths: Lengths,
+        generation: GenerationToken,
+        throttle: Throttle,
+    ) -> Self {
+        Self {
+            client,
+            bases: Arc::new(bases),
+            disabled: Default::default(),
+            disabled_files: Default::default(),
+            backoff: Default::default(),
+            info,
+            layout: storage.layout().clone(),
+            storage,
+            verifier,
+            lengths,
+            generation,
+            throttle,
+        }
+    }
+
     fn mirror_usable(&self, idx: usize) -> bool {
         !self.disabled.lock().contains(&idx)
             && self
@@ -1435,6 +1538,32 @@ struct PieceAssembly {
     completed: bool,
 }
 
+struct TorrentCtx<'a> {
+    torrent_id: usize,
+    info_hash: Id20,
+    private_torrent: bool,
+    our_peer_id: Id20,
+    registry_scope: &'a Arc<()>,
+    lengths: &'a Lengths,
+    storage: &'a Arc<FilesystemStorage>,
+    stats: &'a Arc<Mutex<TorrentStats>>,
+    upload_tick: &'a Arc<AtomicU64>,
+    upload_read_failures: &'a Arc<AtomicU32>,
+    peer_src_tx: &'a mpsc::Sender<PeerEnvelope>,
+    generation: &'a GenerationToken,
+    verifier: &'a PieceVerifier,
+    failed_copies: Option<&'a SharedFailedCopies>,
+    info_bytes: &'a Arc<Vec<u8>>,
+    hash_tables: Option<&'a Arc<Vec<MerkleProofTable>>>,
+    leaf_pool: &'a LeafHashPool,
+    pipeline_floor: usize,
+    pipeline_cap: usize,
+    max_peers: usize,
+    upload_limiter: &'a Throttle,
+    blocklist: &'a RwLock<BlockList>,
+    listen_port: u16,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn torrent_loop(
     torrent_id: usize,
@@ -1443,6 +1572,7 @@ async fn torrent_loop(
     listen_port: u16,
     mut cmd_rx: mpsc::Receiver<TorrentCommand>,
     stats: Arc<Mutex<TorrentStats>>,
+    upload_read_failures: Arc<AtomicU32>,
     advertise_v2_flag: Arc<AtomicBool>,
     upload_only_flag: Arc<AtomicBool>,
     ext_handshake_builder: crate::peer::ExtHandshakeBuilder,
@@ -1505,10 +1635,13 @@ async fn torrent_loop(
         ),
     );
     let mut piece_tracker = PieceTracker::new(lengths).with_order_salt(rand::rng().random::<u64>());
+    let mut requested_files = init.only_files.clone();
+    let mut selection_error: Option<String> = None;
     let (mut only_files, applied, _) =
         apply_storage_selection(&storage, init.only_files.clone()).await;
     if let Err(e) = applied {
         tracing::warn!("file selection for {info_hash}: {e}");
+        selection_error = Some(format!("Could not prepare the selected files: {e}"));
     }
     piece_tracker.set_wanted(wanted_pieces(
         storage.layout(),
@@ -1521,6 +1654,7 @@ async fn torrent_loop(
     let (scan_tx, scan_rx) = mpsc::channel::<Vec<u32>>(16);
     let mut scan_rx = Some(scan_rx);
     let mut scanning = true;
+    let mut recheck_on_resume = false;
     let mut scan_task = Some({
         let verifier = verifier.clone();
         let storage = Arc::clone(&storage);
@@ -1592,10 +1726,7 @@ async fn torrent_loop(
     let mut ip_budgets = IpBudgets::default();
     let mut mse_first_addrs: HashSet<SocketAddr> = HashSet::new();
     let mut pending_dials: HashMap<u32, SocketAddr> = HashMap::new();
-    let mut peer_backlog: VecDeque<SocketAddr> = VecDeque::new();
-    let mut priority_backlog: VecDeque<SocketAddr> = VecDeque::new();
-    let mut dial_retries: VecDeque<(SocketAddr, Instant)> = VecDeque::new();
-    let mut useful_redials: VecDeque<(SocketAddr, Instant)> = VecDeque::new();
+    let mut queues = PeerQueues::default();
     let mut useful_peers: HashMap<SocketAddr, usize> = HashMap::new();
     let registry_scope = Arc::new(());
     let mut paused = false;
@@ -1603,7 +1734,9 @@ async fn torrent_loop(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_tick = Instant::now();
     let mut last_keepalive = Instant::now();
-    let mut last_peer_snapshot = Instant::now() - PEER_SNAPSHOT_INTERVAL;
+    let mut last_peer_snapshot = Instant::now()
+        .checked_sub(PEER_SNAPSHOT_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut last_choke_eval = Instant::now();
     let mut last_quality_pass = Instant::now();
     let mut inbound_evictions: Vec<u32> = Vec::new();
@@ -1626,24 +1759,24 @@ async fn torrent_loop(
     let mut seen_ban_revision = blocklist.read().ban_revision();
     let mut dial_failures: HashMap<SocketAddr, u8> = HashMap::new();
     let mut write_tasks = DiskQueue::new(disk_queue_limit(lengths.piece_length()));
+    if let Some(error) = &selection_error {
+        write_tasks.halt(error.clone());
+        stats.lock().set_error(error.clone(), true);
+    }
     let mut webseed_tasks: tokio::task::JoinSet<WebSeedBatchResult> = tokio::task::JoinSet::new();
     let mut webseed_inflight: HashSet<u32> = HashSet::new();
     let mut webseed_ctx = if !private_torrent && !init.meta.url_list.is_empty() {
         match build_webseed_client(p2p_proxy.as_ref()) {
-            Ok(client) => Some(WebSeedContext {
+            Ok(client) => Some(WebSeedContext::new(
                 client,
-                bases: Arc::new(init.meta.url_list.clone()),
-                disabled: Arc::new(Mutex::new(HashSet::new())),
-                disabled_files: Arc::new(Mutex::new(HashSet::new())),
-                backoff: Arc::new(Mutex::new(HashMap::new())),
-                info: Arc::clone(&info),
-                layout: storage.layout().clone(),
-                storage: Arc::clone(&storage),
-                verifier: verifier.clone(),
+                init.meta.url_list.clone(),
+                Arc::clone(&info),
+                Arc::clone(&storage),
+                verifier.clone(),
                 lengths,
-                generation: generation.clone(),
-                throttle: recv_throttle.clone(),
-            }),
+                generation.clone(),
+                recv_throttle.clone(),
+            )),
             Err(e) => {
                 tracing::warn!("torrent {info_hash}: unable to initialize WebSeed client: {e}");
                 None
@@ -1670,6 +1803,58 @@ async fn torrent_loop(
             Arc::clone(&dht_relaxed),
         )
     });
+    let torrent_ctx = TorrentCtx {
+        torrent_id,
+        info_hash,
+        private_torrent: init.meta.info.private,
+        our_peer_id,
+        registry_scope: &registry_scope,
+        lengths: &lengths,
+        storage: &storage,
+        stats: &stats,
+        upload_tick: &upload_tick,
+        upload_read_failures: &upload_read_failures,
+        peer_src_tx: &peer_src_tx,
+        generation: &generation,
+        verifier: &verifier,
+        failed_copies: failed_copies.as_ref(),
+        info_bytes: &info_bytes,
+        hash_tables: hash_tables.as_ref(),
+        leaf_pool: &leaf_pool,
+        pipeline_floor,
+        pipeline_cap,
+        max_peers,
+        upload_limiter: &upload_limiter,
+        blocklist: &blocklist,
+        listen_port,
+    };
+
+    macro_rules! drain_backlog {
+        () => {
+            drain_peer_backlog(
+                &mut queues,
+                &mut pending_dials,
+                &mut known_addrs,
+                &useful_peers,
+                &holepunch,
+                &mse_first_addrs,
+                &mut next_pid,
+                peers.len(),
+                &torrent_ctx,
+                &peer_event_tx,
+                encryption,
+                advertise_v2,
+                !private_torrent,
+                &ext_handshake_builder,
+                &outbound_utp,
+                &p2p_proxy,
+                &recv_throttle,
+                &mut outbound_tasks,
+                &mut outbound_aborts,
+                &mut conn_lease,
+            )
+        };
+    }
 
     let stop_ack = 'torrent: loop {
         conn_lease.sync(peers.len() + pending_dials.len());
@@ -1691,43 +1876,11 @@ async fn torrent_loop(
                     if enqueue_peer_candidate(
                         addr,
                         useful_peers.contains_key(&addr),
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
+                        &mut queues,
                         &mut known_addrs,
                         &blocklist,
                     ) && !paused {
-                        drain_peer_backlog(
-                            &mut priority_backlog,
-                            &mut peer_backlog,
-                            &mut dial_retries,
-                            &mut useful_redials,
-                            &mut pending_dials,
-                            &mut known_addrs,
-                            &useful_peers,
-                            &holepunch,
-                            &mse_first_addrs,
-                            &mut next_pid,
-                            peers.len(),
-                            max_peers,
-                            torrent_id,
-                            &registry_scope,
-                            info_hash,
-                            our_peer_id,
-                            &peer_event_tx,
-                            encryption,
-                            advertise_v2,
-                            !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &blocklist,
-                            &mut conn_lease,
-                        );
+                        drain_backlog!();
                     }
                 }
                 TorrentCommand::AddInboundPeer { addr, cmd_tx, piece_tx, bind, reserved, peer_id, io_abort, encrypted, utp } => {
@@ -1796,22 +1949,13 @@ async fn torrent_loop(
                             Route::of(p2p_proxy.as_ref()),
                         )
                         .await;
-                        unqueue_peer_addr(
-                            addr,
-                            &mut priority_backlog,
-                            &mut peer_backlog,
-                            &mut dial_retries,
-                            &mut useful_redials,
-                        );
+                        queues.remove(addr);
                     } else {
                         if utp && (!private_torrent || tracker_authorized.contains(&addr)) {
                             enqueue_peer_candidate(
                                 addr,
                                 useful_peers.contains_key(&addr),
-                                &mut priority_backlog,
-                                &mut peer_backlog,
-                                &mut dial_retries,
-                                &mut useful_redials,
+                                &mut queues,
                                 &mut known_addrs,
                                 &blocklist,
                             );
@@ -1865,16 +2009,13 @@ async fn torrent_loop(
 
                     for addr in paused_candidates {
                         if useful_peers.contains_key(&addr) {
-                            priority_backlog.push_back(addr);
+                            queues.priority.push_back(addr);
                         } else {
-                            peer_backlog.push_back(addr);
+                            queues.backlog.push_back(addr);
                         }
                     }
                     refresh_peer_queue_state(
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
+                        &mut queues,
                         &peers,
                         &pending_dials,
                         &mut known_addrs,
@@ -1889,7 +2030,7 @@ async fn torrent_loop(
                     while let Some(result) = write_tasks.join_next().await {
                         match result {
                             Ok(vr) => {
-                                process_verify_result(
+                                if process_verify_result(
                                     vr,
                                     &lengths,
                                     &mut piece_tracker,
@@ -1899,8 +2040,13 @@ async fn torrent_loop(
                                     &stats,
                                     &mut piece_assemblies,
                                  &mut corruption, &blocklist,
+                                    write_tasks.halted.is_some(),
                                 )
-                                .await;
+                                .await
+                                .is_some()
+                                {
+                                    recheck_on_resume = true;
+                                }
                             }
                             Err(e) if !e.is_cancelled() => {
                                 tracing::warn!("piece write/verify task failed during pause: {e}");
@@ -1910,17 +2056,83 @@ async fn torrent_loop(
                     }
                     if let Err(e) = storage.close_handles().await {
                         tracing::warn!("failed to close storage handles on pause: {e}");
+                        recheck_on_resume = true;
                     }
+                    note_failed_flush(&storage, &stats);
                     let _ = ack.send(());
                 }
                 TorrentCommand::Unpause(ack) => {
                     paused = false;
                     write_tasks.resume();
-                    stats.lock().error = None;
+                    stats.lock().clear_error();
+                    upload_read_failures.store(0, Ordering::Relaxed);
                     {
                         let mut lifecycle = tracker_state.lock();
                         lifecycle.retry_failed_now();
                         lifecycle.announce_now(false);
+                    }
+                    if selection_error.take().is_some() {
+                        let applied;
+                        let flushed;
+                        (only_files, applied, flushed) = select_files(
+                            &storage,
+                            requested_files.clone(),
+                            &lengths,
+                            &mut piece_tracker,
+                            &mut chunk_tracker,
+                            &mut piece_assemblies,
+                            &stats,
+                            scanning,
+                            write_tasks.halted.is_some(),
+                        )
+                        .await;
+                        if let Err(e) = applied {
+                            tracing::warn!("file selection for {info_hash}: {e}");
+                            let error = format!("Could not prepare the selected files: {e}");
+                            write_tasks.halt(error.clone());
+                            {
+                                let mut s = stats.lock();
+                                s.set_error(error.clone(), true);
+                                s.finished = false;
+                            }
+                            selection_error = Some(error);
+                        }
+                        if let Some(error) = flushed {
+                            tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                            write_tasks.halt(error);
+                            recheck_on_resume = true;
+                        }
+                    }
+                    if std::mem::take(&mut recheck_on_resume) {
+                        tracing::info!("re-verifying {info_hash} after a failed flush");
+                        restart_verification(
+                            &verifier,
+                            &storage,
+                            lengths,
+                            only_files.as_deref(),
+                            &stats,
+                            &mut piece_tracker,
+                            &mut chunk_tracker,
+                            &mut piece_assemblies,
+                            &mut scan_task,
+                            &mut scan_rx,
+                        )
+                        .await;
+                        scanning = true;
+                    }
+                    if !scanning {
+                        if let Some(error) = finish_if_complete(
+                            &storage,
+                            &stats,
+                            piece_tracker.is_complete(),
+                            write_tasks.halted.is_some(),
+                        )
+                        .await
+                        {
+                            tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                            write_tasks.halt(error);
+                            recheck_on_resume = true;
+                        }
                     }
                     if !scanning && tracker_tasks.is_empty() {
                         tracker_tasks = spawn_tracker_tier_pollers(
@@ -1945,36 +2157,7 @@ async fn torrent_loop(
                             ));
                         }
                     }
-                    drain_peer_backlog(
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        max_peers,
-                        torrent_id,
-                        &registry_scope,
-                        info_hash,
-                        our_peer_id,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &blocklist,
-                            &mut conn_lease,
-                        );
+                    drain_backlog!();
                     let _ = ack.send(());
                 }
                 TorrentCommand::ReconfigureP2p { proxy, replace_proxy, dht: next_dht, ack } => {
@@ -1986,19 +2169,17 @@ async fn torrent_loop(
                     release_webseed_inflight(&mut webseed_inflight, &mut piece_tracker, &lengths);
                     if replace_proxy {
                         webseed_ctx = if !private_torrent && !init.meta.url_list.is_empty() {
-                            build_webseed_client(p2p_proxy.as_ref()).ok().map(|client| WebSeedContext {
-                                client,
-                                bases: Arc::new(init.meta.url_list.clone()),
-                                disabled: Arc::new(Mutex::new(HashSet::new())),
-                                disabled_files: Arc::new(Mutex::new(HashSet::new())),
-                                backoff: Arc::new(Mutex::new(HashMap::new())),
-                                info: Arc::clone(&info),
-                                layout: storage.layout().clone(),
-                                storage: Arc::clone(&storage),
-                                verifier: verifier.clone(),
-                                lengths,
-                                generation: generation.clone(),
-                                throttle: recv_throttle.clone(),
+                            build_webseed_client(p2p_proxy.as_ref()).ok().map(|client| {
+                                WebSeedContext::new(
+                                    client,
+                                    init.meta.url_list.clone(),
+                                    Arc::clone(&info),
+                                    Arc::clone(&storage),
+                                    verifier.clone(),
+                                    lengths,
+                                    generation.clone(),
+                                    recv_throttle.clone(),
+                                )
                             })
                         } else {
                             None
@@ -2045,31 +2226,28 @@ async fn torrent_loop(
                     let _ = ack.send(());
                 }
                 TorrentCommand::SetOnlyFiles { files, ack } => {
+                    requested_files = files.clone();
                     let applied;
-                    let promoted;
-                    (only_files, applied, promoted) =
-                        apply_storage_selection(&storage, files).await;
-                    piece_tracker.set_wanted(wanted_pieces(
-                        storage.layout(),
+                    let flushed;
+                    (only_files, applied, flushed) = select_files(
+                        &storage,
+                        files,
                         &lengths,
-                        only_files.as_deref(),
-                    ));
-                    drop_unwanted_partial_pieces(
-                        &piece_tracker,
+                        &mut piece_tracker,
                         &mut chunk_tracker,
                         &mut piece_assemblies,
-                        &lengths,
-                    );
-                    if !scanning {
-                        let file_progress = Arc::clone(&stats.lock().file_progress);
-                        storage
-                            .settle_promoted_files(&promoted, &file_progress)
-                            .await;
+                        &stats,
+                        scanning,
+                        write_tasks.halted.is_some(),
+                    )
+                    .await;
+                    if applied.is_ok() {
+                        selection_error = None;
                     }
-                    {
-                        let mut s = stats.lock();
-                        s.left_bytes = piece_tracker.bytes_left();
-                        s.finished = !scanning && piece_tracker.is_complete();
+                    if let Some(error) = flushed {
+                        tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                        write_tasks.halt(error);
+                        recheck_on_resume = true;
                     }
                     for peer in peers.values_mut() {
                         refresh_peer_needs(peer, &piece_tracker, &lengths);
@@ -2109,10 +2287,7 @@ async fn torrent_loop(
                         &mut pending_dials,
                         &mut outbound_aborts,
                         &mut known_addrs,
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
+                        &mut queues,
                         &mut useful_peers,
                         &mut pex_source,
                         &mut holepunch,
@@ -2125,6 +2300,19 @@ async fn torrent_loop(
                     );
                     choke_dirty = true;
                     let _ = ack.send((disconnected, removed));
+                }
+                TorrentCommand::FileStamps(ack) => {
+                    let stamps = if scanning
+                        || write_tasks.halted.is_some()
+                        || !write_tasks.is_empty()
+                        || !has_every_piece(&piece_tracker, &lengths)
+                    {
+                        None
+                    } else {
+                        stamp_complete_files(&storage, &info).await
+                    };
+                    note_failed_flush(&storage, &stats);
+                    let _ = ack.send(stamps);
                 }
                 TorrentCommand::Stop(ack) => {
                     storage.invalidate_read_cache();
@@ -2155,53 +2343,21 @@ async fn torrent_loop(
                     addr,
                     source,
                     known_useful,
-                    &mut priority_backlog,
-                    &mut peer_backlog,
-                    &mut dial_retries,
-                    &mut useful_redials,
+                    &mut queues,
                     &mut known_addrs,
                     &blocklist,
                 ) && !paused {
-                    drain_peer_backlog(
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        max_peers,
-                        torrent_id,
-                        &registry_scope,
-                        info_hash,
-                        our_peer_id,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                        &ext_handshake_builder,
-                        &outbound_utp,
-                        &p2p_proxy,
-                        &recv_throttle,
-                        &mut outbound_tasks,
-                        &mut outbound_aborts,
-                        &blocklist,
-                        &mut conn_lease,
-                    );
+                    drain_backlog!();
                 }
             }
             Some(tier_ack) = tracker_tier_rx.recv(), if private_torrent => {
                 generation.bump();
                 tracker_authorized.clear();
                 while peer_addr_rx.try_recv().is_ok() {}
-                priority_backlog.clear();
-                peer_backlog.clear();
-                dial_retries.clear();
-                useful_redials.clear();
+                queues.priority.clear();
+                queues.backlog.clear();
+                queues.dial_retries.clear();
+                queues.useful_redials.clear();
                 for (pid, addr) in pending_dials.drain() {
                     if let Some(abort) = outbound_aborts.remove(&pid) {
                         abort.abort();
@@ -2255,10 +2411,19 @@ async fn torrent_loop(
                             tracing::warn!("preallocate failed for {info_hash}: {e}");
                         }
                         scanning = false;
+                        stats.lock().left_bytes = piece_tracker.bytes_left();
+                        note_failed_flush(&storage, &stats);
+                        if let Some(error) = finish_if_complete(
+                            &storage,
+                            &stats,
+                            piece_tracker.is_complete(),
+                            write_tasks.halted.is_some(),
+                        )
+                        .await
                         {
-                            let mut s = stats.lock();
-                            s.left_bytes = piece_tracker.bytes_left();
-                            s.finished = piece_tracker.is_complete();
+                            tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                            write_tasks.halt(error);
+                            recheck_on_resume = true;
                         }
                         piece_tracker.refresh_order();
                         for peer in peers.values_mut() {
@@ -2275,74 +2440,38 @@ async fn torrent_loop(
                                     &tracker_info_hashes,
                                 );
                             }
-                            drain_peer_backlog(
-                                &mut priority_backlog,
-                                &mut peer_backlog,
-                                &mut dial_retries,
-                                &mut useful_redials,
-                                &mut pending_dials,
-                                &mut known_addrs,
-                                &useful_peers,
-                                &holepunch,
-                                &mse_first_addrs,
-                                &mut next_pid,
-                                peers.len(),
-                                max_peers,
-                                torrent_id,
-                                &registry_scope,
-                                info_hash,
-                                our_peer_id,
-                                &peer_event_tx,
-                                encryption,
-                                advertise_v2,
-                                !private_torrent,
-                                &ext_handshake_builder,
-                                &outbound_utp,
-                                &p2p_proxy,
-                                &recv_throttle,
-                                &mut outbound_tasks,
-                                &mut outbound_aborts,
-                                &blocklist,
-                                &mut conn_lease,
-                            );
+                            drain_backlog!();
                         }
                     }
                 }
             }
             Some((pid, ev)) = peer_event_rx.recv() => {
                 let kick = process_peer_event(
-                    torrent_id, info_hash, init.meta.info.private, pid, ev, our_peer_id, &registry_scope, paused, &mut peers, &mut piece_tracker, &mut chunk_tracker,
-                    &mut piece_assemblies,
-                    &lengths, &storage, &stats, &mut bytes_this_tick,
-                    &upload_tick,
-                    &mut write_tasks,
-                    &mut pending_dials,
-                    &mut outbound_aborts,
-                    &mut known_addrs,
-                    &mut priority_backlog,
-                    &mut peer_backlog,
-                    &mut dial_retries,
-                    &mut useful_redials,
-                    &mut useful_peers,
-                    &mut dial_failures,
-                    &mut pex_source, &mut holepunch, &mut ip_budgets,
-                    &peer_src_tx,
-                    &generation,
-                    &verifier,
-                    failed_copies.as_ref(),
-                    &info_bytes,
-                    hash_tables.as_ref(),
-                    &leaf_pool,
-                    pipeline_floor,
-                    pipeline_cap,
-                    max_peers,
-                    &mut choke_dirty,
-                    &upload_limiter,
+                    &torrent_ctx,
+                    pid,
+                    ev,
+                    paused,
+                    SwarmRefs {
+                        peers: &mut peers,
+                        piece_tracker: &mut piece_tracker,
+                        chunk_tracker: &mut chunk_tracker,
+                        piece_assemblies: &mut piece_assemblies,
+                        bytes_this_tick: &mut bytes_this_tick,
+                        write_tasks: &mut write_tasks,
+                        pending_dials: &mut pending_dials,
+                        outbound_aborts: &mut outbound_aborts,
+                        known_addrs: &mut known_addrs,
+                        queues: &mut queues,
+                        useful_peers: &mut useful_peers,
+                        dial_failures: &mut dial_failures,
+                        pex_source: &mut pex_source,
+                        holepunch: &mut holepunch,
+                        ip_budgets: &mut ip_budgets,
+                        choke_dirty: &mut choke_dirty,
+                    },
                     dht.as_ref(),
-                    &blocklist,
                     &tracker_authorized,
                     Route::of(p2p_proxy.as_ref()),
-                    listen_port,
                 ).await;
                 if kick && !(paused || scanning) && !write_tasks.is_full() {
                     drive_peer(pid, &mut peers, &mut piece_tracker, &mut chunk_tracker, &webseed_inflight);
@@ -2361,16 +2490,21 @@ async fn torrent_loop(
                                     bytes_this_tick.0 += u64::from(lengths.piece_length_of(vpi));
                                 }
                             }
-                            if let Some(error) = write_tasks.record_write(&vr) {
-                                tracing::error!("torrent {info_hash}: downloading stopped: {error}");
-                                stats.lock().error = Some(error);
+                            if let Some(halt) = write_tasks.record_write(&vr) {
+                                tracing::error!("torrent {info_hash}: downloading stopped: {}", halt.error);
+                                stats.lock().set_error(halt.error, halt.storage);
                             }
-                            process_verify_result(
+                            if let Some(error) = process_verify_result(
                                 vr, &lengths, &mut piece_tracker,
                                 &mut chunk_tracker, &mut peers, &storage, &stats,
                                 &mut piece_assemblies,
                              &mut corruption, &blocklist,
-                            ).await;
+                                write_tasks.halted.is_some(),
+                            ).await {
+                                tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                                write_tasks.halt(error);
+                                recheck_on_resume = true;
+                            }
                         }
                         if !(paused || scanning) {
                             if !write_tasks.is_full() {
@@ -2400,16 +2534,21 @@ async fn torrent_loop(
                 while let Some(result) = next {
                     match result {
                         Ok(vr) => {
-                            if let Some(error) = write_tasks.record_write(&vr) {
-                                tracing::error!("torrent {info_hash}: downloading stopped: {error}");
-                                stats.lock().error = Some(error);
+                            if let Some(halt) = write_tasks.record_write(&vr) {
+                                tracing::error!("torrent {info_hash}: downloading stopped: {}", halt.error);
+                                stats.lock().set_error(halt.error, halt.storage);
                             }
-                            process_verify_result(
+                            if let Some(error) = process_verify_result(
                                 vr, &lengths, &mut piece_tracker,
                                 &mut chunk_tracker, &mut peers, &storage, &stats,
                                 &mut piece_assemblies,
                              &mut corruption, &blocklist,
-                            ).await;
+                                write_tasks.halted.is_some(),
+                            ).await {
+                                tracing::error!("torrent {info_hash}: downloading stopped: {error}");
+                                write_tasks.halt(error);
+                                recheck_on_resume = true;
+                            }
                             verified_any = true;
                         }
                         Err(e) if !e.is_cancelled() => {
@@ -2430,36 +2569,7 @@ async fn torrent_loop(
                     }
                 }
                 if !paused {
-                    drain_peer_backlog(
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        max_peers,
-                        torrent_id,
-                        &registry_scope,
-                        info_hash,
-                        our_peer_id,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &blocklist,
-                            &mut conn_lease,
-                        );
+                    drain_backlog!();
                 }
             }
             _ = tick.tick() => {
@@ -2547,7 +2657,7 @@ async fn torrent_loop(
                     if now.duration_since(last_quality_pass) >= PEER_QUALITY_INTERVAL {
                         last_quality_pass = now;
                         let candidates_waiting =
-                            !priority_backlog.is_empty() || !peer_backlog.is_empty();
+                            !queues.priority.is_empty() || !queues.backlog.is_empty();
                         if candidates_waiting && peers.len() * 10 >= max_peers * 9 {
                             let scope = RecycleScope {
                                 complete: piece_tracker.is_complete(),
@@ -2591,8 +2701,7 @@ async fn torrent_loop(
                                         dial_addr,
                                         known_useful,
                                         failures,
-                                        &mut dial_retries,
-                                        &mut useful_redials,
+                                        &mut queues,
                                     );
                                 }
                             }
@@ -2613,10 +2722,7 @@ async fn torrent_loop(
                     }
                     if evicted_any {
                         refresh_peer_queue_state(
-                            &mut priority_backlog,
-                            &mut peer_backlog,
-                            &mut dial_retries,
-                            &mut useful_redials,
+                            &mut queues,
                             &peers,
                             &pending_dials,
                             &mut known_addrs,
@@ -2726,6 +2832,7 @@ async fn torrent_loop(
                 } else {
                     None
                 };
+                note_failed_flush(&storage, &stats);
                 {
                     let mut s = stats.lock();
                     let upload_dt = upload_tick.swap(0, Ordering::Relaxed);
@@ -2764,7 +2871,7 @@ async fn torrent_loop(
                         peers.len(),
                         pending_dials.len(),
                         known_addrs.len(),
-                        peer_backlog.len(),
+                        queues.backlog.len(),
                         chunk_tracker.endgame(),
                         bytes_this_tick.0,
                         bytes_this_tick.1,
@@ -2781,36 +2888,7 @@ async fn torrent_loop(
                 }
                 bytes_this_tick = (0, 0);
                 if !paused {
-                    drain_peer_backlog(
-                        &mut priority_backlog,
-                        &mut peer_backlog,
-                        &mut dial_retries,
-                        &mut useful_redials,
-                        &mut pending_dials,
-                        &mut known_addrs,
-                        &useful_peers,
-                        &holepunch,
-                        &mse_first_addrs,
-                        &mut next_pid,
-                        peers.len(),
-                        max_peers,
-                        torrent_id,
-                        &registry_scope,
-                        info_hash,
-                        our_peer_id,
-                        &peer_event_tx,
-                        encryption,
-                        advertise_v2,
-                        !private_torrent,
-                            &ext_handshake_builder,
-                            &outbound_utp,
-                            &p2p_proxy,
-                            &recv_throttle,
-                            &mut outbound_tasks,
-                            &mut outbound_aborts,
-                            &blocklist,
-                            &mut conn_lease,
-                    );
+                    drain_backlog!();
                 }
                 if !(paused || scanning) {
                     piece_tracker.refresh_order();
@@ -2860,10 +2938,10 @@ async fn torrent_loop(
     }
     pending_dials.clear();
 
-    priority_backlog.clear();
-    peer_backlog.clear();
-    dial_retries.clear();
-    useful_redials.clear();
+    queues.priority.clear();
+    queues.backlog.clear();
+    queues.dial_retries.clear();
+    queues.useful_redials.clear();
     useful_peers.clear();
     known_addrs.clear();
     pex_source.clear();
@@ -2873,7 +2951,7 @@ async fn torrent_loop(
         while let Some(result) = write_tasks.join_next().await {
             match result {
                 Ok(vr) => {
-                    process_verify_result(
+                    if let Some(error) = process_verify_result(
                         vr,
                         &lengths,
                         &mut piece_tracker,
@@ -2884,8 +2962,12 @@ async fn torrent_loop(
                         &mut piece_assemblies,
                         &mut corruption,
                         &blocklist,
+                        write_tasks.halted.is_some(),
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("torrent {info_hash} at shutdown: {error}");
+                    }
                 }
                 Err(e) if !e.is_cancelled() => {
                     tracing::warn!("piece write/verify task failed during shutdown: {e}");
@@ -2904,6 +2986,7 @@ async fn torrent_loop(
     if let Err(e) = storage.close_handles().await {
         tracing::warn!("failed to close storage handles on shutdown: {e}");
     }
+    note_failed_flush(&storage, &stats);
     {
         let mut stats = stats.lock();
         stats.live_mut().snapshot.peer_stats.live = 0;
@@ -2912,6 +2995,79 @@ async fn torrent_loop(
     if let Some(ack) = stop_ack {
         let _ = ack.send(());
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_verification(
+    verifier: &PieceVerifier,
+    storage: &Arc<FilesystemStorage>,
+    lengths: Lengths,
+    only_files: Option<&[usize]>,
+    stats: &Mutex<TorrentStats>,
+    piece_tracker: &mut PieceTracker,
+    chunk_tracker: &mut ChunkTracker,
+    piece_assemblies: &mut HashMap<u32, PieceAssembly>,
+    scan_task: &mut Option<tokio::task::JoinHandle<()>>,
+    scan_rx: &mut Option<mpsc::Receiver<Vec<u32>>>,
+) {
+    if let Some(task) = scan_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    *piece_tracker = PieceTracker::new(lengths).with_order_salt(rand::rng().random::<u64>());
+    piece_tracker.set_wanted(wanted_pieces(storage.layout(), &lengths, only_files));
+    *chunk_tracker = ChunkTracker::new(lengths).with_padding(storage.layout().padding_ranges());
+    piece_assemblies.clear();
+    {
+        let mut s = stats.lock();
+        s.file_progress = Arc::new(vec![0; storage.layout().files().len()]);
+        s.progress_bytes = 0;
+        s.left_bytes = piece_tracker.bytes_left();
+        s.finished = false;
+    }
+    let (tx, rx) = mpsc::channel::<Vec<u32>>(16);
+    *scan_rx = Some(rx);
+    let verifier = verifier.clone();
+    let storage = Arc::clone(storage);
+    *scan_task = Some(tokio::spawn(async move {
+        scan_existing_pieces(&verifier, &storage, &lengths, tx).await;
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn select_files(
+    storage: &FilesystemStorage,
+    files: Option<Vec<usize>>,
+    lengths: &Lengths,
+    piece_tracker: &mut PieceTracker,
+    chunk_tracker: &mut ChunkTracker,
+    piece_assemblies: &mut HashMap<u32, PieceAssembly>,
+    stats: &Mutex<TorrentStats>,
+    scanning: bool,
+    halted: bool,
+) -> (Option<Vec<usize>>, Result<(), String>, Option<String>) {
+    let (only_files, applied, promoted) = apply_storage_selection(storage, files).await;
+    piece_tracker.set_wanted(wanted_pieces(
+        storage.layout(),
+        lengths,
+        only_files.as_deref(),
+    ));
+    drop_unwanted_partial_pieces(piece_tracker, chunk_tracker, piece_assemblies, lengths);
+    if !scanning {
+        let file_progress = Arc::clone(&stats.lock().file_progress);
+        storage
+            .settle_promoted_files(&promoted, &file_progress)
+            .await;
+    }
+    stats.lock().left_bytes = piece_tracker.bytes_left();
+    let flush_error = finish_if_complete(
+        storage,
+        stats,
+        !scanning && piece_tracker.is_complete(),
+        halted,
+    )
+    .await;
+    (only_files, applied, flush_error)
 }
 
 fn dht_announce_due(last_announce: Option<Instant>, now: Instant) -> bool {
@@ -3304,6 +3460,17 @@ fn accept_initial_availability(peer: &mut Peer, availability: InitialAvailabilit
     true
 }
 
+fn accept_bitfield(peer: &mut Peer, len: usize) -> bool {
+    if len != peer.bitfield.len() {
+        return false;
+    }
+    if peer.supports_fast && !accept_initial_availability(peer, InitialAvailability::Bitfield) {
+        return false;
+    }
+    peer.bitfield_messages = peer.bitfield_messages.saturating_add(1);
+    peer.bitfield_messages <= MAX_BITFIELD_MESSAGES
+}
+
 fn send_allowed_fast(peer: &mut Peer, info_hash: &Id20, total_pieces: u32) {
     if !peer.supports_fast {
         return;
@@ -3433,6 +3600,7 @@ struct UploadJob {
     lane: UploadLane,
     stats: Arc<Mutex<TorrentStats>>,
     upload_tick: Arc<AtomicU64>,
+    read_failures: Arc<AtomicU32>,
     peer_uploaded: Arc<AtomicU64>,
     peer_uploaded_total: Arc<AtomicU64>,
     limiter: Throttle,
@@ -3440,11 +3608,33 @@ struct UploadJob {
     key: (u32, u32, u32),
     offset: u64,
     extent: Option<(u64, usize)>,
+    wanted: bool,
     live: LiveUpload,
 }
 
 fn piece_frame_cost(length: usize) -> usize {
     (length + PIECE_FRAME_OVERHEAD).max(MIN_PIECE_FRAME_COST)
+}
+
+fn record_upload_read(
+    read: Result<(), &StorageError>,
+    wanted: bool,
+    failures: &AtomicU32,
+    stats: &Mutex<TorrentStats>,
+) {
+    if !wanted {
+        return;
+    }
+    let Err(error) = read else {
+        failures.store(0, Ordering::Relaxed);
+        return;
+    };
+    if failures.fetch_add(1, Ordering::Relaxed).saturating_add(1) >= MAX_READ_FAILURES {
+        let mut s = stats.lock();
+        if s.error.is_none() {
+            s.set_error(format!("Disk read failed: {error}"), true);
+        }
+    }
 }
 
 async fn serve_upload(job: UploadJob) {
@@ -3454,6 +3644,7 @@ async fn serve_upload(job: UploadJob) {
         lane,
         stats,
         upload_tick,
+        read_failures,
         peer_uploaded,
         peer_uploaded_total,
         limiter,
@@ -3461,6 +3652,7 @@ async fn serve_upload(job: UploadJob) {
         key: request_key,
         offset,
         extent,
+        wanted,
         live: _live,
     } = job;
     let (index, begin, length) = request_key;
@@ -3476,17 +3668,21 @@ async fn serve_upload(job: UploadJob) {
     if !pending.lock().contains(&request_key) {
         return;
     }
-    let read = match extent {
-        Some((ext_start, ext_len)) => {
-            storage
-                .read_block_cached(ext_start, ext_len, offset, length as usize)
-                .await
-        }
+    let cached = match extent {
+        Some((ext_start, ext_len)) => storage
+            .read_block_cached(ext_start, ext_len, offset, length as usize)
+            .await
+            .ok(),
+        None => None,
+    };
+    let read = match cached {
+        Some(data) => Ok(data),
         None => storage
             .read_owned(offset, length as usize)
             .await
             .map(Bytes::from),
     };
+    record_upload_read(read.as_ref().map(|_| ()), wanted, &read_failures, &stats);
     let Ok(data) = read else {
         if pending.lock().remove(&request_key) && supports_fast {
             permit.send(Message::RejectRequest {
@@ -3722,56 +3918,79 @@ async fn adopt_inbound_peer(
     );
 }
 
+struct SwarmRefs<'a> {
+    peers: &'a mut HashMap<u32, Peer>,
+    piece_tracker: &'a mut PieceTracker,
+    chunk_tracker: &'a mut ChunkTracker,
+    piece_assemblies: &'a mut HashMap<u32, PieceAssembly>,
+    bytes_this_tick: &'a mut (u64, u64),
+    write_tasks: &'a mut DiskQueue,
+    pending_dials: &'a mut HashMap<u32, SocketAddr>,
+    outbound_aborts: &'a mut HashMap<u32, AbortHandle>,
+    known_addrs: &'a mut HashSet<SocketAddr>,
+    queues: &'a mut PeerQueues,
+    useful_peers: &'a mut HashMap<SocketAddr, usize>,
+    dial_failures: &'a mut HashMap<SocketAddr, u8>,
+    pex_source: &'a mut HashMap<SocketAddr, u32>,
+    holepunch: &'a mut HolepunchState,
+    ip_budgets: &'a mut IpBudgets,
+    choke_dirty: &'a mut bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_peer_event(
-    torrent_id: usize,
-    info_hash: Id20,
-    private_torrent: bool,
+    ctx: &TorrentCtx<'_>,
     pid: u32,
     ev: PeerEvent,
-    our_peer_id: Id20,
-    registry_scope: &Arc<()>,
     paused: bool,
-    peers: &mut HashMap<u32, Peer>,
-    piece_tracker: &mut PieceTracker,
-    chunk_tracker: &mut ChunkTracker,
-    piece_assemblies: &mut HashMap<u32, PieceAssembly>,
-    lengths: &Lengths,
-    storage: &Arc<FilesystemStorage>,
-    stats: &Arc<Mutex<TorrentStats>>,
-    bytes_this_tick: &mut (u64, u64),
-    upload_tick: &Arc<AtomicU64>,
-    write_tasks: &mut DiskQueue,
-    pending_dials: &mut HashMap<u32, SocketAddr>,
-    outbound_aborts: &mut HashMap<u32, AbortHandle>,
-    known_addrs: &mut HashSet<SocketAddr>,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_peers: &mut HashMap<SocketAddr, usize>,
-    dial_failures: &mut HashMap<SocketAddr, u8>,
-    pex_source: &mut HashMap<SocketAddr, u32>,
-    holepunch: &mut HolepunchState,
-    ip_budgets: &mut IpBudgets,
-    peer_src_tx: &mpsc::Sender<PeerEnvelope>,
-    generation: &GenerationToken,
-    verifier: &PieceVerifier,
-    failed_copies: Option<&SharedFailedCopies>,
-    info_bytes: &Arc<Vec<u8>>,
-    hash_tables: Option<&Arc<Vec<MerkleProofTable>>>,
-    leaf_pool: &LeafHashPool,
-    pipeline_floor: usize,
-    pipeline_cap: usize,
-    max_peers: usize,
-    choke_dirty: &mut bool,
-    upload_limiter: &Throttle,
+    swarm: SwarmRefs<'_>,
     dht: Option<&Arc<crate::dht::Dht>>,
-    blocklist: &RwLock<BlockList>,
     tracker_authorized: &HashSet<SocketAddr>,
     address_route: Route,
-    listen_port: u16,
 ) -> bool {
+    let SwarmRefs {
+        peers,
+        piece_tracker,
+        chunk_tracker,
+        piece_assemblies,
+        bytes_this_tick,
+        write_tasks,
+        pending_dials,
+        outbound_aborts,
+        known_addrs,
+        queues,
+        useful_peers,
+        dial_failures,
+        pex_source,
+        holepunch,
+        ip_budgets,
+        choke_dirty,
+    } = swarm;
+    let TorrentCtx {
+        torrent_id,
+        info_hash,
+        private_torrent,
+        our_peer_id,
+        registry_scope,
+        lengths,
+        storage,
+        stats,
+        upload_tick,
+        upload_read_failures,
+        peer_src_tx,
+        generation,
+        verifier,
+        failed_copies,
+        info_bytes,
+        hash_tables,
+        leaf_pool,
+        pipeline_floor,
+        pipeline_cap,
+        max_peers,
+        upload_limiter,
+        blocklist,
+        listen_port,
+    } = *ctx;
     if paused {
         match ev {
             PeerEvent::Handshook { .. } => {
@@ -3823,6 +4042,7 @@ async fn process_peer_event(
                         return false;
                     }
 
+                    let mut replaced = 0usize;
                     match resolve_duplicate(peers, addr.ip(), Some(peer_id), our_peer_id, true) {
                         DuplicateAction::Keep => {}
                         DuplicateAction::RejectNew => {
@@ -3834,10 +4054,7 @@ async fn process_peer_event(
                                 torrent_id,
                                 registry_scope,
                             );
-                            if !peers
-                                .values()
-                                .any(|p| p.addr == addr || p.listen_addr == Some(addr))
-                            {
+                            if !peers.values().any(|p| p.has_addr(addr)) {
                                 known_addrs.remove(&addr);
                             }
                             return false;
@@ -3846,14 +4063,15 @@ async fn process_peer_event(
                             for old_pid in old {
                                 if let Some(old_peer) = peers.get(&old_pid) {
                                     abort_peer_io(old_peer.io_abort.as_ref(), &old_peer.cmd_tx);
+                                    replaced += 1;
                                 }
                             }
                         }
                     }
 
-                    if peers.len() >= max_peers {
+                    if peers.len().saturating_sub(replaced) >= max_peers {
                         let known_useful = useful_peers.contains_key(&addr);
-                        schedule_peer_retry(addr, known_useful, 0, dial_retries, useful_redials);
+                        schedule_peer_retry(addr, known_useful, 0, queues);
                         reject_handshook_peer(
                             pid,
                             &cmd_tx,
@@ -3862,15 +4080,7 @@ async fn process_peer_event(
                             torrent_id,
                             registry_scope,
                         );
-                        refresh_peer_queue_state(
-                            priority_backlog,
-                            peer_backlog,
-                            dial_retries,
-                            useful_redials,
-                            peers,
-                            pending_dials,
-                            known_addrs,
-                        );
+                        refresh_peer_queue_state(queues, peers, pending_dials, known_addrs);
                         tracing::debug!(
                             "peer {addr} handshook after cap {max_peers} filled; scheduled retry"
                         );
@@ -3986,9 +4196,7 @@ async fn process_peer_event(
                     kick = true;
                 }
                 Message::Bitfield(bytes) => {
-                    if peer.supports_fast
-                        && !accept_initial_availability(peer, InitialAvailability::Bitfield)
-                    {
+                    if !accept_bitfield(peer, bytes.len()) {
                         abort_peer_io(peer.io_abort.as_ref(), &peer.cmd_tx);
                         return false;
                     }
@@ -4092,11 +4300,15 @@ async fn process_peer_event(
                         begin as u64,
                         length as u64,
                     );
+                    let wanted = lengths
+                        .validate_piece(index)
+                        .is_ok_and(|vpi| piece_tracker.is_wanted(vpi));
                     let pending = Arc::clone(&peer.pending_uploads);
                     let storage = storage.clone();
                     let lane = UploadLane::new(&peer.cmd_tx, peer.piece_tx.as_ref());
                     let stats = stats.clone();
                     let upload_tick = Arc::clone(upload_tick);
+                    let read_failures = Arc::clone(upload_read_failures);
                     let peer_uploaded = Arc::clone(&peer.uploaded_window);
                     let peer_uploaded_total = Arc::clone(&peer.uploaded_total);
                     let limiter = upload_limiter.clone();
@@ -4107,6 +4319,7 @@ async fn process_peer_event(
                         lane,
                         stats,
                         upload_tick,
+                        read_failures,
                         peer_uploaded,
                         peer_uploaded_total,
                         limiter,
@@ -4114,6 +4327,7 @@ async fn process_peer_event(
                         key: request_key,
                         offset,
                         extent,
+                        wanted,
                         live,
                     }));
                 }
@@ -4352,14 +4566,24 @@ async fn process_peer_event(
                             peer.cmd_tx.clone(),
                         );
                     } else {
-                        let response = build_hash_response(
-                            hash_tables.map(|tables| tables.as_slice()),
-                            pieces_root,
-                            base_layer,
-                            index,
-                            length,
-                            proof_layers,
-                        );
+                        let response = if reply_queue_backed_up(&peer.cmd_tx) {
+                            Message::HashReject {
+                                pieces_root,
+                                base_layer,
+                                index,
+                                length,
+                                proof_layers,
+                            }
+                        } else {
+                            build_hash_response(
+                                hash_tables.map(|tables| tables.as_slice()),
+                                pieces_root,
+                                base_layer,
+                                index,
+                                length,
+                                proof_layers,
+                            )
+                        };
                         let _ = peer.cmd_tx.try_send(PeerCommand::Send(response));
                     }
                 }
@@ -4434,10 +4658,7 @@ async fn process_peer_event(
                             &payload,
                             peers,
                             pending_dials,
-                            priority_backlog,
-                            peer_backlog,
-                            dial_retries,
-                            useful_redials,
+                            queues,
                             known_addrs,
                             holepunch,
                             ip_budgets,
@@ -4473,11 +4694,8 @@ async fn process_peer_event(
                 .as_ref()
                 .map_or(pipeline_floor, |peer| peer.max_outstanding);
 
-            let live_elsewhere = pending_addr.is_some_and(|a| {
-                peers
-                    .values()
-                    .any(|p| p.addr == a || p.listen_addr == Some(a))
-            });
+            let live_elsewhere =
+                pending_addr.is_some_and(|a| peers.values().any(|p| p.has_addr(a)));
             if let Some(a) = addr {
                 tracing::debug!("peer {a} disconnected: {reason}");
                 if dead.is_some() {
@@ -4515,7 +4733,7 @@ async fn process_peer_event(
                 }
                 let known_useful = useful_bytes > 0 || useful_peers.contains_key(&a);
                 if allowed && (known_useful || failures < MAX_DIAL_FAILURES) {
-                    schedule_peer_retry(a, known_useful, failures, dial_retries, useful_redials);
+                    schedule_peer_retry(a, known_useful, failures, queues);
                     if known_useful {
                         tracing::debug!(
                             "scheduled useful peer {a} redial (delivered {useful_bytes} bytes, {failures} failed dials)"
@@ -4542,15 +4760,7 @@ async fn process_peer_event(
                     piece_assemblies,
                     lengths,
                 );
-                refresh_peer_queue_state(
-                    priority_backlog,
-                    peer_backlog,
-                    dial_retries,
-                    useful_redials,
-                    peers,
-                    pending_dials,
-                    known_addrs,
-                );
+                refresh_peer_queue_state(queues, peers, pending_dials, known_addrs);
             }
         }
     }
@@ -4569,9 +4779,10 @@ async fn process_verify_result(
     piece_assemblies: &mut HashMap<u32, PieceAssembly>,
     corruption: &mut CorruptionTracker,
     blocklist: &RwLock<BlockList>,
-) {
+    halted: bool,
+) -> Option<String> {
     let Ok(vpi) = lengths.validate_piece(vr.piece_index) else {
-        return;
+        return None;
     };
     piece_tracker.clear_in_flight(vpi);
     let ban = corruption.record_result(&vr);
@@ -4584,7 +4795,7 @@ async fn process_verify_result(
         );
     }
     if vr.from_webseed && (vr.write_error.is_some() || !vr.verify_ok) {
-        return;
+        return None;
     }
     piece_assemblies.remove(&vr.piece_index);
     if vr.write_error.is_some() {
@@ -4595,7 +4806,7 @@ async fn process_verify_result(
         cancel_piece_outstanding(peers, vr.piece_index);
         chunk_tracker.reset_piece(vpi);
         reinterest_holders(peers, vr.piece_index);
-        return;
+        return None;
     }
     if vr.verify_ok {
         let became_local = mark_verified_piece_local(piece_tracker, vpi);
@@ -4626,12 +4837,40 @@ async fn process_verify_result(
             completed
         };
         storage.files_completed(&completed_files).await;
-        stats.lock().finished = piece_tracker.is_complete();
+        finish_if_complete(storage, stats, piece_tracker.is_complete(), halted).await
     } else {
         tracing::debug!("piece {} verify failed", vr.piece_index);
         cancel_piece_outstanding(peers, vr.piece_index);
         chunk_tracker.reset_piece(vpi);
         reinterest_holders(peers, vr.piece_index);
+        None
+    }
+}
+
+async fn finish_if_complete(
+    storage: &FilesystemStorage,
+    stats: &Mutex<TorrentStats>,
+    complete: bool,
+    halted: bool,
+) -> Option<String> {
+    if complete && !halted {
+        let flushed = storage.sync_written().await;
+        note_failed_flush(storage, stats);
+        if let Err(e) = flushed {
+            let error = format!("Could not flush downloaded data to disk: {e}");
+            let mut s = stats.lock();
+            s.set_error(error.clone(), true);
+            s.finished = false;
+            return Some(error);
+        }
+    }
+    stats.lock().finished = complete && !halted;
+    None
+}
+
+fn note_failed_flush(storage: &FilesystemStorage, stats: &Mutex<TorrentStats>) {
+    if !stats.lock().flush_failed && storage.flush_has_failed() {
+        stats.lock().flush_failed = true;
     }
 }
 
@@ -4687,13 +4926,8 @@ fn webseed_failed_batch(generation: u64, piece_indices: &[u32]) -> WebSeedBatchR
             .copied()
             .map(|piece_index| VerifyResult {
                 piece_index,
-                write_error: None,
-                verify_ok: false,
                 from_webseed: true,
-                hash_conflict: false,
-                contributors: Vec::new(),
-                failed_copy: None,
-                culprits: Vec::new(),
+                ..Default::default()
             })
             .collect(),
     }
@@ -4890,13 +5124,9 @@ async fn fetch_webseed_batch(ctx: WebSeedContext, piece_indices: Vec<u32>) -> We
             if matches!(verdict, Err(VerifyError::InconsistentHashes)) {
                 pieces.push(VerifyResult {
                     piece_index,
-                    write_error: None,
-                    verify_ok: false,
                     from_webseed: true,
                     hash_conflict: true,
-                    contributors: Vec::new(),
-                    failed_copy: None,
-                    culprits: Vec::new(),
+                    ..Default::default()
                 });
                 break;
             }
@@ -4916,10 +5146,7 @@ async fn fetch_webseed_batch(ctx: WebSeedContext, piece_indices: Vec<u32>) -> We
                 verify_ok: !failed,
                 write_error,
                 from_webseed: true,
-                hash_conflict: false,
-                contributors: Vec::new(),
-                failed_copy: None,
-                culprits: Vec::new(),
+                ..Default::default()
             });
             if failed {
                 break;
@@ -5017,10 +5244,7 @@ fn handle_holepunch(
     from: &HolepunchSender,
     peers: &HashMap<u32, Peer>,
     pending_dials: &HashMap<u32, SocketAddr>,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     known_addrs: &mut HashSet<SocketAddr>,
     holepunch: &mut HolepunchState,
     budget: &mut TokenBucket,
@@ -5051,15 +5275,7 @@ fn handle_holepunch(
                 .flatten()
                 .chain(pending_dials.values().copied())
                 .collect::<HashSet<_>>();
-            if promote_holepunch_candidate(
-                target,
-                &active_addrs,
-                priority_backlog,
-                peer_backlog,
-                dial_retries,
-                useful_redials,
-                known_addrs,
-            ) {
+            if promote_holepunch_candidate(target, &active_addrs, queues, known_addrs) {
                 holepunch.note_target(target, now);
             }
         }
@@ -5075,10 +5291,7 @@ fn handle_holepunch(
             } else if !super::magnet::is_dialable_peer_addr(hp.addr) {
                 Relay::Err(holepunch_err::NO_SUCH_PEER)
             } else {
-                match peers
-                    .iter()
-                    .find(|(_, p)| p.addr == hp.addr || p.listen_addr == Some(hp.addr))
-                {
+                match peers.iter().find(|(_, p)| p.has_addr(hp.addr)) {
                     Some((&target_pid, _)) if target_pid == from.pid => {
                         Relay::Err(holepunch_err::NO_SELF)
                     }
@@ -5125,10 +5338,7 @@ fn dispatch_holepunch(
     payload: &[u8],
     peers: &HashMap<u32, Peer>,
     pending_dials: &HashMap<u32, SocketAddr>,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     known_addrs: &mut HashSet<SocketAddr>,
     holepunch: &mut HolepunchState,
     ip_budgets: &mut IpBudgets,
@@ -5158,10 +5368,7 @@ fn dispatch_holepunch(
         &sender,
         peers,
         pending_dials,
-        priority_backlog,
-        peer_backlog,
-        dial_retries,
-        useful_redials,
+        queues,
         known_addrs,
         holepunch,
         budget,
@@ -5215,31 +5422,17 @@ fn ingest_pex(
     admitted
 }
 
-#[allow(clippy::too_many_arguments)]
 fn queue_sourced_candidate(
     addr: SocketAddr,
     source: PeerSource,
     known_useful: bool,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     known_addrs: &mut HashSet<SocketAddr>,
     blocklist: &RwLock<BlockList>,
 ) -> bool {
-    let queued =
-        priority_backlog.len() + peer_backlog.len() + dial_retries.len() + useful_redials.len();
+    let queued = queues.len();
     candidate_fits_source_cap(source, known_useful, queued)
-        && enqueue_peer_candidate(
-            addr,
-            known_useful,
-            priority_backlog,
-            peer_backlog,
-            dial_retries,
-            useful_redials,
-            known_addrs,
-            blocklist,
-        )
+        && enqueue_peer_candidate(addr, known_useful, queues, known_addrs, blocklist)
 }
 
 fn holepunch_endpoint(peer: &Peer) -> SocketAddr {
@@ -5261,10 +5454,7 @@ fn inbound_addr_taken(
     if !known_addrs.contains(&addr) {
         return false;
     }
-    if peers
-        .values()
-        .any(|p| p.addr == addr || p.listen_addr == Some(addr))
-    {
+    if peers.values().any(|p| p.has_addr(addr)) {
         return true;
     }
     !(holepunch.is_target(&addr, now) || pending_dials.values().any(|dialing| *dialing == addr))
@@ -5353,66 +5543,35 @@ fn peer_supplied_dialable(source: IpAddr, addr: SocketAddr) -> bool {
 fn promote_holepunch_candidate(
     addr: SocketAddr,
     active_addrs: &HashSet<SocketAddr>,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     known_addrs: &mut HashSet<SocketAddr>,
 ) -> bool {
-    normalize_peer_queues(
-        priority_backlog,
-        peer_backlog,
-        dial_retries,
-        useful_redials,
-        active_addrs,
-        known_addrs,
-    );
+    normalize_peer_queues(queues, active_addrs, known_addrs);
     if !super::magnet::is_dialable_peer_addr(addr) || active_addrs.contains(&addr) {
         return false;
     }
 
-    priority_backlog.retain(|candidate| *candidate != addr);
-    peer_backlog.retain(|candidate| *candidate != addr);
-    dial_retries.retain(|(candidate, _)| *candidate != addr);
-    useful_redials.retain(|(candidate, _)| *candidate != addr);
+    queues.remove(addr);
 
-    let queued =
-        priority_backlog.len() + peer_backlog.len() + dial_retries.len() + useful_redials.len();
-    if queued >= MAX_PEER_BACKLOG {
-        let evicted = peer_backlog
-            .pop_back()
-            .or_else(|| dial_retries.pop_back().map(|(candidate, _)| candidate))
-            .or_else(|| useful_redials.pop_back().map(|(candidate, _)| candidate))
-            .or_else(|| priority_backlog.pop_back());
-        if evicted.is_none() {
-            return false;
-        }
+    let queued = queues.len();
+    if queued >= MAX_PEER_BACKLOG && queues.evict_last().is_none() {
+        return false;
     }
 
-    priority_backlog.push_front(addr);
-    normalize_peer_queues(
-        priority_backlog,
-        peer_backlog,
-        dial_retries,
-        useful_redials,
-        active_addrs,
-        known_addrs,
-    );
+    queues.priority.push_front(addr);
+    normalize_peer_queues(queues, active_addrs, known_addrs);
     true
 }
 
 fn normalize_peer_queues(
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     active_addrs: &HashSet<SocketAddr>,
     known_addrs: &mut HashSet<SocketAddr>,
 ) {
-    let old_priority = std::mem::take(priority_backlog);
-    let old_useful_redials = std::mem::take(useful_redials);
-    let old_dial_retries = std::mem::take(dial_retries);
-    let old_backlog = std::mem::take(peer_backlog);
+    let old_priority = std::mem::take(&mut queues.priority);
+    let old_useful_redials = std::mem::take(&mut queues.useful_redials);
+    let old_dial_retries = std::mem::take(&mut queues.dial_retries);
+    let old_backlog = std::mem::take(&mut queues.backlog);
 
     let mut seen = active_addrs.clone();
     let mut queued = 0usize;
@@ -5430,22 +5589,22 @@ fn normalize_peer_queues(
 
     for addr in old_priority {
         if accept(addr) {
-            priority_backlog.push_back(addr);
+            queues.priority.push_back(addr);
         }
     }
     for (addr, due) in old_useful_redials {
         if accept(addr) {
-            useful_redials.push_back((addr, due));
+            queues.useful_redials.push_back((addr, due));
         }
     }
     for (addr, due) in old_dial_retries {
         if accept(addr) {
-            dial_retries.push_back((addr, due));
+            queues.dial_retries.push_back((addr, due));
         }
     }
     for addr in old_backlog {
         if accept(addr) {
-            peer_backlog.push_back(addr);
+            queues.backlog.push_back(addr);
         }
     }
 
@@ -5453,24 +5612,8 @@ fn normalize_peer_queues(
     known_addrs.extend(seen);
 }
 
-fn unqueue_peer_addr(
-    addr: SocketAddr,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
-) {
-    priority_backlog.retain(|queued| *queued != addr);
-    peer_backlog.retain(|queued| *queued != addr);
-    dial_retries.retain(|(queued, _)| *queued != addr);
-    useful_redials.retain(|(queued, _)| *queued != addr);
-}
-
 fn refresh_peer_queue_state(
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     peers: &HashMap<u32, Peer>,
     pending_dials: &HashMap<u32, SocketAddr>,
     known_addrs: &mut HashSet<SocketAddr>,
@@ -5481,24 +5624,13 @@ fn refresh_peer_queue_state(
         .flatten()
         .chain(pending_dials.values().copied())
         .collect::<HashSet<_>>();
-    normalize_peer_queues(
-        priority_backlog,
-        peer_backlog,
-        dial_retries,
-        useful_redials,
-        &active_addrs,
-        known_addrs,
-    );
+    normalize_peer_queues(queues, &active_addrs, known_addrs);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn enqueue_peer_candidate(
     addr: SocketAddr,
     priority: bool,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     known_addrs: &mut HashSet<SocketAddr>,
     blocklist: &RwLock<BlockList>,
 ) -> bool {
@@ -5509,17 +5641,12 @@ fn enqueue_peer_candidate(
         return false;
     }
 
-    let queued =
-        priority_backlog.len() + peer_backlog.len() + dial_retries.len() + useful_redials.len();
+    let queued = queues.len();
     if queued >= MAX_PEER_BACKLOG {
         if !priority {
             return false;
         }
-        let evicted = peer_backlog
-            .pop_back()
-            .or_else(|| dial_retries.pop_back().map(|(candidate, _)| candidate))
-            .or_else(|| useful_redials.pop_back().map(|(candidate, _)| candidate))
-            .or_else(|| priority_backlog.pop_back());
+        let evicted = queues.evict_last();
         let Some(evicted) = evicted else {
             return false;
         };
@@ -5527,9 +5654,9 @@ fn enqueue_peer_candidate(
     }
 
     if priority {
-        priority_backlog.push_back(addr);
+        queues.priority.push_back(addr);
     } else {
-        peer_backlog.push_back(addr);
+        queues.backlog.push_back(addr);
     }
     known_addrs.insert(addr);
     true
@@ -5577,13 +5704,7 @@ fn remember_useful_peer(
     useful_peers.insert(addr, window);
 }
 
-fn schedule_peer_retry(
-    addr: SocketAddr,
-    useful: bool,
-    failures: u8,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
-) {
+fn schedule_peer_retry(addr: SocketAddr, useful: bool, failures: u8, queues: &mut PeerQueues) {
     let backoff = 3u32.pow(u32::from(failures.min(MAX_DIAL_FAILURES)));
     let insert = |queue: &mut VecDeque<(SocketAddr, Instant)>, delay: Duration| {
         if queue.len() < MAX_DIAL_RETRIES {
@@ -5593,9 +5714,12 @@ fn schedule_peer_retry(
         }
     };
     if useful {
-        insert(useful_redials, USEFUL_PEER_REDIAL_DELAY * backoff);
+        insert(
+            &mut queues.useful_redials,
+            USEFUL_PEER_REDIAL_DELAY * backoff,
+        );
     } else {
-        insert(dial_retries, DIAL_RETRY_DELAY * backoff);
+        insert(&mut queues.dial_retries, DIAL_RETRY_DELAY * backoff);
     }
 }
 
@@ -5613,10 +5737,7 @@ fn dial_slot_available(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_peer_backlog(
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     pending_dials: &mut HashMap<u32, SocketAddr>,
     known_addrs: &mut HashSet<SocketAddr>,
     useful_peers: &HashMap<SocketAddr, usize>,
@@ -5624,11 +5745,7 @@ fn drain_peer_backlog(
     mse_first: &HashSet<SocketAddr>,
     next_pid: &mut u32,
     live_peers: usize,
-    max_peers: usize,
-    torrent_id: usize,
-    registry_scope: &Arc<()>,
-    info_hash: Id20,
-    our_peer_id: Id20,
+    ctx: &TorrentCtx<'_>,
     peer_event_tx: &mpsc::Sender<(u32, PeerEvent)>,
     encryption: crate::peer::EncryptionPolicy,
     advertise_v2: bool,
@@ -5639,25 +5756,41 @@ fn drain_peer_backlog(
     recv_throttle: &Throttle,
     outbound_tasks: &mut tokio::task::JoinSet<()>,
     outbound_aborts: &mut HashMap<u32, AbortHandle>,
-    blocklist: &RwLock<BlockList>,
     conn_lease: &mut super::conn_budget::BudgetLease,
 ) {
+    let TorrentCtx {
+        torrent_id,
+        info_hash,
+        our_peer_id,
+        registry_scope,
+        max_peers,
+        blocklist,
+        ..
+    } = *ctx;
     let now = Instant::now();
-    while useful_redials.front().is_some_and(|(_, due)| *due <= now) {
-        let Some((addr, _)) = useful_redials.pop_front() else {
+    while queues
+        .useful_redials
+        .front()
+        .is_some_and(|(_, due)| *due <= now)
+    {
+        let Some((addr, _)) = queues.useful_redials.pop_front() else {
             break;
         };
         if known_addrs.contains(&addr) {
-            priority_backlog.push_front(addr);
+            queues.priority.push_front(addr);
         }
     }
 
-    while dial_retries.front().is_some_and(|(_, due)| *due <= now) {
-        let Some((addr, _)) = dial_retries.pop_front() else {
+    while queues
+        .dial_retries
+        .front()
+        .is_some_and(|(_, due)| *due <= now)
+    {
+        let Some((addr, _)) = queues.dial_retries.pop_front() else {
             break;
         };
         if known_addrs.contains(&addr) {
-            peer_backlog.push_back(addr);
+            queues.backlog.push_back(addr);
         }
     }
 
@@ -5699,7 +5832,7 @@ fn drain_peer_backlog(
         MAX_PENDING_DIALS,
         !conn_lease.is_full(),
     ) {
-        let Some(addr) = priority_backlog.pop_front() else {
+        let Some(addr) = queues.priority.pop_front() else {
             break;
         };
         if !known_addrs.contains(&addr) {
@@ -5710,7 +5843,7 @@ fn drain_peer_backlog(
             continue;
         }
         if !conn_lease.try_reserve() {
-            priority_backlog.push_front(addr);
+            queues.priority.push_front(addr);
             break;
         }
         spawn_one(
@@ -5734,7 +5867,7 @@ fn drain_peer_backlog(
         cold_cap,
         !conn_lease.is_full(),
     ) {
-        let Some(addr) = peer_backlog.pop_front() else {
+        let Some(addr) = queues.backlog.pop_front() else {
             break;
         };
         if !known_addrs.contains(&addr) {
@@ -5745,7 +5878,7 @@ fn drain_peer_backlog(
             continue;
         }
         if !conn_lease.try_reserve() {
-            peer_backlog.push_front(addr);
+            queues.backlog.push_front(addr);
             break;
         }
         spawn_one(
@@ -5947,7 +6080,6 @@ enum PipelineAdjustment {
     Rate { target: usize },
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pipeline_adjustment(
     slow_start: bool,
     delivered_since_growth: usize,
@@ -6764,6 +6896,54 @@ async fn stamped_files_unchanged(
     .unwrap_or(false)
 }
 
+fn has_every_piece(piece_tracker: &PieceTracker, lengths: &Lengths) -> bool {
+    (0..lengths.total_pieces()).all(|index| {
+        lengths
+            .validate_piece(index)
+            .is_ok_and(|vpi| piece_tracker.has_local(vpi))
+    })
+}
+
+async fn stamp_complete_files(
+    storage: &FilesystemStorage,
+    info: &super::core::metainfo::ValidatedTorrentMetaV1Info,
+) -> Option<Vec<super::create::FileStamp>> {
+    if storage.flush_has_failed() {
+        return None;
+    }
+    if let Err(e) = storage.sync_written().await {
+        tracing::warn!("could not flush a finished torrent before stamping its files: {e}");
+        return None;
+    }
+    let files: Vec<(PathBuf, u64, Vec<String>)> = storage
+        .layout()
+        .files()
+        .iter()
+        .zip(&info.files)
+        .filter(|(file, _)| !file.padding && file.length > 0)
+        .map(|(file, meta)| (file.path.clone(), file.length, meta.path.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        files
+            .into_iter()
+            .map(|(path, length, components)| {
+                let meta = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.is_file() && m.len() == length)?;
+                Some(super::create::FileStamp {
+                    path: components,
+                    length,
+                    modified: meta.modified().ok()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+    })
+    .await
+    .ok()
+    .flatten()
+    .filter(|stamps| !stamps.is_empty())
+}
+
 async fn mark_all_pieces_found(lengths: &Lengths, found: mpsc::Sender<Vec<u32>>) {
     const BATCH: u32 = 4096;
     let total = lengths.total_pieces();
@@ -6908,10 +7088,7 @@ fn apply_blocklist_to_torrent(
     pending_dials: &mut HashMap<u32, SocketAddr>,
     outbound_aborts: &mut HashMap<u32, AbortHandle>,
     known_addrs: &mut HashSet<SocketAddr>,
-    priority_backlog: &mut VecDeque<SocketAddr>,
-    peer_backlog: &mut VecDeque<SocketAddr>,
-    dial_retries: &mut VecDeque<(SocketAddr, Instant)>,
-    useful_redials: &mut VecDeque<(SocketAddr, Instant)>,
+    queues: &mut PeerQueues,
     useful_peers: &mut HashMap<SocketAddr, usize>,
     pex_source: &mut HashMap<SocketAddr, u32>,
     holepunch: &mut HolepunchState,
@@ -6976,8 +7153,8 @@ fn apply_blocklist_to_torrent(
         });
         removed += (before - queue.len()) as u32;
     };
-    purge_queue(priority_backlog);
-    purge_queue(peer_backlog);
+    purge_queue(&mut queues.priority);
+    purge_queue(&mut queues.backlog);
 
     let mut purge_timed = |queue: &mut VecDeque<(SocketAddr, Instant)>| {
         let before = queue.len();
@@ -6991,8 +7168,8 @@ fn apply_blocklist_to_torrent(
         });
         removed += (before - queue.len()) as u32;
     };
-    purge_timed(dial_retries);
-    purge_timed(useful_redials);
+    purge_timed(&mut queues.dial_retries);
+    purge_timed(&mut queues.useful_redials);
 
     pending_dials.retain(|pid, addr| {
         if is_blocked(*addr) {
@@ -7304,10 +7481,12 @@ impl TrackerCtx {
     async fn forward_peers(
         &self,
         shutdown: &mut watch::Receiver<Option<bool>>,
+        url: &str,
         mut peers: Vec<SocketAddr>,
         generation: u64,
         mse_first: bool,
     ) -> bool {
+        retain_tracker_peers(url, &mut peers);
         (self.ranker_for)(Route::of(self.proxy.as_ref()), self.port).order_batch(&mut peers);
         for addr in peers {
             let sent = tokio::select! {
@@ -7325,6 +7504,10 @@ impl TrackerCtx {
         }
         true
     }
+}
+
+fn retain_tracker_peers(url: &str, peers: &mut Vec<SocketAddr>) {
+    peers.retain(|&peer| super::tracker::tracker_may_supply(url, peer));
 }
 
 #[derive(Clone)]
@@ -7762,7 +7945,13 @@ async fn run_tracker_tier_poller(
                     _ => request_generation,
                 };
                 if !ctx
-                    .forward_peers(shutdown, resp.peers, request_generation, obfuscate)
+                    .forward_peers(
+                        shutdown,
+                        &selected.url,
+                        resp.peers,
+                        request_generation,
+                        obfuscate,
+                    )
                     .await
                 {
                     break;
@@ -7783,6 +7972,7 @@ async fn run_tracker_tier_poller(
 type TrackerAnnounceDone = (
     usize,
     usize,
+    String,
     AnnounceEvent,
     Result<AnnounceResponse, TrackerError>,
     u64,
@@ -7838,7 +8028,7 @@ async fn run_tracker_swarm_poller(
                                 tracing::info!(target: "diag", "tracker ANNOUNCE fail url={shown} event={event:?} err={}", redacted_tracker_error(e, &url));
                             }
                         }
-                        (ti, ui, event, result, request_generation, finished)
+                        (ti, ui, url, event, result, request_generation, finished)
                     });
                 }
             }
@@ -7854,7 +8044,7 @@ async fn run_tracker_swarm_poller(
             _ = wake.changed() => continue,
             _ = tokio::time::sleep(sleep_for) => continue,
         };
-        let Ok((ti, ui, event, result, request_generation, finished_at_send)) = done else {
+        let Ok((ti, ui, url, event, result, request_generation, finished_at_send)) = done else {
             continue;
         };
         inflight.remove(&(ti, ui));
@@ -7877,7 +8067,7 @@ async fn run_tracker_swarm_poller(
                 publish_swarm_counts(&ctx.lifecycle, &ctx.stats);
                 let mse_first = ti < ctx.obfuscated_tiers;
                 if !ctx
-                    .forward_peers(shutdown, resp.peers, request_generation, mse_first)
+                    .forward_peers(shutdown, &url, resp.peers, request_generation, mse_first)
                     .await
                 {
                     break;
@@ -8300,6 +8490,12 @@ fn build_hash_response(
     }
 }
 
+const MAX_QUEUED_BULK_REPLIES: usize = 16;
+
+fn reply_queue_backed_up(cmd_tx: &mpsc::Sender<PeerCommand>) -> bool {
+    cmd_tx.max_capacity() - cmd_tx.capacity() > MAX_QUEUED_BULK_REPLIES
+}
+
 fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>) {
     let Some(msg) = super::wire::extended::parse_ut_metadata(payload.clone()) else {
         return;
@@ -8310,7 +8506,7 @@ fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>) {
     let total = info_bytes.len();
     let total_pieces = total.div_ceil(META_PIECE_SIZE);
     let piece = msg.piece;
-    if piece < 0 || (piece as usize) >= total_pieces {
+    if piece < 0 || (piece as usize) >= total_pieces || reply_queue_backed_up(&peer.cmd_tx) {
         if let Some(their_id) = peer.their_ut_metadata_id {
             let reject = super::wire::extended::ut_metadata_reject(piece);
             let _ = peer.cmd_tx.try_send(PeerCommand::Send(Message::Extended {
@@ -8367,6 +8563,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn bulk_replies_stop_once_the_peer_queue_backs_up() {
+        let (tx, _rx) = mpsc::channel::<PeerCommand>(64);
+        for _ in 0..=MAX_QUEUED_BULK_REPLIES {
+            assert!(!reply_queue_backed_up(&tx));
+            tx.try_send(PeerCommand::Disconnect).unwrap();
+        }
+        assert!(reply_queue_backed_up(&tx));
+    }
     use crate::core::merkle::{
         compute_root, hash_block, piece_layer_root, MerkleProofTable, BLOCK_SIZE,
     };
@@ -8601,23 +8807,17 @@ mod tests {
     fn enqueue_skips_blocked_peer() {
         let mut list = BlockList::default();
         list.replace(&[test_peer(6881).ip().to_string()]);
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = VecDeque::new();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
+        let mut queues = PeerQueues::default();
         let mut known_addrs = HashSet::new();
         assert!(!enqueue_peer_candidate(
             test_peer(6881),
             false,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
+            &mut queues,
             &mut known_addrs,
             &RwLock::new(list),
         ));
-        assert!(priority_backlog.is_empty());
-        assert!(peer_backlog.is_empty());
+        assert!(queues.priority.is_empty());
+        assert!(queues.backlog.is_empty());
         assert!(known_addrs.is_empty());
     }
 
@@ -8632,69 +8832,58 @@ mod tests {
         let retry = test_peer(10_006);
         let cold = test_peer(10_007);
         let mut active = HashSet::from([active_a, active_b]);
-        let mut priority_backlog = VecDeque::from([priority_a, priority_b, active_a]);
-        let mut useful_redials = VecDeque::from([
-            (priority_b, now + Duration::from_secs(1)),
-            (useful, now + Duration::from_secs(2)),
-        ]);
-        let mut dial_retries = VecDeque::from([
-            (useful, now + Duration::from_secs(3)),
-            (retry, now + Duration::from_secs(4)),
-        ]);
-        let mut peer_backlog = VecDeque::from([retry, cold, active_b]);
+        let mut queues = PeerQueues {
+            priority: VecDeque::from([priority_a, priority_b, active_a]),
+            useful_redials: VecDeque::from([
+                (priority_b, now + Duration::from_secs(1)),
+                (useful, now + Duration::from_secs(2)),
+            ]),
+            dial_retries: VecDeque::from([
+                (useful, now + Duration::from_secs(3)),
+                (retry, now + Duration::from_secs(4)),
+            ]),
+            backlog: VecDeque::from([retry, cold, active_b]),
+        };
         let mut known_addrs = HashSet::from([test_peer(19_999)]);
 
-        normalize_peer_queues(
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
-            &active,
-            &mut known_addrs,
-        );
+        normalize_peer_queues(&mut queues, &active, &mut known_addrs);
 
-        assert_eq!(priority_backlog, VecDeque::from([priority_a, priority_b]));
+        assert_eq!(queues.priority, VecDeque::from([priority_a, priority_b]));
         assert_eq!(
-            useful_redials
+            queues
+                .useful_redials
                 .iter()
                 .map(|(addr, _)| *addr)
                 .collect::<Vec<_>>(),
             vec![useful]
         );
         assert_eq!(
-            dial_retries
+            queues
+                .dial_retries
                 .iter()
                 .map(|(addr, _)| *addr)
                 .collect::<Vec<_>>(),
             vec![retry]
         );
-        assert_eq!(peer_backlog, VecDeque::from([cold]));
+        assert_eq!(queues.backlog, VecDeque::from([cold]));
         active.extend([priority_a, priority_b, useful, retry, cold]);
         assert_eq!(known_addrs, active);
     }
 
     #[test]
     fn peer_queue_normalization_caps_combined_unique_candidates() {
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = (0..MAX_PEER_BACKLOG + 100)
-            .map(|i| test_peer(20_000 + i as u16))
-            .collect::<VecDeque<_>>();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
+        let mut queues = PeerQueues {
+            backlog: (0..MAX_PEER_BACKLOG + 100)
+                .map(|i| test_peer(20_000 + i as u16))
+                .collect::<VecDeque<_>>(),
+            ..Default::default()
+        };
         let active = HashSet::from([test_peer(10_001)]);
         let mut known_addrs = HashSet::new();
 
-        normalize_peer_queues(
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
-            &active,
-            &mut known_addrs,
-        );
+        normalize_peer_queues(&mut queues, &active, &mut known_addrs);
 
-        let queued =
-            priority_backlog.len() + peer_backlog.len() + dial_retries.len() + useful_redials.len();
+        let queued = queues.len();
         assert_eq!(queued, MAX_PEER_BACKLOG);
         assert_eq!(known_addrs.len(), MAX_PEER_BACKLOG + active.len());
         assert!(active.is_subset(&known_addrs));
@@ -8707,36 +8896,35 @@ mod tests {
         let existing_priority = test_peer(11_002);
         let target = test_peer(11_003);
         let cold = test_peer(11_004);
-        let mut priority_backlog = VecDeque::from([existing_priority]);
-        let mut peer_backlog = VecDeque::from([cold]);
-        let mut dial_retries = VecDeque::from([(target, now + Duration::from_secs(30))]);
-        let mut useful_redials = VecDeque::from([(target, now + Duration::from_secs(10))]);
+        let mut queues = PeerQueues {
+            priority: VecDeque::from([existing_priority]),
+            backlog: VecDeque::from([cold]),
+            dial_retries: VecDeque::from([(target, now + Duration::from_secs(30))]),
+            useful_redials: VecDeque::from([(target, now + Duration::from_secs(10))]),
+        };
         let mut known_addrs = HashSet::new();
 
         assert!(promote_holepunch_candidate(
             target,
             &active,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
+            &mut queues,
             &mut known_addrs,
         ));
 
-        assert_eq!(
-            priority_backlog,
-            VecDeque::from([target, existing_priority])
-        );
-        assert!(!peer_backlog.contains(&target));
-        assert!(!dial_retries.iter().any(|(addr, _)| *addr == target));
-        assert!(!useful_redials.iter().any(|(addr, _)| *addr == target));
+        assert_eq!(queues.priority, VecDeque::from([target, existing_priority]));
+        assert!(!queues.backlog.contains(&target));
+        assert!(!queues.dial_retries.iter().any(|(addr, _)| *addr == target));
+        assert!(!queues
+            .useful_redials
+            .iter()
+            .any(|(addr, _)| *addr == target));
         let expected = active
             .iter()
             .copied()
-            .chain(priority_backlog.iter().copied())
-            .chain(peer_backlog.iter().copied())
-            .chain(dial_retries.iter().map(|(addr, _)| *addr))
-            .chain(useful_redials.iter().map(|(addr, _)| *addr))
+            .chain(queues.priority.iter().copied())
+            .chain(queues.backlog.iter().copied())
+            .chain(queues.dial_retries.iter().map(|(addr, _)| *addr))
+            .chain(queues.useful_redials.iter().map(|(addr, _)| *addr))
             .collect::<HashSet<_>>();
         assert_eq!(known_addrs, expected);
     }
@@ -8746,33 +8934,35 @@ mod tests {
         let now = Instant::now();
         let target = test_peer(12_001);
         let active = HashSet::from([target, test_peer(12_002)]);
-        let mut priority_backlog = VecDeque::from([target, test_peer(12_003)]);
-        let mut peer_backlog = VecDeque::from([target, test_peer(12_004)]);
-        let mut dial_retries = VecDeque::from([(target, now + Duration::from_secs(30))]);
-        let mut useful_redials = VecDeque::from([(target, now + Duration::from_secs(10))]);
+        let mut queues = PeerQueues {
+            priority: VecDeque::from([target, test_peer(12_003)]),
+            backlog: VecDeque::from([target, test_peer(12_004)]),
+            dial_retries: VecDeque::from([(target, now + Duration::from_secs(30))]),
+            useful_redials: VecDeque::from([(target, now + Duration::from_secs(10))]),
+        };
         let mut known_addrs = HashSet::new();
 
         assert!(!promote_holepunch_candidate(
             target,
             &active,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
+            &mut queues,
             &mut known_addrs,
         ));
 
-        assert!(!priority_backlog.contains(&target));
-        assert!(!peer_backlog.contains(&target));
-        assert!(!dial_retries.iter().any(|(addr, _)| *addr == target));
-        assert!(!useful_redials.iter().any(|(addr, _)| *addr == target));
+        assert!(!queues.priority.contains(&target));
+        assert!(!queues.backlog.contains(&target));
+        assert!(!queues.dial_retries.iter().any(|(addr, _)| *addr == target));
+        assert!(!queues
+            .useful_redials
+            .iter()
+            .any(|(addr, _)| *addr == target));
         let expected = active
             .iter()
             .copied()
-            .chain(priority_backlog.iter().copied())
-            .chain(peer_backlog.iter().copied())
-            .chain(dial_retries.iter().map(|(addr, _)| *addr))
-            .chain(useful_redials.iter().map(|(addr, _)| *addr))
+            .chain(queues.priority.iter().copied())
+            .chain(queues.backlog.iter().copied())
+            .chain(queues.dial_retries.iter().map(|(addr, _)| *addr))
+            .chain(queues.useful_redials.iter().map(|(addr, _)| *addr))
             .collect::<HashSet<_>>();
         assert_eq!(known_addrs, expected);
     }
@@ -8780,10 +8970,7 @@ mod tests {
     struct HolepunchFixture {
         peers: HashMap<u32, Peer>,
         pending_dials: HashMap<u32, SocketAddr>,
-        priority_backlog: VecDeque<SocketAddr>,
-        peer_backlog: VecDeque<SocketAddr>,
-        dial_retries: VecDeque<(SocketAddr, Instant)>,
-        useful_redials: VecDeque<(SocketAddr, Instant)>,
+        queues: PeerQueues,
         known_addrs: HashSet<SocketAddr>,
         holepunch: HolepunchState,
         blocklist: RwLock<BlockList>,
@@ -8795,10 +8982,7 @@ mod tests {
             Self {
                 peers: HashMap::new(),
                 pending_dials: HashMap::new(),
-                priority_backlog: VecDeque::new(),
-                peer_backlog: VecDeque::new(),
-                dial_retries: VecDeque::new(),
-                useful_redials: VecDeque::new(),
+                queues: PeerQueues::default(),
                 known_addrs: HashSet::new(),
                 holepunch: HolepunchState::new(true, 6881, Some(6881)),
                 blocklist: RwLock::new(BlockList::default()),
@@ -8812,10 +8996,7 @@ mod tests {
                 from,
                 &self.peers,
                 &self.pending_dials,
-                &mut self.priority_backlog,
-                &mut self.peer_backlog,
-                &mut self.dial_retries,
-                &mut self.useful_redials,
+                &mut self.queues,
                 &mut self.known_addrs,
                 &mut self.holepunch,
                 budget,
@@ -8825,10 +9006,7 @@ mod tests {
         }
 
         fn queued(&self) -> usize {
-            self.priority_backlog.len()
-                + self.peer_backlog.len()
-                + self.dial_retries.len()
-                + self.useful_redials.len()
+            self.queues.len()
         }
     }
 
@@ -8897,7 +9075,7 @@ mod tests {
             &mut budget,
         );
 
-        assert_eq!(fx.priority_backlog, VecDeque::from([target]));
+        assert_eq!(fx.queues.priority, VecDeque::from([target]));
         assert_eq!(fx.holepunch.targets.len(), MAX_HOLEPUNCH_ENTRIES);
         assert!(fx.holepunch.targets.contains_key(&target));
         assert!(!fx.holepunch.targets.contains_key(&stale));
@@ -9193,17 +9371,17 @@ mod tests {
             &mut budget,
         );
 
-        assert_eq!(fx.priority_backlog, VecDeque::from([target]));
+        assert_eq!(fx.queues.priority, VecDeque::from([target]));
         assert!(fx.holepunch.is_target(&target, fx.now));
     }
 
     #[test]
     fn holepunch_connect_flood_from_one_peer_is_rate_limited() {
         let mut fx = HolepunchFixture::new();
-        fx.peer_backlog = (0..MAX_PEER_BACKLOG)
+        fx.queues.backlog = (0..MAX_PEER_BACKLOG)
             .map(|i| SocketAddr::from(([203, 0, 113, 2], 10_000 + i as u16)))
             .collect();
-        let preloaded = fx.peer_backlog.iter().copied().collect::<HashSet<_>>();
+        let preloaded = fx.queues.backlog.iter().copied().collect::<HashSet<_>>();
         fx.known_addrs = preloaded.clone();
         let (cmd, _rx) = mpsc::channel(1);
         let sender = hp_sender(1, test_peer(14_200), &cmd);
@@ -9214,12 +9392,13 @@ mod tests {
             fx.handle(connect_msg(target), &sender, &mut budget);
         }
 
-        let accepted = fx.priority_backlog.len();
+        let accepted = fx.queues.priority.len();
         assert_eq!(accepted, HOLEPUNCH_CONNECT_BURST as usize);
         assert_eq!(fx.holepunch.targets.len(), accepted);
         assert!(fx.queued() <= MAX_PEER_BACKLOG);
         let survivors = fx
-            .peer_backlog
+            .queues
+            .backlog
             .iter()
             .filter(|addr| preloaded.contains(addr))
             .count();
@@ -9237,16 +9416,16 @@ mod tests {
         for n in 0..HOLEPUNCH_CONNECT_BURST as u16 + 2 {
             fx.handle(connect_msg(target(n)), &sender, &mut budget);
         }
-        assert_eq!(fx.priority_backlog.len(), HOLEPUNCH_CONNECT_BURST as usize);
+        assert_eq!(fx.queues.priority.len(), HOLEPUNCH_CONNECT_BURST as usize);
 
         fx.now += HOLEPUNCH_CONNECT_REFILL;
         fx.handle(connect_msg(target(500)), &sender, &mut budget);
         fx.handle(connect_msg(target(501)), &sender, &mut budget);
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_CONNECT_BURST as usize + 1
         );
-        assert_eq!(fx.priority_backlog.front(), Some(&target(500)));
+        assert_eq!(fx.queues.priority.front(), Some(&target(500)));
     }
 
     #[test]
@@ -9273,7 +9452,7 @@ mod tests {
         fx.peers
             .insert(1, Peer::connected(source, tx, 1, 1, 1, false, false, None));
         connect_all(&mut fx, &mut budgets, 1, source.ip(), 20);
-        assert_eq!(fx.priority_backlog.len(), HOLEPUNCH_CONNECT_BURST as usize);
+        assert_eq!(fx.queues.priority.len(), HOLEPUNCH_CONNECT_BURST as usize);
 
         fx.peers.remove(&1);
         let mapped = match source.ip() {
@@ -9291,13 +9470,13 @@ mod tests {
             fx.peers.remove(&pid);
         }
 
-        assert_eq!(fx.priority_backlog.len(), HOLEPUNCH_CONNECT_BURST as usize);
+        assert_eq!(fx.queues.priority.len(), HOLEPUNCH_CONNECT_BURST as usize);
         assert_eq!(budgets.entries.len(), 1);
 
         fx.now += HOLEPUNCH_CONNECT_REFILL;
         connect_all(&mut fx, &mut budgets, 40, source.ip(), 5);
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_CONNECT_BURST as usize + 1
         );
     }
@@ -9319,7 +9498,7 @@ mod tests {
             send(&mut fx, n);
         }
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_UNSOLICITED_BURST as usize
         );
         assert_eq!(
@@ -9331,10 +9510,10 @@ mod tests {
         send(&mut fx, 100);
         send(&mut fx, 101);
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_UNSOLICITED_BURST as usize + 1
         );
-        assert_eq!(fx.priority_backlog.front(), Some(&target(100)));
+        assert_eq!(fx.queues.priority.front(), Some(&target(100)));
     }
 
     #[test]
@@ -9361,7 +9540,7 @@ mod tests {
             fx.handle(connect_msg(target(n)), &relay, &mut budget);
         }
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_UNSOLICITED_BURST as usize * 2
         );
 
@@ -9370,7 +9549,7 @@ mod tests {
             fx.handle(connect_msg(target(1000 + n)), &public, &mut budget);
         }
         assert_eq!(
-            fx.priority_backlog.len(),
+            fx.queues.priority.len(),
             HOLEPUNCH_UNSOLICITED_BURST as usize * 2 + HOLEPUNCH_CONNECT_BURST as usize
         );
     }
@@ -9463,9 +9642,9 @@ mod tests {
         assert_eq!(fx.queued(), 0);
 
         fx.handle(connect_msg(target), &relay, &mut exhausted);
-        assert_eq!(fx.priority_backlog, VecDeque::from([target]));
+        assert_eq!(fx.queues.priority, VecDeque::from([target]));
 
-        fx.priority_backlog.clear();
+        fx.queues.priority.clear();
         fx.known_addrs.clear();
         fx.handle(connect_msg(target), &relay, &mut exhausted);
         assert_eq!(fx.queued(), 0);
@@ -9498,11 +9677,11 @@ mod tests {
         let mut budget = holepunch_budget(fx.now);
         fx.handle(connect_msg(local_targets[1]), &lan, &mut budget);
         fx.handle(connect_msg(local_targets[0]), &lan, &mut budget);
-        assert_eq!(fx.priority_backlog, VecDeque::from([local_targets[1]]));
+        assert_eq!(fx.queues.priority, VecDeque::from([local_targets[1]]));
 
         let loopback = hp_sender(3, SocketAddr::from(([127, 0, 0, 1], 6882)), &cmd);
         fx.handle(connect_msg(local_targets[0]), &loopback, &mut budget);
-        assert_eq!(fx.priority_backlog.front(), Some(&local_targets[0]));
+        assert_eq!(fx.queues.priority.front(), Some(&local_targets[0]));
     }
 
     #[test]
@@ -9518,7 +9697,7 @@ mod tests {
         );
 
         let canonical = SocketAddr::from(([198, 51, 100, 80], 6881));
-        assert_eq!(fx.priority_backlog, VecDeque::from([canonical]));
+        assert_eq!(fx.queues.priority, VecDeque::from([canonical]));
         assert!(fx.holepunch.is_target(&canonical, fx.now));
     }
 
@@ -10156,7 +10335,7 @@ mod tests {
             &hp_sender(1, SocketAddr::from(([198, 51, 100, 7], 6881)), &cmd),
             &mut budget,
         );
-        assert_eq!(fx.priority_backlog, VecDeque::from([target]));
+        assert_eq!(fx.queues.priority, VecDeque::from([target]));
         assert!(fx.holepunch.is_target(&target, fx.now));
         assert!(!inbound_addr_taken(
             target,
@@ -10172,17 +10351,11 @@ mod tests {
             5,
             Peer::connected(target, peer_tx, 1, 1, 1, false, false, None),
         );
-        fx.dial_retries.push_back((target, fx.now));
-        fx.useful_redials.push_back((target, fx.now));
-        fx.peer_backlog.push_back(target);
+        fx.queues.dial_retries.push_back((target, fx.now));
+        fx.queues.useful_redials.push_back((target, fx.now));
+        fx.queues.backlog.push_back(target);
         fx.known_addrs.insert(target);
-        unqueue_peer_addr(
-            target,
-            &mut fx.priority_backlog,
-            &mut fx.peer_backlog,
-            &mut fx.dial_retries,
-            &mut fx.useful_redials,
-        );
+        fx.queues.remove(target);
 
         assert_eq!(fx.queued(), 0);
         assert!(fx.known_addrs.contains(&target));
@@ -10389,17 +10562,10 @@ mod tests {
         assert!(relay_rx.try_recv().is_ok());
 
         for failures in 1..MAX_DIAL_FAILURES {
-            let mut dial_retries = VecDeque::new();
-            let mut useful_redials = VecDeque::new();
+            let mut queues = PeerQueues::default();
             let before = Instant::now();
-            schedule_peer_retry(
-                target,
-                false,
-                failures,
-                &mut dial_retries,
-                &mut useful_redials,
-            );
-            let (_, due) = dial_retries.pop_front().expect("retry is scheduled");
+            schedule_peer_retry(target, false, failures, &mut queues);
+            let (_, due) = queues.dial_retries.pop_front().expect("retry is scheduled");
             now += due.saturating_duration_since(before);
 
             try_initiate_holepunch(target, &pex_source, &mut holepunch, &peers, now);
@@ -10510,10 +10676,7 @@ mod tests {
 
     #[test]
     fn pex_candidates_leave_backlog_room_for_other_sources() {
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = VecDeque::new();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
+        let mut queues = PeerQueues::default();
         let mut known_addrs = HashSet::new();
         let blocklist = RwLock::new(BlockList::default());
 
@@ -10523,15 +10686,12 @@ mod tests {
                 addr,
                 PeerSource::Pex,
                 false,
-                &mut priority_backlog,
-                &mut peer_backlog,
-                &mut dial_retries,
-                &mut useful_redials,
+                &mut queues,
                 &mut known_addrs,
                 &blocklist,
             );
         }
-        assert_eq!(peer_backlog.len(), MAX_PEX_BACKLOG);
+        assert_eq!(queues.backlog.len(), MAX_PEX_BACKLOG);
 
         let tracker = SocketAddr::from(([192, 0, 2, 77], 6881));
         let mut queue = |addr, source, known_useful| {
@@ -10539,10 +10699,7 @@ mod tests {
                 addr,
                 source,
                 known_useful,
-                &mut priority_backlog,
-                &mut peer_backlog,
-                &mut dial_retries,
-                &mut useful_redials,
+                &mut queues,
                 &mut known_addrs,
                 &blocklist,
             )
@@ -10552,8 +10709,8 @@ mod tests {
         assert!(queue(tracker, PeerSource::Tracker, false));
         let useful_pex = SocketAddr::from(([192, 0, 2, 79], 6881));
         assert!(queue(useful_pex, PeerSource::Pex, true));
-        assert_eq!(priority_backlog.back(), Some(&useful_pex));
-        assert_eq!(peer_backlog.back(), Some(&tracker));
+        assert_eq!(queues.priority.back(), Some(&useful_pex));
+        assert_eq!(queues.backlog.back(), Some(&tracker));
     }
 
     fn pex_message(addrs: &[SocketAddr], dropped: &[SocketAddr]) -> Bytes {
@@ -10697,10 +10854,7 @@ mod tests {
             &payload,
             &fx.peers,
             &fx.pending_dials,
-            &mut fx.priority_backlog,
-            &mut fx.peer_backlog,
-            &mut fx.dial_retries,
-            &mut fx.useful_redials,
+            &mut fx.queues,
             &mut fx.known_addrs,
             &mut fx.holepunch,
             budgets,
@@ -10721,7 +10875,7 @@ mod tests {
                 SocketAddr::from(([198, 51, 100, 50 + n], 6881)),
             );
         }
-        assert_eq!(fx.priority_backlog.len(), HOLEPUNCH_CONNECT_BURST as usize);
+        assert_eq!(fx.queues.priority.len(), HOLEPUNCH_CONNECT_BURST as usize);
         let relay_ip = IpAddr::from([198, 51, 100, 7]);
         assert!(!budgets.entry(relay_ip, fx.now).connect.is_full(fx.now));
         assert_eq!(budgets.entry(relay_ip, fx.now).connect.take(1, fx.now), 0);
@@ -10941,13 +11095,15 @@ mod tests {
         let existing_priority = test_peer(13_001);
         let useful = test_peer(13_002);
         let retry = test_peer(13_003);
-        let mut priority_backlog = VecDeque::from([existing_priority]);
-        let mut useful_redials = VecDeque::from([(useful, now + Duration::from_secs(10))]);
-        let mut dial_retries = VecDeque::from([(retry, now + Duration::from_secs(30))]);
-        let mut peer_backlog = (0..MAX_PEER_BACKLOG - 3)
-            .map(|i| test_peer(20_000 + i as u16))
-            .collect::<VecDeque<_>>();
-        let evicted = *peer_backlog.back().expect("full combined queue");
+        let mut queues = PeerQueues {
+            priority: VecDeque::from([existing_priority]),
+            useful_redials: VecDeque::from([(useful, now + Duration::from_secs(10))]),
+            dial_retries: VecDeque::from([(retry, now + Duration::from_secs(30))]),
+            backlog: (0..MAX_PEER_BACKLOG - 3)
+                .map(|i| test_peer(20_000 + i as u16))
+                .collect::<VecDeque<_>>(),
+        };
+        let evicted = *queues.backlog.back().expect("full combined queue");
         let target = test_peer(45_001);
         let active = HashSet::from([test_peer(13_004)]);
         let mut known_addrs = HashSet::new();
@@ -10955,25 +11111,21 @@ mod tests {
         assert!(promote_holepunch_candidate(
             target,
             &active,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
+            &mut queues,
             &mut known_addrs,
         ));
 
-        assert_eq!(priority_backlog.front(), Some(&target));
+        assert_eq!(queues.priority.front(), Some(&target));
         assert!(!known_addrs.contains(&evicted));
-        let queued =
-            priority_backlog.len() + peer_backlog.len() + dial_retries.len() + useful_redials.len();
+        let queued = queues.len();
         assert_eq!(queued, MAX_PEER_BACKLOG);
         let expected = active
             .iter()
             .copied()
-            .chain(priority_backlog.iter().copied())
-            .chain(peer_backlog.iter().copied())
-            .chain(dial_retries.iter().map(|(addr, _)| *addr))
-            .chain(useful_redials.iter().map(|(addr, _)| *addr))
+            .chain(queues.priority.iter().copied())
+            .chain(queues.backlog.iter().copied())
+            .chain(queues.dial_retries.iter().map(|(addr, _)| *addr))
+            .chain(queues.useful_redials.iter().map(|(addr, _)| *addr))
             .collect::<HashSet<_>>();
         assert_eq!(known_addrs, expected);
     }
@@ -10992,20 +11144,14 @@ mod tests {
         assert_eq!(older, pool[10..19]);
         assert_eq!(newer, pool[..10]);
 
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = VecDeque::new();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
+        let mut queues = PeerQueues::default();
         let mut known_addrs = HashSet::new();
         let blocklist = RwLock::new(BlockList::default());
         let mut queue = |addr, priority| {
             assert!(enqueue_peer_candidate(
                 addr,
                 priority,
-                &mut priority_backlog,
-                &mut peer_backlog,
-                &mut dial_retries,
-                &mut useful_redials,
+                &mut queues,
                 &mut known_addrs,
                 &blocklist,
             ));
@@ -11018,36 +11164,33 @@ mod tests {
             queue(*addr, false);
         }
 
-        assert_eq!(priority_backlog, VecDeque::from([useful]));
+        assert_eq!(queues.priority, VecDeque::from([useful]));
         let expected: VecDeque<SocketAddr> = older.iter().chain(&newer).copied().collect();
-        assert_eq!(peer_backlog, expected);
+        assert_eq!(queues.backlog, expected);
     }
 
     #[test]
     fn priority_peer_displaces_lowest_priority_cold_candidate_when_full() {
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = (0..MAX_PEER_BACKLOG)
-            .map(|i| test_peer(30_000 + i as u16))
-            .collect::<VecDeque<_>>();
-        let evicted = *peer_backlog.back().expect("full backlog");
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
-        let mut known_addrs = peer_backlog.iter().copied().collect::<HashSet<_>>();
+        let mut queues = PeerQueues {
+            backlog: (0..MAX_PEER_BACKLOG)
+                .map(|i| test_peer(30_000 + i as u16))
+                .collect::<VecDeque<_>>(),
+            ..Default::default()
+        };
+        let evicted = *queues.backlog.back().expect("full backlog");
+        let mut known_addrs = queues.backlog.iter().copied().collect::<HashSet<_>>();
         let priority = test_peer(45_000);
 
         assert!(enqueue_peer_candidate(
             priority,
             true,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
+            &mut queues,
             &mut known_addrs,
             &RwLock::new(BlockList::default()),
         ));
 
-        assert_eq!(priority_backlog, VecDeque::from([priority]));
-        assert_eq!(peer_backlog.len(), MAX_PEER_BACKLOG - 1);
+        assert_eq!(queues.priority, VecDeque::from([priority]));
+        assert_eq!(queues.backlog.len(), MAX_PEER_BACKLOG - 1);
         assert!(known_addrs.contains(&priority));
         assert!(!known_addrs.contains(&evicted));
         assert_eq!(known_addrs.len(), MAX_PEER_BACKLOG);
@@ -11194,6 +11337,7 @@ mod tests {
             &mut assemblies,
             &mut corruption,
             &blocklist,
+            false,
         )
         .await;
         assert!(assemblies.contains_key(&0));
@@ -11211,6 +11355,7 @@ mod tests {
             &mut assemblies,
             &mut corruption,
             &blocklist,
+            false,
         )
         .await;
         assert!(!assemblies.contains_key(&0));
@@ -11278,6 +11423,7 @@ mod tests {
             &mut assemblies,
             &mut corruption,
             &RwLock::new(BlockList::default()),
+            false,
         )
         .await;
 
@@ -11348,6 +11494,7 @@ mod tests {
             &mut assemblies,
             &mut corruption,
             &RwLock::new(BlockList::default()),
+            false,
         )
         .await;
 
@@ -11502,9 +11649,12 @@ mod tests {
         let halted = queue
             .record_write(&conflict)
             .expect("a hash conflict stops downloading");
-        assert!(halted.contains("Piece 7"), "{halted}");
+        assert!(halted.error.contains("Piece 7"), "{}", halted.error);
+        assert!(!halted.storage);
         assert!(queue.is_full());
         assert_eq!(queue.record_write(&conflict), None);
+        queue.resume();
+        assert!(!queue.is_full());
     }
 
     #[tokio::test]
@@ -11535,10 +11685,11 @@ mod tests {
         }
         assert!(!queue.is_full());
         assert_eq!(
-            queue
-                .record_write(&outcome(Some("No space left on device")))
-                .as_deref(),
-            Some("Disk write failed: No space left on device")
+            queue.record_write(&outcome(Some("No space left on device"))),
+            Some(WriteHalt {
+                error: "Disk write failed: No space left on device".into(),
+                storage: true,
+            })
         );
         assert!(queue.is_full());
         queue.resume();
@@ -12172,11 +12323,72 @@ mod tests {
         assert!(peer_registry::take(torrent_b, 1, &scope_a).is_some());
     }
 
-    #[tokio::test]
-    async fn apply_blocklist_cancels_peers_when_command_channel_is_full() {
+    fn localhost_blocklist() -> RwLock<BlockList> {
         let mut list = BlockList::default();
         list.replace(&["127.0.0.1".into()]);
-        let blocklist = RwLock::new(list);
+        RwLock::new(list)
+    }
+
+    struct BlocklistFixture {
+        peers: HashMap<u32, Peer>,
+        pending_dials: HashMap<u32, SocketAddr>,
+        outbound_aborts: HashMap<u32, AbortHandle>,
+        known_addrs: HashSet<SocketAddr>,
+        queues: PeerQueues,
+        useful_peers: HashMap<SocketAddr, usize>,
+        pex_source: HashMap<SocketAddr, u32>,
+        holepunch: HolepunchState,
+        piece_tracker: PieceTracker,
+        chunk_tracker: ChunkTracker,
+        piece_assemblies: HashMap<u32, PieceAssembly>,
+        lengths: Lengths,
+        registry_scope: Arc<()>,
+    }
+
+    impl BlocklistFixture {
+        fn new(peers: HashMap<u32, Peer>, known_addrs: HashSet<SocketAddr>) -> Self {
+            let (lengths, _) = two_file_layout();
+            Self {
+                peers,
+                pending_dials: HashMap::new(),
+                outbound_aborts: HashMap::new(),
+                known_addrs,
+                queues: PeerQueues::default(),
+                useful_peers: HashMap::new(),
+                pex_source: HashMap::new(),
+                holepunch: HolepunchState::default(),
+                piece_tracker: PieceTracker::new(lengths),
+                chunk_tracker: ChunkTracker::new(lengths),
+                piece_assemblies: HashMap::new(),
+                lengths,
+                registry_scope: Arc::new(()),
+            }
+        }
+
+        fn apply(&mut self, blocklist: &RwLock<BlockList>) -> (u32, u32) {
+            apply_blocklist_to_torrent(
+                blocklist,
+                &mut self.peers,
+                &mut self.pending_dials,
+                &mut self.outbound_aborts,
+                &mut self.known_addrs,
+                &mut self.queues,
+                &mut self.useful_peers,
+                &mut self.pex_source,
+                &mut self.holepunch,
+                &mut self.piece_tracker,
+                &mut self.chunk_tracker,
+                &mut self.piece_assemblies,
+                &self.lengths,
+                42,
+                &self.registry_scope,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_blocklist_cancels_peers_when_command_channel_is_full() {
+        let blocklist = localhost_blocklist();
 
         let live_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let pending_addr: SocketAddr = "127.0.0.1:6882".parse().unwrap();
@@ -12199,69 +12411,38 @@ mod tests {
             pending_extra.closed().await;
         });
 
-        let mut pending_dials = HashMap::new();
-        pending_dials.insert(2, pending_addr);
-        let mut known_addrs = HashSet::from([live_addr, pending_addr]);
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = VecDeque::new();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
-        let mut useful_peers = HashMap::new();
-        let mut pex_source = HashMap::new();
-        let mut holepunch = HolepunchState::default();
-        let (lengths, _) = two_file_layout();
-        let mut piece_tracker = PieceTracker::new(lengths);
-        let mut chunk_tracker = ChunkTracker::new(lengths);
-        let mut piece_assemblies = HashMap::new();
-        let registry_scope = Arc::new(());
+        let mut state = BlocklistFixture::new(peers, HashSet::from([live_addr, pending_addr]));
+        state.pending_dials.insert(2, pending_addr);
         peer_registry::put(
             42,
             2,
-            &registry_scope,
+            &state.registry_scope,
             pending_tx,
             pending_addr,
             Some(pending_io.abort_handle()),
         );
 
         let mut outbound_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        let mut outbound_aborts = HashMap::new();
-        outbound_aborts.insert(
+        state.outbound_aborts.insert(
             1,
             outbound_tasks.spawn(async move {
                 extra.closed().await;
             }),
         );
-        outbound_aborts.insert(2, outbound_tasks.spawn(std::future::pending::<()>()));
+        state
+            .outbound_aborts
+            .insert(2, outbound_tasks.spawn(std::future::pending::<()>()));
 
-        let (disconnected, removed) = apply_blocklist_to_torrent(
-            &blocklist,
-            &mut peers,
-            &mut pending_dials,
-            &mut outbound_aborts,
-            &mut known_addrs,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
-            &mut useful_peers,
-            &mut pex_source,
-            &mut holepunch,
-            &mut piece_tracker,
-            &mut chunk_tracker,
-            &mut piece_assemblies,
-            &lengths,
-            42,
-            &registry_scope,
-        );
+        let (disconnected, removed) = state.apply(&blocklist);
 
         assert_eq!(disconnected, 1);
         assert_eq!(removed, 1);
-        assert!(peers.is_empty());
-        assert!(pending_dials.is_empty());
-        assert!(!known_addrs.contains(&live_addr));
-        assert!(!known_addrs.contains(&pending_addr));
-        assert!(outbound_aborts.is_empty());
-        assert!(peer_registry::take(42, 2, &registry_scope).is_none());
+        assert!(state.peers.is_empty());
+        assert!(state.pending_dials.is_empty());
+        assert!(!state.known_addrs.contains(&live_addr));
+        assert!(!state.known_addrs.contains(&pending_addr));
+        assert!(state.outbound_aborts.is_empty());
+        assert!(peer_registry::take(42, 2, &state.registry_scope).is_none());
 
         for _ in 0..2 {
             let joined = tokio::time::timeout(Duration::from_secs(1), outbound_tasks.join_next())
@@ -12279,9 +12460,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_blocklist_aborts_inbound_peer_when_command_channel_is_full() {
-        let mut list = BlockList::default();
-        list.replace(&["127.0.0.1".into()]);
-        let blocklist = RwLock::new(list);
+        let blocklist = localhost_blocklist();
 
         let live_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
@@ -12294,51 +12473,15 @@ mod tests {
         });
         peer.io_abort = Some(io_task.abort_handle());
 
-        let mut peers = HashMap::new();
-        peers.insert(1, peer);
-
-        let mut pending_dials = HashMap::new();
-        let mut known_addrs = HashSet::from([live_addr]);
-        let mut priority_backlog = VecDeque::new();
-        let mut peer_backlog = VecDeque::new();
-        let mut dial_retries = VecDeque::new();
-        let mut useful_redials = VecDeque::new();
-        let mut useful_peers = HashMap::new();
-        let mut pex_source = HashMap::new();
-        let mut holepunch = HolepunchState::default();
-        let (lengths, _) = two_file_layout();
-        let mut piece_tracker = PieceTracker::new(lengths);
-        let mut chunk_tracker = ChunkTracker::new(lengths);
-        let mut piece_assemblies = HashMap::new();
-        let registry_scope = Arc::new(());
-        let mut outbound_aborts = HashMap::new();
-
-        let (disconnected, removed) = apply_blocklist_to_torrent(
-            &blocklist,
-            &mut peers,
-            &mut pending_dials,
-            &mut outbound_aborts,
-            &mut known_addrs,
-            &mut priority_backlog,
-            &mut peer_backlog,
-            &mut dial_retries,
-            &mut useful_redials,
-            &mut useful_peers,
-            &mut pex_source,
-            &mut holepunch,
-            &mut piece_tracker,
-            &mut chunk_tracker,
-            &mut piece_assemblies,
-            &lengths,
-            42,
-            &registry_scope,
-        );
+        let mut state =
+            BlocklistFixture::new(HashMap::from([(1, peer)]), HashSet::from([live_addr]));
+        let (disconnected, removed) = state.apply(&blocklist);
 
         assert_eq!(disconnected, 1);
         assert_eq!(removed, 0);
-        assert!(peers.is_empty());
-        assert!(!known_addrs.contains(&live_addr));
-        assert!(outbound_aborts.is_empty());
+        assert!(state.peers.is_empty());
+        assert!(!state.known_addrs.contains(&live_addr));
+        assert!(state.outbound_aborts.is_empty());
 
         let joined = tokio::time::timeout(Duration::from_secs(1), io_task)
             .await
@@ -12819,6 +12962,40 @@ mod tests {
             &mut peer,
             InitialAvailability::HaveAll
         ));
+    }
+
+    #[test]
+    fn bitfield_of_the_wrong_size_is_rejected_without_using_up_a_slot() {
+        for fast in [true, false] {
+            let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+            let mut peer = Peer::connected(test_peer(52_002), cmd_tx, 2, 1, 1, true, fast, None);
+            assert!(!accept_bitfield(&mut peer, 1));
+            assert!(!accept_bitfield(&mut peer, 3));
+            assert!(!accept_bitfield(&mut peer, 0));
+            assert_eq!(peer.bitfield_messages, 0);
+            assert!(peer.initial_availability.is_none());
+            assert!(accept_bitfield(&mut peer, 2));
+            assert_eq!(peer.bitfield_messages, 1);
+        }
+    }
+
+    #[test]
+    fn fast_peer_may_send_only_one_bitfield() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut peer = Peer::connected(test_peer(52_003), cmd_tx, 2, 1, 1, true, true, None);
+        assert!(accept_bitfield(&mut peer, 2));
+        assert!(!accept_bitfield(&mut peer, 2));
+    }
+
+    #[test]
+    fn peer_without_fast_may_repeat_a_bitfield_only_a_few_times() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut peer = Peer::connected(test_peer(52_004), cmd_tx, 2, 1, 1, true, false, None);
+        for _ in 0..MAX_BITFIELD_MESSAGES {
+            assert!(accept_bitfield(&mut peer, 2));
+        }
+        assert!(!accept_bitfield(&mut peer, 2));
+        assert!(!accept_bitfield(&mut peer, 2));
     }
 
     #[test]
@@ -13899,6 +14076,28 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    #[test]
+    fn only_loopback_trackers_forward_loopback_peers() {
+        let peers = || -> Vec<SocketAddr> {
+            ["203.0.113.5:6881", "127.0.0.1:6379", "192.168.1.10:6881"]
+                .iter()
+                .map(|raw| raw.parse().unwrap())
+                .collect()
+        };
+        let mut from_public = peers();
+        retain_tracker_peers("http://tracker.example/announce", &mut from_public);
+        assert_eq!(
+            from_public,
+            vec![
+                "203.0.113.5:6881".parse::<SocketAddr>().unwrap(),
+                "192.168.1.10:6881".parse().unwrap(),
+            ]
+        );
+        let mut from_loopback = peers();
+        retain_tracker_peers("http://127.0.0.1:8000/announce", &mut from_loopback);
+        assert_eq!(from_loopback, peers());
+    }
+
     #[tokio::test]
     async fn announce_logs_never_carry_tracker_paths_or_query_secrets() {
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -14654,16 +14853,18 @@ mod tests {
     #[test]
     fn retries_are_queued_in_due_order() {
         let addr = |n: u16| test_peer(53_000 + n);
-        let mut retries = VecDeque::new();
-        let mut useful = VecDeque::new();
-        schedule_peer_retry(addr(1), false, 3, &mut retries, &mut useful);
-        schedule_peer_retry(addr(2), false, 0, &mut retries, &mut useful);
-        schedule_peer_retry(addr(3), false, 1, &mut retries, &mut useful);
-        let order: Vec<_> = retries.iter().map(|(a, _)| *a).collect();
+        let mut queues = PeerQueues::default();
+        schedule_peer_retry(addr(1), false, 3, &mut queues);
+        schedule_peer_retry(addr(2), false, 0, &mut queues);
+        schedule_peer_retry(addr(3), false, 1, &mut queues);
+        let order: Vec<_> = queues.dial_retries.iter().map(|(a, _)| *a).collect();
         assert_eq!(order, vec![addr(2), addr(3), addr(1)]);
-        schedule_peer_retry(addr(4), true, 1, &mut retries, &mut useful);
-        schedule_peer_retry(addr(5), true, 0, &mut retries, &mut useful);
-        assert_eq!(useful.front().map(|(a, _)| *a), Some(addr(5)));
+        schedule_peer_retry(addr(4), true, 1, &mut queues);
+        schedule_peer_retry(addr(5), true, 0, &mut queues);
+        assert_eq!(
+            queues.useful_redials.front().map(|(a, _)| *a),
+            Some(addr(5))
+        );
     }
 
     #[test]
@@ -14934,11 +15135,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn webseed_batch_fetches_adjacent_pieces_in_one_http_range() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let payload = b"abcdefghijkl";
+    fn four_byte_piece_info(payload: &[u8]) -> (Arc<ValidatedTorrentMetaV1Info>, Vec<u8>) {
         let mut piece_hashes = Vec::new();
         for piece in payload.chunks(4) {
             piece_hashes.extend_from_slice(crate::core::hash::sha1(piece).as_bytes());
@@ -14956,6 +15153,15 @@ mod tests {
             }],
             single_file_mode: true,
         });
+        (info, piece_hashes)
+    }
+
+    #[tokio::test]
+    async fn webseed_batch_fetches_adjacent_pieces_in_one_http_range() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = b"abcdefghijkl";
+        let (info, piece_hashes) = four_byte_piece_info(payload);
         let tmp = tempfile::tempdir().unwrap();
         let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -14981,22 +15187,18 @@ mod tests {
         });
 
         let lengths = Lengths::new(payload.len() as u64, 4).unwrap();
-        let ctx = WebSeedContext {
-            client: build_webseed_client(None).unwrap(),
-            bases: Arc::new(vec![format!("http://{addr}/")]),
-            disabled: Arc::new(Mutex::new(HashSet::new())),
-            disabled_files: Arc::new(Mutex::new(HashSet::new())),
-            backoff: Arc::new(Mutex::new(HashMap::new())),
-            layout: storage.layout().clone(),
+        let ctx = WebSeedContext::new(
+            build_webseed_client(None).unwrap(),
+            vec![format!("http://{addr}/")],
             info,
-            storage: Arc::clone(&storage),
-            verifier: PieceVerifier::V1Sha1 {
+            Arc::clone(&storage),
+            PieceVerifier::V1Sha1 {
                 pieces: Arc::new(piece_hashes),
             },
             lengths,
-            generation: GenerationToken::new(),
-            throttle: Throttle::unlimited(),
-        };
+            GenerationToken::new(),
+            Throttle::unlimited(),
+        );
 
         let result = fetch_webseed_batch(ctx, vec![0, 1, 2]).await;
         assert_eq!(result.pieces.len(), 3);
@@ -15016,23 +15218,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(20), async {
             let payload = b"abcdefgh";
-            let mut piece_hashes = Vec::new();
-            for piece in payload.chunks(4) {
-                piece_hashes.extend_from_slice(crate::core::hash::sha1(piece).as_bytes());
-            }
-            let info = Arc::new(ValidatedTorrentMetaV1Info {
-                name: "payload.bin".into(),
-                piece_length: 4,
-                pieces: piece_hashes.clone(),
-                private: false,
-                files: vec![TorrentMetaInfo {
-                    path: vec!["payload.bin".into()],
-                    length: payload.len() as u64,
-                    padding: false,
-                    executable: false,
-                }],
-                single_file_mode: true,
-            });
+            let (info, piece_hashes) = four_byte_piece_info(payload);
             let tmp = tempfile::tempdir().unwrap();
             let storage = Arc::new(FilesystemStorage::new(&info, tmp.path()));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -15055,22 +15241,7 @@ mod tests {
                     socket.write_all(&payload[start..=end]).await.unwrap();
                 }
             });
-            let ctx = WebSeedContext {
-                client: build_webseed_client(None).unwrap(),
-                bases: Arc::new(vec![format!("http://{addr}/")]),
-                disabled: Arc::new(Mutex::new(HashSet::new())),
-                disabled_files: Arc::new(Mutex::new(HashSet::new())),
-                backoff: Arc::new(Mutex::new(HashMap::new())),
-                layout: storage.layout().clone(),
-                info,
-                storage: Arc::clone(&storage),
-                verifier: PieceVerifier::V1Sha1 {
-                    pieces: Arc::new(piece_hashes),
-                },
-                lengths: Lengths::new(payload.len() as u64, 4).unwrap(),
-                generation: GenerationToken::new(),
-                throttle: Throttle::unlimited(),
-            };
+            let ctx = WebSeedContext::new(build_webseed_client(None).unwrap(), vec![format!("http://{addr}/")], info, Arc::clone(&storage), PieceVerifier::V1Sha1 { pieces: Arc::new(piece_hashes) }, Lengths::new(payload.len() as u64, 4).unwrap(), GenerationToken::new(), Throttle::unlimited());
 
             let first = fetch_webseed_batch(ctx.clone(), vec![0]).await;
             let second = fetch_webseed_batch(ctx.clone(), vec![1]).await;
@@ -15125,22 +15296,18 @@ mod tests {
                 let _ = socket.write_all(reply).await;
             }
         });
-        let ctx = WebSeedContext {
-            client: build_webseed_client(None).unwrap(),
-            bases: Arc::new(vec![format!("http://{addr}/")]),
-            disabled: Arc::new(Mutex::new(HashSet::new())),
-            disabled_files: Arc::new(Mutex::new(HashSet::new())),
-            backoff: Arc::new(Mutex::new(HashMap::new())),
-            layout: storage.layout().clone(),
+        let ctx = WebSeedContext::new(
+            build_webseed_client(None).unwrap(),
+            vec![format!("http://{addr}/")],
             info,
-            storage: Arc::clone(&storage),
-            verifier: PieceVerifier::V1Sha1 {
+            Arc::clone(&storage),
+            PieceVerifier::V1Sha1 {
                 pieces: Arc::new(piece_hashes),
             },
-            lengths: Lengths::new(16, 8).unwrap(),
-            generation: GenerationToken::new(),
-            throttle: Throttle::unlimited(),
-        };
+            Lengths::new(16, 8).unwrap(),
+            GenerationToken::new(),
+            Throttle::unlimited(),
+        );
 
         assert!(ctx.pieces_servable(&[1]));
         let missing = fetch_webseed_batch(ctx.clone(), vec![1]).await;
@@ -15359,6 +15526,831 @@ mod tests {
     async fn private_torrents_never_dial_an_unlisted_utp_peer_turned_away_while_paused() {
         assert!(!dials_back_a_utp_stranger_turned_away_while_paused(true).await);
     }
+
+    async fn zero_a_piece_across_a_pause(
+        fail_flush: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::session::Session>,
+        Arc<ManagedTorrent>,
+        u64,
+    ) {
+        use crate::bencode::{encode_to_vec, Value};
+        use crate::session::{AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
+
+        const PIECE: usize = 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let payload: Vec<u8> = (0..PIECE * 4).map(|i| (i % 251) as u8 + 1).collect();
+        let pieces: Vec<u8> = payload
+            .chunks(PIECE)
+            .flat_map(|piece| crate::core::hash::sha1(piece).as_bytes().to_vec())
+            .collect();
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(payload.len() as i64)),
+            (b"name".to_vec(), Value::Bytes(b"seed.bin".to_vec())),
+            (b"piece length".to_vec(), Value::Int(PIECE as i64)),
+            (b"pieces".to_vec(), Value::Bytes(pieces)),
+        ]);
+        let file = tmp.path().join("seed.bin");
+        std::fs::write(&file, &payload).unwrap();
+        let session = Session::new_with_opts(
+            tmp.path().to_path_buf(),
+            SessionOptions {
+                disable_dht: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let AddTorrentResponse::Added(_, handle) = session
+            .add_from_meta(
+                crate::parse_torrent(&bytes).unwrap(),
+                AddTorrentOptions::default(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Added");
+        };
+        eventually("the payload to verify", || handle.stats().finished).await;
+
+        let dir = tmp.path().to_path_buf();
+        if fail_flush {
+            crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        }
+        let paused = session.pause(&handle).await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        paused.unwrap();
+
+        let mut on_disk = std::fs::read(&file).unwrap();
+        on_disk[2 * PIECE..3 * PIECE].fill(0);
+        std::fs::write(&file, &on_disk).unwrap();
+        session.unpause(&handle).await.unwrap();
+        (tmp, session, handle, PIECE as u64)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_flush_on_pause_rechecks_on_resume() {
+        let (_tmp, session, handle, piece) = zero_a_piece_across_a_pause(true).await;
+        eventually("the recheck to find the zeroed piece", || {
+            let stats = handle.stats();
+            !stats.finished && stats.left_bytes == piece
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = handle.stats();
+        assert!(!stats.finished);
+        assert_eq!(stats.left_bytes, piece);
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_pause_does_not_recheck() {
+        let (_tmp, session, handle, _) = zero_a_piece_across_a_pause(false).await;
+        let stats = handle.stats();
+        assert!(stats.finished);
+        assert_eq!(stats.left_bytes, 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = handle.stats();
+        assert!(stats.finished);
+        assert_eq!(stats.left_bytes, 0);
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_flush_on_pause_is_reported_in_the_stats() {
+        let (_tmp, session, handle, _) = zero_a_piece_across_a_pause(true).await;
+        assert!(handle.stats().flush_failed);
+        session.shutdown().await;
+        assert!(handle.stats().flush_failed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_flush_at_shutdown_is_reported_in_the_stats_when_shutdown_returns() {
+        let (tmp, session, handle, _) = zero_a_piece_across_a_pause(false).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!handle.stats().flush_failed);
+        let dir = tmp.path().to_path_buf();
+        crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        session.shutdown().await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        assert!(handle.stats().flush_failed);
+    }
+
+    async fn download_with_failing_flushes() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<crate::session::Session>,
+        Arc<crate::session::Session>,
+        Arc<ManagedTorrent>,
+        Vec<u8>,
+    ) {
+        use crate::bencode::{encode_to_vec, Value};
+        use crate::session::{
+            AddTorrentOptions, AddTorrentResponse, ListenerOptions, Session, SessionOptions,
+        };
+
+        const PIECE: usize = 16 * 1024;
+        let payload: Vec<u8> = (0..PIECE * 4).map(|i| (i % 251) as u8 + 1).collect();
+        let pieces: Vec<u8> = payload
+            .chunks(PIECE)
+            .flat_map(|piece| crate::core::hash::sha1(piece).as_bytes().to_vec())
+            .collect();
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(payload.len() as i64)),
+            (b"name".to_vec(), Value::Bytes(b"flush.bin".to_vec())),
+            (b"piece length".to_vec(), Value::Int(PIECE as i64)),
+            (b"pieces".to_vec(), Value::Bytes(pieces)),
+        ]);
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let seed_dir = tempfile::tempdir().unwrap();
+        let leech_dir = tempfile::tempdir().unwrap();
+        std::fs::write(seed_dir.path().join("flush.bin"), &payload).unwrap();
+        let opts = SessionOptions {
+            disable_dht: true,
+            disable_local_service_discovery: true,
+            listen: Some(ListenerOptions {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let seed = Session::new_with_opts(seed_dir.path().to_path_buf(), opts.clone())
+            .await
+            .unwrap();
+        let leech = Session::new_with_opts(leech_dir.path().to_path_buf(), opts)
+            .await
+            .unwrap();
+        let add = |session: Arc<Session>| {
+            let meta = crate::parse_torrent(&bytes).unwrap();
+            async move {
+                match session
+                    .add_from_meta(meta, AddTorrentOptions::default())
+                    .await
+                    .unwrap()
+                {
+                    AddTorrentResponse::Added(_, handle) => handle,
+                    _ => panic!("expected Added"),
+                }
+            }
+        };
+        let seeding = add(Arc::clone(&seed)).await;
+        eventually("the seed to verify", || seeding.stats().finished).await;
+
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .push(leech_dir.path().to_path_buf());
+        let handle = add(Arc::clone(&leech)).await;
+        let seed_addr: SocketAddr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+        leech.add_peer(handle.info_hash(), seed_addr).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while handle.stats().left_bytes != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out downloading"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        eventually("the completion to settle", || {
+            let stats = handle.stats();
+            stats.finished || stats.error.is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = handle.stats();
+        assert!(!stats.finished);
+        assert!(stats.storage_error);
+        let error = stats.error.unwrap_or_default();
+        assert!(error.contains("flush"), "{error}");
+        (seed_dir, leech_dir, seed, leech, handle, payload)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_flush_at_completion_is_an_error_not_a_finish() {
+        let (_seed_dir, leech_dir, seed, leech, handle, payload) =
+            download_with_failing_flushes().await;
+        let dir = leech_dir.path().to_path_buf();
+
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        leech.pause(&handle).await.unwrap();
+        leech.unpause(&handle).await.unwrap();
+        eventually("the recheck to finish the torrent", || {
+            let stats = handle.stats();
+            stats.finished && stats.error.is_none() && stats.left_bytes == 0
+        })
+        .await;
+        assert!(!handle.stats().storage_error);
+        assert_eq!(
+            std::fs::read(leech_dir.path().join("flush.bin")).unwrap(),
+            payload
+        );
+        leech.shutdown().await;
+        seed.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recheck_does_not_finish_while_its_flush_fails() {
+        let (_seed_dir, leech_dir, seed, leech, handle, payload) =
+            download_with_failing_flushes().await;
+        let dir = leech_dir.path().to_path_buf();
+
+        leech.pause(&handle).await.unwrap();
+        leech.unpause(&handle).await.unwrap();
+        eventually("the recheck to settle", || {
+            let stats = handle.stats();
+            stats.left_bytes == 0 && (stats.finished || stats.error.is_some())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = handle.stats();
+        assert!(!stats.finished);
+        let error = stats.error.unwrap_or_default();
+        assert!(error.contains("flush"), "{error}");
+
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        leech.pause(&handle).await.unwrap();
+        leech.unpause(&handle).await.unwrap();
+        eventually("the recheck to finish the torrent", || {
+            let stats = handle.stats();
+            stats.finished && stats.error.is_none() && stats.left_bytes == 0
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(leech_dir.path().join("flush.bin")).unwrap(),
+            payload
+        );
+        leech.shutdown().await;
+        seed.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_flush_stays_in_the_stats_after_flushes_work_again() {
+        let (_seed_dir, leech_dir, seed, leech, handle, _payload) =
+            download_with_failing_flushes().await;
+        assert!(handle.stats().flush_failed);
+        let dir = leech_dir.path().to_path_buf();
+
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        leech.pause(&handle).await.unwrap();
+        leech.unpause(&handle).await.unwrap();
+        eventually("the recheck to finish the torrent", || {
+            let stats = handle.stats();
+            stats.finished && stats.error.is_none() && stats.left_bytes == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(handle.stats().flush_failed);
+        leech.shutdown().await;
+        seed.shutdown().await;
+    }
+
+    fn two_single_piece_files(root: &Path) -> (FilesystemStorage, Lengths) {
+        let file = |name: &str| TorrentMetaInfo {
+            path: vec![name.into()],
+            length: 16,
+            padding: false,
+            executable: false,
+        };
+        let info = ValidatedTorrentMetaV1Info {
+            name: "pair".into(),
+            piece_length: 16,
+            pieces: vec![0; 40],
+            private: false,
+            files: vec![file("a"), file("b")],
+            single_file_mode: false,
+        };
+        (
+            FilesystemStorage::new(&info, root),
+            Lengths::new(32, 16).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_finished_torrent_flushes_data_written_after_it_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (storage, _) = two_single_piece_files(tmp.path());
+        storage
+            .write_at_owned(16, Bytes::from_static(&[2; 16]))
+            .await
+            .unwrap();
+        let stats = Mutex::new(TorrentStats::initial(32, 0, vec![16, 16]));
+        stats.lock().finished = true;
+        let dir = tmp.path().to_path_buf();
+        crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        let error = finish_if_complete(&storage, &stats, true, false).await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        let error = error.unwrap_or_default();
+        assert!(error.contains("flush"), "{error}");
+        let stats = stats.lock();
+        assert!(!stats.finished);
+        assert_eq!(stats.error.as_deref(), Some(error.as_str()));
+        assert!(stats.storage_error);
+    }
+
+    #[tokio::test]
+    async fn finishing_reports_a_failed_flush_in_the_stats_for_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (storage, _) = two_single_piece_files(tmp.path());
+        let stats = Mutex::new(TorrentStats::initial(32, 0, vec![16, 16]));
+        storage
+            .write_at_owned(0, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        assert_eq!(
+            finish_if_complete(&storage, &stats, true, false).await,
+            None
+        );
+        assert!(stats.lock().finished);
+        assert!(!stats.lock().flush_failed);
+
+        storage
+            .write_at_owned(16, Bytes::from_static(&[2; 16]))
+            .await
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
+        crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        let error = finish_if_complete(&storage, &stats, true, false).await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        assert!(error.is_some());
+        {
+            let stats = stats.lock();
+            assert!(!stats.finished);
+            assert!(stats.flush_failed);
+            assert_eq!(stats.error, error);
+        }
+
+        assert_eq!(
+            finish_if_complete(&storage, &stats, true, false).await,
+            None
+        );
+        assert!(stats.lock().finished);
+        assert!(stats.lock().flush_failed);
+    }
+
+    async fn deselect_the_missing_file(
+        failing_flush: bool,
+    ) -> (
+        tempfile::TempDir,
+        FilesystemStorage,
+        Mutex<TorrentStats>,
+        Option<String>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (storage, lengths) = two_single_piece_files(tmp.path());
+        storage
+            .write_at_owned(0, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let mut pieces = PieceTracker::new(lengths);
+        mark_verified_piece_local(&mut pieces, lengths.validate_piece(0).unwrap());
+        let stats = Mutex::new(TorrentStats::initial(32, pieces.bytes_left(), vec![16, 16]));
+        let dir = tmp.path().to_path_buf();
+        if failing_flush {
+            crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        }
+        let (only_files, applied, flushed) = select_files(
+            &storage,
+            Some(vec![0]),
+            &lengths,
+            &mut pieces,
+            &mut ChunkTracker::new(lengths),
+            &mut HashMap::new(),
+            &stats,
+            false,
+            false,
+        )
+        .await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        assert_eq!(only_files, Some(vec![0]));
+        assert!(applied.is_ok());
+        (tmp, storage, stats, flushed)
+    }
+
+    #[tokio::test]
+    async fn deselecting_the_missing_files_reports_a_failed_flush_instead_of_finishing() {
+        let (_tmp, _storage, stats, flushed) = deselect_the_missing_file(true).await;
+        let stats = stats.lock();
+        assert!(!stats.finished);
+        let error = stats.error.clone().unwrap_or_default();
+        assert!(error.contains("flush"), "{error}");
+        assert_eq!(flushed, Some(error));
+    }
+
+    #[tokio::test]
+    async fn deselecting_the_missing_files_flushes_before_finishing() {
+        let (tmp, storage, stats, flushed) = deselect_the_missing_file(false).await;
+        assert_eq!(flushed, None);
+        assert!(stats.lock().finished);
+        assert_eq!(stats.lock().error, None);
+        let dir = tmp.path().to_path_buf();
+        crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        let clean = storage.sync_written().await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        assert!(
+            clean.is_ok(),
+            "the selection finished with unflushed writes"
+        );
+    }
+
+    const STAMPED_PIECE: usize = 1024;
+
+    async fn two_stamped_files(
+        b_fill: Option<u8>,
+        only_files: Option<Vec<usize>>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::session::Session>,
+        Arc<ManagedTorrent>,
+        PathBuf,
+        Vec<u8>,
+    ) {
+        use crate::bencode::{encode_to_vec, Value};
+        use crate::session::{AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
+
+        let file = |path: &[&str]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(STAMPED_PIECE as i64)),
+                (
+                    b"path".to_vec(),
+                    Value::List(
+                        path.iter()
+                            .map(|part| Value::Bytes(part.as_bytes().to_vec()))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let pieces: Vec<u8> = [3u8, 4]
+            .iter()
+            .flat_map(|fill| {
+                crate::core::hash::sha1(&[*fill; STAMPED_PIECE])
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![file(&["a"]), file(&["sub", "b"])]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"pair".to_vec())),
+            (b"piece length".to_vec(), Value::Int(STAMPED_PIECE as i64)),
+            (b"pieces".to_vec(), Value::Bytes(pieces)),
+        ]);
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pair");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a"), [3u8; STAMPED_PIECE]).unwrap();
+        if let Some(fill) = b_fill {
+            std::fs::write(root.join("sub").join("b"), [fill; STAMPED_PIECE]).unwrap();
+        }
+        let session = Session::new_with_opts(
+            tmp.path().to_path_buf(),
+            SessionOptions {
+                disable_dht: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let AddTorrentResponse::Added(_, handle) = session
+            .add_from_meta(
+                crate::parse_torrent(&bytes).unwrap(),
+                AddTorrentOptions {
+                    only_files,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Added");
+        };
+        (tmp, session, handle, root, bytes)
+    }
+
+    fn stamp_on_disk(root: &Path, path: &[&str]) -> crate::create::FileStamp {
+        let file = path
+            .iter()
+            .fold(root.to_path_buf(), |dir, part| dir.join(part));
+        let meta = std::fs::metadata(file).unwrap();
+        crate::create::FileStamp {
+            path: path.iter().map(|part| part.to_string()).collect(),
+            length: meta.len(),
+            modified: meta.modified().unwrap(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_torrent_stamps_every_file() {
+        let (_tmp, session, handle, root, _) = two_stamped_files(Some(4), None).await;
+        eventually("the payload to verify", || handle.stats().finished).await;
+        assert_eq!(
+            handle.complete_file_stamps().await,
+            Some(vec![
+                stamp_on_disk(&root, &["a"]),
+                stamp_on_disk(&root, &["sub", "b"]),
+            ])
+        );
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_or_missing_file_gets_no_stamps() {
+        let (_tmp, session, handle, root, _) = two_stamped_files(Some(4), None).await;
+        eventually("the payload to verify", || handle.stats().finished).await;
+        assert!(handle.complete_file_stamps().await.is_some());
+
+        let a = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("a"))
+            .unwrap();
+        a.set_len(STAMPED_PIECE as u64 - 1).unwrap();
+        assert_eq!(handle.complete_file_stamps().await, None);
+        a.set_len(STAMPED_PIECE as u64).unwrap();
+        assert!(handle.complete_file_stamps().await.is_some());
+
+        std::fs::remove_file(root.join("sub").join("b")).unwrap();
+        assert_eq!(handle.complete_file_stamps().await, None);
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_selection_gets_stamps_only_with_every_piece_present() {
+        let (_tmp, session, handle, _root, _) = two_stamped_files(Some(0), Some(vec![0])).await;
+        eventually("the selected file to verify", || handle.stats().finished).await;
+        assert_eq!(handle.complete_file_stamps().await, None);
+        session.shutdown().await;
+
+        let (_tmp, session, handle, _root, _) = two_stamped_files(Some(4), Some(vec![0])).await;
+        eventually("the selected file to verify", || handle.stats().finished).await;
+        assert!(handle.complete_file_stamps().await.is_some());
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_flush_withholds_stamps_for_the_rest_of_the_run() {
+        let (tmp, session, handle, _root, _) = two_stamped_files(Some(4), None).await;
+        eventually("the payload to verify", || handle.stats().finished).await;
+        assert!(handle.complete_file_stamps().await.is_some());
+
+        let dir = tmp.path().to_path_buf();
+        crate::storage::FAIL_SYNC_UNDER.lock().push(dir.clone());
+        let paused = session.pause(&handle).await;
+        crate::storage::FAIL_SYNC_UNDER
+            .lock()
+            .retain(|listed| *listed != dir);
+        paused.unwrap();
+        session.unpause(&handle).await.unwrap();
+        eventually("the recheck to finish the torrent", || {
+            let stats = handle.stats();
+            stats.finished && stats.error.is_none()
+        })
+        .await;
+        assert_eq!(handle.complete_file_stamps().await, None);
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stamps_skip_the_recheck_only_while_the_files_keep_their_times() {
+        use crate::session::{AddTorrentOptions, AddTorrentResponse};
+
+        let (_tmp, session, handle, root, bytes) = two_stamped_files(Some(4), None).await;
+        eventually("the payload to verify", || handle.stats().finished).await;
+        let stamps = handle.complete_file_stamps().await.unwrap();
+        session
+            .delete(crate::TorrentIdOrHash::Id(handle.id), false)
+            .await
+            .unwrap();
+        assert_eq!(handle.complete_file_stamps().await, None);
+
+        let a = root.join("a");
+        let stamped = stamps
+            .iter()
+            .find(|stamp| stamp.path == ["a"])
+            .unwrap()
+            .modified;
+        std::fs::write(&a, [0u8; STAMPED_PIECE]).unwrap();
+        let set_time = |time| {
+            std::fs::File::options()
+                .write(true)
+                .open(&a)
+                .unwrap()
+                .set_modified(time)
+                .unwrap()
+        };
+        let add = || {
+            let meta = crate::parse_torrent(&bytes).unwrap();
+            let session = Arc::clone(&session);
+            let verified_files = stamps.clone();
+            async move {
+                match session
+                    .add_from_meta(
+                        meta,
+                        AddTorrentOptions {
+                            verified_files,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                {
+                    AddTorrentResponse::Added(_, handle) => handle,
+                    _ => panic!("expected Added"),
+                }
+            }
+        };
+
+        set_time(stamped);
+        let trusted = add().await;
+        eventually("the stamped torrent to finish", || trusted.stats().finished).await;
+        assert_eq!(trusted.stats().left_bytes, 0);
+        session
+            .delete(crate::TorrentIdOrHash::Id(trusted.id), false)
+            .await
+            .unwrap();
+
+        set_time(stamped + Duration::from_secs(5));
+        let rechecked = add().await;
+        eventually("the recheck to settle", || {
+            rechecked.stats().left_bytes == STAMPED_PIECE as u64
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = rechecked.stats();
+        assert!(!stats.finished);
+        assert_eq!(stats.left_bytes, STAMPED_PIECE as u64);
+        session.shutdown().await;
+    }
+
+    async fn start_with_a_blocked_part_file(
+        a_on_disk: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::session::Session>,
+        Arc<ManagedTorrent>,
+        PathBuf,
+        u64,
+    ) {
+        use crate::bencode::{encode_to_vec, Value};
+        use crate::session::{AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
+
+        const PIECE: usize = 1024;
+        let a = vec![1u8; PIECE];
+        let file = |path: &[&str]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(PIECE as i64)),
+                (
+                    b"path".to_vec(),
+                    Value::List(
+                        path.iter()
+                            .map(|part| Value::Bytes(part.as_bytes().to_vec()))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let pieces: Vec<u8> = [a.clone(), vec![2u8; PIECE]]
+            .iter()
+            .flat_map(|piece| crate::core::hash::sha1(piece).as_bytes().to_vec())
+            .collect();
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![file(&["a"]), file(&["sub", "b"])]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"multi".to_vec())),
+            (b"piece length".to_vec(), Value::Int(PIECE as i64)),
+            (b"pieces".to_vec(), Value::Bytes(pieces)),
+        ]);
+        let meta =
+            crate::parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)])))
+                .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("multi");
+        let parts = crate::storage::parts_dir_for(&root, &meta.info_hash.to_hex());
+        std::fs::create_dir_all(&parts).unwrap();
+        std::fs::write(parts.join("1"), b"").unwrap();
+        std::fs::write(root.join("sub"), b"").unwrap();
+        if a_on_disk {
+            std::fs::write(root.join("a"), &a).unwrap();
+        }
+        let session = Session::new_with_opts(
+            tmp.path().to_path_buf(),
+            SessionOptions {
+                disable_dht: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let AddTorrentResponse::Added(_, handle) = session
+            .add_from_meta(
+                meta,
+                AddTorrentOptions {
+                    only_files: Some(vec![0, 1]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Added");
+        };
+        (tmp, session, handle, root, PIECE as u64)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_selection_failure_at_start_is_an_error_and_resume_retries() {
+        let (_tmp, session, handle, root, piece) = start_with_a_blocked_part_file(false).await;
+        eventually("the selection error", || handle.stats().error.is_some()).await;
+        let stats = handle.stats();
+        assert!(stats.storage_error);
+        let error = stats.error.unwrap();
+        let blocked = root.join("sub").join("b").display().to_string();
+        assert!(error.contains(&blocked), "{error}");
+        assert_eq!(stats.left_bytes, piece);
+
+        std::fs::remove_file(root.join("sub")).unwrap();
+        handle
+            .upload_read_failures
+            .store(MAX_READ_FAILURES, Ordering::Relaxed);
+        session.pause(&handle).await.unwrap();
+        session.unpause(&handle).await.unwrap();
+        let stats = handle.stats();
+        assert_eq!(stats.error, None);
+        assert!(!stats.storage_error);
+        assert_eq!(handle.upload_read_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.left_bytes, 2 * piece);
+        let parts = crate::storage::parts_dir_for(&root, &handle.info_hash().to_hex());
+        assert!(!parts.join("1").exists());
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_selection_failure_never_finishes_the_reduced_selection() {
+        let (_tmp, session, handle, root, piece) = start_with_a_blocked_part_file(true).await;
+        eventually("the scan to find file a", || handle.stats().left_bytes == 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stats = handle.stats();
+        assert!(stats.error.is_some());
+        assert!(!stats.finished);
+
+        std::fs::remove_file(root.join("sub")).unwrap();
+        session.pause(&handle).await.unwrap();
+        session.unpause(&handle).await.unwrap();
+        let stats = handle.stats();
+        assert_eq!(stats.error, None);
+        assert_eq!(stats.left_bytes, piece);
+        assert!(!stats.finished);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!handle.stats().finished);
+        session.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changing_the_selection_while_halted_recovers_on_resume() {
+        let (_tmp, session, handle, _root, _) = start_with_a_blocked_part_file(true).await;
+        eventually("the scan to find file a", || handle.stats().left_bytes == 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.set_only_files(Some(vec![0])).await.unwrap();
+        let stats = handle.stats();
+        assert!(stats.error.is_some());
+        assert!(!stats.finished);
+
+        session.pause(&handle).await.unwrap();
+        session.unpause(&handle).await.unwrap();
+        eventually("the resumed torrent to finish", || {
+            let stats = handle.stats();
+            stats.finished && stats.error.is_none()
+        })
+        .await;
+        session.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -15426,6 +16418,7 @@ mod tracker_list_tests {
             lane: UploadLane::Piece(tx.clone()),
             stats: stats.clone(),
             upload_tick: Arc::new(AtomicU64::new(0)),
+            read_failures: Arc::new(AtomicU32::new(0)),
             peer_uploaded: Arc::new(AtomicU64::new(0)),
             peer_uploaded_total: Arc::new(AtomicU64::new(0)),
             limiter: Throttle::unlimited(),
@@ -15433,6 +16426,7 @@ mod tracker_list_tests {
             key,
             offset: u64::from(begin),
             extent: crate::read_cache::extent_for(0, piece_len, u64::from(begin), 16384),
+            wanted: true,
             live: LiveUpload {
                 pending: pending.clone(),
                 bytes: 16384,
@@ -15482,6 +16476,7 @@ mod tracker_list_tests {
                     lane: UploadLane::Piece(tx.clone()),
                     stats: stats.clone(),
                     upload_tick: Arc::new(AtomicU64::new(0)),
+                    read_failures: Arc::new(AtomicU32::new(0)),
                     peer_uploaded: Arc::new(AtomicU64::new(0)),
                     peer_uploaded_total: Arc::new(AtomicU64::new(0)),
                     limiter: limiter.clone(),
@@ -15489,6 +16484,7 @@ mod tracker_list_tests {
                     key,
                     offset: u64::from(begin),
                     extent: None,
+                    wanted: true,
                     live: LiveUpload {
                         pending: pending.clone(),
                         bytes: 1,
@@ -15563,6 +16559,7 @@ mod tracker_list_tests {
                     lane: UploadLane::Piece(piece_tx.clone()),
                     stats: stats.clone(),
                     upload_tick: Arc::new(AtomicU64::new(0)),
+                    read_failures: Arc::new(AtomicU32::new(0)),
                     peer_uploaded: Arc::new(AtomicU64::new(0)),
                     peer_uploaded_total: Arc::new(AtomicU64::new(0)),
                     limiter: Throttle::unlimited(),
@@ -15570,6 +16567,7 @@ mod tracker_list_tests {
                     key,
                     offset: offset + u64::from(begin),
                     extent: None,
+                    wanted: true,
                     live,
                 }));
                 tokio::task::yield_now().await;
@@ -15590,5 +16588,230 @@ mod tracker_list_tests {
         .await
         .expect("parked jobs end once the lane closes");
         assert_eq!(peer.pending_uploads.lock().live_bytes, 0);
+    }
+
+    #[test]
+    fn three_failed_reads_of_wanted_data_in_a_row_are_a_storage_error() {
+        let stats = Mutex::new(TorrentStats::initial(10, 0, vec![10]));
+        let failures = AtomicU32::new(0);
+        let gone = StorageError::Io(std::io::Error::other("gone"));
+        for _ in 1..MAX_READ_FAILURES {
+            record_upload_read(Err(&gone), true, &failures, &stats);
+        }
+        assert_eq!(stats.lock().error, None);
+        record_upload_read(Ok(()), true, &failures, &stats);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        for _ in 1..MAX_READ_FAILURES {
+            record_upload_read(Err(&gone), true, &failures, &stats);
+        }
+        assert_eq!(stats.lock().error, None);
+        record_upload_read(Err(&gone), true, &failures, &stats);
+        let stats = stats.lock().clone();
+        assert!(stats.storage_error);
+        let error = stats.error.unwrap();
+        assert!(error.starts_with("Disk read failed:"), "{error}");
+        assert!(error.contains("gone"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_read_keeps_an_error_that_is_already_shown() {
+        let stats = Mutex::new(TorrentStats::initial(10, 0, vec![10]));
+        stats
+            .lock()
+            .set_error("Disk write failed: full".into(), true);
+        let failures = AtomicU32::new(MAX_READ_FAILURES);
+        let gone = StorageError::Io(std::io::Error::other("gone"));
+        record_upload_read(Err(&gone), true, &failures, &stats);
+        assert_eq!(
+            stats.lock().error.as_deref(),
+            Some("Disk write failed: full")
+        );
+    }
+
+    #[test]
+    fn reads_of_unwanted_data_neither_count_nor_reset() {
+        let stats = Mutex::new(TorrentStats::initial(10, 0, vec![10]));
+        let failures = AtomicU32::new(MAX_READ_FAILURES - 1);
+        let gone = StorageError::Io(std::io::Error::other("gone"));
+        for _ in 0..MAX_READ_FAILURES {
+            record_upload_read(Err(&gone), false, &failures, &stats);
+        }
+        record_upload_read(Ok(()), false, &failures, &stats);
+        assert_eq!(failures.load(Ordering::Relaxed), MAX_READ_FAILURES - 1);
+        assert_eq!(stats.lock().error, None);
+        record_upload_read(Err(&gone), true, &failures, &stats);
+        assert!(stats.lock().storage_error);
+    }
+
+    const SPLIT_PIECE: usize = 256 * 1024;
+
+    async fn two_file_upload_storage(
+        with_payload: bool,
+    ) -> (tempfile::TempDir, Arc<FilesystemStorage>, Vec<u8>) {
+        use crate::bencode::{encode_to_vec, Value};
+        let file = |len: usize, name: &[u8]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(len as i64)),
+                (
+                    b"path".to_vec(),
+                    Value::List(vec![Value::Bytes(name.to_vec())]),
+                ),
+            ])
+        };
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![file(SPLIT_PIECE, b"a.bin"), file(16384, b"b.bin")]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(SPLIT_PIECE as i64)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 40])),
+        ]);
+        let bytes = encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]));
+        let meta = crate::core::metainfo::parse_torrent(&bytes).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let storage = Arc::new(
+            FilesystemStorage::new(&meta.info, &root)
+                .with_parts_dir(crate::storage::parts_dir_for(&root, "abcd")),
+        );
+        let payload: Vec<u8> = (0..SPLIT_PIECE).map(|i| (i % 251) as u8).collect();
+        if with_payload {
+            storage.write_at(0, &payload).await.unwrap();
+        }
+        let only_a: HashSet<usize> = [0].into_iter().collect();
+        storage.set_selection(Some(&only_a)).await;
+        (tmp, storage, payload)
+    }
+
+    async fn hold_storage_io(
+        storage: &Arc<FilesystemStorage>,
+    ) -> (
+        crate::storage::WriteHold,
+        tokio::task::JoinHandle<Result<(), StorageError>>,
+    ) {
+        let hold = storage.hold_next_write();
+        let promotion = tokio::spawn({
+            let storage = Arc::clone(storage);
+            async move { storage.promote_file(1).await }
+        });
+        hold.reached.notified().await;
+        (hold, promotion)
+    }
+
+    fn spawn_window_uploads(
+        storage: &Arc<FilesystemStorage>,
+        stats: &Arc<Mutex<TorrentStats>>,
+        failures: &Arc<AtomicU32>,
+        tx: &mpsc::Sender<Message>,
+        wanted: bool,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let pending = Arc::new(Mutex::new(PendingUploads::default()));
+        [0, 16384, 32768]
+            .into_iter()
+            .map(|begin| {
+                let mut job = upload_job(storage, &pending, tx, stats, begin, SPLIT_PIECE as u64);
+                job.read_failures = Arc::clone(failures);
+                job.wanted = wanted;
+                tokio::spawn(serve_upload(job))
+            })
+            .collect()
+    }
+
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_whose_shared_read_was_invalidated_is_read_again_and_served() {
+        let (_tmp, storage, payload) = two_file_upload_storage(true).await;
+        let (hold, promotion) = hold_storage_io(&storage).await;
+        let stats = Arc::new(Mutex::new(TorrentStats::initial(
+            SPLIT_PIECE as u64,
+            0,
+            vec![],
+        )));
+        let failures = Arc::new(AtomicU32::new(MAX_READ_FAILURES - 1));
+        let (tx, mut rx) = mpsc::channel(64);
+        let uploads = spawn_window_uploads(&storage, &stats, &failures, &tx, true);
+        settle().await;
+        storage.invalidate_read_cache();
+        settle().await;
+        hold.release.notify_one();
+        promotion.await.unwrap().unwrap();
+        for upload in uploads {
+            upload.await.unwrap();
+        }
+        let mut served = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            let Message::Piece { begin, data, .. } = message else {
+                panic!("expected a piece, got {message:?}");
+            };
+            assert_eq!(&data[..], &payload[begin as usize..begin as usize + 16384]);
+            served.push(begin);
+        }
+        served.sort_unstable();
+        assert_eq!(served, [0, 16384, 32768]);
+        assert_eq!(storage.read_cache_loads(), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.lock().error, None);
+    }
+
+    #[tokio::test]
+    async fn three_failed_reads_of_a_missing_file_set_a_storage_error_with_its_cause() {
+        let (_tmp, storage, _) = two_file_upload_storage(false).await;
+        let (hold, promotion) = hold_storage_io(&storage).await;
+        let stats = Arc::new(Mutex::new(TorrentStats::initial(
+            SPLIT_PIECE as u64,
+            0,
+            vec![],
+        )));
+        let failures = Arc::new(AtomicU32::new(0));
+        let (tx, mut rx) = mpsc::channel(64);
+        let uploads = spawn_window_uploads(&storage, &stats, &failures, &tx, true);
+        settle().await;
+        hold.release.notify_one();
+        promotion.await.unwrap().unwrap();
+        for upload in uploads {
+            upload.await.unwrap();
+        }
+        let mut rejected = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            let Message::RejectRequest { begin, .. } = message else {
+                panic!("expected a reject, got {message:?}");
+            };
+            rejected.push(begin);
+        }
+        rejected.sort_unstable();
+        assert_eq!(rejected, [0, 16384, 32768]);
+        assert_eq!(storage.read_cache_loads(), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), MAX_READ_FAILURES);
+        let cause = storage.read_owned(0, 16384).await.unwrap_err();
+        let stats = stats.lock().clone();
+        assert!(stats.storage_error);
+        assert_eq!(stats.error, Some(format!("Disk read failed: {cause}")));
+    }
+
+    #[tokio::test]
+    async fn failed_reads_of_unwanted_data_are_rejected_without_an_error() {
+        let (_tmp, storage, _) = two_file_upload_storage(false).await;
+        let stats = Arc::new(Mutex::new(TorrentStats::initial(
+            SPLIT_PIECE as u64,
+            0,
+            vec![],
+        )));
+        let failures = Arc::new(AtomicU32::new(MAX_READ_FAILURES - 1));
+        let (tx, mut rx) = mpsc::channel(64);
+        for upload in spawn_window_uploads(&storage, &stats, &failures, &tx, false) {
+            upload.await.unwrap();
+        }
+        for _ in 0..3 {
+            assert!(matches!(rx.try_recv(), Ok(Message::RejectRequest { .. })));
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(failures.load(Ordering::Relaxed), MAX_READ_FAILURES - 1);
+        assert_eq!(stats.lock().error, None);
     }
 }

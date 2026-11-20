@@ -1,8 +1,8 @@
 export default {
-	reload: "Перезагрузить",
-	close: "Закрыть",
-	minimize: "Свернуть",
+	reload: "Презареждане",
+	close: "Затваряне",
+	minimize: "Минимизиране",
 	zoom: "Увеличение",
-	"toggle-fullscreen": "Перейти в полноэкранный режим",
-	front: "Поверх всех окон",
+	"toggle-fullscreen": "Преминаване на цял екран",
+	front: "Всички на преден план",
 };

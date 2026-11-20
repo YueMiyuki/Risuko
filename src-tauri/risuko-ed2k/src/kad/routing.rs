@@ -216,9 +216,12 @@ impl Contact {
 pub enum InsertResult {
     Inserted,
     Updated,
+    Known,
     Rejected,
     SelfContact,
 }
+
+const MAX_HEARSAY_CONTACTS_PER_IP: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct RoutingTable {
@@ -289,6 +292,30 @@ impl RoutingTable {
     }
 
     pub fn insert(&mut self, contact: Contact) -> InsertResult {
+        self.insert_checked(contact, false)
+    }
+
+    pub fn insert_hearsay(&mut self, contact: Contact) -> InsertResult {
+        if self.by_id.contains_key(&contact.id) {
+            return InsertResult::Known;
+        }
+        let queued = bucket_index(&self.local_id.0, &contact.id.0)
+            .is_some_and(|index| self.replacements[index].iter().any(|r| r.id == contact.id));
+        if queued {
+            return InsertResult::Known;
+        }
+        if is_public_ipv4(*contact.addr.ip()) {
+            let same_ip = self
+                .buckets
+                .iter()
+                .chain(&self.replacements)
+                .flatten()
+                .filter(|known| known.addr.ip() == contact.addr.ip())
+                .count();
+            if same_ip >= MAX_HEARSAY_CONTACTS_PER_IP {
+                return InsertResult::Known;
+            }
+        }
         self.insert_checked(contact, false)
     }
 
@@ -666,6 +693,81 @@ mod tests {
         table.mark_failed(id);
 
         assert!(table.remove_if_unchanged(&snapshot).is_some());
+    }
+
+    #[test]
+    fn hearsay_cannot_move_a_known_contact_or_flood_one_address() {
+        let mut table = RoutingTable::new(NodeId(id(0)));
+        assert_eq!(
+            table.insert(contact(1, [8, 8, 8, 8])),
+            InsertResult::Inserted
+        );
+
+        assert_eq!(
+            table.insert_hearsay(contact(1, [9, 9, 9, 9])),
+            InsertResult::Known
+        );
+        assert_eq!(
+            table.get(NodeId(id(1))).unwrap().addr.ip(),
+            &Ipv4Addr::new(8, 8, 8, 8)
+        );
+
+        assert_eq!(
+            table.insert_hearsay(contact(2, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            table.insert_hearsay(contact(3, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            table.insert_hearsay(contact(4, [1, 1, 1, 1])),
+            InsertResult::Known
+        );
+        assert!(table.get(NodeId(id(4))).is_none());
+        assert_eq!(
+            table.insert(contact(4, [1, 1, 1, 1])),
+            InsertResult::Inserted
+        );
+    }
+
+    fn fill_first_bucket(table: &mut RoutingTable) {
+        for value in 1..=K as u8 {
+            let entry = contact_with_id([0x80 | value; ID_BYTES], [9, 9, 9, value]);
+            assert_eq!(table.insert(entry), InsertResult::Inserted);
+        }
+    }
+
+    #[test]
+    fn hearsay_cannot_move_a_queued_replacement() {
+        let mut table = RoutingTable::new(NodeId(id(0)));
+        fill_first_bucket(&mut table);
+        let queued = contact_with_id([0xf0; ID_BYTES], [8, 8, 8, 8]);
+        assert_eq!(table.insert(queued.clone()), InsertResult::Rejected);
+
+        let moved = contact_with_id([0xf0; ID_BYTES], [7, 7, 7, 7]);
+        assert_eq!(table.insert_hearsay(moved), InsertResult::Known);
+        assert_eq!(table.replacements[0].len(), 1);
+        assert_eq!(table.replacements[0][0].addr, queued.addr);
+    }
+
+    #[test]
+    fn hearsay_address_limit_counts_queued_replacements() {
+        let mut table = RoutingTable::new(NodeId(id(0)));
+        fill_first_bucket(&mut table);
+        for value in 0..MAX_HEARSAY_CONTACTS_PER_IP as u8 {
+            let flood = contact_with_id([0xf0 | value; ID_BYTES], [1, 1, 1, 1]);
+            assert_eq!(table.insert_hearsay(flood), InsertResult::Rejected);
+        }
+        assert_eq!(table.replacements[0].len(), MAX_HEARSAY_CONTACTS_PER_IP);
+
+        let extra = contact_with_id([0xe0; ID_BYTES], [1, 1, 1, 1]);
+        assert_eq!(table.insert_hearsay(extra.clone()), InsertResult::Known);
+        assert_eq!(table.replacements[0].len(), MAX_HEARSAY_CONTACTS_PER_IP);
+
+        let other = contact_with_id([0xe1; ID_BYTES], [2, 2, 2, 2]);
+        assert_eq!(table.insert_hearsay(other), InsertResult::Rejected);
+        assert_eq!(table.insert(extra), InsertResult::Rejected);
     }
 
     #[test]

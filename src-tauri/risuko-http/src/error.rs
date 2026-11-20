@@ -62,7 +62,17 @@ impl From<hyper::Error> for Error {
 
 impl From<hyper_util::client::legacy::Error> for Error {
     fn from(e: hyper_util::client::legacy::Error) -> Self {
-        Error::Request(e.to_string())
+        let mut message = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            if let Some(error) = cause.downcast_ref::<Error>() {
+                return crate::connector::clone_route_error(error);
+            }
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        Error::Request(message)
     }
 }
 

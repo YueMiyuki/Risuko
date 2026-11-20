@@ -12,13 +12,18 @@ Risuko 使用 [i18next](https://www.i18next.com/overview/getting-started) 作为
 
 - about.ts
 - app.ts
+- cloudSinks.ts
 - edit.ts
+- health.ts
 - help.ts
 - index.ts
 - menu.ts
 - preferences.ts
+- rss.ts
+- share.ts
 - subnav.ts
+- sync.ts
 - task.ts
 - window.ts
 
-菜单的国际化已经打散到了以上文件里，不再需要复制 `src/main/menus` 里的配置。
+菜单的国际化已经打散到了以上文件里。

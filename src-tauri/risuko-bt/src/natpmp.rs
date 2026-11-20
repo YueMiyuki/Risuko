@@ -27,6 +27,7 @@ const ATTEMPTS: u32 = 3;
 const RELEASE_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_LIFETIME: u32 = 7200;
 const MIN_RENEWAL: Duration = Duration::from_secs(30);
+const MAX_RENEWAL: Duration = Duration::from_secs(3600);
 
 type GatewayLookup = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
 
@@ -105,6 +106,10 @@ async fn run_forever(
         }
     }
     mapper.release().await;
+}
+
+fn renewal_after(granted: Duration, requested: Duration) -> Duration {
+    (granted.min(requested) / 2).clamp(MIN_RENEWAL, MAX_RENEWAL)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,11 +231,11 @@ impl Mapper {
         if let (Some(ip), IpAddr::V4(gateway_ip)) = (external_ip, gateway.ip()) {
             report_external_address(ExternalIp::shared(), gateway_ip, ip);
         }
+        let requested = Duration::from_secs(self.lifetime.into());
         let renewal = mapped
             .iter()
-            .map(|m| m.lifetime / 2)
-            .min()
-            .map(|d| d.max(MIN_RENEWAL));
+            .map(|m| renewal_after(m.lifetime, requested))
+            .min();
         *self.active.lock() = mapped;
         Ok(renewal)
     }
@@ -467,6 +472,18 @@ fn parse_natpmp_external_response(buf: &[u8]) -> Option<Option<Ipv4Addr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_is_half_the_shorter_lease_within_bounds() {
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let secs = Duration::from_secs;
+        assert_eq!(renewal_after(hours(2), hours(2)), hours(1));
+        assert_eq!(renewal_after(secs(u64::from(u32::MAX)), hours(2)), hours(1));
+        assert_eq!(renewal_after(secs(60), hours(2)), secs(30));
+        assert_eq!(renewal_after(secs(10), hours(2)), MIN_RENEWAL);
+        assert_eq!(renewal_after(hours(2), secs(600)), secs(300));
+        assert_eq!(renewal_after(hours(48), hours(48)), MAX_RENEWAL);
+    }
 
     #[derive(Clone, Copy)]
     enum Mode {

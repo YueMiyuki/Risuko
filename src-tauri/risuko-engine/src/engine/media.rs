@@ -211,22 +211,65 @@ fn apply_yt_dlp_network_options(
     Ok(())
 }
 
-pub async fn run_media_download(
+const YT_DLP_DEFAULT_OUTPUT: &str = "%(title)s [%(id)s].%(ext)s";
+
+fn yt_dlp_expands_to_absolute(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path
+            .strip_prefix('~')
+            .is_some_and(|rest| rest.chars().next().is_none_or(std::path::is_separator))
+}
+
+fn yt_dlp_output_template(
+    dir: &str,
+    out: &str,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<String, String> {
+    let template = if out.trim().is_empty() {
+        YT_DLP_DEFAULT_OUTPUT
+    } else {
+        out
+    };
+    if yt_dlp_expands_to_absolute(template) {
+        return Ok(template.to_string());
+    }
+    let dir = dir.trim();
+    let folder = if yt_dlp_expands_to_absolute(dir) {
+        PathBuf::from(dir)
+    } else {
+        cwd()
+            .map_err(|e| format!("failed to resolve the download folder: {e}"))?
+            .join(dir)
+    };
+    let folder = folder.to_string_lossy().replace('%', "%%");
+    Ok(Path::new(&folder)
+        .join(template)
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn yt_dlp_command() -> Result<(Command, tempfile::TempDir), String> {
+    let home = tempfile::TempDir::new()
+        .map_err(|e| format!("failed to create a working folder for yt-dlp: {e}"))?;
+    let mut cmd = Command::new("yt-dlp");
+    // yt-dlp reads yt-dlp.conf from its home folder, which is the working directory when -P is not given
+    cmd.current_dir(home.path());
+    Ok((cmd, home))
+}
+
+fn yt_dlp_ffmpeg_location(ffmpeg: Option<&Path>) -> Option<&Path> {
+    ffmpeg.filter(|path| path.is_absolute())
+}
+
+fn media_download_command(
     url: &str,
     dir: &str,
     out: &str,
     options: &Map<String, Value>,
     global_rate_limit: u64,
-    total: Arc<AtomicU64>,
-    completed: Arc<AtomicU64>,
-    speed: Arc<AtomicU64>,
-    connections: Arc<AtomicU32>,
-    cancel_token: CancellationToken,
-    dest_tx: watch::Sender<String>,
-) -> Result<PathBuf, String> {
-    ensure_yt_dlp().await?;
-
-    let mut cmd = Command::new("yt-dlp");
+    ffmpeg: Option<&Path>,
+) -> Result<(Command, tempfile::TempDir), String> {
+    let (mut cmd, home) = yt_dlp_command()?;
     cmd.arg("--newline")
         .arg("--no-color")
         .arg("--print")
@@ -244,9 +287,10 @@ pub async fn run_media_download(
 
     apply_yt_dlp_network_options(&mut cmd, options, url)?;
 
-    let ffmpeg = find_ffmpeg().await;
-    if let Some(ffmpeg_path) = ffmpeg.as_ref() {
-        cmd.arg("--ffmpeg-location").arg(ffmpeg_path);
+    if let Some(location) = yt_dlp_ffmpeg_location(ffmpeg) {
+        cmd.arg("--ffmpeg-location").arg(location);
+    }
+    if ffmpeg.is_some() {
         let merge_fmt = option_non_empty_str(options, "media-merge-format")
             .or_else(|| option_non_empty_str(options, "youtube-merge-format"))
             .unwrap_or("mp4");
@@ -276,13 +320,8 @@ pub async fn run_media_download(
         cmd.arg("--limit-rate").arg(rate_limit.to_string());
     }
 
-    if !dir.trim().is_empty() {
-        cmd.arg("-P").arg(dir);
-    }
-
-    if !out.trim().is_empty() {
-        cmd.arg("-o").arg(out);
-    }
+    cmd.arg("-o")
+        .arg(yt_dlp_output_template(dir, out, std::env::current_dir)?);
 
     let fragments = options
         .get("split")
@@ -305,7 +344,28 @@ pub async fn run_media_download(
         cmd.arg("--fragment-retries").arg(&retries);
     }
 
-    cmd.arg(url);
+    Ok((cmd, home))
+}
+
+pub async fn run_media_download(
+    url: &str,
+    dir: &str,
+    out: &str,
+    options: &Map<String, Value>,
+    global_rate_limit: u64,
+    total: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    speed: Arc<AtomicU64>,
+    connections: Arc<AtomicU32>,
+    cancel_token: CancellationToken,
+    dest_tx: watch::Sender<String>,
+) -> Result<PathBuf, String> {
+    ensure_yt_dlp().await?;
+
+    let ffmpeg = find_ffmpeg().await;
+    let (mut cmd, _home) =
+        media_download_command(url, dir, out, options, global_rate_limit, ffmpeg.as_deref())?;
+    cmd.arg("--").arg(url);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -548,14 +608,14 @@ fn extract_format(obj: &serde_json::Value) -> Option<MediaFormat> {
     })
 }
 
-pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<MediaInfo, String> {
-    ensure_yt_dlp().await?;
-
-    let mut cmd = Command::new("yt-dlp");
+fn media_info_command(
+    url: &str,
+    options: &Map<String, Value>,
+) -> Result<(Command, tempfile::TempDir), String> {
+    let (mut cmd, home) = yt_dlp_command()?;
     cmd.arg("--dump-json")
         .arg("--no-playlist")
         .arg("--flat-playlist")
-        .arg(url)
         .kill_on_drop(true);
 
     if is_youtube_uri(url) {
@@ -564,6 +624,14 @@ pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<M
     }
 
     apply_yt_dlp_network_options(&mut cmd, options, url)?;
+    Ok((cmd, home))
+}
+
+pub async fn get_media_info(url: &str, options: &Map<String, Value>) -> Result<MediaInfo, String> {
+    ensure_yt_dlp().await?;
+
+    let (mut cmd, _home) = media_info_command(url, options)?;
+    cmd.arg("--").arg(url);
 
     let output = cmd
         .output()
@@ -710,5 +778,266 @@ mod tests {
         let mut false_opt = Map::new();
         false_opt.insert("force-ytdlp".into(), json!(false));
         assert!(!is_force_ytdlp(&false_opt));
+    }
+
+    #[cfg(windows)]
+    const ROOT: &str = r"C:\";
+    #[cfg(not(windows))]
+    const ROOT: &str = "/";
+    const S: char = std::path::MAIN_SEPARATOR;
+
+    fn work() -> std::io::Result<PathBuf> {
+        Ok(PathBuf::from(format!("{ROOT}work")))
+    }
+
+    fn no_cwd() -> std::io::Result<PathBuf> {
+        Err(std::io::Error::other("no working directory"))
+    }
+
+    #[test]
+    fn output_template_puts_the_folder_in_front_of_the_name() {
+        let dl = format!("{ROOT}Downloads");
+        assert_eq!(
+            yt_dlp_output_template(&dl, "", no_cwd).unwrap(),
+            format!("{dl}{S}%(title)s [%(id)s].%(ext)s")
+        );
+        assert_eq!(
+            yt_dlp_output_template(&format!(" {dl} "), "%(title)s.%(ext)s", no_cwd).unwrap(),
+            format!("{dl}{S}%(title)s.%(ext)s")
+        );
+        assert_eq!(
+            yt_dlp_output_template(&dl, "clips/a.mp4", no_cwd).unwrap(),
+            format!("{dl}{S}clips/a.mp4")
+        );
+    }
+
+    #[test]
+    fn output_template_keeps_an_absolute_out() {
+        let out = format!("{ROOT}elsewhere{S}%(id)s.%(ext)s");
+        assert_eq!(
+            yt_dlp_output_template(&format!("{ROOT}Downloads"), &out, no_cwd).unwrap(),
+            out
+        );
+        assert_eq!(yt_dlp_output_template("", &out, no_cwd).unwrap(), out);
+    }
+
+    #[test]
+    fn output_template_escapes_percent_in_the_folder_only() {
+        assert_eq!(
+            yt_dlp_output_template(&format!("{ROOT}100% done"), "%(id)s.mp4", no_cwd).unwrap(),
+            format!("{ROOT}100%% done{S}%(id)s.mp4")
+        );
+        let percent_cwd = || Ok(PathBuf::from(format!("{ROOT}a%b")));
+        assert_eq!(
+            yt_dlp_output_template("", "a.mp4", percent_cwd).unwrap(),
+            format!("{ROOT}a%%b{S}a.mp4")
+        );
+    }
+
+    #[test]
+    fn output_template_resolves_other_folders_against_the_working_directory() {
+        assert_eq!(
+            yt_dlp_output_template("", "a.mp4", work).unwrap(),
+            format!("{ROOT}work{S}a.mp4")
+        );
+        assert_eq!(
+            yt_dlp_output_template(".", "a.mp4", work).unwrap(),
+            format!("{ROOT}work{S}.{S}a.mp4")
+        );
+        assert_eq!(
+            yt_dlp_output_template("videos", "", work).unwrap(),
+            format!("{ROOT}work{S}videos{S}%(title)s [%(id)s].%(ext)s")
+        );
+        assert_eq!(
+            yt_dlp_output_template("~videos", "a.mp4", work).unwrap(),
+            format!("{ROOT}work{S}~videos{S}a.mp4")
+        );
+        assert!(yt_dlp_output_template("", "a.mp4", no_cwd).is_err());
+    }
+
+    #[test]
+    fn output_template_leaves_a_home_folder_to_yt_dlp() {
+        assert_eq!(
+            yt_dlp_output_template("~/Videos", "", no_cwd).unwrap(),
+            format!("~/Videos{S}%(title)s [%(id)s].%(ext)s")
+        );
+        assert_eq!(
+            yt_dlp_output_template("~", "a.mp4", no_cwd).unwrap(),
+            format!("~{S}a.mp4")
+        );
+        assert_eq!(
+            yt_dlp_output_template(&format!("{ROOT}Downloads"), "~/a.mp4", no_cwd).unwrap(),
+            "~/a.mp4"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_template_joins_with_backslashes_on_windows() {
+        assert_eq!(
+            yt_dlp_output_template(r"D:\Users\me\Videos", "%(title)s.%(ext)s", no_cwd).unwrap(),
+            r"D:\Users\me\Videos\%(title)s.%(ext)s"
+        );
+        assert_eq!(
+            yt_dlp_output_template(r"D:\Videos", r"E:\a.mp4", no_cwd).unwrap(),
+            r"E:\a.mp4"
+        );
+        assert_eq!(
+            yt_dlp_output_template(r"~\Videos", "a.mp4", no_cwd).unwrap(),
+            r"~\Videos\a.mp4"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn output_template_treats_windows_paths_as_relative_elsewhere() {
+        assert_eq!(
+            yt_dlp_output_template(r"D:\Videos", "a.mp4", work).unwrap(),
+            r"/work/D:\Videos/a.mp4"
+        );
+        assert_eq!(
+            yt_dlp_output_template(r"~\Videos", "a.mp4", work).unwrap(),
+            r"/work/~\Videos/a.mp4"
+        );
+    }
+
+    #[test]
+    fn yt_dlp_commands_run_in_an_empty_private_folder() {
+        let (download, download_home) =
+            media_download_command("https://youtu.be/x", "", "", &Map::new(), 0, None).unwrap();
+        let (info, info_home) = media_info_command("https://youtu.be/x", &Map::new()).unwrap();
+        for (cmd, home) in [(download, download_home), (info, info_home)] {
+            assert_eq!(cmd.as_std().get_current_dir(), Some(home.path()));
+            assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
+        }
+    }
+
+    fn download_args(ffmpeg: Option<&Path>) -> Vec<String> {
+        let (cmd, _home) =
+            media_download_command("https://youtu.be/x", "", "", &Map::new(), 0, ffmpeg).unwrap();
+        cmd.as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|arg| arg == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn ffmpeg_location_is_only_a_path() {
+        let absolute = PathBuf::from(format!("{ROOT}usr{S}bin{S}ffmpeg"));
+        assert_eq!(
+            yt_dlp_ffmpeg_location(Some(&absolute)),
+            Some(absolute.as_path())
+        );
+        assert_eq!(yt_dlp_ffmpeg_location(Some(Path::new("ffmpeg"))), None);
+        assert_eq!(yt_dlp_ffmpeg_location(None), None);
+    }
+
+    #[test]
+    fn a_bare_ffmpeg_name_is_not_passed_as_a_location_but_still_merges() {
+        let args = download_args(Some(Path::new("ffmpeg")));
+        assert_eq!(value_after(&args, "--ffmpeg-location"), None);
+        assert_eq!(value_after(&args, "--merge-output-format"), Some("mp4"));
+    }
+
+    #[test]
+    fn an_absolute_ffmpeg_path_is_passed_on_and_merges() {
+        let absolute = PathBuf::from(format!("{ROOT}usr{S}bin{S}ffmpeg"));
+        let args = download_args(Some(&absolute));
+        assert_eq!(value_after(&args, "--ffmpeg-location"), absolute.to_str());
+        assert_eq!(value_after(&args, "--merge-output-format"), Some("mp4"));
+    }
+
+    #[test]
+    fn no_ffmpeg_passes_neither_a_location_nor_a_merge_format() {
+        let args = download_args(None);
+        assert_eq!(value_after(&args, "--ffmpeg-location"), None);
+        assert_eq!(value_after(&args, "--merge-output-format"), None);
+    }
+
+    const UNREACHABLE_URL: &str = "http://127.0.0.1:9/x";
+
+    fn folder_with_bad_config() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("yt-dlp.conf"),
+            "--risuko-test-no-such-option\n",
+        )
+        .unwrap();
+        folder
+    }
+
+    async fn assert_runs_without_the_config(mut cmd: Command, inherited_cwd: &Path) {
+        if check_yt_dlp_available().await.is_err() {
+            eprintln!("yt-dlp is not installed; skipping the test against the real program");
+            return;
+        }
+        if cmd.as_std().get_current_dir().is_none() {
+            cmd.current_dir(inherited_cwd);
+        }
+        cmd.arg("--simulate").arg("--").arg(UNREACHABLE_URL);
+        let output = cmd.output().await.unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("no such option"), "{text}");
+        assert_ne!(output.status.code(), Some(2), "{text}");
+        assert!(text.contains("[generic]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn download_ignores_a_config_file_in_the_save_folder() {
+        let folder = folder_with_bad_config();
+        let dir = folder.path().to_string_lossy();
+        let (cmd, _home) =
+            media_download_command(UNREACHABLE_URL, &dir, "", &Map::new(), 0, None).unwrap();
+        assert_runs_without_the_config(cmd, folder.path()).await;
+    }
+
+    #[tokio::test]
+    async fn media_info_ignores_a_config_file_in_the_working_directory() {
+        let folder = folder_with_bad_config();
+        let (cmd, _home) = media_info_command(UNREACHABLE_URL, &Map::new()).unwrap();
+        assert_runs_without_the_config(cmd, folder.path()).await;
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_finds_an_ffmpeg_that_is_only_on_the_path() {
+        if check_yt_dlp_available().await.is_err() {
+            eprintln!("yt-dlp is not installed; skipping the test against the real program");
+            return;
+        }
+        let Some(ffmpeg) = find_ffmpeg().await else {
+            eprintln!("ffmpeg is not installed; skipping the test against the real program");
+            return;
+        };
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path().to_string_lossy();
+        let (mut cmd, _home) = media_download_command(
+            UNREACHABLE_URL,
+            &dir,
+            "",
+            &Map::new(),
+            0,
+            Some(ffmpeg.as_path()),
+        )
+        .unwrap();
+        cmd.arg("--simulate")
+            .arg("-v")
+            .arg("--")
+            .arg(UNREACHABLE_URL);
+        let output = cmd.output().await.unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("Continuing without ffmpeg"), "{text}");
     }
 }

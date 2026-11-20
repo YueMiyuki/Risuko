@@ -28,14 +28,6 @@ pub fn vault_put_credential(
 }
 
 #[tauri::command(async)]
-pub fn vault_get_credential(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<Option<Value>, String> {
-    state.vault.get(&id)
-}
-
-#[tauri::command(async)]
 pub fn vault_remove_credential(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.vault.remove(&id)
 }

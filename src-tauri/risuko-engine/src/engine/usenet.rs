@@ -266,7 +266,17 @@ pub fn parse(bytes: &[u8]) -> Result<NzbDocument, String> {
     })
 }
 
-fn subject_filename(subject: &str) -> Option<String> {
+fn last_quoted(subject: &str) -> Option<&str> {
+    let parts: Vec<&str> = subject.split('"').collect();
+    parts
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, part)| i % 2 == 1 && i + 1 < parts.len() && !part.trim().is_empty())
+        .map(|(_, part)| part.trim())
+}
+
+fn unquoted_tail(subject: &str) -> &str {
     let mut value = subject.trim();
     if let Some((_, suffix)) = value.rsplit_once(" - ") {
         value = suffix.trim();
@@ -276,6 +286,25 @@ fn subject_filename(subject: &str) -> Option<String> {
             value = prefix.trim();
         }
     }
+    value
+}
+
+fn has_extension(name: &str) -> bool {
+    name.trim_matches(['"', '\''])
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=8).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+}
+
+fn subject_filename(subject: &str) -> Option<String> {
+    let tail = unquoted_tail(subject);
+    let mut value = match last_quoted(subject) {
+        Some(quoted) if has_extension(quoted) || !has_extension(tail) => quoted,
+        _ => tail,
+    };
     value = value.trim_matches(['"', '\'']);
     let value = value
         .replace("[1/1]", "")
@@ -419,6 +448,51 @@ mod tests {
             )
             .as_deref(),
             Some("rar-files.part01.rar")
+        );
+        assert_eq!(
+            subject_filename(r#"[1/5] - "Artist - Track.mp3" yEnc (1/9)"#).as_deref(),
+            Some("Artist - Track.mp3")
+        );
+        assert_eq!(
+            subject_filename("some post - plain.bin yEnc (1/2)").as_deref(),
+            Some("plain.bin")
+        );
+    }
+
+    #[test]
+    fn a_quoted_release_title_does_not_hide_the_attachment_name() {
+        assert_eq!(
+            subject_filename(r#""Release Name" - movie.part01.rar yEnc (1/9)"#).as_deref(),
+            Some("movie.part01.rar")
+        );
+        assert_eq!(
+            subject_filename(r#""Release Name" [01/10] - "movie.part01.rar" yEnc (1/9)"#)
+                .as_deref(),
+            Some("movie.part01.rar")
+        );
+        assert_eq!(
+            subject_filename(r#"[1/5] - "file.rar" - 1.2 GB yEnc (1/10)"#).as_deref(),
+            Some("file.rar")
+        );
+    }
+
+    #[test]
+    fn an_obfuscated_quoted_name_without_an_extension_is_kept() {
+        assert_eq!(
+            subject_filename(r#"Title [01/10] "5a8f3b2c9d" yEnc (1/5)"#).as_deref(),
+            Some("5a8f3b2c9d")
+        );
+        assert_eq!(
+            subject_filename(r#""5a8f3b2c9d" yEnc (1/1)"#).as_deref(),
+            Some("5a8f3b2c9d")
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_quote_falls_back_to_the_unquoted_tail() {
+        assert_eq!(
+            subject_filename(r#"post - "plain.bin yEnc (1/2)"#).as_deref(),
+            Some("plain.bin")
         );
     }
 

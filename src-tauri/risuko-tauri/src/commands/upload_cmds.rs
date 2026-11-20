@@ -100,21 +100,24 @@ async fn fill_from_vault(
     id: &str,
     config: &mut SinkConfig,
 ) {
-    if vault.enabled() {
-        match vault.get_sink(id) {
-            Ok(Some(secrets)) => {
-                apply_sink_secrets(config, &secrets);
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("Failed to load vault entry for sink {id}: {e}, trying fallback");
-            }
-        }
-    }
     if let Some(secrets) = mgr.get_sink_secret_fallback(id).await {
         apply_sink_secrets(config, &secrets);
+        return;
     }
+    if vault.enabled() {
+        match vault.get_sink(id) {
+            Ok(Some(secrets)) => apply_sink_secrets(config, &secrets),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Failed to load vault entry for sink {id}: {e}"),
+        }
+    }
+}
+
+async fn clear_stale_sink_fallback(mgr: &UploadSinkManager, id: &str) -> Result<(), String> {
+    if mgr.remove_sink_secret_fallback(id).await.is_ok() {
+        return Ok(());
+    }
+    mgr.remove_sink_secret_fallback(id).await
 }
 
 async fn persist_sink_secrets(
@@ -128,7 +131,7 @@ async fn persist_sink_secrets(
             if vault.enabled() {
                 match vault.put_sink(id, &v) {
                     Ok(()) => {
-                        if let Err(e) = mgr.remove_sink_secret_fallback(id).await {
+                        if let Err(e) = clear_stale_sink_fallback(mgr, id).await {
                             tracing::warn!("Failed to clear stale fallback for sink {id}: {e}");
                         }
                         return;
@@ -160,30 +163,24 @@ async fn persist_sink_secrets(
 pub async fn rehydrate_upload_sinks(mgr: &UploadSinkManager, vault: &Arc<VaultManager>) {
     let sinks = mgr.list_sinks().await;
     for mut record in sinks {
-        let mut secrets: Option<Value> = None;
-        let lookup = {
-            let vault = vault.clone();
-            let id = record.id.clone();
-            tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get_sink(&id))).await
-        };
-        match lookup {
-            Ok(Some(Ok(Some(v)))) => secrets = Some(v),
-            Ok(Some(Ok(None))) | Ok(None) => {}
-            Ok(Some(Err(e))) => {
-                tracing::warn!(
-                    "Failed to load vault entry for sink {}: {e}, trying fallback",
-                    record.id
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Vault lookup for sink {} did not complete: {e}, trying fallback",
-                    record.id
-                );
-            }
-        }
+        let mut secrets = mgr.get_sink_secret_fallback(&record.id).await;
         if secrets.is_none() {
-            secrets = mgr.get_sink_secret_fallback(&record.id).await;
+            let lookup = {
+                let vault = vault.clone();
+                let id = record.id.clone();
+                tokio::task::spawn_blocking(move || vault.enabled().then(|| vault.get_sink(&id)))
+                    .await
+            };
+            match lookup {
+                Ok(Some(Ok(found))) => secrets = found,
+                Ok(None) => {}
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("Failed to load vault entry for sink {}: {e}", record.id);
+                }
+                Err(e) => {
+                    tracing::warn!("Vault lookup for sink {} did not complete: {e}", record.id);
+                }
+            }
         }
         let Some(secrets) = secrets else { continue };
         let id = record.id.clone();
@@ -434,6 +431,67 @@ mod tests {
             }
             _ => panic!("expected sftp"),
         }
+    }
+
+    struct FlakyStorage {
+        failures: std::sync::atomic::AtomicUsize,
+        saved: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl risuko_engine::traits::StorageBackend for FlakyStorage {
+        fn load(&self, _key: &str) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+
+        fn save(&self, _key: &str, value: &Value) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err("disk full".into());
+            }
+            self.saved.lock().unwrap().push(value.clone());
+            Ok(())
+        }
+    }
+
+    async fn manager_holding_a_fallback(failures: usize) -> (Arc<FlakyStorage>, UploadSinkManager) {
+        use risuko_engine::traits::NoopEventSink;
+
+        let storage = Arc::new(FlakyStorage {
+            failures: std::sync::atomic::AtomicUsize::new(0),
+            saved: std::sync::Mutex::new(Vec::new()),
+        });
+        let event_sink: Arc<dyn risuko_engine::traits::EventSink> = Arc::new(NoopEventSink);
+        let mgr = UploadSinkManager::new(storage.clone(), event_sink);
+        mgr.put_sink_secret_fallback("sink", &json!({"password": "old"}))
+            .await
+            .unwrap();
+        storage
+            .failures
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        (storage, mgr)
+    }
+
+    #[tokio::test]
+    async fn clearing_a_stale_fallback_retries_a_failed_save() {
+        let (storage, mgr) = manager_holding_a_fallback(1).await;
+
+        clear_stale_sink_fallback(&mgr, "sink").await.unwrap();
+
+        assert!(mgr.get_sink_secret_fallback("sink").await.is_none());
+        let saved = storage.saved.lock().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved[1]["data"]["secret_fallback"].get("sink").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_fallback_that_cannot_be_cleared_is_never_rewritten() {
+        let (storage, mgr) = manager_holding_a_fallback(2).await;
+
+        assert!(clear_stale_sink_fallback(&mgr, "sink").await.is_err());
+
+        assert!(mgr.get_sink_secret_fallback("sink").await.is_none());
+        assert_eq!(storage.saved.lock().unwrap().len(), 1);
     }
 
     fn uuid_like() -> String {

@@ -59,6 +59,7 @@ export function dirname(path = ""): string {
 }
 
 const chunkMetaPath = (partPath = ""): string => `${partPath}.chunks`;
+const resumeMetaPath = (partPath = ""): string => `${partPath}.resume`;
 
 const sleep = (ms: number): Promise<void> =>
 	new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -347,8 +348,10 @@ export const moveTaskFilesToTrash = async (
 		if (partPath) {
 			add(`${partPath}.ytdl`);
 			add(chunkMetaPath(partPath));
+			add(resumeMetaPath(partPath));
 		} else if (path.toLowerCase().endsWith(TEMP_DOWNLOAD_SUFFIX)) {
 			add(chunkMetaPath(path));
+			add(resumeMetaPath(path));
 		}
 
 		return [...set];

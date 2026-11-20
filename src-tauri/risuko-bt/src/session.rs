@@ -125,6 +125,31 @@ impl Drop for PrivateHashReleaseGuard {
     }
 }
 
+struct InfoHashReleaseGuard<'a> {
+    inner: &'a Mutex<SessionInner>,
+    info_hash: Id20,
+    id: usize,
+}
+
+impl<'a> InfoHashReleaseGuard<'a> {
+    fn new(inner: &'a Mutex<SessionInner>, info_hash: Id20, id: usize) -> Self {
+        Self {
+            inner,
+            info_hash,
+            id,
+        }
+    }
+}
+
+impl Drop for InfoHashReleaseGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        if inner.by_hash.get(&self.info_hash) == Some(&self.id) {
+            inner.by_hash.remove(&self.info_hash);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpnpStatus {
     pub enabled: bool,
@@ -335,6 +360,12 @@ impl Session {
     ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&output_dir)?;
         raise_nofile_limit();
+        let nofile_soft = super::conn_budget::nofile_soft_limit();
+        let handle_budget = super::storage::handle_budget_for(nofile_soft);
+        super::storage::set_handle_budget(handle_budget);
+        tracing::debug!(
+            "open-file soft limit: {nofile_soft:?}, torrent file handle budget: {handle_budget}"
+        );
         let peer_id = generate_peer_id();
 
         let listen_addr = opts
@@ -729,7 +760,7 @@ impl Session {
         );
         match self.delete(TorrentIdOrHash::Id(id), false).await {
             Ok(()) => {}
-            Err(e) if e == "not found" => {}
+            Err(e) if e == NOT_FOUND => {}
             Err(e) => return Err(e),
         }
         Ok(None)
@@ -1113,13 +1144,14 @@ impl Session {
                 TorrentIdOrHash::Hash(hash) => *inner
                     .by_hash
                     .get(&hash)
-                    .ok_or_else(|| "not found".to_string())?,
+                    .ok_or_else(|| NOT_FOUND.to_string())?,
             };
             inner
                 .torrents
                 .remove(&id)
-                .ok_or_else(|| "not found".to_string())?
+                .ok_or_else(|| NOT_FOUND.to_string())?
         };
+        let hash_release = InfoHashReleaseGuard::new(&self.inner, handle.info_hash, handle.id);
         let is_private = handle
             .metadata
             .load()
@@ -1188,19 +1220,10 @@ impl Session {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Err(error) = handle.cmd_tx().send(TorrentCommand::Stop(tx)).await {
-            let mut inner = self.inner.lock();
-            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
-                inner.by_hash.remove(&handle.info_hash);
-            }
             return Err(error.to_string());
         }
         let _ = rx.await;
-        {
-            let mut inner = self.inner.lock();
-            if inner.by_hash.get(&handle.info_hash) == Some(&handle.id) {
-                inner.by_hash.remove(&handle.info_hash);
-            }
-        }
+        drop(hash_release);
         if is_private {
             if let Some(release) = private_release.as_mut() {
                 release.release();
@@ -1332,6 +1355,7 @@ async fn managed_needs_rescan(handle: &ManagedTorrent) -> bool {
     }
 }
 
+const NOT_FOUND: &str = "not found";
 const DEFAULT_UPNP_LEASE: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn upnp_lease(opts: &SessionOptions) -> std::time::Duration {
@@ -1858,6 +1882,46 @@ mod tests {
             AddTorrentResponse::Added(_, handle)
             | AddTorrentResponse::AlreadyManaged(_, handle) => handle.info_hash,
         }
+    }
+
+    fn inner_with_hash(hash: Id20, id: usize) -> Mutex<SessionInner> {
+        Mutex::new(SessionInner {
+            torrents: HashMap::new(),
+            by_hash: HashMap::from([(hash, id)]),
+            next_id: id + 1,
+        })
+    }
+
+    #[test]
+    fn the_info_hash_guard_clears_its_own_entry_on_drop() {
+        let hash = Id20::new([7; 20]);
+        let inner = inner_with_hash(hash, 3);
+        let guard = InfoHashReleaseGuard::new(&inner, hash, 3);
+        assert!(inner.lock().by_hash.contains_key(&hash));
+        drop(guard);
+        assert!(inner.lock().by_hash.is_empty());
+    }
+
+    #[test]
+    fn the_info_hash_guard_leaves_an_entry_that_maps_to_another_torrent() {
+        let hash = Id20::new([7; 20]);
+        let inner = inner_with_hash(hash, 4);
+        drop(InfoHashReleaseGuard::new(&inner, hash, 3));
+        assert_eq!(inner.lock().by_hash.get(&hash), Some(&4));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_delete_releases_the_info_hash() {
+        let (_tmp, session) = quiet_session().await;
+        let hash = host_torrent(&session).await;
+        let id = *session.inner.lock().by_hash.get(&hash).unwrap();
+        let polled = futures_util::FutureExt::now_or_never(
+            session.delete(TorrentIdOrHash::Hash(hash), false),
+        );
+        assert!(polled.is_none());
+        let inner = session.inner.lock();
+        assert!(!inner.by_hash.contains_key(&hash));
+        assert!(!inner.torrents.contains_key(&id));
     }
 
     async fn assert_closed_promptly(stream: &mut TcpStream) {

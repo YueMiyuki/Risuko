@@ -12,7 +12,15 @@ import logger from "@shared/utils/logger";
 import { defineStore } from "pinia";
 import api from "@/api";
 import { useAppStore } from "@/store/app";
-import { reuseUnchangedRows, TASK_LIST_KEYS } from "@/utils/taskRows";
+import {
+	canRefreshLight,
+	fillRowFiles,
+	LIGHT_REFRESH_MAX_MISSING,
+	mergeRowFiles,
+	reuseUnchangedRows,
+	TASK_LIST_KEYS,
+	TASK_LIST_LIGHT_KEYS,
+} from "@/utils/taskRows";
 
 const DEFAULT_TASKS_PER_PAGE = 20;
 const TASKS_PER_PAGE_OPTIONS = [10, 20, 30, 40, 50];
@@ -213,6 +221,20 @@ const loadSortOrder = (): TaskSortOrder => {
 };
 
 let fetchListSeq = 0;
+let lastListType: string | null = null;
+let lightRefreshesSinceFull = 0;
+
+const ROW_FILE_KEYS = ["gid", "files"];
+
+const filterListRows = (type: string, rows: DownloadTask[]): DownloadTask[] => {
+	if (type === "completed") {
+		return rows.filter((task) => task.status === TASK_STATUS.COMPLETE);
+	}
+	if (type === "stopped") {
+		return rows.filter((task) => task.status !== TASK_STATUS.COMPLETE);
+	}
+	return rows;
+};
 
 const getTaskSortName = (task: DownloadTask | DisplayTask): string => {
 	return getTaskName(task, { defaultName: "", maxLen: -1 }).toLowerCase();
@@ -448,36 +470,63 @@ export const useTaskStore = defineStore("task", {
 		toggleSortOrder() {
 			this.setSortOrder(this.sortOrder === "asc" ? "desc" : "asc");
 		},
-		async fetchList() {
+		async fetchList(options: { light?: boolean } = {}) {
 			const type = this.currentList;
 			const seq = ++fetchListSeq;
+			const isStale = () => type !== this.currentList || seq !== fetchListSeq;
 			try {
-				let fetchType = type;
-				if (type === "completed") {
-					fetchType = "stopped";
-				}
-				const rawData = (await api.fetchTaskList({
-					type: fetchType,
-					keys: TASK_LIST_KEYS,
-				})) as DownloadTask[];
-
-				if (type !== this.currentList || seq !== fetchListSeq) {
-					return [];
-				}
-
-				let data: DownloadTask[];
-				if (type === "completed") {
-					data = rawData.filter(
-						(task: DownloadTask) => task.status === TASK_STATUS.COMPLETE,
+				const fetchType = type === "completed" ? "stopped" : type;
+				let rows: DownloadTask[] | null = null;
+				if (
+					options.light &&
+					canRefreshLight({
+						type,
+						lastType: lastListType,
+						lightRefreshes: lightRefreshesSinceFull,
+					})
+				) {
+					const lightData = (await api.fetchTaskList({
+						type: fetchType,
+						keys: TASK_LIST_LIGHT_KEYS,
+					})) as DownloadTask[];
+					if (isStale()) {
+						return [];
+					}
+					const merged = mergeRowFiles(
+						this.taskList,
+						filterListRows(type, lightData),
 					);
-				} else if (type === "stopped") {
-					data = rawData.filter(
-						(task: DownloadTask) => task.status !== TASK_STATUS.COMPLETE,
-					);
-				} else {
-					data = rawData;
+					if (merged.missing.length === 0) {
+						rows = merged.rows;
+					} else if (merged.missing.length <= LIGHT_REFRESH_MAX_MISSING) {
+						const items = await Promise.all(
+							merged.missing.map((gid) =>
+								api.fetchTaskItem({ gid, keys: ROW_FILE_KEYS }),
+							),
+						).catch(() => null);
+						if (isStale()) {
+							return [];
+						}
+						rows = items && fillRowFiles(merged.rows, items);
+					}
 				}
 
+				const light = rows !== null;
+				if (rows === null) {
+					lastListType = null;
+					const rawData = (await api.fetchTaskList({
+						type: fetchType,
+						keys: TASK_LIST_KEYS,
+					})) as DownloadTask[];
+					if (isStale()) {
+						return [];
+					}
+					rows = filterListRows(type, rawData);
+				}
+				lastListType = type;
+				lightRefreshesSinceFull = light ? lightRefreshesSinceFull + 1 : 0;
+
+				let data = rows;
 				for (const task of data) {
 					(task as DisplayTask)._displayKey = task.gid;
 				}
@@ -503,13 +552,20 @@ export const useTaskStore = defineStore("task", {
 				return orderedData;
 			} catch (err: unknown) {
 				logger.warn("[Risuko] fetchList failed:", (err as Error).message);
-				if (type !== this.currentList || seq !== fetchListSeq) {
+				if (isStale()) {
 					return [];
 				}
+				lastListType = null;
 				this.taskList = [];
 				this.selectedGidList = [];
 				return [];
 			}
+		},
+		refreshAfterChange() {
+			const refreshed = this.fetchList();
+			this.saveSession();
+			void useAppStore().fetchGlobalStat();
+			return refreshed;
 		},
 		updateTaskCountsFromStat(stat: Record<string, number>) {
 			const activeCount = stat.numActive || 0;
@@ -730,7 +786,10 @@ export const useTaskStore = defineStore("task", {
 			options: Record<string, string>;
 		}) {
 			const { gid, options } = payload;
-			return api.changeOption({ gid, options });
+			return api.changeOption({ gid, options }).then((result) => {
+				void this.refreshAfterChange();
+				return result;
+			});
 		},
 		removeTask(task: DownloadTask) {
 			const { gid } = task;
@@ -745,55 +804,42 @@ export const useTaskStore = defineStore("task", {
 				.finally(() => {
 					speedHistoryCache.delete(gid);
 					useAppStore().clearCloudflareRetryFlag(gid);
-					this.fetchList();
-					this.saveSession();
+					this.refreshAfterChange();
 				});
-		},
-		forcePauseTask(task: Pick<DownloadTask, "gid" | "status">) {
-			const { gid, status } = task;
-			if (status !== TASK_STATUS.ACTIVE) {
-				return Promise.resolve(true);
-			}
-
-			return api.forcePauseTask({ gid }).finally(() => {
-				this.fetchList();
-				this.saveSession();
-			});
 		},
 		pauseTask(task: DownloadTask) {
 			const { gid } = task;
-			const isBT = checkTaskIsBT(task);
-			const promise = isBT
-				? api.forcePauseTask({ gid })
-				: api.pauseTask({ gid });
+			const promise = api.pauseTask({ gid });
 			promise.finally(() => {
-				this.fetchList();
-				this.saveSession();
+				this.refreshAfterChange();
 			});
 			return promise;
 		},
 		resumeTask(task: DownloadTask) {
 			const { gid } = task;
 			return api.resumeTask({ gid }).finally(() => {
-				this.fetchList();
-				this.saveSession();
+				this.refreshAfterChange();
+			});
+		},
+		restartTask(task: DownloadTask) {
+			const { gid } = task;
+			return api.restartTask({ gid }).finally(() => {
+				this.refreshAfterChange();
 			});
 		},
 		pauseAllTask() {
 			return api
 				.pauseAllTask()
 				.catch(() => {
-					return api.forcePauseAllTask();
+					return api.pauseAllTask();
 				})
 				.finally(() => {
-					this.fetchList();
-					this.saveSession();
+					this.refreshAfterChange();
 				});
 		},
 		resumeAllTask() {
 			return api.resumeAllTask().finally(() => {
-				this.fetchList();
-				this.saveSession();
+				this.refreshAfterChange();
 			});
 		},
 		addToSeedingList(gid: string) {
@@ -848,8 +894,7 @@ export const useTaskStore = defineStore("task", {
 			}
 
 			return api.batchResumeTask({ gids }).finally(() => {
-				this.fetchList();
-				this.saveSession();
+				this.refreshAfterChange();
 			});
 		},
 		batchPauseSelectedTasks() {
@@ -859,8 +904,7 @@ export const useTaskStore = defineStore("task", {
 			}
 
 			return api.batchPauseTask({ gids }).finally(() => {
-				this.fetchList();
-				this.saveSession();
+				this.refreshAfterChange();
 			});
 		},
 		batchRemoveTask(gids: string[]) {
@@ -879,8 +923,7 @@ export const useTaskStore = defineStore("task", {
 						speedHistoryCache.delete(gid);
 						appStore.clearCloudflareRetryFlag(gid);
 					}
-					this.fetchList();
-					this.saveSession();
+					this.refreshAfterChange();
 				});
 		},
 		async reorderTasks(gids: string[], targetGid: string, after: boolean) {
@@ -906,8 +949,7 @@ export const useTaskStore = defineStore("task", {
 
 			try {
 				await api.reorderTasks({ gids, targetGid, after });
-				await this.fetchList();
-				this.saveSession();
+				await this.refreshAfterChange();
 			} catch (err: unknown) {
 				logger.warn("[Risuko] reorderTasks failed:", (err as Error).message);
 				this.updateTaskOrder(this.currentList, []);
@@ -916,8 +958,7 @@ export const useTaskStore = defineStore("task", {
 		},
 		async setSchedule(gid: string, startAt: number) {
 			await api.setTaskSchedule({ gid, startAt });
-			await this.fetchList();
-			this.saveSession();
+			await this.refreshAfterChange();
 		},
 		async updateTask(
 			gid: string,
@@ -930,14 +971,12 @@ export const useTaskStore = defineStore("task", {
 			},
 		) {
 			const outcome = await api.updateTask({ gid, patch });
-			await this.fetchList();
-			this.saveSession();
+			await this.refreshAfterChange();
 			return outcome;
 		},
 		async startNow(gid: string) {
 			await api.startTaskNow({ gid });
-			await this.fetchList();
-			this.saveSession();
+			await this.refreshAfterChange();
 		},
 	},
 });

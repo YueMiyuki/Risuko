@@ -168,6 +168,19 @@ pub trait StorageBackend: Send + Sync {
     fn save(&self, key: &str, value: &Value) -> Result<(), String>;
 }
 
+pub fn keep_unreadable_copy(storage: &dyn StorageBackend, key: &str, value: &Value) {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.to_string().as_bytes());
+    let backup_key = format!("{key}.unreadable-{}", hex::encode(&digest[..8]));
+    match storage.save(&backup_key, value) {
+        Ok(()) => tracing::warn!("kept a copy of the unreadable {key} data under {backup_key}"),
+        Err(e) => tracing::warn!(
+            "could not keep a copy of the unreadable {key} data under {backup_key}: {e}"
+        ),
+    }
+}
+
 pub struct FileStorage {
     dir: PathBuf,
 }
@@ -297,6 +310,76 @@ mod tests {
         assert!(fresh.exists());
         assert!(live.exists());
         assert!(unrelated.exists());
+    }
+
+    fn unreadable_backups(dir: &Path, key: &str) -> Vec<Value> {
+        let prefix = format!("{key}.unreadable-");
+        let mut kept: Vec<Value> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+            .collect();
+        kept.sort_by_key(Value::to_string);
+        kept
+    }
+
+    #[test]
+    fn unreadable_value_is_kept_under_a_backup_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path().to_path_buf());
+        let value = json!({"data": {"feeds": 5}});
+
+        keep_unreadable_copy(&storage, "rss", &value);
+
+        assert_eq!(unreadable_backups(dir.path(), "rss"), vec![value]);
+    }
+
+    #[test]
+    fn the_same_unreadable_value_is_kept_once_under_a_content_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path().to_path_buf());
+        let value = json!({"data": {"feeds": 5}});
+
+        keep_unreadable_copy(&storage, "rss", &value);
+        keep_unreadable_copy(&storage, "rss", &value);
+        keep_unreadable_copy(&storage, "rss", &value.clone());
+
+        assert_eq!(unreadable_backups(dir.path(), "rss"), vec![value]);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let [name] = names.as_slice() else {
+            panic!("expected one backup file, found {names:?}");
+        };
+        let digest = name
+            .strip_prefix("rss.unreadable-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .unwrap_or_else(|| panic!("unexpected backup name {name}"));
+        assert_eq!(digest.len(), 16, "{name}");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+    }
+
+    #[test]
+    fn different_unreadable_values_never_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path().to_path_buf());
+        let first = json!({"data": {"feeds": 5}});
+        let second = json!({"data": {"feeds": 6}});
+
+        keep_unreadable_copy(&storage, "rss", &first);
+        keep_unreadable_copy(&storage, "rss", &second);
+        keep_unreadable_copy(&storage, "stats", &first);
+
+        let mut expected = vec![first.clone(), second];
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(unreadable_backups(dir.path(), "rss"), expected);
+        assert_eq!(unreadable_backups(dir.path(), "stats"), vec![first]);
     }
 
     #[cfg(unix)]

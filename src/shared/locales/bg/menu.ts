@@ -2,7 +2,7 @@ export default {
 	app: "Risuko",
 	file: "Файл",
 	task: "Задача",
-	edit: "Редктиране",
+	edit: "Редактиране",
 	window: "Прозорец",
-	help: "Грижа",
+	help: "Помощ",
 };

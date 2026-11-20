@@ -1,4 +1,5 @@
 import { userKeys } from "./configKeys";
+import { SECRET_SYNC_KEYS } from "./utils/syncSecrets";
 
 export interface SyncCategory {
 	id: string;
@@ -15,8 +16,13 @@ const DEVICE_LOCAL_KEYS = new Set<string>([
 	"cloud-sync-last-at",
 	"cloud-sync-server-url",
 	"cloud-sync-category-timestamps",
+	"cloud-sync-category-revs",
+	"cloud-sync-dirty-keys",
 	"legal-accepted",
 	"clipboard-watch-notice-seen",
+	"rpc-allow-any-dir",
+	"rpc-host",
+	...SECRET_SYNC_KEYS,
 ]);
 
 const namedCategories: SyncCategory[] = [
@@ -47,7 +53,6 @@ const namedCategories: SyncCategory[] = [
 			"p2p-no-proxy",
 			"p2p-udp-proxy",
 			"p2p-udp-no-proxy",
-			"cookie",
 		],
 	},
 	{
@@ -71,6 +76,7 @@ const namedCategories: SyncCategory[] = [
 			"new-task-show-downloading",
 			"auto-retry",
 			"auto-retry-interval",
+			"auto-retry-max-attempts",
 			"auto-retry-strategy",
 			"no-confirm-before-delete-task",
 			"resume-all-when-app-launched",
@@ -85,6 +91,7 @@ const namedCategories: SyncCategory[] = [
 			"max-download-limit",
 			"max-overall-download-limit",
 			"max-overall-upload-limit",
+			"bt-upload-rate-limit",
 			"engine-mode",
 			"max-worker-retries",
 			"netrc-path",
@@ -97,7 +104,6 @@ const namedCategories: SyncCategory[] = [
 			"split",
 			"uri-selector",
 			"user-agent",
-			"header",
 			"load-cookies",
 			"bt-create-subfolder",
 		],
@@ -147,16 +153,10 @@ const namedCategories: SyncCategory[] = [
 	{
 		id: "engine",
 		keys: [
-			"external-engine-enabled",
-			"external-engine-host",
-			"external-engine-port",
-			"external-engine-secret",
 			"engine-overrides",
 			"rpc-listen-port",
-			"rpc-secret",
 			"pbh-enable",
 			"pbh-listen-port",
-			"pbh-rpc-secret",
 		],
 	},
 	{
@@ -176,10 +176,6 @@ const namedCategories: SyncCategory[] = [
 	{
 		id: "logs",
 		keys: ["log-dir-override", "log-level"],
-	},
-	{
-		id: "credentials",
-		keys: ["saved-credentials"],
 	},
 	{
 		id: "bittorrent",
@@ -212,14 +208,7 @@ const namedCategories: SyncCategory[] = [
 	},
 	{
 		id: "ftp",
-		keys: [
-			"ftp-passwd",
-			"ftp-user",
-			"sftp-passwd",
-			"sftp-private-key",
-			"sftp-private-key-passphrase",
-			"sftp-user",
-		],
+		keys: ["ftp-user", "sftp-user"],
 	},
 	{
 		id: "usenet",

@@ -2,7 +2,6 @@ package app.risuko.webview_upgrade.swap
 
 import android.content.Context
 import android.content.pm.PackageInfo
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Looper
 import android.util.Log
@@ -24,13 +23,10 @@ internal object WebViewSwap {
     class PreconditionException(message: String) : Exception(message)
 
     @Synchronized
-    fun swapToInstalledPackage(context: Context, packageName: String): PackageInfo? {
+    fun swapToInstalledPackage(context: Context, packageInfo: PackageInfo): PackageInfo? {
         checkPreconditions()
 
-        val packageInfo = context.packageManager.getPackageInfo(
-            packageName,
-            PackageManager.GET_SHARED_LIBRARY_FILES or PackageManager.GET_META_DATA,
-        )
+        val packageName = packageInfo.packageName
         val appInfo = packageInfo.applicationInfo
             ?: throw PreconditionException("no applicationInfo for $packageName")
         val apkPath: String? = appInfo.sourceDir

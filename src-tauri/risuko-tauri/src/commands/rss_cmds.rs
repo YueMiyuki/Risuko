@@ -422,7 +422,7 @@ pub async fn dry_run_rss_rule(
     sample_size: Option<usize>,
 ) -> Result<Value, String> {
     let mgr = state.rss.clone();
-    let results = mgr.dry_run_rule(rule, sample_size.unwrap_or(50)).await;
+    let results = mgr.dry_run_rule(rule, sample_size.unwrap_or(50)).await?;
     serde_json::to_value(results).map_err(|e| e.to_string())
 }
 

@@ -37,6 +37,10 @@ impl risuko_engine::engine::usenet::UsenetCredentialResolver for VaultCredential
         &self,
         profile_id: &str,
     ) -> Result<Option<risuko_engine::engine::usenet::UsenetCredentials>, String> {
+        let fallback = self.fallback.resolve(profile_id).await;
+        if let Ok(Some(credentials)) = fallback {
+            return Ok(Some(credentials));
+        }
         let lookup = {
             let vault = self.vault.clone();
             let key = credential_key(profile_id);
@@ -59,17 +63,15 @@ impl risuko_engine::engine::usenet::UsenetCredentialResolver for VaultCredential
             }
             Ok(Some(Ok(None))) | Ok(None) => {}
             Ok(Some(Err(error))) => {
-                tracing::warn!(
-                    "Failed to load Usenet credentials for {profile_id}: {error}; trying fallback"
-                );
+                tracing::warn!("Failed to load Usenet credentials for {profile_id}: {error}");
             }
             Err(error) => {
                 tracing::warn!(
-                    "Usenet credential lookup for {profile_id} did not complete: {error}; trying fallback"
+                    "Usenet credential lookup for {profile_id} did not complete: {error}"
                 );
             }
         }
-        self.fallback.resolve(profile_id).await
+        fallback
     }
 }
 
@@ -161,7 +163,9 @@ fn save_fallback(path: &Path, profile_id: &str, credentials: &Value) -> Result<(
 fn remove_fallback(path: &Path, profile_id: &str) -> Result<(), String> {
     with_fallback_lock(path, || {
         let mut entries = load_fallback(path)?;
-        entries.remove(profile_id);
+        if entries.remove(profile_id).is_none() && !entries.is_empty() {
+            return Ok(());
+        }
         if entries.is_empty() {
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
@@ -172,6 +176,15 @@ fn remove_fallback(path: &Path, profile_id: &str) -> Result<(), String> {
             let data = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
             write_fallback_atomic(path, &data)
         }
+    })
+}
+
+fn clear_stale_fallback(path: &Path, profile_id: &str) -> Result<(), String> {
+    remove_fallback(path, profile_id).map_err(|error| {
+        tracing::warn!("Failed to clear stale Usenet credential fallback for {profile_id}: {error}");
+        format!(
+            "Credentials were saved to the vault, but the older fallback copy could not be cleared: {error}"
+        )
     })
 }
 
@@ -211,14 +224,7 @@ pub fn usenet_save_credentials(
     let fallback_path = risuko_engine::engine::usenet_credential_fallback_path(&config_dir);
     if state.vault.enabled() {
         match state.vault.put(&credential_key(&profile_id), &credentials) {
-            Ok(()) => {
-                if let Err(error) = remove_fallback(&fallback_path, &profile_id) {
-                    tracing::warn!(
-                        "Failed to clear stale Usenet credential fallback for {profile_id}: {error}"
-                    );
-                }
-                return Ok(());
-            }
+            Ok(()) => return clear_stale_fallback(&fallback_path, &profile_id),
             Err(error) => tracing::warn!(
                 "Failed to store Usenet credentials in vault for {profile_id}: {error}; using fallback"
             ),
@@ -347,5 +353,53 @@ mod tests {
 
         remove_fallback(&path, "primary").unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_failed_cleanup_is_reported_and_never_rewrites_the_fallback() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("usenet-credentials.json");
+        save_fallback(&path, "primary", &json!({"password": "old"})).unwrap();
+        save_fallback(&path, "backup", &json!({"password": "other"})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let lock = dir.path().join(".usenet-credentials.json.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let error = clear_stale_fallback(&path, "primary").unwrap_err();
+
+        assert!(error.contains("could not be cleared"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clearing_a_profile_without_an_entry_does_not_touch_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("usenet-credentials.json");
+        save_fallback(&path, "backup", &json!({"password": "other"})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o500)).unwrap();
+        let result = clear_stale_fallback(&path, "primary");
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o700)).unwrap();
+
+        result.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_cleanup_that_works_drops_only_that_profile() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("usenet-credentials.json");
+        save_fallback(&path, "primary", &json!({"password": "old"})).unwrap();
+        save_fallback(&path, "backup", &json!({"password": "other"})).unwrap();
+
+        clear_stale_fallback(&path, "primary").unwrap();
+        let entries = load_fallback(&path).unwrap();
+        assert!(!entries.contains_key("primary"));
+        assert!(entries.contains_key("backup"));
     }
 }

@@ -258,6 +258,7 @@ impl ShareManager {
     }
 
     pub async fn start_send(&self, id: String, paths: Vec<PathBuf>) -> Result<SendInfo> {
+        anyhow::ensure!(is_valid_transfer_id(&id), "invalid transfer id");
         anyhow::ensure!(!paths.is_empty(), "no files selected");
         let blobs_dir = self.data_dir.join(format!("send-{id}"));
         let result = self.start_send_inner(id, paths, blobs_dir.clone()).await;
@@ -507,6 +508,7 @@ impl ShareManager {
         dest_dir: PathBuf,
         files: Vec<FileMeta>,
     ) -> Result<()> {
+        anyhow::ensure!(is_valid_transfer_id(&id), "invalid transfer id");
         let blobs_dir = self.data_dir.join(format!("recv-{id}"));
         let stop = Arc::new(AtomicBool::new(false));
         let events = self.events.clone();
@@ -591,6 +593,7 @@ async fn run_receive(
     let hash = ticket.hash();
     let format = ticket.format();
     let total: u64 = files.iter().map(|f| f.size).sum();
+    let limit = announced_limit(files);
 
     let store: Store = FsStore::load(blobs_dir)
         .await
@@ -639,6 +642,10 @@ async fn run_receive(
         }
         match item {
             DownloadProgressItem::Progress(offset) => {
+                if exceeds_announced(offset, limit) {
+                    path_handle.abort();
+                    anyhow::bail!("sender sent more data than it announced");
+                }
                 emit_receive_progress(events, id, &mut last_emit, offset, total, false);
             }
             DownloadProgressItem::Error(err) => {
@@ -817,12 +824,24 @@ fn file_name(path: &Path) -> String {
 fn sanitize_rel_path(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for component in name.split(['/', '\\']) {
-        let component = component.trim();
-        if component.is_empty() || component == "." || component == ".." || component.contains(':')
-        {
+        let component: String = component
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_control()
+                    || risuko_util::is_invisible_format_char(c)
+                    || matches!(c, ':' | '<' | '>' | '|' | '?' | '*' | '"')
+                {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if component.is_empty() || component == "." || component == ".." {
             continue;
         }
-        if risuko_engine::engine::is_windows_device_name(component) {
+        if risuko_util::is_windows_device_name(&component) {
             out.push(format!("_{component}"));
             continue;
         }
@@ -834,6 +853,32 @@ fn sanitize_rel_path(name: &str) -> PathBuf {
     out
 }
 
+fn is_valid_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+const ANNOUNCED_SLACK: u64 = 4 * 1024 * 1024;
+const COLLECTION_ENTRY_OVERHEAD: u64 = 40;
+
+fn announced_limit(files: &[FileMeta]) -> u64 {
+    let total = files.iter().fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let entries = files.iter().fold(0u64, |sum, f| {
+        sum.saturating_add((f.name.len() as u64).saturating_add(COLLECTION_ENTRY_OVERHEAD))
+    });
+    total
+        .saturating_add(total / 8)
+        .saturating_add(entries)
+        .saturating_add(ANNOUNCED_SLACK)
+}
+
+fn exceeds_announced(received: u64, limit: u64) -> bool {
+    received > limit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +887,90 @@ mod tests {
     fn rel_path_neutralises_device_names() {
         assert_eq!(sanitize_rel_path("a/CON.txt"), PathBuf::from("a/_CON.txt"));
         assert_eq!(sanitize_rel_path("../x/y"), PathBuf::from("x/y"));
+    }
+
+    #[test]
+    fn rel_path_keeps_components_with_reserved_characters() {
+        assert_eq!(
+            sanitize_rel_path("logs/run-12:30:01.txt"),
+            PathBuf::from("logs/run-12_30_01.txt")
+        );
+        assert_eq!(sanitize_rel_path("a:b.txt"), PathBuf::from("a_b.txt"));
+        assert_eq!(
+            sanitize_rel_path("C:\\x\\y?.txt"),
+            PathBuf::from("C_/x/y_.txt")
+        );
+    }
+
+    #[test]
+    fn rel_path_replaces_invisible_format_chars() {
+        let spoofed = sanitize_rel_path("invoice\u{202E}fdp.exe");
+        let spoofed = spoofed.to_string_lossy();
+        assert!(!spoofed.chars().any(risuko_util::is_invisible_format_char));
+        assert!(spoofed.ends_with(".exe"));
+
+        let hidden = sanitize_rel_path("a\u{200B}b\u{2066}c.txt");
+        assert!(!hidden
+            .to_string_lossy()
+            .chars()
+            .any(risuko_util::is_invisible_format_char));
+
+        assert_eq!(
+            sanitize_rel_path("レポート.pdf"),
+            PathBuf::from("レポート.pdf")
+        );
+    }
+
+    #[test]
+    fn transfer_id_validation() {
+        assert!(is_valid_transfer_id("3f2b6c1e-8d4a-4c1b-9e0f-1a2b3c4d5e6f"));
+        assert!(is_valid_transfer_id("abc_123"));
+        for bad in ["", "../x", "a/b", "a\\b", "..", &"a".repeat(65), "a b"] {
+            assert!(!is_valid_transfer_id(bad), "{bad:?}");
+        }
+    }
+
+    fn meta(name: &str, size: u64) -> FileMeta {
+        FileMeta {
+            name: name.to_string(),
+            size,
+        }
+    }
+
+    #[test]
+    fn announced_size_allowance() {
+        let files = [meta("a", 1000)];
+        let limit = announced_limit(&files);
+        let allowance = 1000 / 8 + 4 * 1024 * 1024 + 1 + COLLECTION_ENTRY_OVERHEAD;
+        assert_eq!(limit, 1000 + allowance);
+        assert!(!exceeds_announced(1000, limit));
+        assert!(!exceeds_announced(limit, limit));
+        assert!(exceeds_announced(limit + 1, limit));
+
+        let huge = announced_limit(&[meta("a", u64::MAX)]);
+        assert!(!exceeds_announced(u64::MAX, huge));
+    }
+
+    #[test]
+    fn announced_zero_size_still_has_a_limit() {
+        let limit = announced_limit(&[meta("empty", 0)]);
+        assert!(exceeds_announced(u64::MAX, limit));
+        assert!(exceeds_announced(limit + 1, limit));
+        assert!(exceeds_announced(10 * 1024 * 1024, announced_limit(&[])));
+    }
+
+    #[test]
+    fn announced_limit_covers_collection_metadata_of_many_files() {
+        let name = "photos/2024/holiday/IMG_000000.jpg";
+        let files: Vec<FileMeta> = (0..200_000).map(|_| meta(name, 0)).collect();
+        let count = files.len() as u64;
+        let hash_seq = 32 * (count + 1);
+        let names = 13 + 3 + count * (name.len() as u64 + 1);
+        assert!(hash_seq + names > ANNOUNCED_SLACK);
+        assert!(!exceeds_announced(
+            hash_seq + names,
+            announced_limit(&files)
+        ));
     }
 
     #[test]

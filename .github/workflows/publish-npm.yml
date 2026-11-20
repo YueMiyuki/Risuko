@@ -124,26 +124,11 @@ jobs:
       - name: Stamp release version
         run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust for ${{ matrix.target }}
+        uses: ./.github/actions/setup-rust-target
         with:
-          targets: ${{ matrix.target }}
-
-      - name: MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-        with:
-          arch: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-        with:
-          workspaces: src-tauri -> target
-          key: cli-${{ matrix.target }}
-
-      - name: Install Linux build deps
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          target: ${{ matrix.target }}
+          cache-key: cli-${{ matrix.target }}
 
       - name: Build risuko-cli
         if: runner.os != 'Linux'
@@ -203,26 +188,11 @@ jobs:
       - name: Stamp release version
         run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust for ${{ matrix.target }}
+        uses: ./.github/actions/setup-rust-target
         with:
-          targets: ${{ matrix.target }}
-
-      - name: MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-        with:
-          arch: ${{ matrix.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-        with:
-          workspaces: src-tauri -> target
-          key: napi-${{ matrix.target }}
-
-      - name: Install Linux build deps
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          target: ${{ matrix.target }}
+          cache-key: napi-${{ matrix.target }}
 
       - name: Build risuko-napi
         working-directory: src-tauri

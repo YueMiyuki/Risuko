@@ -1,19 +1,19 @@
 use risuko_cookies::{cookies_for_url, list_browsers, BrowserInfo, HostCookies};
 use risuko_engine::engine;
-use risuko_engine::engine::cookie_store::{
-    cookies_to_header, eligible_cookies, CookieEntry, StoredCookie,
-};
+use risuko_engine::engine::cookie_store::{eligible_cookies, CookieEntry, StoredCookie};
+use risuko_http::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
+const APP_BOUND_COOKIES_ERROR: &str = "APP_BOUND_COOKIES_UNSUPPORTED";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedCookieView {
     pub name: String,
-    pub value: String,
     pub domain: String,
     pub path: String,
     pub secure: bool,
@@ -26,7 +26,6 @@ pub struct ImportedCookieView {
 pub struct ImportedCookies {
     pub host: String,
     pub user_agent: String,
-    pub cookie_header: String,
     pub count: usize,
     pub has_cf_clearance: bool,
     pub cookie_names: Vec<String>,
@@ -77,15 +76,17 @@ pub async fn import_browser_cookies(
     user_agent: Option<String>,
 ) -> Result<ImportedCookies, String> {
     tracing::info!("import_browser_cookies: browser={browser}");
+    if !cookie_import_url_allowed(&url) {
+        return Err("Only http and https URLs can be used for cookie import".to_string());
+    }
     let host_cookies = match cookies_for_url(&browser, &url).await {
         Ok(hc) => hc,
         Err(e) => {
-            // Windows Chrome v20 app-bound cookies decrypt only as admin
-            if e.contains(risuko_cookies::ELEVATION_REQUIRED) {
+            if e.contains(risuko_cookies::APP_BOUND_UNSUPPORTED) {
                 tracing::info!(
-                    "import_browser_cookies: app-bound cookies require elevation (browser={browser})"
+                    "import_browser_cookies: app-bound cookies cannot be read (browser={browser})"
                 );
-                return Err("ELEVATION_REQUIRED".to_string());
+                return Err(APP_BOUND_COOKIES_ERROR.to_string());
             }
             return Err(e);
         }
@@ -93,26 +94,8 @@ pub async fn import_browser_cookies(
     build_imported_cookies(host_cookies, &browser, persist, user_agent).await
 }
 
-#[tauri::command]
-pub async fn import_browser_cookies_elevated(
-    browser: String,
-    url: String,
-    persist: Option<bool>,
-    user_agent: Option<String>,
-) -> Result<ImportedCookies, String> {
-    #[cfg(target_os = "windows")]
-    {
-        tracing::info!("import_browser_cookies_elevated: browser={browser}");
-        let host_cookies = elevate::extract_cookies_elevated(&browser, &url).await?;
-        build_imported_cookies(host_cookies, &browser, persist, user_agent).await
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (&url, &persist, &user_agent);
-        Err(format!(
-            "elevated cookie import for {browser} is only supported on Windows"
-        ))
-    }
+fn cookie_import_url_allowed(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
 }
 
 async fn build_imported_cookies(
@@ -165,7 +148,6 @@ async fn build_imported_cookies(
             "no unexpired, header-safe cookies found in {browser} for {host}"
         ));
     }
-    let cookie_header = cookies_to_header(&stored);
     let has_cf_clearance = stored
         .iter()
         .any(|c| c.name.eq_ignore_ascii_case("cf_clearance"));
@@ -201,7 +183,6 @@ async fn build_imported_cookies(
         .iter()
         .map(|c| ImportedCookieView {
             name: c.name.clone(),
-            value: c.value.clone(),
             domain: c.domain.clone(),
             path: c.path.clone(),
             secure: c.secure,
@@ -213,7 +194,6 @@ async fn build_imported_cookies(
     Ok(ImportedCookies {
         host,
         user_agent: effective_user_agent,
-        cookie_header,
         count: stored.len(),
         has_cf_clearance,
         cookie_names,
@@ -250,9 +230,18 @@ pub async fn retry_with_cookies(
     payload: RetryWithCookiesPayload,
 ) -> Result<(), String> {
     let manager = engine::get_manager().await.ok_or("Engine not running")?;
-    manager
-        .retry_with_cookies(&gid, payload.cookie, payload.user_agent)
-        .await
+    match payload.cookie.filter(|c| !c.trim().is_empty()) {
+        Some(cookie) => {
+            manager
+                .retry_with_cookies(&gid, Some(cookie), payload.user_agent)
+                .await
+        }
+        None => {
+            manager
+                .retry_with_stored_cookies(&gid, payload.user_agent)
+                .await
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -363,94 +352,22 @@ fn parse_request(buf: &[u8]) -> Option<(String, String)> {
     Some((path, user_agent))
 }
 
-#[cfg(target_os = "windows")]
-mod elevate {
-    use risuko_cookies::HostCookies;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-
-    const HELPER_TIMEOUT_MS: u32 = 120_000;
-
-    fn to_wide(s: &str) -> Vec<u16> {
-        OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    pub async fn extract_cookies_elevated(browser: &str, url: &str) -> Result<HostCookies, String> {
-        let browser = browser.to_string();
-        let url = url.to_string();
-        tokio::task::spawn_blocking(move || run_elevated(&browser, &url))
-            .await
-            .map_err(|e| format!("join error: {e}"))?
-    }
-
-    fn run_elevated(browser: &str, url: &str) -> Result<HostCookies, String> {
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
-
-        let out_path = tempfile::Builder::new()
-            .prefix("risuko-cookies-")
-            .suffix(".json")
-            .tempfile()
-            .map_err(|e| format!("create temp file failed: {e}"))?
-            .into_temp_path();
-
-        let params = format!(
-            "extract-cookies --browser \"{}\" --url \"{}\" --out \"{}\"",
-            browser.replace('"', ""),
-            url.replace('"', ""),
-            out_path.to_string_lossy().replace('"', "")
-        );
-
-        let verb = to_wide("runas");
-        let file = to_wide(&exe.to_string_lossy());
-        let params_w = to_wide(&params);
-
-        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        info.fMask = SEE_MASK_NOCLOSEPROCESS;
-        info.lpVerb = verb.as_ptr();
-        info.lpFile = file.as_ptr();
-        info.lpParameters = params_w.as_ptr();
-        info.nShow = SW_HIDE;
-
-        let ok = unsafe { ShellExecuteExW(&mut info) };
-        if ok == 0 {
-            return Err(
-                "administrator approval was declined or the elevated helper failed to start"
-                    .to_string(),
-            );
+    #[test]
+    fn cookie_import_accepts_only_http_and_https_urls_with_a_host() {
+        assert!(cookie_import_url_allowed("https://example.com/a"));
+        assert!(cookie_import_url_allowed("http://example.com"));
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "https://",
+            "",
+            "javascript:alert(1)",
+        ] {
+            assert!(!cookie_import_url_allowed(url), "{url}");
         }
-        if info.hProcess.is_null() {
-            return Err("elevated helper did not return a process handle".to_string());
-        }
-
-        let timed_out = unsafe {
-            let timed_out = WaitForSingleObject(info.hProcess, HELPER_TIMEOUT_MS) == WAIT_TIMEOUT;
-            if timed_out {
-                TerminateProcess(info.hProcess, 1);
-            }
-            CloseHandle(info.hProcess);
-            timed_out
-        };
-        if timed_out {
-            return Err("the elevated helper timed out".to_string());
-        }
-
-        let bytes =
-            std::fs::read(&out_path).map_err(|e| format!("read elevated output failed: {e}"))?;
-        if bytes.is_empty() {
-            return Err("the elevated helper produced no cookies".to_string());
-        }
-        serde_json::from_slice::<HostCookies>(&bytes)
-            .map_err(|e| format!("parse elevated output failed: {e}"))
     }
 }

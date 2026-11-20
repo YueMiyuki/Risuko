@@ -1,7 +1,7 @@
 export default {
 	"official-website": "Risuko Weboldala",
 	manual: "Kézikönyv",
-	"release-notes": "Valtózások...",
+	"release-notes": "Változások...",
 	"report-problem": "Hiba jelentés",
-	"toggle-dev-tools": "Fejlesztöi eszközök",
+	"toggle-dev-tools": "Fejlesztői eszközök",
 };

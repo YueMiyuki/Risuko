@@ -1,16 +1,158 @@
 export default {
 	basic: "Pengaturan Dasar",
 	advanced: "Pengaturan Lanjut",
+	cloudSinks: "Tujuan Cloud",
+	usenet: "Usenet",
+	search: "Cari",
+	"search-placeholder": "Cari semua preferensi",
+	"search-all-tabs": "Semua preferensi",
+	"search-results": "{{count}} pengaturan yang cocok",
+	"search-no-results": "Tidak ada pengaturan yang cocok",
+	"search-clear": "Hapus pencarian",
+	"search-go-to-tab": "Buka pengaturan",
+	"search-more-results":
+		"Persempit pencarian Anda untuk melihat lebih banyak hasil",
+	"usenet-tips":
+		"Kelola penyedia NNTP dan pengaturan bawaan pembersihan arsip yang aman.",
+	"usenet-profiles": "Profil Penyedia",
+	"usenet-profiles-tips":
+		"Atur prioritas penyedia, keamanan, autentikasi, dan batas koneksi.",
+	"usenet-add-profile": "Tambah Profil",
+	"usenet-no-profiles": "Belum ada profil penyedia yang dikonfigurasi.",
+	"usenet-no-profiles-tips":
+		"Tambahkan setidaknya satu penyedia sebelum mengimpor unduhan NZB.",
+	"usenet-edit-profile": "Sunting Profil",
+	"usenet-profile-dialog-tips":
+		"Pengaturan profil dapat disinkronkan antar perangkat. Kredensial tetap lokal di perangkat ini.",
+	"usenet-profile-dialog-tips-vault":
+		"Pengaturan profil dapat disinkronkan antar perangkat. Kredensial tetap berada di keychain aman perangkat ini.",
+	"usenet-profile-name": "Nama profil",
+	"usenet-profile-name-placeholder": "Penyedia utama",
+	"usenet-profile-host": "Host NNTP",
+	"usenet-profile-port": "Port",
+	"usenet-security": "Keamanan koneksi",
+	"usenet-tls": "TLS implisit",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "NNTP polos",
+	"usenet-authentication": "Autentikasi",
+	"usenet-auth-credentials": "Nama pengguna dan kata sandi",
+	"usenet-auth-anonymous": "Anonim",
+	"usenet-username": "Nama pengguna",
+	"usenet-password": "Kata sandi",
+	"usenet-credentials-saved": "Kredensial tersimpan",
+	"usenet-credentials-unavailable": "Status kredensial tidak tersedia",
+	"usenet-credentials-saved-tips":
+		"Kredensial sudah tersimpan. Biarkan kedua kolom kosong agar tidak berubah.",
+	"usenet-plain-warning-title": "Koneksi tidak terenkripsi",
+	"usenet-plain-opt-in":
+		"Saya mengerti dan ingin mengizinkan NNTP polos untuk profil ini.",
+	"usenet-plain-warning":
+		"NNTP polos tidak mengenkripsi kredensial maupun data yang diunduh. Gunakan hanya jika penyedia Anda secara eksplisit mewajibkannya.",
+	"usenet-enabled": "Aktif",
+	"usenet-enabled-tips":
+		"Profil yang dinonaktifkan tetap disimpan tetapi tidak digunakan untuk unduhan.",
+	"usenet-disabled": "Nonaktif",
+	"usenet-priority": "Prioritas",
+	"usenet-priority-tips":
+		"Nilai yang lebih rendah dicoba lebih dahulu. Prioritas yang sama berbagi beban.",
+	"usenet-priority-value": "Prioritas {{value}}",
+	"usenet-max-connections": "Koneksi maksimum",
+	"usenet-max-connections-tips": "Batas koneksi untuk profil penyedia ini.",
+	"usenet-connections-value": "{{value}} koneksi",
+	"usenet-test": "Uji",
+	"usenet-edit": "Sunting profil",
+	"usenet-remove": "Hapus",
+	"usenet-remove-title": "Hapus profil penyedia?",
+	"usenet-remove-confirm":
+		"{{name}} tidak akan lagi tersedia untuk unduhan. Kredensial yang tersimpan juga akan dihapus dari perangkat ini.",
+	"usenet-profile-saved": "Profil penyedia disimpan.",
+	"usenet-profile-removed": "{{name}} telah dihapus.",
+	"usenet-test-success": "Terhubung ke {{name}}.",
+	"usenet-test-failed": "Koneksi gagal: {{message}}",
+	"usenet-validation-name": "Masukkan nama profil.",
+	"usenet-validation-host": "Masukkan host NNTP.",
+	"usenet-validation-port": "Port harus antara 1 dan 65535.",
+	"usenet-validation-plain":
+		"Konfirmasikan peringatan NNTP polos sebelum menyimpan.",
+	"usenet-validation-priority": "Prioritas harus nol atau lebih besar.",
+	"usenet-validation-connections": "Koneksi harus antara 1 dan 128.",
+	"usenet-validation-credentials":
+		"Masukkan nama pengguna dan kata sandi, atau pilih autentikasi anonim.",
+	"usenet-validation-credential-status":
+		"Status kredensial tidak tersedia. Coba lagi sebelum mengubah profil ini.",
+	"usenet-cleanup": "Pembersihan setelah berhasil",
+	"usenet-cleanup-tips":
+		"Pembersihan hanya berjalan setelah perakitan lengkap dan ekstraksi berhasil.",
+	"usenet-cleanup-action": "Setelah keberhasilan terverifikasi",
+	"usenet-cleanup-keep": "Pertahankan semua masukan",
+	"usenet-cleanup-keep-tips":
+		"Mempertahankan berkas PAR2 dan semua volume arsip.",
+	"usenet-cleanup-par2": "Hapus berkas PAR2",
+	"usenet-cleanup-par2-tips":
+		"Menghapus berkas paritas tetapi mempertahankan volume arsip yang diunduh.",
+	"usenet-cleanup-all": "Hapus PAR2 dan volume arsip",
+	"usenet-cleanup-all-tips":
+		"Menghapus berkas paritas dan volume arsip setelah ekstraksi berhasil.",
+	"usenet-archive-safety": "Keamanan arsip",
+	"usenet-limits-defaults":
+		"Batas per tugas melindungi penyimpanan dan pemrosesan selama verifikasi dan ekstraksi.",
+	"usenet-desktop-limits": "Batas desktop",
+	"usenet-android-limits": "Batas Android",
+	"usenet-limits-summary":
+		"{{entries}} entri · {{total}} total ekspansi · {{perEntry}} per entri",
+	"usenet-limits-secondary-summary":
+		"rasio {{ratio}}:1 · {{depth}} tingkat bersarang · cadangan ruang kosong {{reserve}} · {{hours}} jam aktif",
+	"usenet-customize-limits": "Sesuaikan batas",
+	"usenet-hide-limits": "Sembunyikan batas",
+	"usenet-limits-adjusted": "Batas yang disinkronkan telah disesuaikan",
+	"usenet-limits-adjusted-tips":
+		"Satu atau beberapa nilai melebihi batas maksimum platform ini dan telah dikurangi.",
+	"usenet-max-entries": "Entri maksimum",
+	"usenet-max-expanded": "Total ukuran hasil ekstraksi",
+	"usenet-max-entry": "Ukuran per entri",
+	"usenet-max-depth": "Kedalaman penyarangan",
+	"usenet-max-ratio": "Rasio kompresi",
+	"usenet-free-space-reserve": "Cadangan ruang kosong",
+	"usenet-max-active-time": "Waktu pemrosesan aktif",
+	"usenet-unit-entries": "entri",
+	"usenet-unit-levels": "tingkat",
+	"usenet-unit-hours": "jam",
+	"usenet-limits-hard-cap":
+		"Nilai tidak boleh melebihi empat kali pengaturan bawaan platform. Penimpaan per tugas tetap dikonfirmasi terpisah.",
+	"usenet-restore-limits": "Pulihkan bawaan platform",
+	"usenet-limits-restored": "Batas arsip dipulihkan ke bawaan platform.",
 	save: "Simpan & Terapkan",
 	"save-success-message": "Berhasil menyimpan pengaturan",
 	"save-fail-message": "Gagal menyimpan pengaturan",
 	discard: "Batal",
+	"history-directories": "Direktori unduhan terbaru",
+	"favorite-directory": "Direktori favorit",
+	"unfavorite-directory": "Hapus direktori dari favorit",
+	"remove-history-directory": "Hapus direktori dari riwayat",
 	startup: "Memulai",
 	"open-at-login": "Buka saat login",
 	"keep-window-state":
 		"Pertahankan ukuran dan posisi jendela aplikasi saat keluar",
 	"auto-resume-all": "Otomatis lanjutkan semua tugas yang belum selesai",
 	"default-dir": "Lokasi Bawaan",
+	"file-category-dirs": "Jalur Kategori",
+	"file-category-dirs-tips":
+		"Timpa jalur unduhan bawaan untuk jenis berkas tertentu. Biarkan kosong untuk memakai jalur bawaan.",
+	"task-routing-rules": "Aturan Perutean Tugas",
+	"task-routing-rules-tips":
+		"Mengarahkan tugas ke direktori berdasarkan pola nama berkas. Aturan pertama yang cocok yang dipakai.",
+	"task-routing-rule-pattern-placeholder": "Pola (mis. *.mkv)",
+	"task-routing-rule-label-placeholder": "Tag",
+	"task-routing-rule-dir-placeholder": "Direktori",
+	"task-routing-rule-add": "Tambah Aturan",
+	"file-category-music": "Musik",
+	"file-category-video": "Video",
+	"file-category-image": "Gambar",
+	"file-category-document": "Dokumen",
+	"file-category-compressed": "Terkompresi",
+	"file-category-program": "Program",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Karena pembatasan dari App Store, direktori unduhan default direkomendasikan untuk disetel ke ~/Downloads",
 	"transfer-settings": "Transfer Setting",
@@ -19,6 +161,12 @@ export default {
 	"transfer-speed-unlimited": "Tak Terbatas",
 	"bt-settings": "BitTorrent",
 	"bt-save-metadata": "Simpan tautan magnet sebagai file torrent",
+	"bt-create-subfolder": "Kelompokkan torrent multi-berkas ke dalam subfolder",
+	"bt-create-subfolder-tips":
+		"Jika diaktifkan, unduhan BitTorrent dan magnet multi-berkas ditempatkan di dalam folder bernama sesuai torrent. Jika dinonaktifkan, berkas ditulis langsung ke direktori unduhan.",
+	"bt-upload-rate-limit": "Limit unggah BitTorrent",
+	"bt-upload-rate-limit-tips":
+		"Membatasi unggahan BitTorrent selain limit unggah global. 0 berarti tanpa batas terpisah.",
 	"bt-auto-download-content":
 		"Secara otomatis mengunduh magnet dan konten torrent",
 	"bt-force-encryption": "Memaksa enkripsi paksa BT",
@@ -29,18 +177,78 @@ export default {
 	"seed-time-unit": "menit",
 	"task-manage": "Pengelola Tugas",
 	"max-concurrent-downloads": "Maksimal tugas aktif",
+	"connections-per-task": "Koneksi per tugas",
 	"max-connection-per-server": "Maksimal koneksi per server",
+	"auto-retry": "Coba lagi otomatis tugas yang gagal",
+	"auto-retry-strategy": "Mode interval percobaan ulang",
+	"auto-retry-strategy-static": "Tetap",
+	"auto-retry-strategy-exponential": "Backoff eksponensial",
+	"auto-retry-interval": "Interval dasar percobaan ulang",
+	"auto-retry-interval-unit": "detik",
+	"auto-retry-max-attempts": "Percobaan ulang maksimum (0 = tak terbatas)",
+	"worker-max-retries": "Percobaan ulang maks per bagian worker",
+	"auto-detect-low-speed-tasks": "Deteksi otomatis tugas berkecepatan rendah",
+	"auto-detect-low-speed-tasks-tips":
+		"Jika tugas yang berjalan tetap di bawah ambang kecepatan, tunda dan mulai ulang secara otomatis.",
+	"low-speed-threshold": "Ambang kecepatan rendah",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "Keandalan HTTP / Jaringan",
+	"http-reliability-tips":
+		"Atur batas waktu koneksi dan deteksi transfer macet untuk unduhan HTTP/HTTPS/FTP.",
+	"connect-timeout": "Batas waktu koneksi",
+	"nzb-body-timeout": "Batas waktu isi NZB",
+	"lowest-speed-limit": "Batas kecepatan terendah",
+	"lowest-speed-limit-timeout": "Batas waktu macet",
+	"lowest-speed-limit-help":
+		"Jika unduhan tetap di bawah batas kecepatan terendah selama batas waktu macet, worker dihentikan dan (jika coba lagi otomatis aktif) dimulai ulang. Atur batas ke 0 untuk menonaktifkan.",
+	"uri-selector": "Pemilihan mirror",
+	"uri-selector-feedback": "Umpan balik (buang mirror yang lambat/gagal)",
+	"uri-selector-inorder": "Berurutan (coba mirror dari kiri ke kanan)",
+	"uri-selector-adaptive": "Adaptif (utamakan yang tercepat)",
+	"unit-seconds": "detik",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "Penyimpanan",
+	"storage-tips": "Cara mesin memesan ruang disk sebelum mengunduh.",
+	"file-allocation": "Alokasi berkas",
+	"file-allocation-falloc": "Alokasi di awal (falloc)",
+	"file-allocation-trunc": "Potong (hanya atur panjang)",
+	"file-allocation-none": "Tidak ada (tumbuh sesuai kebutuhan)",
+	"file-allocation-tips":
+		"Alokasi di awal memesan blok disk sungguhan sejak awal untuk menghindari ENOSPC di tengah unduhan dan mengurangi fragmentasi. Beralih ke pemotongan (truncate) pada sistem berkas yang tidak mendukungnya.",
 	"new-task-show-downloading":
 		"Tampilkan pengunduhan secara otomatis setelah menambahkan tugas",
 	"no-confirm-before-delete-task":
 		"Konfirmasi tidak diperlukan sebelum menghapus tugas",
+	"auto-file-renaming": "Ubah nama otomatis berkas duplikat",
+	"auto-file-renaming-tips":
+		'Jika berkas dengan nama yang sama sudah ada, simpan sebagai "file.1.ext" alih-alih menimpanya',
+	"use-remote-file-time":
+		"Gunakan waktu modifikasi berkas jarak jauh saat menyimpan",
+	"use-remote-file-time-tips":
+		"Atur waktu modifikasi berkas sesuai stempel waktu dari server jarak jauh",
 	continue: "Lanjutkan",
 	"task-completed-notify": "Pemberitahuan setelah pengunduhan selesai",
+	"clipboard-watch": "Pantau papan klip untuk tautan unduhan",
+	"clipboard-watch-tips":
+		"Saat Anda menyalin tautan magnet atau berkas di mana pun, risuko menawarkan untuk mengunduhnya.",
+	"clipboard-watch-ext": "Ekstensi berkas yang dipantau",
+	"clipboard-watch-ext-tips":
+		"Hanya tautan http(s) yang berakhir dengan ekstensi ini yang memicu permintaan. Tautan magnet, ed2k, dan torrent selalu memicunya. Pisahkan dengan spasi atau koma.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"risuko kini memantau papan klip Anda untuk tautan unduhan. Matikan di Pengaturan → Dasar.",
 	"prevent-sleep-while-downloading": "Cegah sistem tidur saat mengunduh",
 	"prevent-sleep-while-downloading-tips":
 		"Jaga komputer tetap aktif selama ada tugas yang sedang berjalan",
+	"shutdown-when-complete": "Matikan komputer saat semua tugas selesai",
+	"shutdown-when-complete-tips":
+		"Sekali pakai: mematikan komputer setelah antrean unduhan kosong",
+	"shutdown-countdown-title": "Mematikan dalam {{seconds}} dtk…",
+	"shutdown-countdown-cancel": "Batal",
+	"shutdown-failed": "Gagal mematikan komputer. Periksa izin.",
 	"auto-purge-record":
 		"Otomatis bersihkan catatan unduhan saat keluar dari aplikasi",
+	"purge-record-on-start": "Bersihkan catatan unduhan saat aplikasi dimulai",
 	ui: "UI",
 	appearance: "Penampilan",
 	"theme-auto": "Auto",
@@ -72,7 +280,16 @@ export default {
 	"change-language": "Ubah Bahasa",
 	"hide-app-menu": "Sembunyikan Menu Aplikasi (hanya: Windows & Linux)",
 	proxy: "Proxy",
+	"proxy-http-profile": "Proxy HTTP / FTP / Usenet",
+	"proxy-p2p-profile": "Proxy P2P",
 	"enable-proxy": "Aktifkan Proxy",
+	"enable-p2p-proxy": "Aktifkan Proxy P2P",
+	"proxy-p2p-tcp-server": "Server proxy TCP",
+	"proxy-p2p-tcp-bypass": "Pengecualian proxy TCP",
+	"proxy-p2p-udp-server": "Server proxy UDP",
+	"proxy-p2p-udp-server-placeholder":
+		"Opsional; kosongkan untuk memakai proxy P2P TCP",
+	"proxy-p2p-udp-bypass": "Pengecualian proxy UDP",
 	"proxy-bypass-input-tips":
 		"Abaikan pengaturan proxy untuk Host dan Domain ini, satu per baris",
 	"proxy-scope-label": "Digunakan untuk",
@@ -83,35 +300,72 @@ export default {
 	"proxy-scope-update-trackers": "Perbarui Pelacak",
 	"proxy-scope-update-trackers-desc": "Ambil daftar pelacak BT melalui proxy",
 	"proxy-tips": "Lihat Manual Proxy",
+	"proxy-p2p-tips":
+		"SOCKS5 atau SOCKS5H diperlukan untuk DHT, pelacak UDP, dan uTP. Proxy HTTP hanya digunakan untuk koneksi P2P TCP.",
+	"proxy-p2p-udp-tips":
+		"Kosongkan proxy UDP untuk memakai kembali rute P2P TCP. Proxy UDP memerlukan SOCKS5 atau SOCKS5H; proxy HTTP tidak dapat membawa UDP.",
+	"proxy-p2p-restart-title": "Mulai ulang unduhan P2P?",
+	"proxy-p2p-restart-confirm":
+		"Mengubah proxy P2P akan memulai ulang unduhan peer-to-peer yang aktif. Unduhan HTTP, FTP, dan Usenet tetap berjalan.",
+	doh: "DNS over HTTPS",
+	"doh-tips":
+		"Selesaikan nama host melalui endpoint DNS terenkripsi, bukan resolver sistem Anda",
+	"doh-enable": "Aktifkan DNS over HTTPS",
+	"doh-provider": "Penyedia",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "Kustom",
+	"doh-url": "URL Endpoint",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "Endpoint DoH harus diawali dengan https://",
+	"doh-bootstrap": "IP Bootstrap",
+	"doh-bootstrap-placeholder":
+		"IP untuk menjangkau endpoint, dipisahkan koma (opsional)",
+	"doh-fallback": "Beralih ke DNS sistem",
+	"doh-fallback-tips":
+		"Jika kueri DoH gagal, selesaikan melalui resolver sistem alih-alih menggagalkan unduhan",
 	"bt-tracker": "Server Pelacak",
 	"bt-tracker-input-tips": "Server pelacak, satu per baris",
 	"bt-tracker-tips": "Direkomendasikan: ",
+	"bt-max-peers-per-torrent": "Maks Peer per Torrent",
+	"bt-max-peers-per-torrent-tips":
+		"Jumlah maksimum koneksi peer bersamaan per torrent. Nilai yang lebih tinggi meningkatkan penemuan swarm (memerlukan mulai ulang mesin)",
+	"bt-max-outstanding-per-peer": "Maks Permintaan Tertunda per Peer",
+	"bt-max-outstanding-per-peer-tips":
+		"Jumlah maksimum permintaan chunk bersamaan yang di-pipeline ke setiap peer (batas atas, hingga 500). 0 memakai bawaan adaptif 6–500; anggaran permintaan seluruh torrent dibagi di antara peer yang aktif. Memerlukan mulai ulang mesin",
+	"bt-max-connections": "Maks Koneksi Peer",
+	"bt-max-connections-tips":
+		"Total koneksi peer di semua torrent, 20 hingga 5000. Menurunkannya tidak pernah memutus koneksi yang sudah terbuka, hanya menahan koneksi baru. Di Linux, macOS, dan Android, nilai efektifnya juga dibatasi setengah dari batas file descriptor sistem",
+	"bt-ban-corrupt-peers": "Blokir Peer yang Mengirim Data Rusak",
+	"bt-ban-corrupt-peers-tips":
+		"Blokir alamat IP selama sisa sesi setelah bagian yang ikut dikirimnya terus gagal pemeriksaan hash. Banyak pengguna dapat berbagi satu IP (operator seluler, jaringan bersama), sehingga pemblokiran dapat ikut memutus peer yang tidak bersalah (memerlukan mulai ulang mesin)",
+	"bt-ban-corrupt-strikes": "Bagian Gagal Sebelum Diblokir",
+	"bt-ban-corrupt-strikes-tips":
+		"Berapa kali sebuah alamat IP boleh terlibat dalam bagian yang gagal sebelum diblokir. Nilai yang lebih tinggi menoleransi kerusakan sesekali (memerlukan mulai ulang mesin)",
+	"bt-enable-upnp": "Penerusan Port UPnP / NAT-PMP",
+	"bt-enable-upnp-tips":
+		"Buka port dengar BitTorrent di router secara otomatis melalui UPnP IGD, NAT-PMP, atau PCP (memerlukan mulai ulang mesin)",
+	"bt-upnp-lease": "Durasi Sewa Pemetaan Port (detik)",
+	"bt-upnp-lease-tips":
+		"Durasi sewa untuk pemetaan port UPnP dan NAT-PMP. Sewa yang lebih singkat lebih cepat pulih dari pemetaan usang (memerlukan mulai ulang mesin)",
+	"bt-enable-lsd": "Local Service Discovery",
+	"bt-enable-lsd-tips":
+		"Temukan peer di jaringan lokal melalui multicast BEP-14 (memerlukan mulai ulang mesin)",
+	"bt-encryption-policy": "Enkripsi Protokol",
+	"bt-encryption-policy-tips":
+		"Kebijakan MSE/PE untuk koneksi peer. 'Utamakan' mencoba enkripsi lebih dahulu dan beralih ke teks biasa (memerlukan mulai ulang mesin)",
+	"bt-encryption-plaintext": "Hanya teks biasa",
+	"bt-encryption-prefer": "Utamakan enkripsi",
+	"bt-encryption-require": "Wajibkan enkripsi",
+	"bt-listen-v6": "Dengarkan di IPv6",
+	"bt-listen-v6-tips":
+		"Ikat listener TCP IPv6 tambahan pada port yang sama (memerlukan mulai ulang mesin)",
 	"sync-tracker-tips": "Sinkronkan",
 	"auto-sync-tracker": "Perbarui daftar pelacak setiap hari secara otomatis",
-	port: "Dengarkan Ports",
-	"bt-port": "Dengarkan Port BT",
-	"dht-port": "Dengarkan Port DHT",
-	security: "Keamanan",
-	rpc: "RPC",
-	"rpc-listen-port": "Port Dengar RPC",
-	"rpc-secret": "RPC Secret",
-	"rpc-secret-tips": "Lihat Petunjuk RPC Secret",
-	pbh: "PeerBanHelper",
-	"pbh-enable": "Aktifkan API PeerBanHelper",
-	"pbh-enable-tips":
-		"Membuka listener JSON-RPC yang kompatibel dengan Aria2Next agar PeerBanHelper dapat memantau dan memblokir peer BitTorrent",
-	"pbh-listen-port": "Port dengar PeerBanHelper",
-	"pbh-rpc-secret": "Token RPC PeerBanHelper",
-	"generate-pbh-rpc-secret": "Buat token baru",
-	"pbh-endpoint-hint":
-		"Di PeerBanHelper, tambahkan pengunduh Aria2Next yang mengarah ke http://127.0.0.1:{{port}}/jsonrpc",
-	"engine-overrides": "Override mesin (JSON)",
-	"engine-overrides-placeholder":
-		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
-	"engine-overrides-tips":
-		"Lanjutan: atur kunci opsi mesin apa pun sebagai objek JSON. Perubahan berlaku setelah mulai ulang.",
-	"engine-overrides-invalid":
-		"Override mesin harus berupa objek JSON yang valid.",
+	"ed2k-server": "Server eDonkey",
+	"ed2k-server-input-tips": "Server eDonkey, satu per baris (ip:port)",
+	"ed2k-server-tips": "Server bawaan akan digunakan jika kosong",
 	"ed2k-kad": "eMule Kad",
 	"ed2k-enable-kad": "Aktifkan penemuan sumber melalui Kad",
 	"ed2k-enable-kad-tips":
@@ -121,30 +375,121 @@ export default {
 		"Port UDP yang digunakan untuk penemuan melalui Kad. Nilai yang valid adalah 1-65535 (memerlukan mulai ulang mesin)",
 	"ed2k-kad-port-invalid":
 		"Port UDP Kad harus berupa bilangan bulat dari 1 hingga 65535",
+	"listen-port-invalid":
+		"Port BT harus berupa port dari 1 hingga 65535, rentang seperti 6881-6889, atau daftar dari nilai-nilai tersebut yang dipisahkan koma",
+	"dht-listen-port-invalid":
+		"Port DHT harus berupa port dari 1 hingga 65535, rentang seperti 6881-6889, atau daftar dari nilai-nilai tersebut yang dipisahkan koma",
+	"ed2k-port-invalid":
+		"Port ED2K harus berupa bilangan bulat dari 1 hingga 65535",
 	"ed2k-enable-upload": "Bagikan berkas melalui ED2K",
 	"ed2k-enable-upload-tips":
 		"Unggah berkas yang selesai dan bagian terverifikasi dari unduhan ED2K yang berjalan ke peer lain. Kad dapat tetap mencantumkan berkas yang sudah tidak Anda bagikan hingga 5 jam (memerlukan mulai ulang mesin)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"Kredensial bawaan untuk unduhan FTP, FTPS, dan SFTP",
+	"ftp-username": "Nama Pengguna FTP",
+	"ftp-password": "Kata Sandi FTP",
+	"sftp-private-key": "Jalur Kunci Privat SSH",
+	"sftp-private-key-content": "Isi Kunci Privat SSH",
+	"sftp-private-key-tips":
+		"Jalur ke berkas kunci privat PEM, mis. ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips": "Tempel isi kunci privat PEM di sini",
+	"sftp-key-passphrase": "Frasa Sandi Kunci",
+	"sftp-key-passphrase-tips":
+		"Biarkan kosong jika kunci tidak memiliki frasa sandi",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "Format Keluaran",
+	"media-settings": "Situs Media (yt-dlp)",
+	"media-settings-tips":
+		"Pengaturan bawaan untuk unduhan situs media (YouTube, Vimeo, Bilibili, dan lainnya). Memerlukan yt-dlp di PATH; ffmpeg diperlukan untuk menggabungkan aliran video dan audio yang terpisah.",
+	"media-format": "Format Pilihan",
+	"media-format-placeholder":
+		"mis. bestvideo+bestaudio/best (string format yt-dlp)",
+	"media-format-tips":
+		"Pemilih format yt-dlp. Biarkan kosong untuk kualitas terbaik. Contoh: bestvideo[height<=1080]+bestaudio/best, 137+140",
+	port: "Dengarkan Ports",
+	"bt-port": "Dengarkan Port BT",
+	"dht-port": "Dengarkan Port DHT",
+	"ed2k-port": "Port Dengar ed2k",
+	security: "Keamanan",
+	rpc: "RPC",
+	"rpc-host": "Alamat Server",
+	"rpc-host-local": "Hanya perangkat ini",
+	"rpc-host-all": "Semua antarmuka jaringan",
+	"rpc-host-custom": "Kustom ({{host}})",
+	"rpc-host-exposed-tips":
+		"Perangkat lain di jaringan Anda dapat menjangkau port RPC, serta port PeerBanHelper saat diaktifkan. Siapa pun yang mengetahui rahasia dapat menambahkan dan mengendalikan unduhan.",
+	"rpc-listen-port": "Port Dengar RPC",
+	"rpc-secret": "RPC Secret",
+	"rpc-secret-tips": "Lihat Petunjuk RPC Secret",
+	"rpc-allow-any-dir": "Izinkan klien RPC memakai jalur lokal mana pun",
+	"rpc-allow-any-dir-tips":
+		"Jika dinonaktifkan, unduhan yang ditambahkan melalui RPC hanya dapat disimpan di folder unduhan, subfoldernya, serta folder kategori dan perutean Anda, dan klien RPC tidak dapat membuat aplikasi membaca berkas Cookie, netrc, atau kunci SSH.",
+	pbh: "PeerBanHelper",
+	"pbh-enable": "Aktifkan API PeerBanHelper",
+	"pbh-enable-tips":
+		"Membuka listener JSON-RPC yang kompatibel dengan Aria2Next agar PeerBanHelper dapat memantau dan memblokir peer BitTorrent",
+	"pbh-listen-port": "Port dengar PeerBanHelper",
+	"pbh-rpc-secret": "Token RPC PeerBanHelper",
+	"generate-pbh-rpc-secret": "Buat token baru",
+	"pbh-endpoint-hint":
+		"Di PeerBanHelper, tambahkan pengunduh Aria2Next yang mengarah ke http://127.0.0.1:{{port}}/jsonrpc",
+	"randomize-port": "Pilih port acak",
+	"generate-rpc-secret": "Buat rahasia RPC baru",
+	"copy-rpc-url": "Salin URL RPC",
+	"engine-overrides": "Override mesin (JSON)",
+	"engine-overrides-placeholder":
+		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
+	"engine-overrides-tips":
+		"Lanjutan: atur kunci opsi mesin apa pun sebagai objek JSON. Perubahan berlaku setelah mulai ulang.",
+	"engine-overrides-invalid":
+		"Override mesin harus berupa objek JSON yang valid.",
 	"engine-overrides-reserved-keys":
 		"Kunci override mesin yang dicadangkan diabaikan: {{keys}}",
 	"engine-overrides-too-large":
 		"Override mesin terlalu besar: maksimal 64 kunci, 64 karakter per kunci, dan 2048 karakter per nilai.",
-	"external-engine-enable": "Gunakan mesin eksternal",
-	"external-engine-enable-tips":
-		"Saat diaktifkan, Risuko tidak akan memulai mesin bawaan secara otomatis.",
-	"external-engine-ip": "IP mesin eksternal",
-	"external-engine-port": "Port mesin eksternal",
-	"external-engine-secret": "Rahasia mesin eksternal",
 	developer: "Developer",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "Mock User-Agent",
+	cookies: "Cookie",
+	"cookies-tips":
+		"Muat cookie dari berkas cookies.txt berformat Netscape/Mozilla (juga menerima keluaran curl/wget).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "Kredensial domain tersimpan",
+	"saved-cookies-tips":
+		"Cookie dan User-Agent yang diimpor dari browser saat melewati Cloudflare atau unduhan lain yang dilindungi autentikasi. Risuko memakainya kembali untuk unduhan baru di domain yang sama hingga kedaluwarsa atau tidak lagi berfungsi.",
+	"saved-cookies-empty": "Belum ada kredensial tersimpan.",
+	"saved-cookies-host": "Domain",
+	"saved-cookies-browser": "Browser",
+	"saved-cookies-count": "Cookie",
+	"saved-cookies-imported": "Diimpor",
+	"saved-cookies-actions": "Tindakan",
+	"saved-cookies-clear": "Hapus semua",
+	"saved-cookies-confirm-clear":
+		"Hapus semua kredensial domain tersimpan? Unduhan berikutnya di situs tersebut mungkin gagal sampai Anda mengimpor ulang.",
+	"saved-cookies-delete": "Hapus",
+	netrc: "Kredensial .netrc",
+	"netrc-tips":
+		"Sisipkan autentikasi HTTP Basic dari berkas .netrc jika URL tidak memuat kredensial. Bawaan: ~/.netrc (atau %USERPROFILE%/_netrc di Windows).",
+	"netrc-path-placeholder": "Timpa jalur .netrc (opsional)",
+	"no-netrc": "Nonaktifkan pencarian .netrc",
+	"no-netrc-tips":
+		"Lewati .netrc sepenuhnya. Berguna saat berkas berisi kredensial yang bukan untuk unduhan.",
 	"app-log-path": "Lokasi Log Aplikasi",
+	"log-dir-override-placeholder":
+		"Direktori log kustom (kosongkan untuk bawaan)",
+	"log-dir-override-tips":
+		"Log saat ini ditulis ke {{path}}. Menetapkan direktori kustom (mis. di dalam Downloads) membuatnya terlihat oleh pengelola berkas mana pun. Perubahan berlaku setelah aplikasi dimulai ulang.",
 	"download-session-path": "Lokasi Session Unduhan",
+	"session-reset": "Reset sesi unduhan",
+	"session-reset-confirm": "Anda yakin ingin mereset sesi unduhan?",
 	"factory-reset": "Reset Pabrik",
 	"factory-reset-confirm": "Anda yakin ingin kembali ke pengaturan pabrik?",
 	"download-protocol": "Protocols",
 	"protocols-default-client": "Tetapkan sebagai klien untuk Protocol berikut",
 	"protocols-magnet": "Magnet [ magnet:// ]",
 	"protocols-thunder": "Thunder [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -161,9 +506,6 @@ export default {
 	"auto-update": "Pembaruan Otomatis",
 	"auto-check-update": "Secara otomatis memeriksa pembaruan",
 	"last-check-update-time": "Terakhir Kali Memeriksa Pembaruan",
-	"not-saved": "Preferensi tidak disimpan",
-	"not-saved-confirm":
-		"Preferensi yang dimodifikasi akan hilang, apakah Anda yakin untuk keluar?",
 	"completion-script": "Skrip saat selesai",
 	"completion-script-enabled": "Jalankan skrip saat unduhan selesai",
 	"completion-script-tips":
@@ -181,10 +523,38 @@ export default {
 	"completion-script-test-ok": "Uji skrip berhasil",
 	"completion-script-test-fail": "Uji skrip gagal",
 	"completion-script-empty": "Tentukan perintah terlebih dahulu",
-	"history-directories": "Direktori unduhan terbaru",
-	"favorite-directory": "Direktori favorit",
-	"unfavorite-directory": "Hapus direktori dari favorit",
-	"remove-history-directory": "Hapus direktori dari riwayat",
-	"randomize-port": "Pilih port acak",
-	"generate-rpc-secret": "Buat rahasia RPC baru",
+	"completion-script-not-approved":
+		"Skrip selesai tidak diizinkan, sehingga tidak ada yang disimpan.",
+	"not-saved": "Preferensi tidak disimpan",
+	"not-saved-confirm":
+		"Preferensi yang dimodifikasi akan hilang, apakah Anda yakin untuk keluar?",
+	"saved-credentials": "Kredensial Tersimpan",
+	"saved-credentials-description":
+		"Kelola kredensial autentikasi tersimpan untuk unduhan",
+	"no-saved-credentials": "Tidak ada kredensial tersimpan",
+	"credential-host": "Host",
+	"credential-label": "Label",
+	"credential-protocol": "Protokol",
+	"credential-last-used": "Terakhir Digunakan",
+	"credential-delete": "Hapus Kredensial",
+	"credential-delete-confirm":
+		"Anda yakin ingin menghapus kredensial tersimpan ini?",
+	"vault-enabled": "Rahasia disimpan di keychain OS",
+	"vault-disabled":
+		"Keychain OS tidak tersedia — rahasia disimpan sebagai teks biasa",
+	"credential-encrypted-badge": "Disimpan di keychain OS",
+	"credential-vault-unavailable":
+		"Keychain OS tidak dapat dijangkau; kredensial baru akan disimpan sebagai teks biasa",
+	"speed-limit-enabled": "Aktifkan batas kecepatan",
+	"speed-limit-enabled-description":
+		"Terapkan batas di bawah. Jika nonaktif, unduhan berjalan dengan kecepatan penuh; nilainya tetap disimpan.",
+	"appearance-theme": "Tema",
+	"appearance-typography": "Tipografi",
+	"appearance-window": "Jendela",
+	"task-list-style": "Daftar tugas",
+	"task-list-style-description": "Cara unduhan ditampilkan di daftar tugas.",
+	"task-list-style-compact": "Ringkas",
+	"task-list-style-card": "Kartu",
+	"sidebar-collapsed": "Ciutkan bilah samping",
+	"sidebar-collapsed-description": "Tampilkan ikon saja di bilah samping.",
 };

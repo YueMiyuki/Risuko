@@ -169,6 +169,13 @@ const showTaskDetail = (payload: { gid?: string } = {}) => {
 	}
 };
 
+const clearFinishedTasks = () => {
+	getTaskStore()
+		.purgeTaskRecord()
+		.then(() => toast.success(i18n.t("task.purge-record-success")))
+		.catch(() => toast.error(i18n.t("task.purge-record-fail")));
+};
+
 const fetchPreference = () => {
 	getPreferenceStore().fetchPreference();
 };
@@ -183,6 +190,7 @@ commands.register("application:about", showAboutPanel);
 
 commands.register("application:new-task", addTask);
 commands.register("application:new-bt-task", showAddBtTask);
+commands.register("application:open-file", showAddBtTask);
 commands.register("application:new-bt-task-with-file", showAddBtTaskWithFile);
 commands.register("application:create-torrent", () =>
 	getAppStore().showCreateTorrentDialog(),
@@ -194,6 +202,7 @@ commands.register("application:pause-all-task", pauseAllTask);
 commands.register("application:resume-all-task", resumeAllTask);
 commands.register("application:select-all-task", selectAllTask);
 commands.register("application:show-task-detail", showTaskDetail);
+commands.register("application:clear-recent-tasks", clearFinishedTasks);
 
 commands.register("application:update-preference-config", fetchPreference);
 commands.register("application:check-for-updates", checkForUpdatesNow);

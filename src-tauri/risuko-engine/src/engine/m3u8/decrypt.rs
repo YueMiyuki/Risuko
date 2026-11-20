@@ -69,11 +69,12 @@ mod tests {
     use super::*;
 
     async fn serve_body(len: usize) -> String {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.read(&mut [0u8; 4096]).await;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
                 );

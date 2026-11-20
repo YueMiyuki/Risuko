@@ -32,11 +32,7 @@ fn with_desktop_plugins<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri:
                 let _ = window.show();
                 let _ = window.set_focus();
 
-                if let Some(path) = args
-                    .iter()
-                    .skip(1)
-                    .find(|arg| !arg.starts_with('-') && std::path::Path::new(arg).exists())
-                {
+                if let Some(path) = commands::app_cmds::file_argument(&args) {
                     tracing::info!("Single instance received file: {}", path);
                     let _ = window.emit("open-file", path);
                 }
@@ -235,7 +231,6 @@ pub fn run(context: tauri::Context) {
 
     let app = with_updater_plugins(with_desktop_plugins(
         tauri::Builder::default()
-            .plugin(tauri_plugin_store::Builder::default().build())
             .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_shell::init()),
     ))
@@ -316,21 +311,13 @@ pub fn run(context: tauri::Context) {
             let _ = window.set_decorations(false);
         }
 
-        let opened_at_login = std::env::args_os().any(|arg| arg == "--opened-at-login=1");
-        if opened_at_login {
+        if commands::app_cmds::is_opened_at_login() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
             }
         }
 
         let config_guard = app.state::<state::AppState>();
-        let should_start = {
-            let config = config_guard
-                .config
-                .lock()
-                .map_err(|_| "Configuration lock poisoned")?;
-            risuko_engine::engine::should_start_embedded_engine(&config)
-        };
 
         let event_sink_clone = event_sink.clone();
         let upload_mgr = app.state::<state::AppState>().upload_sinks.clone();
@@ -357,7 +344,7 @@ pub fn run(context: tauri::Context) {
             });
         }
 
-        if should_start {
+        {
             let config_ref = config_guard
                 .config
                 .lock()
@@ -491,6 +478,7 @@ pub fn run(context: tauri::Context) {
         commands::app_cmds::reset_session,
         commands::app_cmds::toggle_app_menu,
         commands::app_cmds::is_opened_at_login,
+        commands::app_cmds::take_startup_file,
         commands::app_cmds::set_android_system_bars,
         commands::app_cmds::ensure_android_storage_access,
         commands::app_cmds::update_android_download_notification,
@@ -506,6 +494,7 @@ pub fn run(context: tauri::Context) {
         commands::file_cmds::resolve_torrent_path,
         commands::file_cmds::cleanup_generated_torrent_sidecars_for_task,
         commands::engine_cmds::restart_engine,
+        commands::engine_cmds::stop_engine_for_update,
         commands::health_cmds::run_health_checks,
         commands::health_cmds::list_log_files,
         commands::health_cmds::read_log_file,
@@ -530,6 +519,7 @@ pub fn run(context: tauri::Context) {
         commands::engine_cmds::tell_scheduled,
         commands::engine_cmds::pause_task,
         commands::engine_cmds::unpause_task,
+        commands::engine_cmds::restart_task,
         commands::engine_cmds::remove_task,
         commands::engine_cmds::change_option,
         commands::engine_cmds::update_task,
@@ -550,7 +540,6 @@ pub fn run(context: tauri::Context) {
         commands::engine_cmds::multicall_engine,
         commands::cookie_cmds::list_browsers_cmd,
         commands::cookie_cmds::import_browser_cookies,
-        commands::cookie_cmds::import_browser_cookies_elevated,
         commands::cookie_cmds::list_cookie_entries,
         commands::cookie_cmds::delete_cookie_entry,
         commands::cookie_cmds::clear_cookie_entries,
@@ -562,6 +551,7 @@ pub fn run(context: tauri::Context) {
         commands::event_cmds::on_task_download_complete,
         commands::completion_script_cmds::run_completion_script,
         commands::completion_script_cmds::test_completion_script,
+        commands::completion_script_cmds::approve_completion_script,
         commands::event_cmds::update_tray,
         commands::event_cmds::update_tray_menu_labels,
         commands::event_cmds::update_app_menu_labels,
@@ -599,7 +589,6 @@ pub fn run(context: tauri::Context) {
         commands::upload_cmds::clear_upload_history,
         commands::vault_cmds::vault_status,
         commands::vault_cmds::vault_put_credential,
-        commands::vault_cmds::vault_get_credential,
         commands::vault_cmds::vault_remove_credential,
         commands::usenet_cmds::usenet_save_credentials,
         commands::usenet_cmds::usenet_remove_credentials,

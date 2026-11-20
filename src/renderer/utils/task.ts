@@ -10,7 +10,9 @@ import {
 	buildHeadersFromCurl,
 	buildUrisFromCurl,
 } from "@shared/utils/curl";
+import logger from "@shared/utils/logger";
 import { buildOuts } from "@shared/utils/rename";
+import { invoke } from "@tauri-apps/api/core";
 import { isEmpty } from "lodash";
 import { decodeThunderLink } from "@/utils/thunder";
 
@@ -109,6 +111,63 @@ const buildHeader = (form: TaskForm) => {
 	return result;
 };
 
+export interface CompletionScriptPair {
+	command: string;
+	args: string;
+}
+
+export const taskCompletionScript = (
+	form: TaskForm,
+): CompletionScriptPair | null => {
+	if (!form.completionScriptOverride) {
+		return null;
+	}
+	const command = `${form.completionScriptCommand || ""}`.trim();
+	if (isEmpty(command)) {
+		return null;
+	}
+	return { command, args: form.completionScriptArgs || "" };
+};
+
+const COMPLETION_SCRIPT_SETTINGS = [
+	"completionScriptEnabled",
+	"completionScriptCommand",
+	"completionScriptArgs",
+	"completionScriptTimeoutMs",
+];
+
+export const pendingCompletionScript = (
+	changes: Record<string, unknown>,
+	saved: Partial<AppConfig>,
+): CompletionScriptPair | null => {
+	if (!COMPLETION_SCRIPT_SETTINGS.some((key) => Object.hasOwn(changes, key))) {
+		return null;
+	}
+	const pending = { ...saved, ...changes };
+	const command = `${pending.completionScriptCommand || ""}`.trim();
+	if (pending.completionScriptEnabled !== true || isEmpty(command)) {
+		return null;
+	}
+	const { completionScriptArgs: args } = pending;
+	return { command, args: typeof args === "string" ? args : "" };
+};
+
+export const approveCompletionScript = async ({
+	command,
+	args,
+}: CompletionScriptPair): Promise<boolean> => {
+	try {
+		const allowed = await invoke<boolean>("approve_completion_script", {
+			command,
+			args,
+		});
+		return allowed === true;
+	} catch (err) {
+		logger.warn("[Risuko] completion script approval failed:", err);
+		return false;
+	}
+};
+
 export const buildOption = (type: string, form: TaskForm) => {
 	const { allProxy, dir, out, referer, selectFile, split, userAgent } = form;
 	const result: Record<string, unknown> = {};
@@ -177,10 +236,10 @@ export const buildOption = (type: string, form: TaskForm) => {
 	}
 
 	if (form.completionScriptOverride) {
-		const command = `${form.completionScriptCommand || ""}`.trim();
-		if (!isEmpty(command)) {
-			result["risuko-completion-script-command"] = command;
-			result["risuko-completion-script-args"] = form.completionScriptArgs || "";
+		const script = taskCompletionScript(form);
+		if (script) {
+			result["risuko-completion-script-command"] = script.command;
+			result["risuko-completion-script-args"] = script.args;
 			result["risuko-completion-script-timeout-ms"] =
 				Number(form.completionScriptTimeoutMs) || 30000;
 		} else {

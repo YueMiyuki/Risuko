@@ -78,26 +78,16 @@ impl EngineOptions {
         if let Some(proxy) = user.get("proxy") {
             let normalized = crate::config::normalize_proxy_config(proxy);
             let http_profile_is_explicit = crate::config::proxy_http_profile_is_explicit(proxy);
-            let http = normalized.get("http").and_then(Value::as_object);
-            let http_enabled = http
-                .and_then(|p| p.get("enable"))
-                .is_some_and(value_as_bool);
-            let http_server = http
-                .and_then(|p| p.get("server"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
-            let http_active = http_enabled && !http_server.is_empty();
-            let download = http
-                .and_then(|p| p.get("scope"))
-                .and_then(Value::as_array)
-                .is_some_and(|scopes| scopes.iter().any(|v| v.as_str() == Some("download")));
+            let profiles = crate::config::proxy_profiles(&normalized);
+            let http = profiles.http.unwrap_or_default();
+            let http_active = http.enabled && !http.server.is_empty();
+            let download = http.scope.iter().any(|scope| scope == "download");
 
-            if http_enabled || http_profile_is_explicit {
+            if http.enabled || http_profile_is_explicit {
                 global.insert(
                     "all-proxy".into(),
                     Value::String(if http_active && download {
-                        http_server.to_string()
+                        http.server
                     } else {
                         String::new()
                     }),
@@ -105,10 +95,7 @@ impl EngineOptions {
                 global.insert(
                     "no-proxy".into(),
                     Value::String(if http_active && download {
-                        http.and_then(|p| p.get("bypass"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string()
+                        http.bypass
                     } else {
                         String::new()
                     }),
@@ -116,18 +103,12 @@ impl EngineOptions {
             }
 
             if crate::config::proxy_p2p_profile_is_explicit(proxy) {
-                let p2p = normalized.get("p2p").and_then(Value::as_object);
-                let p2p_enabled = p2p.and_then(|p| p.get("enable")).is_some_and(value_as_bool);
-                let p2p_server = p2p
-                    .and_then(|p| p.get("server"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .unwrap_or("");
-                let p2p_tcp_active = p2p_enabled && !p2p_server.is_empty();
+                let p2p = profiles.p2p.unwrap_or_default();
+                let p2p_tcp_active = p2p.enabled && !p2p.server.is_empty();
                 global.insert(
                     "p2p-proxy".into(),
                     Value::String(if p2p_tcp_active {
-                        p2p_server.to_string()
+                        p2p.server.clone()
                     } else {
                         String::new()
                     }),
@@ -135,40 +116,17 @@ impl EngineOptions {
                 global.insert(
                     "p2p-no-proxy".into(),
                     Value::String(if p2p_tcp_active {
-                        p2p.and_then(|p| p.get("bypass"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string()
+                        p2p.bypass.clone()
                     } else {
                         String::new()
                     }),
                 );
 
-                let udp = p2p.and_then(|p| p.get("udp")).and_then(Value::as_object);
-                let udp_server_override = udp
-                    .and_then(|profile| profile.get("server"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .unwrap_or("");
-                let udp_server = if udp_server_override.is_empty() {
-                    p2p_server
-                } else {
-                    udp_server_override
-                };
-                let udp_bypass = if udp_server_override.is_empty() {
-                    p2p.and_then(|p| p.get("bypass"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                } else {
-                    udp.and_then(|profile| profile.get("bypass"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                };
-                let p2p_route_active = p2p_enabled && !udp_server.is_empty();
+                let p2p_route_active = p2p.enabled && !p2p.udp_server().is_empty();
                 global.insert(
                     "p2p-udp-proxy".into(),
                     Value::String(if p2p_route_active {
-                        udp_server.to_string()
+                        p2p.udp_server().to_string()
                     } else {
                         String::new()
                     }),
@@ -176,7 +134,7 @@ impl EngineOptions {
                 global.insert(
                     "p2p-udp-no-proxy".into(),
                     Value::String(if p2p_route_active {
-                        udp_bypass.to_string()
+                        p2p.udp_bypass().to_string()
                     } else {
                         String::new()
                     }),
@@ -220,7 +178,7 @@ impl EngineOptions {
     }
 
     pub fn max_concurrent_downloads(&self) -> usize {
-        self.get_u64("max-concurrent-downloads").unwrap_or(5) as usize
+        self.get_u64("max-concurrent-downloads").unwrap_or(5).max(1) as usize
     }
 
     pub fn max_overall_download_limit(&self) -> u64 {
@@ -533,18 +491,13 @@ impl EngineOptions {
                 }
                 Some(value @ Value::Object(_)) => {
                     let normalized = crate::config::normalize_proxy_config(value);
-                    if let Some(http) = normalized.get("http").and_then(Value::as_object) {
-                        let http_server = http
-                            .get("server")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .unwrap_or("");
-                        let http_active = value_as_bool(http.get("enable").unwrap_or(&Value::Null))
-                            && !http_server.is_empty();
+                    let profiles = crate::config::proxy_profiles(&normalized);
+                    if let Some(http) = profiles.http {
+                        let http_active = http.enabled && !http.server.is_empty();
                         merged.insert(
                             "all-proxy".into(),
                             Value::String(if http_active {
-                                http_server.to_string()
+                                http.server
                             } else {
                                 String::new()
                             }),
@@ -552,27 +505,18 @@ impl EngineOptions {
                         merged.insert(
                             "no-proxy".into(),
                             Value::String(if http_active {
-                                http.get("bypass")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string()
+                                http.bypass
                             } else {
                                 String::new()
                             }),
                         );
                     }
-                    if let Some(p2p) = normalized.get("p2p").and_then(Value::as_object) {
-                        let p2p_server = p2p
-                            .get("server")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .unwrap_or("");
-                        let p2p_enabled = value_as_bool(p2p.get("enable").unwrap_or(&Value::Null));
-                        let p2p_tcp_active = p2p_enabled && !p2p_server.is_empty();
+                    if let Some(p2p) = profiles.p2p {
+                        let p2p_tcp_active = p2p.enabled && !p2p.server.is_empty();
                         merged.insert(
                             "p2p-proxy".into(),
                             Value::String(if p2p_tcp_active {
-                                p2p_server.to_string()
+                                p2p.server.clone()
                             } else {
                                 String::new()
                             }),
@@ -580,38 +524,17 @@ impl EngineOptions {
                         merged.insert(
                             "p2p-no-proxy".into(),
                             Value::String(if p2p_tcp_active {
-                                p2p.get("bypass")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string()
+                                p2p.bypass.clone()
                             } else {
                                 String::new()
                             }),
                         );
 
-                        let udp = p2p.get("udp").and_then(Value::as_object);
-                        let udp_override = udp
-                            .and_then(|profile| profile.get("server"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .unwrap_or("");
-                        let udp_server = if udp_override.is_empty() {
-                            p2p_server
-                        } else {
-                            udp_override
-                        };
-                        let udp_bypass = if udp_override.is_empty() {
-                            p2p.get("bypass").and_then(Value::as_str).unwrap_or("")
-                        } else {
-                            udp.and_then(|profile| profile.get("bypass"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                        };
-                        let p2p_route_active = p2p_enabled && !udp_server.is_empty();
+                        let p2p_route_active = p2p.enabled && !p2p.udp_server().is_empty();
                         merged.insert(
                             "p2p-udp-proxy".into(),
                             Value::String(if p2p_route_active {
-                                udp_server.to_string()
+                                p2p.udp_server().to_string()
                             } else {
                                 String::new()
                             }),
@@ -619,7 +542,7 @@ impl EngineOptions {
                         merged.insert(
                             "p2p-udp-no-proxy".into(),
                             Value::String(if p2p_route_active {
-                                udp_bypass.to_string()
+                                p2p.udp_bypass().to_string()
                             } else {
                                 String::new()
                             }),
@@ -707,10 +630,6 @@ fn parse_port(value: &Value, key: &str) -> Result<u16, String> {
     }
 
     Ok(parsed as u16)
-}
-
-fn value_as_bool(value: &Value) -> bool {
-    json_bool(value).unwrap_or(false)
 }
 
 pub(crate) fn build_p2p_proxy_connector(
@@ -936,6 +855,21 @@ mod tests {
         assert_eq!(opts.pbh_listen_port_checked().unwrap(), 16801);
         assert_eq!(opts.pbh_listen_port(), 16801);
         assert!(opts.pbh_rpc_config(16800).unwrap().is_none());
+    }
+
+    #[test]
+    fn max_concurrent_downloads_is_at_least_one() {
+        let limit = |value: Option<Value>| {
+            let mut opts = EngineOptions::from_config(&Map::new(), &Map::new());
+            if let Some(value) = value {
+                opts.set("max-concurrent-downloads".into(), value);
+            }
+            opts.max_concurrent_downloads()
+        };
+        assert_eq!(limit(Some(json!(0))), 1);
+        assert_eq!(limit(Some(json!("0"))), 1);
+        assert_eq!(limit(Some(json!(3))), 3);
+        assert_eq!(limit(None), 5);
     }
 
     #[test]
@@ -1285,6 +1219,359 @@ mod tests {
         assert_eq!(merged.get("p2p-no-proxy"), Some(&json!("")));
     }
 
+    const PROXY_KEYS: [&str; 6] = [
+        "all-proxy",
+        "no-proxy",
+        "p2p-proxy",
+        "p2p-no-proxy",
+        "p2p-udp-proxy",
+        "p2p-udp-no-proxy",
+    ];
+
+    type ProxyRow = (&'static str, [Option<&'static str>; 6]);
+
+    fn proxy_table_cases() -> Vec<(&'static str, Value)> {
+        let http_a = json!({
+            "enable": true,
+            "server": "http://proxy.example:8080",
+            "scope": ["download"],
+            "bypass": "localhost, 10.0.0.0/8"
+        });
+        let p2p_g = json!({
+            "enable": true,
+            "server": "socks5://tcp.example:1080",
+            "bypass": "tcp.example",
+            "udp": {
+                "server": "socks5h://udp.example:1080",
+                "bypass": "udp.example"
+            }
+        });
+        vec![
+            ("a", json!({ "http": http_a })),
+            (
+                "b",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "http://proxy.example:8080",
+                    "scope": ["update-app", "update-trackers"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "c",
+                json!({ "http": {
+                    "enable": false,
+                    "server": "http://proxy.example:8080",
+                    "scope": ["download"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "d",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "   ",
+                    "scope": ["download"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "e",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "http://proxy.example:8080",
+                    "scope": [" download "],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "f",
+                json!({ "p2p": {
+                    "enable": true,
+                    "server": " socks5://tcp.example:1080 ",
+                    "bypass": "tcp.example"
+                } }),
+            ),
+            ("g", json!({ "p2p": p2p_g })),
+            (
+                "h",
+                json!({ "p2p": {
+                    "enable": true,
+                    "server": "",
+                    "bypass": "tcp.example",
+                    "udp": {
+                        "server": "socks5h://udp.example:1080",
+                        "bypass": "udp.example"
+                    }
+                } }),
+            ),
+            (
+                "i",
+                json!({ "p2p": {
+                    "enable": false,
+                    "server": "socks5://tcp.example:1080",
+                    "bypass": "tcp.example",
+                    "udp": {
+                        "server": "socks5h://udp.example:1080",
+                        "bypass": "udp.example"
+                    }
+                } }),
+            ),
+            (
+                "j",
+                json!({
+                    "http": {
+                        "enable": true,
+                        "server": "http://proxy.example:8080",
+                        "scope": ["download"],
+                        "bypass": "a.example\na.example, b.example"
+                    },
+                    "p2p": {
+                        "enable": true,
+                        "server": "socks5://tcp.example:1080",
+                        "bypass": "a.example\na.example, b.example",
+                        "udp": {
+                            "server": "socks5h://udp.example:1080",
+                            "bypass": "a.example\na.example, b.example"
+                        }
+                    }
+                }),
+            ),
+            ("k", json!({ "http": http_a, "p2p": p2p_g })),
+        ]
+    }
+
+    fn assert_proxy_table(expected: &[ProxyRow], produce: impl Fn(&Value) -> Map<String, Value>) {
+        let actual = proxy_table_cases()
+            .iter()
+            .map(|(case, proxy)| {
+                let map = produce(proxy);
+                let keys = PROXY_KEYS
+                    .iter()
+                    .map(|key| {
+                        map.get(*key)
+                            .map(|value| value.as_str().unwrap().to_string())
+                    })
+                    .collect::<Vec<_>>();
+                (*case, keys)
+            })
+            .collect::<Vec<_>>();
+        let expected = expected
+            .iter()
+            .map(|(case, keys)| (*case, keys.map(|key| key.map(str::to_string)).to_vec()))
+            .collect::<Vec<_>>();
+        let rows = actual
+            .iter()
+            .map(|row| format!("{row:?},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, expected, "\n{rows}");
+    }
+
+    #[test]
+    fn from_config_proxy_keys_table() {
+        let expected: [ProxyRow; 11] = [
+            (
+                "a",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+            ("b", [Some(""), Some(""), None, None, None, None]),
+            ("c", [Some(""), Some(""), None, None, None, None]),
+            ("d", [Some(""), Some(""), None, None, None, None]),
+            (
+                "e",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+            (
+                "f",
+                [
+                    None,
+                    None,
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                ],
+            ),
+            (
+                "g",
+                [
+                    None,
+                    None,
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            (
+                "h",
+                [
+                    None,
+                    None,
+                    Some(""),
+                    Some(""),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            ("i", [None, None, Some(""), Some(""), Some(""), Some("")]),
+            (
+                "j",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("a.example,b.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("a.example,b.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("a.example,b.example"),
+                ],
+            ),
+            (
+                "k",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+        ];
+        assert_proxy_table(&expected, |proxy| {
+            let mut user = Map::new();
+            user.insert("proxy".into(), proxy.clone());
+            EngineOptions::from_config(&Map::new(), &user).global
+        });
+    }
+
+    #[test]
+    fn merge_task_options_proxy_keys_table() {
+        let expected: [ProxyRow; 11] = [
+            (
+                "a",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                ],
+            ),
+            (
+                "b",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                ],
+            ),
+            (
+                "c",
+                [Some(""), Some(""), Some(""), Some(""), Some(""), Some("")],
+            ),
+            (
+                "d",
+                [Some(""), Some(""), Some(""), Some(""), Some(""), Some("")],
+            ),
+            (
+                "e",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                ],
+            ),
+            (
+                "f",
+                [
+                    Some(""),
+                    Some(""),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                ],
+            ),
+            (
+                "g",
+                [
+                    Some(""),
+                    Some(""),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            (
+                "h",
+                [
+                    Some(""),
+                    Some(""),
+                    Some(""),
+                    Some(""),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            (
+                "i",
+                [Some(""), Some(""), Some(""), Some(""), Some(""), Some("")],
+            ),
+            (
+                "j",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("a.example,b.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("a.example,b.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("a.example,b.example"),
+                ],
+            ),
+            (
+                "k",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+        ];
+        let opts = EngineOptions::from_config(&Map::new(), &Map::new());
+        assert_proxy_table(&expected, |proxy| {
+            let mut task = Map::new();
+            task.insert("proxy".into(), proxy.clone());
+            opts.merge_task_options(&task)
+        });
+    }
+
     #[test]
     fn get_bool_accepts_native_strings_and_numbers() {
         let mut sys = Map::new();
@@ -1323,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn json_bool_matches_value_as_bool() {
+    fn json_bool_accepts_legacy_values() {
         for v in [
             json!(" TRUE "),
             json!("On"),
@@ -1332,15 +1619,12 @@ mod tests {
             json!(2),
         ] {
             assert_eq!(json_bool(&v), Some(true), "{v}");
-            assert!(value_as_bool(&v), "{v}");
         }
         for v in [json!(" False"), json!("OFF"), json!("no"), json!(0)] {
             assert_eq!(json_bool(&v), Some(false), "{v}");
-            assert!(!value_as_bool(&v), "{v}");
         }
         for v in [json!("maybe"), json!(1.5), json!(null), json!([true])] {
             assert_eq!(json_bool(&v), None, "{v}");
-            assert!(!value_as_bool(&v), "{v}");
         }
     }
 

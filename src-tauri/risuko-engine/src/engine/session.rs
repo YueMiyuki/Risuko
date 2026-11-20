@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::task::{DownloadTask, TaskStatus};
@@ -14,9 +15,15 @@ pub struct SessionData {
     pub tasks: Vec<DownloadTask>,
 }
 
+#[derive(Deserialize)]
+struct RawSessionData {
+    tasks: Vec<serde_json::Value>,
+}
+
 pub struct SessionManager {
     path: PathBuf,
     last_hash: Mutex<Option<u64>>,
+    blocked: AtomicBool,
 }
 
 impl SessionManager {
@@ -25,39 +32,87 @@ impl SessionManager {
         Self {
             path,
             last_hash: Mutex::new(None),
+            blocked: AtomicBool::new(false),
         }
     }
 
     pub fn load(&self) -> Vec<DownloadTask> {
         let data = match fs::read_to_string(&self.path) {
             Ok(d) => d,
-            Err(_) => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::warn!("Failed to read engine session: {e}");
+                self.set_aside();
+                return Vec::new();
+            }
         };
 
-        match serde_json::from_str::<SessionData>(&data) {
-            Ok(session) => session
-                .tasks
-                .into_iter()
-                .filter(|t| !matches!(t.status, TaskStatus::Removed))
-                .map(|mut t| {
-                    if t.status == TaskStatus::Active {
-                        t.status = TaskStatus::Paused;
-                    }
-                    t.download_speed = 0;
-                    t.upload_speed = 0;
-                    t.connections = 0;
-                    if t.seeder && t.seeding_since > 0 {
-                        t.seeding_since = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                    }
-                    t
-                })
-                .collect(),
+        let entries = match serde_json::from_str::<RawSessionData>(&data) {
+            Ok(session) => session.tasks,
             Err(e) => {
-                tracing::warn!("Failed to parse engine session: {}", e);
-                Vec::new()
+                tracing::warn!("Failed to parse engine session: {e}");
+                self.keep_backup();
+                return Vec::new();
+            }
+        };
+
+        let total = entries.len();
+        let tasks: Vec<DownloadTask> = entries
+            .into_iter()
+            .filter_map(|entry| match serde_json::from_value(entry) {
+                Ok(task) => Some(task),
+                Err(e) => {
+                    tracing::warn!("Skipping unreadable session task: {e}");
+                    None
+                }
+            })
+            .collect();
+        if tasks.len() != total {
+            self.keep_backup();
+        }
+
+        tasks
+            .into_iter()
+            .filter(|t| !matches!(t.status, TaskStatus::Removed))
+            .map(|mut t| {
+                if t.status == TaskStatus::Active {
+                    t.status = TaskStatus::Paused;
+                }
+                t.download_speed = 0;
+                t.upload_speed = 0;
+                t.connections = 0;
+                if t.seeder && t.seeding_since > 0 {
+                    t.seeding_since = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                }
+                t
+            })
+            .collect()
+    }
+
+    fn keep_backup(&self) {
+        let mut backup = self.path.clone().into_os_string();
+        backup.push(".bak");
+        if let Err(e) = fs::copy(&self.path, &backup) {
+            tracing::warn!("Failed to back up engine session: {e}");
+        }
+    }
+
+    fn set_aside(&self) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut aside = self.path.clone().into_os_string();
+        aside.push(format!(".unreadable-{secs}"));
+        let aside = PathBuf::from(aside);
+        match fs::rename(&self.path, &aside) {
+            Ok(()) => tracing::warn!("Moved unreadable engine session to {}", aside.display()),
+            Err(e) => {
+                tracing::warn!("Failed to move unreadable engine session aside: {e}");
+                self.blocked.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -86,6 +141,12 @@ impl SessionManager {
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), String> {
+        if self.blocked.load(Ordering::Relaxed) {
+            return Err(
+                "engine session was unreadable at startup and could not be moved aside; not overwriting it"
+                    .to_string(),
+            );
+        }
         let new_hash = {
             let mut hasher = DefaultHasher::new();
             data.hash(&mut hasher);
@@ -190,6 +251,74 @@ mod tests {
 
         let mgr = SessionManager::new(dir.path());
         assert!(mgr.load().is_empty());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("engine-session.json.bak")).unwrap(),
+            "not valid json {{{"
+        );
+    }
+
+    #[test]
+    fn load_keeps_readable_tasks_next_to_an_unreadable_one() {
+        let dir = TempDir::new().unwrap();
+        let mgr = SessionManager::new(dir.path());
+        mgr.save(&[
+            make_http_task("first", TaskStatus::Paused),
+            make_http_task("second", TaskStatus::Waiting),
+        ])
+        .unwrap();
+
+        let path = dir.path().join(SESSION_FILENAME);
+        let mut session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        session["tasks"][0]["status"] = serde_json::json!("from-a-newer-build");
+        fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
+
+        let loaded = mgr.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].gid, "second");
+        assert!(dir.path().join("engine-session.json.bak").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_session_is_moved_aside_not_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(SESSION_FILENAME);
+        SessionManager::new(dir.path())
+            .save(&[make_http_task("first", TaskStatus::Paused)])
+            .unwrap();
+        let original_len = fs::metadata(&path).unwrap().len();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            return;
+        }
+
+        let mgr = SessionManager::new(dir.path());
+        assert!(mgr.load().is_empty());
+
+        let set_aside = |dir: &Path| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("engine-session.json.unreadable-")
+                })
+                .map(|e| e.path())
+                .collect()
+        };
+        let moved = set_aside(dir.path());
+        assert_eq!(moved.len(), 1);
+        assert_eq!(fs::metadata(&moved[0]).unwrap().len(), original_len);
+        assert!(!path.exists());
+
+        mgr.save(&[make_http_task("second", TaskStatus::Waiting)])
+            .unwrap();
+        assert!(path.exists());
+        assert_eq!(set_aside(dir.path()), moved);
     }
 
     #[test]

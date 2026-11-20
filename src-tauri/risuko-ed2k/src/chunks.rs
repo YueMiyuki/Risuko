@@ -102,6 +102,7 @@ pub struct ChunkManager {
     file: Option<Arc<std::fs::File>>,
     part_sources: Vec<Vec<u64>>,
     strikes: HashMap<u64, u32>,
+    retest_owner: HashMap<usize, Option<u64>>,
     in_flight: Arc<parking_lot::Mutex<Vec<(u64, u64)>>>,
     met_path: Option<PathBuf>,
     met_dirty: bool,
@@ -197,6 +198,7 @@ impl ChunkManager {
             file: None,
             part_sources: vec![Vec::new(); count as usize],
             strikes: HashMap::new(),
+            retest_owner: HashMap::new(),
             in_flight: Arc::new(parking_lot::Mutex::new(Vec::new())),
             met_path: None,
             met_dirty: false,
@@ -334,6 +336,12 @@ impl ChunkManager {
             .any(|i| self.chunk_status[i] == ChunkStatus::Missing && Self::peer_has(peer_parts, i))
     }
 
+    pub fn awaits_verification(&self, peer_parts: &[bool]) -> bool {
+        (0..self.chunk_count as usize).any(|i| {
+            self.chunk_status[i] == ChunkStatus::Verifying && Self::peer_has(peer_parts, i)
+        })
+    }
+
     fn block_done(&self, idx: usize) -> bool {
         let b = self.blocks[idx];
         covers(&self.covered[b.part], b.start, b.end)
@@ -364,12 +372,14 @@ impl ChunkManager {
                 if self.chunk_status[part] != ChunkStatus::Missing
                     || !Self::peer_has(peer_parts, part)
                     || self.part_started(part) != (pass == 0)
+                    || self.owned_by_another(part, peer)
                 {
                     continue;
                 }
                 for i in self.first_block[part]..self.first_block[part + 1] {
                     if self.req_count[i] == 0 && !self.block_done(i) {
                         picked.push(i);
+                        self.claim_retest(part, peer);
                         if picked.len() >= max {
                             break 'fresh;
                         }
@@ -381,6 +391,7 @@ impl ChunkManager {
             'endgame: for part in 0..parts {
                 if self.chunk_status[part] != ChunkStatus::Missing
                     || !Self::peer_has(peer_parts, part)
+                    || self.retest_owner.contains_key(&part)
                 {
                     continue;
                 }
@@ -414,6 +425,43 @@ impl ChunkManager {
             for i in held {
                 self.req_count[i] = self.req_count[i].saturating_sub(1);
             }
+        }
+        let abandoned: Vec<usize> = self
+            .retest_owner
+            .iter()
+            .filter(|(_, owner)| **owner == Some(peer))
+            .map(|(part, _)| *part)
+            .collect();
+        for part in abandoned {
+            self.retest_owner.insert(part, None);
+            if self.chunk_status[part] == ChunkStatus::Missing {
+                self.part_sources[part].clear();
+                self.reset_part(part);
+            }
+        }
+    }
+
+    fn owned_by_another(&self, part: usize, peer: u64) -> bool {
+        matches!(self.retest_owner.get(&part), Some(Some(owner)) if *owner != peer)
+    }
+
+    fn claim_retest(&mut self, part: usize, peer: u64) {
+        if let Some(owner) = self.retest_owner.get_mut(&part) {
+            *owner = Some(peer);
+        }
+    }
+
+    fn reset_part(&mut self, part: usize) {
+        self.completed_length = self.completed_length.saturating_sub(self.part_bytes[part]);
+        self.part_bytes[part] = 0;
+        self.covered[part].clear();
+        self.chunk_status[part] = ChunkStatus::Missing;
+        let (lo, hi) = (self.first_block[part], self.first_block[part + 1]);
+        for held in self.peer_blocks.values_mut() {
+            held.retain(|&i| !(lo..hi).contains(&i));
+        }
+        for c in &mut self.req_count[lo..hi] {
+            *c = 0;
         }
     }
 
@@ -536,6 +584,12 @@ impl ChunkManager {
         jobs
     }
 
+    pub fn requeue_verify(&mut self, part: usize) {
+        if let Some(hashing) = self.hashing.get_mut(part) {
+            *hashing = false;
+        }
+    }
+
     pub fn finish_verify(&mut self, part: usize, ok: bool) {
         if part >= self.chunk_status.len() {
             return;
@@ -543,6 +597,7 @@ impl ChunkManager {
         self.hashing[part] = false;
         let sources = std::mem::take(&mut self.part_sources[part]);
         if ok {
+            self.retest_owner.remove(&part);
             self.chunk_status[part] = ChunkStatus::Downloaded;
             self.met_dirty = true;
             if let Some(map) = &self.part_map {
@@ -553,17 +608,8 @@ impl ChunkManager {
         if let [peer] = sources.as_slice() {
             *self.strikes.entry(*peer).or_insert(0) += 1;
         }
-        self.completed_length = self.completed_length.saturating_sub(self.part_bytes[part]);
-        self.part_bytes[part] = 0;
-        self.covered[part].clear();
-        self.chunk_status[part] = ChunkStatus::Missing;
-        let (lo, hi) = (self.first_block[part], self.first_block[part + 1]);
-        for held in self.peer_blocks.values_mut() {
-            held.retain(|&i| !(lo..hi).contains(&i));
-        }
-        for c in &mut self.req_count[lo..hi] {
-            *c = 0;
-        }
+        self.retest_owner.insert(part, None);
+        self.reset_part(part);
     }
 }
 
@@ -706,6 +752,41 @@ mod tests {
         cm.finish_verify(0, got == jobs[0].expected);
         assert!(!cm.is_banned(1) && !cm.is_banned(2));
         assert_eq!(cm.strikes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_shared_part_is_retested_by_one_peer_at_a_time() {
+        let block = ED2K_BLOCK_SIZE as usize;
+        let good = vec![5u8; block * 2];
+        let (mut cm, _dir) = manager(good.len() as u64, md4(&good));
+        cm.init_file().await.unwrap();
+        cm.assign_blocks(1, &[], 1);
+        cm.assign_blocks(2, &[], 1);
+        assert!(put(&mut cm, 1, 0, &vec![9u8; block]));
+        assert!(put(&mut cm, 2, ED2K_BLOCK_SIZE, &good[block..]));
+        assert_eq!(cm.take_verify_jobs().len(), 1);
+        cm.finish_verify(0, false);
+        assert!(!cm.is_banned(1) && !cm.is_banned(2));
+
+        for _ in 0..MAX_PEER_STRIKES {
+            assert_eq!(cm.assign_blocks(1, &[], 2).len(), 2);
+            assert!(cm.assign_blocks(2, &[], 2).is_empty());
+            assert!(put(&mut cm, 1, 0, &vec![9u8; block]));
+            assert!(put(&mut cm, 1, ED2K_BLOCK_SIZE, &vec![9u8; block]));
+            assert_eq!(cm.take_verify_jobs().len(), 1);
+            cm.finish_verify(0, false);
+        }
+        assert!(cm.is_banned(1));
+        assert!(!cm.is_banned(2));
+
+        cm.release_peer(1);
+        assert_eq!(cm.assign_blocks(2, &[], 2).len(), 2);
+        assert!(put(&mut cm, 2, 0, &good[..block]));
+        assert!(put(&mut cm, 2, ED2K_BLOCK_SIZE, &good[block..]));
+        assert_eq!(cm.take_verify_jobs().len(), 1);
+        cm.finish_verify(0, true);
+        assert!(cm.retest_owner.is_empty());
+        assert!(cm.is_complete());
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use tauri::{utils::config::BundleType, AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{config::parse_keep_seeding_option, state::AppState};
+use risuko_engine::engine::options::json_bool;
 use risuko_http::{NoProxy, Url};
 
 #[tauri::command]
@@ -96,27 +97,23 @@ pub async fn save_preference(
         Ok((p2p_profile_changed, mgr.config_dir().to_path_buf()))
     })();
 
+    let changed_system = config.get("system").and_then(Value::as_object);
+    let open_at_login_change = previous_open_at_login.zip(open_at_login);
+    let roll_back = |error: String| {
+        roll_back_preferences(
+            &handle,
+            &state,
+            error,
+            &previous_system_config,
+            &previous_user_config,
+            changed_system,
+            open_at_login_change,
+        )
+    };
+
     let (p2p_profile_changed, config_dir) = match save_result {
         Ok(result) => result,
-        Err(err) => {
-            restore_runtime_options(
-                &previous_system_config,
-                &previous_user_config,
-                config.get("system").and_then(Value::as_object),
-            )
-            .await;
-            if let (Some(previous), Some(current)) = (previous_open_at_login, open_at_login) {
-                if previous != current {
-                    if let Err(rollback_err) = apply_open_at_login(&handle, previous) {
-                        return Err(format!(
-                            "{}; also failed to restore open-at-login to {}: {}",
-                            err, previous, rollback_err
-                        ));
-                    }
-                }
-            }
-            return Err(err);
-        }
+        Err(err) => return Err(roll_back(err).await),
     };
 
     if p2p_profile_changed {
@@ -124,70 +121,50 @@ pub async fn save_preference(
             .map_err(|error| error.to_string());
         let reload_config = match reload_config {
             Ok(config) => config,
-            Err(error_message) => {
-                let rollback_message = {
-                    let rollback = state
-                        .config
-                        .lock()
-                        .map_err(|lock_error| lock_error.to_string())
-                        .and_then(|mut mgr| {
-                            mgr.replace_config_maps(&previous_system_config, &previous_user_config)
-                        });
-                    rollback.err().map(|rollback_error| {
-                        format!("; also failed to restore persisted preferences: {rollback_error}")
-                    })
-                };
-                restore_runtime_options(
-                    &previous_system_config,
-                    &previous_user_config,
-                    config.get("system").and_then(Value::as_object),
-                )
-                .await;
-                return Err(format!(
-                    "{}{}",
-                    error_message,
-                    rollback_message.as_deref().unwrap_or_default()
-                ));
-            }
+            Err(error) => return Err(roll_back(error).await),
         };
         let reload_result = risuko_engine::engine::reload_p2p_profile(&reload_config)
             .await
             .map_err(|error| error.to_string());
         if let Err(error) = reload_result {
-            let rollback = state
-                .config
-                .lock()
-                .map_err(|lock_error| lock_error.to_string())
-                .and_then(|mut mgr| {
-                    mgr.replace_config_maps(&previous_system_config, &previous_user_config)
-                });
-            let rollback_message = rollback.err().map(|rollback_error| {
-                format!("; also failed to restore persisted preferences: {rollback_error}")
-            });
-            restore_runtime_options(
-                &previous_system_config,
-                &previous_user_config,
-                config.get("system").and_then(Value::as_object),
-            )
-            .await;
-            if let (Some(previous), Some(current)) = (previous_open_at_login, open_at_login) {
-                if previous != current {
-                    if let Err(rollback_error) = apply_open_at_login(&handle, previous) {
-                        return Err(format!(
-                            "{error}{}; also failed to restore open-at-login: {rollback_error}",
-                            rollback_message.as_deref().unwrap_or_default()
-                        ));
-                    }
-                }
-            }
-            return Err(format!(
-                "{error}{}",
-                rollback_message.as_deref().unwrap_or_default()
-            ));
+            return Err(roll_back(error).await);
         }
     }
 
     Ok(())
+}
+
+async fn roll_back_preferences(
+    handle: &AppHandle,
+    state: &AppState,
+    error: String,
+    previous_system: &Map<String, Value>,
+    previous_user: &Map<String, Value>,
+    changed_system: Option<&Map<String, Value>>,
+    open_at_login_change: Option<(bool, bool)>,
+) -> String {
+    let mut message = error;
+    let restored = state
+        .config
+        .lock()
+        .map_err(|lock_error| lock_error.to_string())
+        .and_then(|mut mgr| mgr.replace_config_maps(previous_system, previous_user));
+    if let Err(rollback_error) = restored {
+        message.push_str(&format!(
+            "; also failed to restore persisted preferences: {rollback_error}"
+        ));
+    }
+    restore_runtime_options(previous_system, previous_user, changed_system).await;
+    if let Some((previous, current)) = open_at_login_change {
+        if previous != current {
+            if let Err(rollback_error) = apply_open_at_login(handle, previous) {
+                message.push_str(&format!(
+                    "; also failed to restore open-at-login: {rollback_error}"
+                ));
+            }
+        }
+    }
+    message
 }
 
 async fn restore_runtime_options(
@@ -268,10 +245,6 @@ fn normalized_proxy(value: Option<&Value>) -> Value {
     risuko_engine::config::normalize_proxy_config(value.unwrap_or(&Value::Null))
 }
 
-fn proxy_profile<'a>(proxy: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    proxy.get(name).and_then(Value::as_object)
-}
-
 fn profile_enabled(profile: Option<&Map<String, Value>>) -> bool {
     value_as_bool(profile.and_then(|p| p.get("enable")))
         && profile
@@ -297,15 +270,7 @@ fn profile_bypass(profile: Option<&Map<String, Value>>) -> String {
 }
 
 fn value_as_bool(value: Option<&Value>) -> bool {
-    value
-        .and_then(|value| {
-            value.as_bool().or_else(|| {
-                value
-                    .as_str()
-                    .map(|text| text.trim().eq_ignore_ascii_case("true"))
-            })
-        })
-        .unwrap_or(false)
+    value.and_then(json_bool).unwrap_or(false)
 }
 
 fn contains_download_scope(value: Option<&Value>) -> bool {
@@ -337,9 +302,7 @@ pub fn prepare_preference_patch(params: Value) -> Result<Value, String> {
     }
 
     if let Some(val) = map.get("use-remote-file-time").cloned() {
-        let enabled = val
-            .as_bool()
-            .unwrap_or_else(|| val.as_str().map(|s| s == "true").unwrap_or(false));
+        let enabled = json_bool(&val).unwrap_or(false);
         map.insert("remote-time".to_string(), Value::from(enabled));
     }
 
@@ -368,40 +331,25 @@ pub fn prepare_preference_patch(params: Value) -> Result<Value, String> {
     .any(|key| map.contains_key(*key));
     let proxy = normalized_proxy(Some(proxy_value));
     map.insert("proxy".to_string(), proxy.clone());
-    let http = proxy_profile(&proxy, "http");
-    let p2p = proxy_profile(&proxy, "p2p");
+    let profiles = risuko_engine::config::proxy_profiles(&proxy);
+    let http = profiles.http.unwrap_or_default();
+    let p2p = profiles.p2p.unwrap_or_default();
+    let http_enabled = http.enabled && !http.server.is_empty();
     let use_download_proxy =
-        profile_enabled(http) && contains_download_scope(http.and_then(|p| p.get("scope")));
-    let http_server = profile_server(http);
-    let http_bypass = profile_bypass(http);
-    let p2p_server = profile_server(p2p);
-    let p2p_bypass = profile_bypass(p2p);
-    let p2p_udp = p2p
-        .and_then(|profile| profile.get("udp"))
-        .and_then(Value::as_object);
-    let p2p_udp_override = p2p_udp
-        .and_then(|profile| profile.get("server"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    let p2p_udp_server = if p2p_udp_override.is_empty() {
-        p2p_server.clone()
-    } else {
-        p2p_udp_override.to_string()
-    };
-    let p2p_udp_bypass = if p2p_udp_override.is_empty() {
+        http_enabled && contains_download_scope(proxy.get("http").and_then(|p| p.get("scope")));
+    let http_bypass = normalize_proxy_bypass(&http.bypass);
+    let http_server = http.server;
+    let p2p_bypass = normalize_proxy_bypass(&p2p.bypass);
+    let p2p_udp_server = p2p.udp_server().to_string();
+    let p2p_udp_bypass = if p2p.udp_override_server.is_empty() {
         p2p_bypass.clone()
     } else {
-        p2p_udp
-            .and_then(|profile| profile.get("bypass"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+        p2p.udp_override_bypass
     };
-    let p2p_enabled = value_as_bool(p2p.and_then(|profile| profile.get("enable")))
-        && (!p2p_server.is_empty() || !p2p_udp_server.is_empty());
+    let p2p_server = p2p.server;
+    let p2p_enabled = p2p.enabled && (!p2p_server.is_empty() || !p2p_udp_server.is_empty());
 
-    if profile_enabled(http) {
+    if http_enabled {
         risuko_http::Proxy::all(&http_server).map_err(|e| format!("Invalid HTTP proxy: {e}"))?;
     }
     if p2p_enabled {
@@ -588,7 +536,7 @@ async fn fetch_one_tracker_source(
     configured_proxy: Option<(String, NoProxy)>,
 ) -> Result<String, String> {
     let mut builder = risuko_http::Client::builder()
-        .user_agent("Risuko/0.6")
+        .user_agent(risuko_engine::engine::USER_AGENT)
         .redirect(risuko_http::Policy::limited(10))
         .timeout(Duration::from_secs(30))
         .gzip(true)
@@ -776,6 +724,9 @@ mod tests {
         assert!(value_as_bool(Some(&json!(" TRUE "))));
         assert!(!value_as_bool(Some(&json!("false"))));
         assert!(!value_as_bool(None));
+        assert!(value_as_bool(Some(&json!(1))));
+        assert!(value_as_bool(Some(&json!("1"))));
+        assert!(!value_as_bool(Some(&json!("0"))));
     }
 
     #[test]
@@ -1148,6 +1099,240 @@ mod tests {
         let map = result.as_object().unwrap();
         assert_eq!(map.get("theme"), Some(&json!("dark")));
         assert_eq!(map.get("locale"), Some(&json!("en-US")));
+    }
+
+    const PROXY_KEYS: [&str; 6] = [
+        "all-proxy",
+        "no-proxy",
+        "p2p-proxy",
+        "p2p-no-proxy",
+        "p2p-udp-proxy",
+        "p2p-udp-no-proxy",
+    ];
+
+    type ProxyRow = (&'static str, [Option<&'static str>; 6]);
+
+    fn proxy_table_cases() -> Vec<(&'static str, Value)> {
+        let http_a = json!({
+            "enable": true,
+            "server": "http://proxy.example:8080",
+            "scope": ["download"],
+            "bypass": "localhost, 10.0.0.0/8"
+        });
+        let p2p_g = json!({
+            "enable": true,
+            "server": "socks5://tcp.example:1080",
+            "bypass": "tcp.example",
+            "udp": {
+                "server": "socks5h://udp.example:1080",
+                "bypass": "udp.example"
+            }
+        });
+        vec![
+            ("a", json!({ "http": http_a })),
+            (
+                "b",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "http://proxy.example:8080",
+                    "scope": ["update-app", "update-trackers"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "c",
+                json!({ "http": {
+                    "enable": false,
+                    "server": "http://proxy.example:8080",
+                    "scope": ["download"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "d",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "   ",
+                    "scope": ["download"],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "e",
+                json!({ "http": {
+                    "enable": true,
+                    "server": "http://proxy.example:8080",
+                    "scope": [" download "],
+                    "bypass": "localhost"
+                } }),
+            ),
+            (
+                "f",
+                json!({ "p2p": {
+                    "enable": true,
+                    "server": " socks5://tcp.example:1080 ",
+                    "bypass": "tcp.example"
+                } }),
+            ),
+            ("g", json!({ "p2p": p2p_g })),
+            (
+                "h",
+                json!({ "p2p": {
+                    "enable": true,
+                    "server": "",
+                    "bypass": "tcp.example",
+                    "udp": {
+                        "server": "socks5h://udp.example:1080",
+                        "bypass": "udp.example"
+                    }
+                } }),
+            ),
+            (
+                "i",
+                json!({ "p2p": {
+                    "enable": false,
+                    "server": "socks5://tcp.example:1080",
+                    "bypass": "tcp.example",
+                    "udp": {
+                        "server": "socks5h://udp.example:1080",
+                        "bypass": "udp.example"
+                    }
+                } }),
+            ),
+            (
+                "j",
+                json!({
+                    "http": {
+                        "enable": true,
+                        "server": "http://proxy.example:8080",
+                        "scope": ["download"],
+                        "bypass": "a.example\na.example, b.example"
+                    },
+                    "p2p": {
+                        "enable": true,
+                        "server": "socks5://tcp.example:1080",
+                        "bypass": "a.example\na.example, b.example",
+                        "udp": {
+                            "server": "socks5h://udp.example:1080",
+                            "bypass": "a.example\na.example, b.example"
+                        }
+                    }
+                }),
+            ),
+            ("k", json!({ "http": http_a, "p2p": p2p_g })),
+        ]
+    }
+
+    #[test]
+    fn prepare_preference_patch_proxy_keys_table() {
+        let expected: [ProxyRow; 11] = [
+            (
+                "a",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+            ("b", [Some(""), Some(""), None, None, None, None]),
+            ("c", [Some(""), Some(""), None, None, None, None]),
+            ("d", [Some(""), Some(""), None, None, None, None]),
+            (
+                "e",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            ),
+            (
+                "f",
+                [
+                    None,
+                    None,
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                ],
+            ),
+            (
+                "g",
+                [
+                    None,
+                    None,
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            (
+                "h",
+                [
+                    None,
+                    None,
+                    Some(""),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+            ("i", [None, None, Some(""), Some(""), Some(""), Some("")]),
+            (
+                "j",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("a.example,b.example"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("a.example,b.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("a.example,b.example"),
+                ],
+            ),
+            (
+                "k",
+                [
+                    Some("http://proxy.example:8080"),
+                    Some("localhost,10.0.0.0/8"),
+                    Some("socks5://tcp.example:1080"),
+                    Some("tcp.example"),
+                    Some("socks5h://udp.example:1080"),
+                    Some("udp.example"),
+                ],
+            ),
+        ];
+        let actual = proxy_table_cases()
+            .iter()
+            .map(|(case, proxy)| {
+                let result = prepare_preference_patch(json!({ "proxy": proxy })).unwrap();
+                let map = result.as_object().unwrap();
+                let keys = PROXY_KEYS
+                    .iter()
+                    .map(|key| {
+                        map.get(*key)
+                            .map(|value| value.as_str().unwrap().to_string())
+                    })
+                    .collect::<Vec<_>>();
+                (*case, keys)
+            })
+            .collect::<Vec<_>>();
+        let expected = expected
+            .iter()
+            .map(|(case, keys)| (*case, keys.map(|key| key.map(str::to_string)).to_vec()))
+            .collect::<Vec<_>>();
+        let rows = actual
+            .iter()
+            .map(|row| format!("{row:?},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, expected, "\n{rows}");
     }
 
     #[test]

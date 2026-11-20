@@ -2,6 +2,8 @@ mod ftp_download;
 mod sftp_download;
 pub(crate) mod tls;
 
+pub(crate) use sftp_download::is_pasted_private_key;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
@@ -103,6 +105,7 @@ pub async fn run_ftp_download(
     cancel_token: CancellationToken,
     global_limiter: Arc<SpeedLimiter>,
     task_limiter: Arc<SpeedLimiter>,
+    adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<PathBuf, String> {
     let parsed = parse_ftp_uri(uri)?;
 
@@ -120,6 +123,7 @@ pub async fn run_ftp_download(
                 cancel_token,
                 global_limiter,
                 task_limiter,
+                adopted_filename,
             )
             .await
         }
@@ -136,51 +140,19 @@ pub async fn run_ftp_download(
                 cancel_token,
                 global_limiter,
                 task_limiter,
+                adopted_filename,
             )
             .await
         }
     }
 }
 
-pub(crate) struct PartClaim(PathBuf);
-
-static ACTIVE_PARTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(Default::default);
-
-fn claim_key(path: &std::path::Path) -> PathBuf {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    match (parent.canonicalize(), path.file_name()) {
-        (Ok(parent), Some(name)) => parent.join(name),
-        _ => path.to_path_buf(),
-    }
-}
-
-impl PartClaim {
-    pub(crate) fn acquire(path: &std::path::Path) -> Result<Self, String> {
-        let key = claim_key(path);
-        let mut active = ACTIVE_PARTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.insert(key.clone()) {
-            return Err(format!(
-                "Another active download is already writing {}",
-                path.display()
-            ));
-        }
-        Ok(Self(key))
-    }
-}
-
-impl Drop for PartClaim {
-    fn drop(&mut self) {
-        ACTIVE_PARTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.0);
-    }
+pub(crate) fn initial_part_path(dir: &str, out: &str, uri: &str) -> Option<PathBuf> {
+    let parsed = parse_ftp_uri(uri).ok()?;
+    Some(ftp_download::part_path_for(
+        std::path::Path::new(dir),
+        &ftp_download::output_filename(&parsed.path, out),
+    ))
 }
 
 #[cfg(test)]
@@ -188,29 +160,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn part_claim_refuses_a_second_writer_until_released() {
-        let path = PathBuf::from("/claim-test/file.bin.part");
-        let first = PartClaim::acquire(&path).unwrap();
-        assert!(PartClaim::acquire(&path).is_err());
-        assert!(PartClaim::acquire(&PathBuf::from("/claim-test/other.part")).is_ok());
-        drop(first);
-        assert!(PartClaim::acquire(&path).is_ok());
-    }
-
-    #[test]
-    fn part_claim_treats_equivalent_paths_as_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("downloads");
-        std::fs::create_dir(&sub).unwrap();
-        let direct = sub.join("file.bin.part");
-        let dotted = sub.join("..").join("downloads").join("file.bin.part");
-        let first = PartClaim::acquire(&direct).unwrap();
-        assert!(PartClaim::acquire(&dotted).is_err());
-        drop(first);
-        let second = PartClaim::acquire(&dotted).unwrap();
-        assert!(PartClaim::acquire(&direct).is_err());
-        drop(second);
-        assert!(PartClaim::acquire(&direct).is_ok());
+    fn the_first_part_path_follows_the_name_or_the_remote_path() {
+        assert_eq!(
+            initial_part_path("/d", "", "ftp://h/pub/My%20File.iso"),
+            Some(PathBuf::from("/d/My File.iso.part"))
+        );
+        assert_eq!(
+            initial_part_path("/d", "named.iso", "sftp://h/pub/file.iso"),
+            Some(PathBuf::from("/d/named.iso.part"))
+        );
+        assert_eq!(initial_part_path("/d", "", "http://h/file.iso"), None);
     }
 
     #[test]

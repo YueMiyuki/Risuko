@@ -1,15 +1,157 @@
 export default {
 	basic: "پایه",
 	advanced: "پیشرفته",
+	cloudSinks: "مقصدهای ابری",
+	usenet: "Usenet",
+	search: "جستجو",
+	"search-placeholder": "جستجو در همهٔ ترجیحات",
+	"search-all-tabs": "همهٔ ترجیحات",
+	"search-results": "{{count}} تنظیم مطابق",
+	"search-no-results": "تنظیم مطابقی پیدا نشد",
+	"search-clear": "پاک کردن جستجو",
+	"search-go-to-tab": "باز کردن تنظیم",
+	"search-more-results": "برای دیدن نتایج بیشتر، جستجوی خود را دقیق‌تر کنید",
+	"usenet-tips":
+		"ارائه‌دهندگان NNTP و پیش‌فرض‌های پاک‌سازی امن آرشیو را مدیریت کنید.",
+	"usenet-profiles": "نمایه‌های ارائه‌دهنده",
+	"usenet-profiles-tips":
+		"اولویت ارائه‌دهنده، امنیت، احراز هویت و محدودیت اتصال‌ها را پیکربندی کنید.",
+	"usenet-add-profile": "افزودن نمایه",
+	"usenet-no-profiles": "هیچ نمایهٔ ارائه‌دهنده‌ای پیکربندی نشده است.",
+	"usenet-no-profiles-tips":
+		"پیش از افزودن بارگیری NZB دست‌کم یک ارائه‌دهنده اضافه کنید.",
+	"usenet-edit-profile": "ویرایش نمایه",
+	"usenet-profile-dialog-tips":
+		"تنظیمات نمایه ممکن است بین دستگاه‌ها همگام شود. اطلاعات ورود روی همین دستگاه می‌مانند.",
+	"usenet-profile-dialog-tips-vault":
+		"تنظیمات نمایه ممکن است بین دستگاه‌ها همگام شود. اطلاعات ورود در دسته‌کلید امن این دستگاه می‌مانند.",
+	"usenet-profile-name": "نام نمایه",
+	"usenet-profile-name-placeholder": "ارائه‌دهندهٔ اصلی",
+	"usenet-profile-host": "میزبان NNTP",
+	"usenet-profile-port": "درگاه",
+	"usenet-security": "امنیت اتصال",
+	"usenet-tls": "TLS ضمنی",
+	"usenet-tls-short": "TLS",
+	"usenet-starttls": "STARTTLS",
+	"usenet-plain": "NNTP بدون رمزگذاری",
+	"usenet-authentication": "احراز هویت",
+	"usenet-auth-credentials": "نام کاربری و گذرواژه",
+	"usenet-auth-anonymous": "ناشناس",
+	"usenet-username": "نام کاربری",
+	"usenet-password": "گذرواژه",
+	"usenet-credentials-saved": "اطلاعات ورود ذخیره شد",
+	"usenet-credentials-unavailable": "وضعیت اطلاعات ورود در دسترس نیست",
+	"usenet-credentials-saved-tips":
+		"اطلاعات ورود قبلاً ذخیره شده‌اند. برای بدون تغییر ماندن آن‌ها، هر دو فیلد را خالی بگذارید.",
+	"usenet-plain-warning-title": "اتصال رمزگذاری‌نشده",
+	"usenet-plain-opt-in":
+		"می‌فهمم و می‌خواهم NNTP بدون رمزگذاری را برای این نمایه مجاز کنم.",
+	"usenet-plain-warning":
+		"NNTP بدون رمزگذاری، اطلاعات ورود و داده‌های بارگیری‌شده را رمزگذاری نمی‌کند. فقط زمانی از آن استفاده کنید که ارائه‌دهنده صراحتاً آن را بخواهد.",
+	"usenet-enabled": "فعال",
+	"usenet-enabled-tips":
+		"نمایه‌های غیرفعال نگه داشته می‌شوند اما برای بارگیری استفاده نمی‌شوند.",
+	"usenet-disabled": "غیرفعال",
+	"usenet-priority": "اولویت",
+	"usenet-priority-tips":
+		"مقادیر کمتر زودتر امتحان می‌شوند. اولویت‌های برابر بار را بین خود تقسیم می‌کنند.",
+	"usenet-priority-value": "اولویت {{value}}",
+	"usenet-max-connections": "بیشینهٔ اتصال‌ها",
+	"usenet-max-connections-tips": "سقف اتصال برای این نمایهٔ ارائه‌دهنده.",
+	"usenet-connections-value": "{{value}} اتصال",
+	"usenet-test": "تست",
+	"usenet-edit": "ویرایش نمایه",
+	"usenet-remove": "حذف",
+	"usenet-remove-title": "نمایهٔ ارائه‌دهنده حذف شود؟",
+	"usenet-remove-confirm":
+		"{{name}} دیگر برای بارگیری در دسترس نخواهد بود. اطلاعات ورود ذخیره‌شدهٔ آن نیز از این دستگاه حذف می‌شود.",
+	"usenet-profile-saved": "نمایهٔ ارائه‌دهنده ذخیره شد.",
+	"usenet-profile-removed": "{{name}} حذف شد.",
+	"usenet-test-success": "اتصال به {{name}} برقرار شد.",
+	"usenet-test-failed": "اتصال ناموفق بود: {{message}}",
+	"usenet-validation-name": "نام نمایه را وارد کنید.",
+	"usenet-validation-host": "میزبان NNTP را وارد کنید.",
+	"usenet-validation-port": "درگاه باید بین 1 و 65535 باشد.",
+	"usenet-validation-plain":
+		"پیش از ذخیره، هشدار NNTP بدون رمزگذاری را تأیید کنید.",
+	"usenet-validation-priority": "اولویت باید صفر یا بیشتر باشد.",
+	"usenet-validation-connections": "تعداد اتصال‌ها باید بین 1 و 128 باشد.",
+	"usenet-validation-credentials":
+		"هم نام کاربری و هم گذرواژه را وارد کنید، یا احراز هویت ناشناس را انتخاب کنید.",
+	"usenet-validation-credential-status":
+		"وضعیت اطلاعات ورود در دسترس نیست. پیش از تغییر این نمایه دوباره تلاش کنید.",
+	"usenet-cleanup": "پاک‌سازی پس از موفقیت",
+	"usenet-cleanup-tips":
+		"پاک‌سازی فقط پس از سرهم‌سازی کامل و استخراج موفق اجرا می‌شود.",
+	"usenet-cleanup-action": "پس از موفقیت تأییدشده",
+	"usenet-cleanup-keep": "نگه‌داشتن همهٔ ورودی‌ها",
+	"usenet-cleanup-keep-tips":
+		"پرونده‌های PAR2 و همهٔ بخش‌های آرشیو را نگه می‌دارد.",
+	"usenet-cleanup-par2": "حذف پرونده‌های PAR2",
+	"usenet-cleanup-par2-tips":
+		"پرونده‌های توازن را حذف می‌کند اما بخش‌های آرشیو بارگیری‌شده را نگه می‌دارد.",
+	"usenet-cleanup-all": "حذف PAR2 و بخش‌های آرشیو",
+	"usenet-cleanup-all-tips":
+		"پس از موفقیت استخراج، پرونده‌های توازن و بخش‌های آرشیو را حذف می‌کند.",
+	"usenet-archive-safety": "ایمنی آرشیو",
+	"usenet-limits-defaults":
+		"محدودیت‌های سراسریِ وظیفه هنگام راستی‌آزمایی و استخراج از فضای ذخیره‌سازی و پردازش محافظت می‌کنند.",
+	"usenet-desktop-limits": "محدودیت‌های دسکتاپ",
+	"usenet-android-limits": "محدودیت‌های Android",
+	"usenet-limits-summary":
+		"{{entries}} ورودی · {{total}} گسترش کل · {{perEntry}} برای هر ورودی",
+	"usenet-limits-secondary-summary":
+		"نسبت {{ratio}}:1 · {{depth}} سطح تودرتو · {{reserve}} ذخیرهٔ فضای آزاد · {{hours}} ساعت فعال",
+	"usenet-customize-limits": "سفارشی‌سازی محدودیت‌ها",
+	"usenet-hide-limits": "پنهان کردن محدودیت‌ها",
+	"usenet-limits-adjusted": "محدودیت‌های همگام‌شده تنظیم شدند",
+	"usenet-limits-adjusted-tips":
+		"یک یا چند مقدار از سقف سخت این پلتفرم فراتر بودند و کاهش یافتند.",
+	"usenet-max-entries": "بیشینهٔ ورودی‌ها",
+	"usenet-max-expanded": "اندازهٔ کل پس از استخراج",
+	"usenet-max-entry": "اندازهٔ هر ورودی",
+	"usenet-max-depth": "عمق تودرتویی",
+	"usenet-max-ratio": "نسبت فشرده‌سازی",
+	"usenet-free-space-reserve": "ذخیرهٔ فضای آزاد",
+	"usenet-max-active-time": "زمان پردازش فعال",
+	"usenet-unit-entries": "ورودی",
+	"usenet-unit-levels": "سطح",
+	"usenet-unit-hours": "ساعت",
+	"usenet-limits-hard-cap":
+		"مقادیر نمی‌توانند از چهار برابر پیش‌فرض‌های پلتفرم بیشتر شوند. بازنویسی‌های هر وظیفه جداگانه تأیید می‌شوند.",
+	"usenet-restore-limits": "بازیابی پیش‌فرض‌های پلتفرم",
+	"usenet-limits-restored":
+		"محدودیت‌های آرشیو به پیش‌فرض‌های پلتفرم بازگردانده شد.",
 	save: "ذخیره و اعمال",
 	"save-success-message": "ترجیحات با موفقیت ذخیره شد",
 	"save-fail-message": "ذخیرهٔ ترجیحات شکست خورد",
 	discard: "دور انداختن",
+	"history-directories": "پوشه‌های دانلود اخیر",
+	"favorite-directory": "پوشه موردعلاقه",
+	"unfavorite-directory": "حذف پوشه از علاقه‌مندی‌ها",
+	"remove-history-directory": "حذف پوشه از تاریخچه",
 	startup: "شروع برنامه",
 	"open-at-login": "گشودن هنگام ورود به سیستم",
 	"keep-window-state": "نگه‌داشتن اندازه و موقعیت پنجره هنگام خروج",
 	"auto-resume-all": "از سرگیری خودکار همه وظایف ناتمام",
 	"default-dir": "مسیر پیش‌فرض",
+	"file-category-dirs": "مسیرهای دسته",
+	"file-category-dirs-tips":
+		"مسیر بارگیری پیش‌فرض را برای انواع مشخصی از پرونده جایگزین کنید. برای استفاده از مسیر پیش‌فرض، خالی بگذارید.",
+	"task-routing-rules": "قواعد مسیریابی وظیفه",
+	"task-routing-rules-tips":
+		"وظایف را بر اساس الگوهای نام پرونده به پوشه‌ها هدایت می‌کند. نخستین قاعدهٔ مطابق برنده است.",
+	"task-routing-rule-pattern-placeholder": "الگو (مثلاً *.mkv)",
+	"task-routing-rule-label-placeholder": "برچسب",
+	"task-routing-rule-dir-placeholder": "پوشه",
+	"task-routing-rule-add": "افزودن قاعده",
+	"file-category-music": "موسیقی",
+	"file-category-video": "ویدئو",
+	"file-category-image": "تصویر",
+	"file-category-document": "سند",
+	"file-category-compressed": "فشرده",
+	"file-category-program": "برنامه",
+	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"بخاطر محدودیت‌های دسترسی سندباکس از اپ استور، پیشنهاد می‌شود شاخه پیش‌فرض دانلود بر روی ~/Downloads تنظیم شده باشد.",
 	"transfer-settings": "انتقال",
@@ -18,6 +160,12 @@ export default {
 	"transfer-speed-unlimited": "نامحدود",
 	"bt-settings": "بیت‌تورنت",
 	"bt-save-metadata": "ذخیره پیوند مگنت به عنوان پرونده تورنت",
+	"bt-create-subfolder": "گروه‌بندی تورنت‌های چندپرونده‌ای در یک زیرپوشه",
+	"bt-create-subfolder-tips":
+		"در صورت فعال بودن، بارگیری‌های BitTorrent و مگنت چندپرونده‌ای درون پوشه‌ای به نام تورنت قرار می‌گیرند. در صورت غیرفعال بودن، پرونده‌ها مستقیماً در پوشهٔ بارگیری نوشته می‌شوند.",
+	"bt-upload-rate-limit": "محدودیت بارگذاری BitTorrent",
+	"bt-upload-rate-limit-tips":
+		"علاوه بر محدودیت بارگذاری سراسری، بارگذاری‌های BitTorrent را محدود می‌کند. مقدار 0 یعنی بدون سقف جداگانه.",
 	"bt-auto-download-content": "بارگیری خودکار مگنت و محتوای تورنت",
 	"bt-force-encryption": "رمزگذاری اجباری ب‌ت",
 	"keep-seeding": "بذرپاشی را تا هنگامی که به صورت دستی قطع نشده، ادامه بده",
@@ -26,16 +174,77 @@ export default {
 	"seed-time-unit": "دقیقه",
 	"task-manage": "مدیریت وظایف",
 	"max-concurrent-downloads": "بیشینهٔ وظایف فعال",
+	"connections-per-task": "اتصال‌ها برای هر وظیفه",
 	"max-connection-per-server": "بیشینهٔ اتصال برای هر سرور",
+	"auto-retry": "تلاش مجدد خودکار برای وظایف ناموفق",
+	"auto-retry-strategy": "حالت فاصلهٔ تلاش مجدد",
+	"auto-retry-strategy-static": "ثابت",
+	"auto-retry-strategy-exponential": "عقب‌نشینی نمایی",
+	"auto-retry-interval": "فاصلهٔ پایهٔ تلاش مجدد",
+	"auto-retry-interval-unit": "ثانیه",
+	"auto-retry-max-attempts": "بیشینهٔ تلاش‌های مجدد (0 = نامحدود)",
+	"worker-max-retries": "بیشینهٔ تلاش مجدد برای هر قطعهٔ کارگر",
+	"auto-detect-low-speed-tasks": "تشخیص خودکار وظایف کم‌سرعت",
+	"auto-detect-low-speed-tasks-tips":
+		"اگر وظیفه‌ای در حال اجرا زیر آستانهٔ سرعت بماند، به‌طور خودکار متوقف و دوباره راه‌اندازی می‌شود.",
+	"low-speed-threshold": "آستانهٔ سرعت کم",
+	"low-speed-threshold-unit": "KB/s",
+	"http-reliability": "پایداری HTTP / شبکه",
+	"http-reliability-tips":
+		"مهلت اتصال و تشخیص انتقال متوقف‌شده را برای بارگیری‌های HTTP/HTTPS/FTP تنظیم کنید.",
+	"connect-timeout": "مهلت اتصال",
+	"nzb-body-timeout": "مهلت بدنهٔ NZB",
+	"lowest-speed-limit": "حداقل سرعت مجاز",
+	"lowest-speed-limit-timeout": "مهلت توقف",
+	"lowest-speed-limit-help":
+		"اگر بارگیری در طول مهلت توقف زیر حداقل سرعت مجاز بماند، کارگر متوقف می‌شود و (در صورت فعال بودن تلاش مجدد خودکار) دوباره راه‌اندازی می‌شود. برای غیرفعال کردن، حد را 0 بگذارید.",
+	"uri-selector": "انتخاب آینه",
+	"uri-selector-feedback":
+		"بازخوردی (آینه‌های کند یا ناموفق کنار گذاشته می‌شوند)",
+	"uri-selector-inorder": "به ترتیب (آینه‌ها یکی‌یکی امتحان می‌شوند)",
+	"uri-selector-adaptive": "تطبیقی (سریع‌ترین ترجیح داده می‌شود)",
+	"unit-seconds": "ثانیه",
+	"unit-kib-per-sec": "KiB/s",
+	storage: "ذخیره‌سازی",
+	"storage-tips": "نحوهٔ رزرو فضای دیسک توسط موتور پیش از بارگیری.",
+	"file-allocation": "تخصیص پرونده",
+	"file-allocation-falloc": "تخصیص پیشاپیش (falloc)",
+	"file-allocation-trunc": "برش (فقط تنظیم طول)",
+	"file-allocation-none": "هیچ (در صورت نیاز رشد می‌کند)",
+	"file-allocation-tips":
+		"تخصیص پیشاپیش، بلوک‌های واقعی دیسک را از قبل رزرو می‌کند تا از ENOSPC در میانهٔ بارگیری جلوگیری شود و پراکندگی کم شود. در سیستم‌پرونده‌هایی که از آن پشتیبانی نمی‌کنند به برش بازمی‌گردد.",
 	"new-task-show-downloading":
 		"بعد افزودن وظیفه به صورت خودکار بارگیری را نشان بده",
 	"no-confirm-before-delete-task": "قبل از حذف وظیفه نیازی به تأیید نیست",
+	"auto-file-renaming": "تغییر نام خودکار پرونده‌های تکراری",
+	"auto-file-renaming-tips":
+		'وقتی پرونده‌ای با همان نام وجود دارد، به جای بازنویسی آن، با نام "file.1.ext" ذخیره شود',
+	"use-remote-file-time":
+		"هنگام ذخیره از زمان ویرایش پروندهٔ راه دور استفاده شود",
+	"use-remote-file-time-tips":
+		"زمان ویرایش پرونده را برابر مهر زمانی سرور راه دور قرار می‌دهد",
 	continue: "ادامه",
 	"task-completed-notify": "پس از تکمیل بارگیری اطلاع رسانی کن",
+	"clipboard-watch": "پایش کلیپ‌بورد برای پیوندهای بارگیری",
+	"clipboard-watch-tips":
+		"وقتی در هر جا پیوند مگنت یا پرونده‌ای را کپی می‌کنید، risuko پیشنهاد بارگیری آن را می‌دهد.",
+	"clipboard-watch-ext": "پسوندهای پروندهٔ پایش‌شده",
+	"clipboard-watch-ext-tips":
+		"فقط پیوندهای http(s) که به این پسوندها ختم می‌شوند پیام را فعال می‌کنند. پیوندهای مگنت، ed2k و تورنت همیشه آن را فعال می‌کنند. با فاصله یا ویرگول جدا کنید.",
+	"clipboard-watch-ext-placeholder": "zip  iso  mp4  pdf",
+	"clipboard-watch-notice":
+		"risuko اکنون کلیپ‌بورد شما را برای پیوندهای بارگیری پایش می‌کند. آن را در تنظیمات ← پایه خاموش کنید.",
 	"prevent-sleep-while-downloading": "جلوگیری از خواب رفتن سیستم هنگام بارگیری",
 	"prevent-sleep-while-downloading-tips":
 		"هر زمان که یک وظیفه فعال در حال اجراست، رایانه را بیدار نگه دار",
+	"shutdown-when-complete": "خاموش کردن رایانه پس از تکمیل همهٔ وظایف",
+	"shutdown-when-complete-tips":
+		"یک‌بار: پس از خالی شدن صف بارگیری، رایانه را خاموش می‌کند",
+	"shutdown-countdown-title": "خاموش شدن تا {{seconds}} ثانیه دیگر…",
+	"shutdown-countdown-cancel": "لغو",
+	"shutdown-failed": "خاموش کردن ناموفق بود. مجوزها را بررسی کنید.",
 	"auto-purge-record": "به صورت خودکار سابقهٔ بارگیری را هنگام خروج پاک کن",
+	"purge-record-on-start": "پاک کردن سابقهٔ بارگیری هنگام شروع برنامه",
 	ui: "رابط کاربری",
 	appearance: "ظاهر",
 	"theme-auto": "خودکار",
@@ -67,7 +276,16 @@ export default {
 	"change-language": "تغییر زبان",
 	"hide-app-menu": "پنهان کردن منوی برنامه (تنها در ویندوز و لینوکس)",
 	proxy: "پیشکار",
+	"proxy-http-profile": "پیشکار HTTP / FTP / Usenet",
+	"proxy-p2p-profile": "پیشکار P2P",
 	"enable-proxy": "فعال کردن پیشکار",
+	"enable-p2p-proxy": "فعال کردن پیشکار P2P",
+	"proxy-p2p-tcp-server": "سرور پیشکار TCP",
+	"proxy-p2p-tcp-bypass": "عبور از پیشکار TCP",
+	"proxy-p2p-udp-server": "سرور پیشکار UDP",
+	"proxy-p2p-udp-server-placeholder":
+		"اختیاری؛ برای استفاده از پیشکار TCP مربوط به P2P خالی بگذارید",
+	"proxy-p2p-udp-bypass": "عبور از پیشکار UDP",
 	"proxy-bypass-input-tips":
 		"تنظیمات پیشکار را برای این میزبان‌ها و دامنه‌ها استفاده نکن، یکی در هر خط",
 	"proxy-scope-label": "استفاده برای",
@@ -75,38 +293,75 @@ export default {
 	"proxy-scope-download-desc": "هدایت ترافیک دانلود از طریق پیشکار",
 	"proxy-scope-update-app": "به‌روزرسانی برنامه",
 	"proxy-scope-update-app-desc": "بررسی به‌روزرسانی برنامه از طریق پیشکار",
-	"proxy-scope-update-trackers": "به‌روزرسانی پیگیر‌ها",
+	"proxy-scope-update-trackers": "به‌روزرسانی ردیاب‌ها",
 	"proxy-scope-update-trackers-desc": "دریافت فهرست ردیاب‌های BT از طریق پیشکار",
 	"proxy-tips": "مشاهده راهنمای پیشکار",
+	"proxy-p2p-tips":
+		"برای DHT، ردیاب‌های UDP و uTP به SOCKS5 یا SOCKS5H نیاز است. پیشکارهای HTTP فقط برای اتصال‌های P2P مبتنی بر TCP استفاده می‌شوند.",
+	"proxy-p2p-udp-tips":
+		"برای استفاده از مسیر TCP مربوط به P2P، پیشکار UDP را خالی بگذارید. پیشکار UDP به SOCKS5 یا SOCKS5H نیاز دارد؛ پیشکارهای HTTP نمی‌توانند UDP را منتقل کنند.",
+	"proxy-p2p-restart-title": "بارگیری‌های P2P دوباره راه‌اندازی شوند؟",
+	"proxy-p2p-restart-confirm":
+		"تغییر پیشکار P2P، بارگیری‌های فعال همتا‌به‌همتا را دوباره راه‌اندازی می‌کند. بارگیری‌های HTTP، FTP و Usenet به کار خود ادامه می‌دهند.",
+	doh: "DNS روی HTTPS",
+	"doh-tips":
+		"نام میزبان‌ها را به جای حل‌کنندهٔ سیستم، از طریق یک نقطهٔ پایانی DNS رمزگذاری‌شده تفکیک می‌کند",
+	"doh-enable": "فعال کردن DNS روی HTTPS",
+	"doh-provider": "ارائه‌دهنده",
+	"doh-provider-cloudflare": "Cloudflare",
+	"doh-provider-google": "Google",
+	"doh-provider-quad9": "Quad9",
+	"doh-provider-custom": "سفارشی",
+	"doh-url": "URL نقطهٔ پایانی",
+	"doh-url-placeholder": "https://example.com/dns-query",
+	"doh-url-invalid": "نقطهٔ پایانی DoH باید با https:// شروع شود",
+	"doh-bootstrap": "IPهای راه‌اندازی اولیه",
+	"doh-bootstrap-placeholder":
+		"IPهای دسترسی به نقطهٔ پایانی، با ویرگول جدا شوند (اختیاری)",
+	"doh-fallback": "بازگشت به DNS سیستم",
+	"doh-fallback-tips":
+		"اگر پرس‌وجوی DoH ناموفق باشد، به جای شکست بارگیری، با حل‌کنندهٔ سیستم تفکیک می‌شود",
 	"bt-tracker": "سرورهای ردیاب",
 	"bt-tracker-input-tips": "سرورهای ردیاب، یکی در هر خط",
 	"bt-tracker-tips": "توصیه شده: ",
+	"bt-max-peers-per-torrent": "بیشینهٔ همتا برای هر تورنت",
+	"bt-max-peers-per-torrent-tips":
+		"بیشینهٔ اتصال‌های همزمان همتا برای هر تورنت. مقادیر بالاتر کشف گروه همتایان را بهبود می‌دهند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-max-outstanding-per-peer": "بیشینهٔ درخواست‌های در انتظار برای هر همتا",
+	"bt-max-outstanding-per-peer-tips":
+		"بیشینهٔ درخواست‌های همزمان تکه که به‌صورت خط‌لوله به هر همتا فرستاده می‌شود (سقف، تا 500). مقدار 0 از پیش‌فرض تطبیقی 6 تا 500 استفاده می‌کند؛ بودجهٔ درخواست در سطح تورنت بین همتایان فعال به اشتراک گذاشته می‌شود. نیازمند راه‌اندازی مجدد موتور",
+	"bt-max-connections": "بیشینهٔ اتصال‌های همتا",
+	"bt-max-connections-tips":
+		"کل اتصال‌های همتا در همهٔ تورنت‌ها، از 20 تا 5000. کاهش آن هرگز اتصال‌های باز را قطع نمی‌کند و فقط جلوی اتصال‌های جدید را می‌گیرد. در Linux، macOS و Android مقدار مؤثر نیز حداکثر به نصف حد توصیف‌گر پروندهٔ سیستم محدود می‌شود",
+	"bt-ban-corrupt-peers": "مسدود کردن همتایانی که داده‌های خراب می‌فرستند",
+	"bt-ban-corrupt-peers-tips":
+		"وقتی قطعه‌هایی که یک نشانی IP در ارسالشان نقش داشته مدام در بررسی هش شکست می‌خورند، آن نشانی را تا پایان نشست مسدود کن. بسیاری از کاربران می‌توانند یک IP را به اشتراک بگذارند (اپراتورهای موبایل، شبکه‌های مشترک)، بنابراین مسدودسازی ممکن است همتایان بی‌گناه را هم قطع کند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-ban-corrupt-strikes": "قطعه‌های ناموفق پیش از مسدودسازی",
+	"bt-ban-corrupt-strikes-tips":
+		"یک نشانی IP تا چند قطعهٔ ناموفق می‌تواند در ارسال آن‌ها نقش داشته باشد تا مسدود شود. مقادیر بالاتر خرابی‌های گاه‌به‌گاه را تحمل می‌کنند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-enable-upnp": "فوروارد درگاه UPnP / NAT-PMP",
+	"bt-enable-upnp-tips":
+		"درگاه شنود BitTorrent را به‌طور خودکار روی روتر از طریق UPnP IGD، NAT-PMP یا PCP باز می‌کند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-upnp-lease": "اجارهٔ نگاشت درگاه (ثانیه)",
+	"bt-upnp-lease-tips":
+		"مدت اجارهٔ نگاشت‌های درگاه UPnP و NAT-PMP. اجاره‌های کوتاه‌تر سریع‌تر از نگاشت‌های کهنه بازیابی می‌شوند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-enable-lsd": "کشف سرویس محلی",
+	"bt-enable-lsd-tips":
+		"همتایان را در شبکهٔ محلی از طریق چندپخشی BEP-14 کشف می‌کند (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-encryption-policy": "رمزگذاری پروتکل",
+	"bt-encryption-policy-tips":
+		"سیاست MSE/PE برای اتصال‌های همتا. «ترجیح رمزگذاری» ابتدا رمزگذاری را امتحان می‌کند و در صورت شکست به متن ساده بازمی‌گردد (نیازمند راه‌اندازی مجدد موتور)",
+	"bt-encryption-plaintext": "فقط متن ساده",
+	"bt-encryption-prefer": "ترجیح رمزگذاری",
+	"bt-encryption-require": "الزام رمزگذاری",
+	"bt-listen-v6": "گوش دادن روی IPv6",
+	"bt-listen-v6-tips":
+		"یک شنوندهٔ TCP اضافی روی IPv6 را به همان درگاه متصل می‌کند (نیازمند راه‌اندازی مجدد موتور)",
 	"sync-tracker-tips": "همگام‌سازی",
 	"auto-sync-tracker": "لیست ردیاب را هر روز به طور خودکار به‌روز کنید",
-	port: "درگاه",
-	"bt-port": "درگاه BT",
-	"dht-port": "درگاه DHT",
-	security: "امنیت",
-	rpc: "RPC",
-	"rpc-listen-port": "پورت گوش دادن به RPC",
-	"rpc-secret": "رمز RPC",
-	"rpc-secret-tips": "مشاهده راهنمای رمز RPC",
-	pbh: "PeerBanHelper",
-	"pbh-enable": "فعال‌سازی API مربوط به PeerBanHelper",
-	"pbh-enable-tips":
-		"یک شنونده JSON-RPC سازگار با Aria2Next در دسترس می‌گذارد تا PeerBanHelper بتواند همتایان بیت‌تورنت را پایش و مسدود کند",
-	"pbh-listen-port": "درگاه شنود PeerBanHelper",
-	"pbh-rpc-secret": "توکن RPC مربوط به PeerBanHelper",
-	"generate-pbh-rpc-secret": "تولید توکن جدید",
-	"pbh-endpoint-hint":
-		"در PeerBanHelper یک دانلودر Aria2Next با آدرس http://127.0.0.1:{{port}}/jsonrpc اضافه کنید",
-	"engine-overrides": "جایگزینی تنظیمات موتور (JSON)",
-	"engine-overrides-placeholder":
-		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
-	"engine-overrides-tips":
-		"پیشرفته: کلیدهای دلخواه گزینه‌های موتور را به صورت یک شیء JSON تنظیم کنید. تغییرات پس از راه‌اندازی دوباره اعمال می‌شوند.",
-	"engine-overrides-invalid":
-		"جایگزینی تنظیمات موتور باید یک شیء JSON معتبر باشد.",
+	"ed2k-server": "سرورهای eDonkey",
+	"ed2k-server-input-tips": "سرورهای eDonkey، یکی در هر خط (ip:port)",
+	"ed2k-server-tips": "در صورت خالی بودن، از سرورهای پیش‌فرض استفاده می‌شود",
 	"ed2k-kad": "eMule Kad",
 	"ed2k-enable-kad": "فعال‌سازی یافتن منابع از طریق Kad",
 	"ed2k-enable-kad-tips":
@@ -116,23 +371,108 @@ export default {
 		"پورت UDP مورد استفاده برای یافتن منابع از طریق Kad. مقادیر معتبر از 1 تا 65535 هستند (نیازمند راه‌اندازی مجدد موتور)",
 	"ed2k-kad-port-invalid":
 		"پورت UDP مربوط به Kad باید عددی صحیح از 1 تا 65535 باشد",
+	"listen-port-invalid":
+		"درگاه BT باید درگاهی از 1 تا 65535، یک بازه مانند 6881-6889، یا فهرستی از آن‌ها با ویرگول جداکننده باشد",
+	"dht-listen-port-invalid":
+		"درگاه DHT باید درگاهی از 1 تا 65535، یک بازه مانند 6881-6889، یا فهرستی از آن‌ها با ویرگول جداکننده باشد",
+	"ed2k-port-invalid": "درگاه ED2K باید عددی صحیح از 1 تا 65535 باشد",
 	"ed2k-enable-upload": "اشتراک‌گذاری فایل‌ها از طریق ED2K",
 	"ed2k-enable-upload-tips":
 		"بارگذاری فایل‌های کامل‌شده و بخش‌های تأییدشده دانلودهای در حال اجرای ED2K برای همتایان دیگر. ممکن است Kad فایلی را که دیگر به اشتراک نمی‌گذارید تا ۵ ساعت همچنان فهرست کند (نیازمند راه‌اندازی مجدد موتور)",
+	"ftp-sftp-settings": "FTP / SFTP",
+	"ftp-sftp-settings-tips":
+		"اطلاعات ورود پیش‌فرض برای بارگیری‌های FTP، FTPS و SFTP",
+	"ftp-username": "نام کاربری FTP",
+	"ftp-password": "گذرواژهٔ FTP",
+	"sftp-private-key": "مسیر کلید خصوصی SSH",
+	"sftp-private-key-content": "محتوای کلید خصوصی SSH",
+	"sftp-private-key-tips": "مسیر پروندهٔ کلید خصوصی PEM، مثلاً ~/.ssh/id_rsa",
+	"sftp-private-key-paste-tips": "محتوای کلید خصوصی PEM را اینجا جای‌گذاری کنید",
+	"sftp-key-passphrase": "عبارت عبور کلید",
+	"sftp-key-passphrase-tips": "اگر کلید عبارت عبور ندارد، خالی بگذارید",
+	"m3u8-output-format": "M3U8 / HLS",
+	"m3u8-output-format-label": "قالب خروجی",
+	"media-settings": "سایت‌های رسانه (yt-dlp)",
+	"media-settings-tips":
+		"تنظیمات پیش‌فرض برای بارگیری از سایت‌های رسانه (YouTube، Vimeo، Bilibili و غیره). به yt-dlp در PATH نیاز دارد؛ برای ادغام جریان‌های جداگانهٔ ویدئو و صدا، ffmpeg لازم است.",
+	"media-format": "قالب ترجیحی",
+	"media-format-placeholder":
+		"مثلاً bestvideo+bestaudio/best (رشتهٔ قالب yt-dlp)",
+	"media-format-tips":
+		"انتخابگر قالب yt-dlp. برای بهترین کیفیت خالی بگذارید. مثال‌ها: bestvideo[height<=1080]+bestaudio/best, 137+140",
+	port: "درگاه",
+	"bt-port": "درگاه BT",
+	"dht-port": "درگاه DHT",
+	"ed2k-port": "درگاه شنود ed2k",
+	security: "امنیت",
+	rpc: "RPC",
+	"rpc-host": "نشانی سرور",
+	"rpc-host-local": "فقط این دستگاه",
+	"rpc-host-all": "همهٔ رابط‌های شبکه",
+	"rpc-host-custom": "سفارشی ({{host}})",
+	"rpc-host-exposed-tips":
+		"دستگاه‌های دیگر در شبکهٔ شما می‌توانند به درگاه RPC و در صورت فعال بودن، به درگاه PeerBanHelper دسترسی داشته باشند. هر کسی که رمز را بداند می‌تواند بارگیری‌ها را اضافه و کنترل کند.",
+	"rpc-listen-port": "پورت گوش دادن به RPC",
+	"rpc-secret": "رمز RPC",
+	"rpc-secret-tips": "مشاهده راهنمای رمز RPC",
+	"rpc-allow-any-dir": "اجازهٔ استفاده از هر مسیر محلی به کلاینت‌های RPC",
+	"rpc-allow-any-dir-tips":
+		"وقتی خاموش باشد، بارگیری‌هایی که از طریق RPC اضافه می‌شوند فقط در پوشهٔ بارگیری، زیرپوشه‌های آن و پوشه‌های دسته‌بندی و مسیریابی شما ذخیره می‌شوند و کلاینت‌های RPC نمی‌توانند برنامه را وادار به خواندن پروندهٔ کوکی، netrc یا کلید SSH کنند.",
+	pbh: "PeerBanHelper",
+	"pbh-enable": "فعال‌سازی API مربوط به PeerBanHelper",
+	"pbh-enable-tips":
+		"یک شنونده JSON-RPC سازگار با Aria2Next در دسترس می‌گذارد تا PeerBanHelper بتواند همتایان بیت‌تورنت را پایش و مسدود کند",
+	"pbh-listen-port": "درگاه شنود PeerBanHelper",
+	"pbh-rpc-secret": "توکن RPC مربوط به PeerBanHelper",
+	"generate-pbh-rpc-secret": "تولید توکن جدید",
+	"pbh-endpoint-hint":
+		"در PeerBanHelper یک دانلودر Aria2Next با آدرس http://127.0.0.1:{{port}}/jsonrpc اضافه کنید",
+	"randomize-port": "انتخاب درگاه تصادفی",
+	"generate-rpc-secret": "ساخت راز RPC جدید",
+	"copy-rpc-url": "رونوشت از URL مربوط به RPC",
+	"engine-overrides": "جایگزینی تنظیمات موتور (JSON)",
+	"engine-overrides-placeholder":
+		'{\n  "piece-length": "1M",\n  "timeout": 60\n}',
+	"engine-overrides-tips":
+		"پیشرفته: کلیدهای دلخواه گزینه‌های موتور را به صورت یک شیء JSON تنظیم کنید. تغییرات پس از راه‌اندازی دوباره اعمال می‌شوند.",
+	"engine-overrides-invalid":
+		"جایگزینی تنظیمات موتور باید یک شیء JSON معتبر باشد.",
 	"engine-overrides-reserved-keys":
 		"کلیدهای رزروشدهٔ جایگزینی تنظیمات موتور نادیده گرفته شدند: {{keys}}",
 	"engine-overrides-too-large":
 		"جایگزینی تنظیمات موتور بیش از حد بزرگ است: حداکثر 64 کلید، 64 نویسه برای هر کلید و 2048 نویسه برای هر مقدار.",
-	"external-engine-enable": "استفاده از موتور خارجی",
-	"external-engine-enable-tips":
-		"وقتی این گزینه فعال باشد، Risuko موتور داخلی را به صورت خودکار اجرا نمی‌کند.",
-	"external-engine-ip": "IP موتور خارجی",
-	"external-engine-port": "پورت موتور خارجی",
-	"external-engine-secret": "رمز موتور خارجی",
 	developer: "توسعه‌دهنده",
 	"user-agent": "User-Agent",
 	"mock-user-agent": "جعل عامل کاربر",
+	cookies: "کوکی‌ها",
+	"cookies-tips":
+		"کوکی‌ها را از یک پروندهٔ cookies.txt با قالب Netscape/Mozilla بارگذاری کنید (خروجی curl/wget را هم می‌پذیرد).",
+	"load-cookies-placeholder": "/path/to/cookies.txt",
+	"saved-cookies": "اطلاعات ورود ذخیره‌شدهٔ دامنه‌ها",
+	"saved-cookies-tips":
+		"کوکی‌ها و User-Agent که هنگام عبور از Cloudflare یا بارگیری‌های محافظت‌شده با احراز هویت از مرورگر وارد شده‌اند. Risuko از آن‌ها برای بارگیری‌های جدید در همان دامنه استفاده می‌کند، تا زمانی که منقضی شوند یا از کار بیفتند.",
+	"saved-cookies-empty": "هنوز اطلاعات ورودی ذخیره نشده است.",
+	"saved-cookies-host": "دامنه",
+	"saved-cookies-browser": "مرورگر",
+	"saved-cookies-count": "کوکی‌ها",
+	"saved-cookies-imported": "واردشده",
+	"saved-cookies-actions": "عملیات",
+	"saved-cookies-clear": "پاک کردن همه",
+	"saved-cookies-confirm-clear":
+		"همهٔ اطلاعات ورود ذخیره‌شدهٔ دامنه‌ها حذف شود؟ ممکن است بارگیری‌های بعدی در آن سایت‌ها تا وارد کردن دوباره ناموفق باشند.",
+	"saved-cookies-delete": "حذف",
+	netrc: "اطلاعات ورود .netrc",
+	"netrc-tips":
+		"وقتی URL اطلاعات ورود جاسازی‌شده ندارد، احراز هویت HTTP Basic را از پروندهٔ .netrc اضافه می‌کند. پیش‌فرض: ~/.netrc (یا %USERPROFILE%/_netrc در Windows).",
+	"netrc-path-placeholder": "جایگزینی مسیر .netrc (اختیاری)",
+	"no-netrc": "غیرفعال کردن جستجوی .netrc",
+	"no-netrc-tips":
+		"از .netrc کلاً صرف‌نظر می‌کند. زمانی مفید است که پرونده اطلاعات ورود غیرمرتبط با بارگیری دارد.",
 	"app-log-path": "مسیر گزارش برنامه",
+	"log-dir-override-placeholder":
+		"پوشهٔ سفارشی گزارش‌ها (برای پیش‌فرض خالی بگذارید)",
+	"log-dir-override-tips":
+		"گزارش‌ها اکنون در {{path}} نوشته می‌شوند. تعیین یک پوشهٔ سفارشی (مثلاً درون Downloads) آن‌ها را برای هر مدیر پروندهٔ دیگری قابل مشاهده می‌کند. تغییرات پس از راه‌اندازی مجدد بعدی برنامه اعمال می‌شوند.",
 	"download-session-path": "مسیر نشست بارگیری",
 	"session-reset": "بازنشانی نشست بارگیری",
 	"session-reset-confirm": "آیا برای بازنشانی نشست بارگیری مطمئنید؟",
@@ -143,6 +483,7 @@ export default {
 		"تنظیم به عنوان کارخواه پیش‌گزیده برای شیوه‌نامه‌های زیر",
 	"protocols-magnet": "آهن‌ربا [ magnet:// ]",
 	"protocols-thunder": "تندر [ thunder:// ]",
+	"protocols-ed2k": "eDonkey [ ed2k:// ]",
 	"protocols-adc": "Direct Connect [ adc:// adcs:// dchub:// nmdc:// ]",
 	"protocols-gnutella": "Gnutella [ gnutella://, gnet:// ]",
 	"protocols-g2": "Gnutella2 [ g2:// ]",
@@ -158,9 +499,6 @@ export default {
 	"auto-update": "به‌روز رسانی خودکار",
 	"auto-check-update": "به صورت خودکار برای به‌روز رسانی بررسی کن",
 	"last-check-update-time": "آخرین زمان بررسی برای به‌روز رسانی",
-	"not-saved": "تنظیمات برگزیده ذخیره نشد",
-	"not-saved-confirm":
-		"تنظیمات برگزیده تغییر یافته از بین خواهند رفت، آیا مطمئن هستید که می روید؟",
 	"completion-script": "اسکریپت پس از اتمام",
 	"completion-script-enabled": "اجرای اسکریپت پس از اتمام دانلود",
 	"completion-script-tips":
@@ -178,10 +516,38 @@ export default {
 	"completion-script-test-ok": "تست اسکریپت موفق بود",
 	"completion-script-test-fail": "تست اسکریپت ناموفق بود",
 	"completion-script-empty": "لطفاً ابتدا یک دستور مشخص کنید",
-	"history-directories": "پوشه‌های دانلود اخیر",
-	"favorite-directory": "پوشه موردعلاقه",
-	"unfavorite-directory": "حذف پوشه از علاقه‌مندی‌ها",
-	"remove-history-directory": "حذف پوشه از تاریخچه",
-	"randomize-port": "انتخاب درگاه تصادفی",
-	"generate-rpc-secret": "ساخت راز RPC جدید",
+	"completion-script-not-approved":
+		"اسکریپت پس از اتمام مجاز نشد، بنابراین چیزی ذخیره نشد.",
+	"not-saved": "تنظیمات برگزیده ذخیره نشد",
+	"not-saved-confirm":
+		"تنظیمات برگزیده تغییر یافته از بین خواهند رفت، آیا مطمئن هستید که می روید؟",
+	"saved-credentials": "اطلاعات ورود ذخیره‌شده",
+	"saved-credentials-description":
+		"اطلاعات ورود ذخیره‌شدهٔ احراز هویت را برای بارگیری‌ها مدیریت کنید",
+	"no-saved-credentials": "اطلاعات ورودی ذخیره نشده است",
+	"credential-host": "میزبان",
+	"credential-label": "برچسب",
+	"credential-protocol": "شیوه‌نامه",
+	"credential-last-used": "آخرین استفاده",
+	"credential-delete": "حذف اطلاعات ورود",
+	"credential-delete-confirm":
+		"آیا مطمئنید که می‌خواهید این اطلاعات ورود ذخیره‌شده را حذف کنید؟",
+	"vault-enabled": "اطلاعات محرمانه در دسته‌کلید سیستم‌عامل ذخیره می‌شوند",
+	"vault-disabled":
+		"دسته‌کلید سیستم‌عامل در دسترس نیست — اطلاعات محرمانه به‌صورت متن ساده ذخیره می‌شوند",
+	"credential-encrypted-badge": "ذخیره‌شده در دسته‌کلید سیستم‌عامل",
+	"credential-vault-unavailable":
+		"دسترسی به دسته‌کلید سیستم‌عامل ممکن نیست؛ اطلاعات ورود جدید به‌صورت متن ساده ذخیره خواهند شد",
+	"speed-limit-enabled": "فعال کردن محدودیت سرعت",
+	"speed-limit-enabled-description":
+		"محدودیت‌های زیر را اعمال می‌کند. وقتی خاموش باشد، بارگیری‌ها با سرعت کامل اجرا می‌شوند؛ مقادیر حفظ می‌شوند.",
+	"appearance-theme": "پوسته",
+	"appearance-typography": "حروف‌نگاری",
+	"appearance-window": "پنجره",
+	"task-list-style": "فهرست وظایف",
+	"task-list-style-description": "نحوهٔ نمایش بارگیری‌ها در فهرست وظایف.",
+	"task-list-style-compact": "فشرده",
+	"task-list-style-card": "کارت‌ها",
+	"sidebar-collapsed": "جمع کردن نوار کناری",
+	"sidebar-collapsed-description": "فقط نمادها را در نوار کناری نشان می‌دهد.",
 };

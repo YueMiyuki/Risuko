@@ -1,6 +1,6 @@
 export default {
 	tagline: "Tam özellikli bir indirme yöneticisi",
-	"engine-version": "Engine Versiyonu",
+	"engine-version": "Motor Sürümü",
 	features: "Özellikler",
 	"check-updates": "Güncellemeleri denetle",
 	"copy-info": "Sürüm bilgisini kopyala",

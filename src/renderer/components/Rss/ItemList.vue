@@ -8,7 +8,7 @@
         <ul :class="['rss-items', densityMode === 'compact' ? 'rss-items--compact' : 'rss-items--comfortable']">
           <motion-enter
             v-for="(item, index) in items"
-            :key="item.id"
+            :key="`${item.feed_id}:${item.id}`"
             tag="li"
             preset="fadeInUp"
             :duration="0.4"
@@ -185,7 +185,7 @@
           <div v-else-if="viewerExternalPath" class="rss-viewer-external">
             <p>{{ $t('rss.binary-file') }}</p>
             <p class="rss-viewer-path">{{ viewerExternalPath }}</p>
-            <Button @click="openLink(viewerExternalPath)">
+            <Button @click="openFile(viewerExternalPath)">
               {{ $t('rss.open-externally') }}
             </Button>
           </div>
@@ -206,7 +206,6 @@
 import { CheckCircle2, Download, ExternalLink, Eye, Trash2 } from "@lucide/vue";
 import type { RssItem } from "@shared/types/rss";
 import { bytesToSize } from "@shared/utils";
-import { invoke } from "@tauri-apps/api/core";
 import api from "@/api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -218,6 +217,8 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { useRssStore } from "@/store/rss";
+import { openExternalUrl } from "@/utils/external";
+import { openItem } from "@/utils/native";
 
 function isHtmlPath(path: string): boolean {
 	const lower = path.toLowerCase();
@@ -441,6 +442,7 @@ export default {
 		},
 		openPreview(item: RssItem) {
 			this.previewItem = item;
+			void useRssStore().markItemRead(item.feed_id, item.id);
 		},
 		closePreview() {
 			this.previewItem = null;
@@ -455,6 +457,7 @@ export default {
 			await useRssStore().clearItemDownload(item.feed_id, item.id);
 		},
 		async openViewer(item: RssItem) {
+			void useRssStore().markItemRead(item.feed_id, item.id);
 			this.viewerItem = item;
 			this.viewerContent = "";
 			this.viewerError = "";
@@ -490,10 +493,19 @@ export default {
 			this.viewerError = "";
 			this.viewerExternalPath = "";
 		},
-		openLink(url: string) {
-			invoke("plugin:shell|open", { path: url }).catch(() => {
-				window.open(url, "_blank");
-			});
+		async openLink(url: string) {
+			if (!(await openExternalUrl(url))) {
+				this.$msg.error(this.$t("app.open-url-failed"));
+			}
+		},
+		async openFile(path: string) {
+			try {
+				if (await openItem(path)) {
+					this.$msg.error(this.$t("task.file-not-exist"));
+				}
+			} catch (err) {
+				this.$msg.error(`${err}`);
+			}
 		},
 		formatDate(timestamp: number): string {
 			return new Date(timestamp * 1000).toLocaleDateString(undefined, {

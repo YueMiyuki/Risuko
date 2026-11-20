@@ -52,9 +52,9 @@ pub(crate) fn ftps_tls_connector(accept_invalid_certs: bool) -> AsyncRustlsConne
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
+        builder
+            .with_root_certificates(risuko_http::tls_roots())
+            .with_no_client_auth()
     };
     AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)))
 }

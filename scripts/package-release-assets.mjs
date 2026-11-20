@@ -5,11 +5,11 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
-	readdirSync,
 	statSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { walkFiles } from "./walk-files.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -66,19 +66,7 @@ function listFiles(dir) {
 	if (!existsSync(dir)) {
 		throw new Error(`Missing bundle directory: ${dir}`);
 	}
-
-	const files = [];
-	for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
-		a.name.localeCompare(b.name),
-	)) {
-		const path = join(dir, entry.name);
-		if (entry.isDirectory()) {
-			files.push(...listFiles(path));
-		} else if (entry.isFile()) {
-			files.push(path);
-		}
-	}
-	return files;
+	return walkFiles(dir);
 }
 
 function findOne(dir, predicate, description) {

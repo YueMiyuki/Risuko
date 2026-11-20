@@ -1,6 +1,10 @@
+#[cfg(not(target_os = "android"))]
 pub mod clip_prompt;
+#[cfg(not(target_os = "android"))]
 pub mod flyout;
 pub mod menu;
+#[cfg(not(target_os = "android"))]
+mod panel;
 #[cfg(not(target_os = "android"))]
 pub mod panel_gate;
 pub mod tray;

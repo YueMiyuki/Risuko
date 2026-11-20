@@ -134,6 +134,7 @@ pub fn decode_all_external(input: &[u8], limits: DecodeLimits) -> Result<Value, 
 }
 
 const MAX_STRICT_DEPTH: usize = 256;
+const MAX_STRICT_VALUES: usize = 4_194_304;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DictMode {
@@ -190,11 +191,18 @@ impl<'a> Parser<'a> {
                     max: limits.max_values,
                 });
             }
-        } else if depth > MAX_STRICT_DEPTH {
-            return Err(Error::DepthLimit {
-                pos: self.pos,
-                max: MAX_STRICT_DEPTH,
-            });
+        } else {
+            if depth > MAX_STRICT_DEPTH {
+                return Err(Error::DepthLimit {
+                    pos: self.pos,
+                    max: MAX_STRICT_DEPTH,
+                });
+            }
+            if self.values >= MAX_STRICT_VALUES {
+                return Err(Error::ValueLimit {
+                    max: MAX_STRICT_VALUES,
+                });
+            }
         }
         self.values = self.values.saturating_add(1);
         Ok(())
@@ -541,6 +549,31 @@ mod tests {
         let deep = [b"l".repeat(100_000), b"e".repeat(100_000)].concat();
         assert!(matches!(decode_all(&deep), Err(Error::DepthLimit { .. })));
         let ok = [b"l".repeat(200), b"e".repeat(200)].concat();
+        assert!(decode_all(&ok).is_ok());
+    }
+
+    #[test]
+    fn strict_decode_enforces_value_budget() {
+        let over = [
+            b"l".to_vec(),
+            b"0:".repeat(MAX_STRICT_VALUES),
+            b"e".to_vec(),
+        ]
+        .concat();
+        assert!(matches!(
+            decode_all(&over),
+            Err(Error::ValueLimit {
+                max: MAX_STRICT_VALUES
+            })
+        ));
+        let large = [
+            b"l".to_vec(),
+            b"0:".repeat(MAX_STRICT_VALUES - 1),
+            b"e".to_vec(),
+        ]
+        .concat();
+        assert!(decode_all(&large).is_ok());
+        let ok = [b"l".to_vec(), b"i0e".repeat(1_000), b"e".to_vec()].concat();
         assert!(decode_all(&ok).is_ok());
     }
 

@@ -97,7 +97,6 @@
 <script lang="ts">
 import { History, Star, StarOff, Trash2 } from "@lucide/vue";
 import { MAX_NUM_OF_DIRECTORIES } from "@shared/constants";
-import logger from "@shared/utils/logger";
 import UiButton from "@/components/ui/compat/UiButton.vue";
 import {
 	Popover,
@@ -117,9 +116,6 @@ export default {
 		Star,
 		StarOff,
 		Trash2,
-	},
-	data() {
-		return {};
 	},
 	computed: {
 		historyDirectories() {
@@ -150,15 +146,12 @@ export default {
 			this.$emit("selected", directory.trim());
 		},
 		handleFavoriteItem(directory) {
-			logger.log("handleFavoriteItem==>", directory);
 			usePreferenceStore().favoriteDirectory(directory);
 		},
 		handleCancelFavoriteItem(directory) {
-			logger.log("handleCancelFavoriteItem==>", directory);
 			usePreferenceStore().cancelFavoriteDirectory(directory);
 		},
 		handleRemoveItem(directory) {
-			logger.log("handleRemoveItem==>", directory);
 			usePreferenceStore().removeDirectory(directory);
 		},
 	},

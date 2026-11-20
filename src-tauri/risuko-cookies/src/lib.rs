@@ -5,12 +5,7 @@ mod utils;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-// Marker the Tauri side matches to offer a UAC retry
-#[cfg(target_os = "windows")]
-pub const ELEVATION_REQUIRED: &str = platform::windows::ELEVATION_REQUIRED;
-
-#[cfg(not(target_os = "windows"))]
-pub const ELEVATION_REQUIRED: &str = "risuko:elevation-required";
+pub const APP_BOUND_UNSUPPORTED: &str = "risuko:app-bound-cookies";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cookie {
@@ -69,91 +64,113 @@ pub async fn list_browsers() -> Vec<BrowserInfo> {
 }
 
 #[cfg(not(target_os = "android"))]
+enum CookieSource {
+    Chromium(fn() -> browser::chromium::BrowserConfig),
+    Firefox(fn() -> browser::firefox::BrowserConfig),
+    #[cfg(target_os = "macos")]
+    Safari,
+}
+
+#[cfg(not(target_os = "android"))]
+struct KnownBrowser {
+    id: &'static str,
+    name: &'static str,
+    source: CookieSource,
+}
+
+#[cfg(not(target_os = "android"))]
+const BROWSERS: &[KnownBrowser] = &[
+    KnownBrowser {
+        id: "chrome",
+        name: "Google Chrome",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::chrome),
+    },
+    KnownBrowser {
+        id: "edge",
+        name: "Microsoft Edge",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::edge),
+    },
+    KnownBrowser {
+        id: "brave",
+        name: "Brave",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::brave),
+    },
+    KnownBrowser {
+        id: "chromium",
+        name: "Chromium",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::chromium),
+    },
+    KnownBrowser {
+        id: "vivaldi",
+        name: "Vivaldi",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::vivaldi),
+    },
+    KnownBrowser {
+        id: "opera",
+        name: "Opera",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::opera),
+    },
+    #[cfg(target_os = "macos")]
+    KnownBrowser {
+        id: "arc",
+        name: "Arc",
+        source: CookieSource::Chromium(browser::chromium::BrowserConfig::arc),
+    },
+    KnownBrowser {
+        id: "firefox",
+        name: "Firefox",
+        source: CookieSource::Firefox(browser::firefox::BrowserConfig::firefox),
+    },
+    KnownBrowser {
+        id: "librewolf",
+        name: "LibreWolf",
+        source: CookieSource::Firefox(browser::firefox::BrowserConfig::librewolf),
+    },
+    KnownBrowser {
+        id: "zen",
+        name: "Zen Browser",
+        source: CookieSource::Firefox(browser::firefox::BrowserConfig::zen),
+    },
+    #[cfg(target_os = "macos")]
+    KnownBrowser {
+        id: "safari",
+        name: "Safari",
+        source: CookieSource::Safari,
+    },
+];
+
+#[cfg(not(target_os = "android"))]
+impl CookieSource {
+    fn is_available(&self) -> bool {
+        match self {
+            Self::Chromium(config) => browser::chromium::is_available(&config()),
+            Self::Firefox(config) => browser::firefox::is_available(&config()),
+            #[cfg(target_os = "macos")]
+            Self::Safari => browser::safari::is_available(),
+        }
+    }
+
+    fn extract(&self, host: &str) -> eyre::Result<Vec<browser::chromium::Cookie>> {
+        match self {
+            Self::Chromium(config) => browser::chromium::extract_cookies(&config(), Some(host)),
+            Self::Firefox(config) => browser::firefox::extract_cookies(&config(), Some(host)),
+            #[cfg(target_os = "macos")]
+            Self::Safari => browser::safari::extract_cookies(Some(host)),
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn list_browsers_sync() -> Vec<BrowserInfo> {
-    let mut browsers = Vec::new();
-
-    macro_rules! probe {
-        ($id:literal, $name:literal, $ua:expr, $config:expr) => {{
-            let available = browser::chromium::is_available(&$config);
-            browsers.push(BrowserInfo {
-                id: $id.into(),
-                name: $name.into(),
-                available,
-                user_agent: $ua.into(),
-            });
-        }};
-        (firefox: $id:literal, $name:literal, $ua:expr, $config:expr) => {{
-            let available = browser::firefox::is_available(&$config);
-            browsers.push(BrowserInfo {
-                id: $id.into(),
-                name: $name.into(),
-                available,
-                user_agent: $ua.into(),
-            });
-        }};
-    }
-
-    probe!(
-        "chrome",
-        "Google Chrome",
-        default_ua("chrome"),
-        browser::chromium::BrowserConfig::chrome()
-    );
-    probe!(
-        "edge",
-        "Microsoft Edge",
-        default_ua("edge"),
-        browser::chromium::BrowserConfig::edge()
-    );
-    probe!(
-        "brave",
-        "Brave",
-        default_ua("brave"),
-        browser::chromium::BrowserConfig::brave()
-    );
-    probe!(
-        "chromium",
-        "Chromium",
-        default_ua("chromium"),
-        browser::chromium::BrowserConfig::chromium()
-    );
-    probe!(
-        "vivaldi",
-        "Vivaldi",
-        default_ua("vivaldi"),
-        browser::chromium::BrowserConfig::vivaldi()
-    );
-    probe!(
-        "opera",
-        "Opera",
-        default_ua("opera"),
-        browser::chromium::BrowserConfig::opera()
-    );
-
-    #[cfg(target_os = "macos")]
-    probe!(
-        "arc",
-        "Arc",
-        default_ua("chrome"),
-        browser::chromium::BrowserConfig::arc()
-    );
-
-    probe!(firefox: "firefox", "Firefox", default_ua("firefox"), browser::firefox::BrowserConfig::firefox());
-    probe!(firefox: "librewolf", "LibreWolf", default_ua("firefox"), browser::firefox::BrowserConfig::librewolf());
-    probe!(firefox: "zen", "Zen Browser", default_ua("firefox"), browser::firefox::BrowserConfig::zen());
-
-    #[cfg(target_os = "macos")]
-    {
-        let available = browser::safari::is_available();
-        browsers.push(BrowserInfo {
-            id: "safari".into(),
-            name: "Safari".into(),
-            available,
-            user_agent: default_ua("safari"),
-        });
-    }
-
-    browsers
+    BROWSERS
+        .iter()
+        .map(|known| BrowserInfo {
+            id: known.id.into(),
+            name: known.name.into(),
+            available: known.source.is_available(),
+            user_agent: default_ua(known.id),
+        })
+        .collect()
 }
 
 pub async fn cookies_for_host(browser: &str, host: &str) -> Result<Vec<Cookie>, String> {
@@ -176,66 +193,12 @@ pub async fn cookies_for_host(browser: &str, host: &str) -> Result<Vec<Cookie>, 
 fn cookies_for_host_sync(browser: &str, host: &str) -> Result<Vec<Cookie>, String> {
     tracing::debug!(target: "risuko_cookies", "cookies_for_host_sync: browser={} host={}", browser, host);
 
-    let result = match browser {
-        "chrome" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::chrome(),
-            Some(host),
-        ),
-        "edge" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::edge(),
-            Some(host),
-        ),
-        "brave" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::brave(),
-            Some(host),
-        ),
-        "chromium" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::chromium(),
-            Some(host),
-        ),
-        "vivaldi" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::vivaldi(),
-            Some(host),
-        ),
-        "opera" => browser::chromium::extract_cookies(
-            &browser::chromium::BrowserConfig::opera(),
-            Some(host),
-        ),
-        "arc" => {
-            #[cfg(target_os = "macos")]
-            {
-                browser::chromium::extract_cookies(
-                    &browser::chromium::BrowserConfig::arc(),
-                    Some(host),
-                )
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(eyre::eyre!("arc only available on macos"))
-            }
+    let result = match BROWSERS.iter().find(|known| known.id == browser) {
+        Some(known) => known.source.extract(host),
+        None if matches!(browser, "arc" | "safari") => {
+            Err(eyre::eyre!("{browser} only available on macos"))
         }
-        "firefox" => browser::firefox::extract_cookies(
-            &browser::firefox::BrowserConfig::firefox(),
-            Some(host),
-        ),
-        "librewolf" => browser::firefox::extract_cookies(
-            &browser::firefox::BrowserConfig::librewolf(),
-            Some(host),
-        ),
-        "zen" => {
-            browser::firefox::extract_cookies(&browser::firefox::BrowserConfig::zen(), Some(host))
-        }
-        "safari" => {
-            #[cfg(target_os = "macos")]
-            {
-                browser::safari::extract_cookies(Some(host))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(eyre::eyre!("safari only available on macos"))
-            }
-        }
-        _ => Err(eyre::eyre!("unsupported browser: {}", browser)),
+        None => Err(eyre::eyre!("unsupported browser: {}", browser)),
     }
     .map_err(|e| e.to_string());
 

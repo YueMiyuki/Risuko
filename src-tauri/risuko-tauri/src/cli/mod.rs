@@ -1,9 +1,16 @@
-pub mod commands;
 pub mod headless;
 
 pub use risuko_cli::{progress, rpc_client};
 
 use clap::{Parser, Subcommand};
+use risuko_cli::args::{DownloadArgs, PauseArgs, RemoveArgs, ResumeArgs, ServeArgs, StatusArgs};
+use risuko_cli::shared::{self, EngineHost};
+
+const HOST: EngineHost = EngineHost {
+    config_dir: headless::get_config_dir,
+    require_download_dir: true,
+    before_start: headless::init_headless_tracing,
+};
 
 #[derive(Parser)]
 #[command(name = "risuko", about = "A full-featured download manager", version)]
@@ -36,179 +43,21 @@ pub enum Command {
 
     /// Start headless engine (RPC server only, no GUI)
     Serve(ServeArgs),
-
-    /// Internal: extract browser cookies as JSON. Used by the Windows elevated helper to decrypt app-bound (Chrome v20) cookies. Hidden from `--help`
-    #[command(hide = true)]
-    ExtractCookies(ExtractCookiesArgs),
-}
-
-#[derive(clap::Args)]
-pub struct DownloadArgs {
-    /// URL(s), magnet link, or path to a .torrent file
-    #[arg(required = true, num_args = 1..)]
-    pub urls: Vec<String>,
-
-    /// Number of connections per download (maps to split)
-    #[arg(short = 't', long, default_value_t = 16)]
-    pub threads: u32,
-
-    /// Download directory
-    #[arg(short, long)]
-    pub dir: Option<String>,
-
-    /// Output filename
-    #[arg(short, long)]
-    pub out: Option<String>,
-
-    /// HTTP header (repeatable, e.g. -H "Cookie: foo=bar")
-    #[arg(short = 'H', long = "header")]
-    pub headers: Vec<String>,
-
-    /// User agent string
-    #[arg(long)]
-    pub user_agent: Option<String>,
-
-    /// Proxy server URL (e.g. http://proxy:8080)
-    #[arg(long)]
-    pub proxy: Option<String>,
-
-    /// DNS-over-HTTPS endpoint URL (e.g. https://cloudflare-dns.com/dns-query)
-    #[arg(long)]
-    pub doh_url: Option<String>,
-
-    /// Bootstrap IPs for the DoH endpoint, comma separated (optional)
-    #[arg(long)]
-    pub doh_bootstrap: Option<String>,
-
-    /// HTTP referer
-    #[arg(long)]
-    pub referer: Option<String>,
-
-    /// Cookie string
-    #[arg(long)]
-    pub cookie: Option<String>,
-
-    /// Media format selector passed to yt-dlp (YouTube, Vimeo, etc.)
-    #[arg(long, alias = "youtube-format")]
-    pub media_format: Option<String>,
-
-    /// Force the URL through the yt-dlp media engine even if its host is not in the built-in allowlist
-    #[arg(long = "ytdlp")]
-    pub force_ytdlp: bool,
-
-    /// BT seed ratio (e.g. 1.0)
-    #[arg(long)]
-    pub seed_ratio: Option<f64>,
-
-    /// BT seed time in minutes
-    #[arg(long)]
-    pub seed_time: Option<u64>,
-
-    /// RPC port to connect to
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-
-    /// RPC secret for authentication
-    #[arg(long)]
-    pub rpc_secret: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(clap::Args)]
-pub struct StatusArgs {
-    /// Show a specific task by GID
-    #[arg(long)]
-    pub gid: Option<String>,
-
-    /// RPC port to connect to
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-
-    /// RPC secret for authentication
-    #[arg(long)]
-    pub rpc_secret: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(clap::Args)]
-pub struct PauseArgs {
-    /// Task GID to pause
-    pub gid: String,
-
-    /// RPC port to connect to
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-
-    /// RPC secret for authentication
-    #[arg(long)]
-    pub rpc_secret: Option<String>,
-}
-
-#[derive(clap::Args)]
-pub struct ResumeArgs {
-    /// Task GID to resume
-    pub gid: String,
-
-    /// RPC port to connect to
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-
-    /// RPC secret for authentication
-    #[arg(long)]
-    pub rpc_secret: Option<String>,
-}
-
-#[derive(clap::Args)]
-pub struct RemoveArgs {
-    /// Task GID to remove
-    pub gid: String,
-
-    /// RPC port to connect to
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-
-    /// RPC secret for authentication
-    #[arg(long)]
-    pub rpc_secret: Option<String>,
-}
-
-#[derive(clap::Args)]
-pub struct ServeArgs {
-    /// RPC port to listen on
-    #[arg(long, default_value_t = 16800)]
-    pub rpc_port: u16,
-}
-
-#[derive(clap::Args)]
-pub struct ExtractCookiesArgs {
-    /// Browser id (chrome, chromium, brave, edge, vivaldi, opera, arc, firefox, librewolf, zen, ...)
-    #[arg(long)]
-    pub browser: String,
-
-    /// Target URL or bare host to scope the cookies to
-    #[arg(long)]
-    pub url: String,
-
-    /// Write the resulting HostCookies JSON to this file instead of stdout. The GUI passes a temp path here when relaunching elevated
-    #[arg(long)]
-    pub out: Option<String>,
 }
 
 pub async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Command::Download(args) => commands::download(args).await,
-        Command::Status(args) => commands::status(args).await,
-        Command::Pause(args) => commands::pause(args).await,
-        Command::Resume(args) => commands::resume(args).await,
-        Command::Remove(args) => commands::remove(args).await,
-        Command::Serve(args) => commands::serve(args).await,
-        Command::ExtractCookies(args) => commands::extract_cookies(args).await,
+        Command::Download(args) => shared::download(&HOST, args).await,
+        Command::Status(args) => shared::status(&HOST, args).await,
+        Command::Pause(args) => shared::pause(&HOST, args).await,
+        Command::Resume(args) => shared::resume(&HOST, args).await,
+        Command::Remove(args) => shared::remove(&HOST, args).await,
+        Command::Serve(args) => {
+            if args.verbose {
+                headless::init_verbose_tracing();
+            }
+            shared::serve(&HOST, args).await
+        }
     }
 }
 
@@ -222,7 +71,6 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
                 | "resume"
                 | "remove"
                 | "serve"
-                | "extract-cookies"
                 | "help"
                 | "-h"
                 | "--help"
@@ -259,5 +107,255 @@ mod launch_tests {
             "risuko",
             "--opened-at-login=1"
         ])));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn argv<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
+        std::iter::once("risuko").chain(args.iter().copied())
+    }
+
+    fn parse(args: &[&str]) -> Command {
+        Cli::try_parse_from(argv(args))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+            .unwrap_or_else(|| panic!("{args:?}: no subcommand"))
+    }
+
+    fn matches(args: &[&str]) -> clap::ArgMatches {
+        Cli::command()
+            .try_get_matches_from(argv(args))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    #[test]
+    fn no_subcommand_and_the_login_flag() {
+        let cli = Cli::try_parse_from(argv(&[])).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.opened_at_login, None);
+
+        let cli = Cli::try_parse_from(argv(&["--opened-at-login=1"])).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.opened_at_login.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn download_takes_several_urls_with_defaults() {
+        let Command::Download(args) = parse(&["download", "http://a/f", "http://b/f"]) else {
+            panic!("not download");
+        };
+        assert_eq!(args.urls, ["http://a/f", "http://b/f"]);
+        assert_eq!(args.threads, 16);
+        assert_eq!(args.dir, None);
+        assert_eq!(args.out, None);
+        assert!(args.headers.is_empty());
+        assert_eq!(args.user_agent, None);
+        assert_eq!(args.proxy, None);
+        assert_eq!(args.doh_url, None);
+        assert_eq!(args.doh_bootstrap, None);
+        assert_eq!(args.referer, None);
+        assert_eq!(args.cookie, None);
+        assert_eq!(args.media_format, None);
+        assert!(!args.force_ytdlp);
+        assert_eq!(args.seed_ratio, None);
+        assert_eq!(args.seed_time, None);
+        assert_eq!(args.rpc_port, 16800);
+        assert_eq!(args.rpc_secret, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn download_takes_every_flag() {
+        let Command::Download(args) = parse(&[
+            "download",
+            "-t",
+            "4",
+            "-d",
+            "/tmp/d",
+            "-o",
+            "f.bin",
+            "-H",
+            "A: 1",
+            "-H",
+            "B: 2",
+            "--user-agent",
+            "UA",
+            "--proxy",
+            "http://p:8080",
+            "--doh-url",
+            "https://dns.example/dns-query",
+            "--doh-bootstrap",
+            "1.1.1.1,1.0.0.1",
+            "--referer",
+            "http://r/",
+            "--cookie",
+            "c=1",
+            "--media-format",
+            "best",
+            "--ytdlp",
+            "--seed-ratio",
+            "1.5",
+            "--seed-time",
+            "30",
+            "--rpc-port",
+            "7000",
+            "--rpc-secret",
+            "s",
+            "--json",
+            "magnet:?xt=urn:btih:abc",
+        ]) else {
+            panic!("not download");
+        };
+        assert_eq!(args.urls, ["magnet:?xt=urn:btih:abc"]);
+        assert_eq!(args.threads, 4);
+        assert_eq!(args.dir.as_deref(), Some("/tmp/d"));
+        assert_eq!(args.out.as_deref(), Some("f.bin"));
+        assert_eq!(args.headers, ["A: 1", "B: 2"]);
+        assert_eq!(args.user_agent.as_deref(), Some("UA"));
+        assert_eq!(args.proxy.as_deref(), Some("http://p:8080"));
+        assert_eq!(
+            args.doh_url.as_deref(),
+            Some("https://dns.example/dns-query")
+        );
+        assert_eq!(args.doh_bootstrap.as_deref(), Some("1.1.1.1,1.0.0.1"));
+        assert_eq!(args.referer.as_deref(), Some("http://r/"));
+        assert_eq!(args.cookie.as_deref(), Some("c=1"));
+        assert_eq!(args.media_format.as_deref(), Some("best"));
+        assert!(args.force_ytdlp);
+        assert_eq!(args.seed_ratio, Some(1.5));
+        assert_eq!(args.seed_time, Some(30));
+        assert_eq!(args.rpc_port, 7000);
+        assert_eq!(args.rpc_secret.as_deref(), Some("s"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn download_takes_long_flags_and_the_format_alias() {
+        let Command::Download(args) = parse(&[
+            "download",
+            "--threads",
+            "2",
+            "--dir",
+            "d",
+            "--out",
+            "o",
+            "--header",
+            "X: y",
+            "--youtube-format",
+            "worst",
+            "u",
+        ]) else {
+            panic!("not download");
+        };
+        assert_eq!(args.threads, 2);
+        assert_eq!(args.dir.as_deref(), Some("d"));
+        assert_eq!(args.out.as_deref(), Some("o"));
+        assert_eq!(args.headers, ["X: y"]);
+        assert_eq!(args.media_format.as_deref(), Some("worst"));
+    }
+
+    #[test]
+    fn download_needs_a_url() {
+        assert!(Cli::try_parse_from(argv(&["download"])).is_err());
+    }
+
+    #[test]
+    fn status_takes_an_optional_gid() {
+        let Command::Status(args) = parse(&["status"]) else {
+            panic!("not status");
+        };
+        assert_eq!(args.gid, None);
+        assert_eq!(args.rpc_port, 16800);
+        assert_eq!(args.rpc_secret, None);
+        assert!(!args.json);
+
+        let Command::Status(args) = parse(&[
+            "status",
+            "--gid",
+            "abc",
+            "--rpc-port",
+            "7000",
+            "--rpc-secret",
+            "s",
+            "--json",
+        ]) else {
+            panic!("not status");
+        };
+        assert_eq!(args.gid.as_deref(), Some("abc"));
+        assert_eq!(args.rpc_port, 7000);
+        assert_eq!(args.rpc_secret.as_deref(), Some("s"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn pause_and_resume_take_one_gid() {
+        let Command::Pause(args) = parse(&["pause", "abc"]) else {
+            panic!("not pause");
+        };
+        assert_eq!(args.gid, "abc");
+        assert_eq!(args.rpc_port, 16800);
+        assert_eq!(args.rpc_secret, None);
+
+        let Command::Resume(args) =
+            parse(&["resume", "abc", "--rpc-port", "7000", "--rpc-secret", "s"])
+        else {
+            panic!("not resume");
+        };
+        assert_eq!(args.gid, "abc");
+        assert_eq!(args.rpc_port, 7000);
+        assert_eq!(args.rpc_secret.as_deref(), Some("s"));
+
+        assert!(Cli::try_parse_from(argv(&["pause"])).is_err());
+        assert!(Cli::try_parse_from(argv(&["resume", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn remove_takes_one_gid() {
+        let Command::Remove(args) =
+            parse(&["remove", "abc", "--rpc-port", "7000", "--rpc-secret", "s"])
+        else {
+            panic!("not remove");
+        };
+        assert_eq!(args.gids, ["abc"]);
+        assert_eq!(args.rpc_port, 7000);
+        assert_eq!(args.rpc_secret.as_deref(), Some("s"));
+        assert!(Cli::try_parse_from(argv(&["remove"])).is_err());
+    }
+
+    #[test]
+    fn remove_takes_several_gids() {
+        let m = matches(&["remove", "a", "b", "c"]);
+        let remove = m.subcommand_matches("remove").unwrap();
+        let gids: Vec<&str> = remove
+            .get_many::<String>("gids")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(gids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn serve_takes_a_port() {
+        let Command::Serve(args) = parse(&["serve"]) else {
+            panic!("not serve");
+        };
+        assert_eq!(args.rpc_port, 16800);
+
+        let Command::Serve(args) = parse(&["serve", "--rpc-port", "7000"]) else {
+            panic!("not serve");
+        };
+        assert_eq!(args.rpc_port, 7000);
+    }
+
+    #[test]
+    fn serve_takes_verbose() {
+        for flag in ["--verbose", "-v"] {
+            let m = matches(&["serve", flag]);
+            assert!(m.subcommand_matches("serve").unwrap().get_flag("verbose"));
+        }
     }
 }

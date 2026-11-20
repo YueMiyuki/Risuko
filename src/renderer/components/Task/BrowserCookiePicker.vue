@@ -61,6 +61,7 @@ import {
 	PopoverContent,
 	PopoverTrigger,
 } from "@/components/ui/popover";
+import { cookieImportErrorKey } from "@/utils/cookieImport";
 
 export default {
 	name: "browser-cookie-picker",
@@ -145,11 +146,7 @@ export default {
 				this.open = false;
 			} catch (e) {
 				logger.error(`[Risuko] cookie picker: import failed: ${String(e)}`);
-				toast.error(
-					this.$t("task.task-cookie-import-failed", {
-						error: String(e),
-					}),
-				);
+				toast.error(this.$t(cookieImportErrorKey(e), { error: String(e) }));
 			} finally {
 				this.importing = "";
 			}

@@ -98,7 +98,7 @@ git clone https://github.com/YueMiyuki/Risuko
 
 ### Install Dependencies
 
-Requires Node.js >= 22 and Rust >= 1.77.
+Requires Node.js >= 22.18, pnpm, and a recent stable Rust toolchain (release builds use the current stable channel).
 
 ```bash
 cd risuko

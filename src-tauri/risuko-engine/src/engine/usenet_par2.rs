@@ -57,6 +57,7 @@ pub struct Par2RepairResult {
 pub enum Par2Error {
     MissingParity,
     Malformed(String),
+    UnusableNames(String),
     UnsafePath(String),
     Limits(String),
     InsufficientRecovery { needed: u32, available: u32 },
@@ -72,6 +73,7 @@ impl std::fmt::Display for Par2Error {
                 formatter.write_str("PAR2 repair requires a complete index and recovery volume")
             }
             Self::Malformed(message) => write!(formatter, "malformed PAR2: {message}"),
+            Self::UnusableNames(message) => formatter.write_str(message),
             Self::UnsafePath(path) => write!(formatter, "unsafe PAR2 filename: {path}"),
             Self::Limits(message) => write!(formatter, "PAR2 safety limit: {message}"),
             Self::InsufficientRecovery { needed, available } => write!(
@@ -97,6 +99,18 @@ pub fn verify_or_repair(request: &Par2RepairRequest) -> Result<Par2RepairResult,
     verify_or_repair_with_cancel(request, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetMode {
+    Apply,
+    CheckOnly,
+}
+
+struct SetRequest<'a> {
+    request: Par2RepairRequest,
+    data_by_name: HashMap<String, &'a Par2InputFile>,
+    parity: ValidatedParityFiles,
+}
+
 pub fn verify_or_repair_with_cancel(
     request: &Par2RepairRequest,
     cancel: Option<&CancellationToken>,
@@ -110,9 +124,213 @@ pub fn verify_or_repair_with_cancel(
     let limits = request.limits;
     let data_by_name = validate_input_files(&request.data_files, limits)?;
     let parity = validate_parity_files(&request.parity_files)?;
+    let sets = group_by_recovery_set(&parity.files);
+    if sets.len() < 2 {
+        return verify_or_repair_one_set(request, &data_by_name, &parity, cancel, SetMode::Apply);
+    }
+    verify_or_repair_sets(request, &data_by_name, &parity, sets, cancel)
+}
+
+fn group_by_recovery_set(files: &[ValidatedParityFile]) -> Vec<ValidatedParityFiles> {
+    let mut sets: Vec<([u8; 16], ValidatedParityFiles)> = Vec::new();
+    for file in files {
+        let position = match sets.iter().position(|(id, _)| *id == file.set_id) {
+            Some(position) => position,
+            None => {
+                sets.push((
+                    file.set_id,
+                    ValidatedParityFiles {
+                        total: ParityStats::default(),
+                        files: Vec::new(),
+                    },
+                ));
+                sets.len() - 1
+            }
+        };
+        let set = &mut sets[position].1;
+        set.total.bytes = set.total.bytes.saturating_add(file.stats.bytes);
+        set.total.packets = set.total.packets.saturating_add(file.stats.packets);
+        set.total.recovery_blocks = set
+            .total
+            .recovery_blocks
+            .saturating_add(file.stats.recovery_blocks);
+        set.files.push(file.clone());
+    }
+    sets.into_iter().map(|(_, set)| set).collect()
+}
+
+fn recovery_set_sources(set: &ValidatedParityFiles) -> BTreeMap<String, u64> {
+    let mut files = set.files.iter().collect::<Vec<_>>();
+    files.sort_by_key(|file| file.stats.bytes);
+    files
+        .into_iter()
+        .filter_map(|file| rust_par2::parse(&file.path).ok())
+        .find(|file_set| !file_set.files.is_empty())
+        .map(|file_set| {
+            file_set
+                .files
+                .into_values()
+                .map(|file| (file.filename, file.size))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn verify_or_repair_sets<'a>(
+    request: &'a Par2RepairRequest,
+    data_by_name: &HashMap<String, &'a Par2InputFile>,
+    parity: &ValidatedParityFiles,
+    sets: Vec<ValidatedParityFiles>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Par2RepairResult, Par2Error> {
+    let mut owned = HashSet::new();
+    let mut source_bytes = 0u64;
+    let mut set_requests = Vec::new();
+    for set in sets {
+        check_cancel(cancel)?;
+        let names = recovery_set_sources(&set)
+            .into_iter()
+            .filter(|(name, _)| owned.insert(name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let set_data = data_by_name
+            .iter()
+            .filter(|(name, _)| names.contains_key(*name))
+            .map(|(name, input)| (name.clone(), *input))
+            .collect::<HashMap<_, _>>();
+        if set_data.is_empty() {
+            continue;
+        }
+        for size in names.values() {
+            source_bytes = source_bytes
+                .checked_add(*size)
+                .ok_or_else(|| Par2Error::Limits("PAR2 source size overflowed".into()))?;
+        }
+        set_requests.push(SetRequest {
+            request: Par2RepairRequest {
+                destination: request.destination.clone(),
+                data_files: request
+                    .data_files
+                    .iter()
+                    .filter(|input| names.contains_key(&input.manifest_name))
+                    .cloned()
+                    .collect(),
+                parity_files: set.files.iter().map(|file| file.path.clone()).collect(),
+                required_incomplete_names: request
+                    .required_incomplete_names
+                    .iter()
+                    .filter(|name| names.contains_key(*name))
+                    .cloned()
+                    .collect(),
+                limits: request.limits,
+                active_started_at: request.active_started_at,
+                active_elapsed_before_repair: request.active_elapsed_before_repair,
+            },
+            data_by_name: set_data,
+            parity: set,
+        });
+    }
+    if set_requests.is_empty() {
+        return verify_or_repair_one_set(request, data_by_name, parity, cancel, SetMode::Apply);
+    }
+    validate_task_budget(
+        request,
+        SourceStats {
+            bytes: source_bytes,
+        },
+        parity.total,
+    )?;
+
+    let mut usable = Vec::new();
+    let mut skipped = Vec::new();
+    let mut short: Option<(u32, u32)> = None;
+    for set in set_requests {
+        check_cancel(cancel)?;
+        check_active_time(request)?;
+        match verify_or_repair_one_set(
+            &set.request,
+            &set.data_by_name,
+            &set.parity,
+            cancel,
+            SetMode::CheckOnly,
+        ) {
+            Ok(_) => usable.push(set),
+            Err(Par2Error::InsufficientRecovery { needed, available }) => {
+                let (total_needed, total_available) = short.unwrap_or_default();
+                short = Some((
+                    total_needed.saturating_add(needed),
+                    total_available.saturating_add(available),
+                ));
+                usable.push(set);
+            }
+            Err(Par2Error::Malformed(message)) => {
+                tracing::warn!(%message, "skipping a PAR2 recovery set that cannot be used");
+                skipped.push(message);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let uncovered = request
+        .required_incomplete_names
+        .iter()
+        .filter(|name| {
+            !usable
+                .iter()
+                .any(|set| set.request.required_incomplete_names.contains(*name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !uncovered.is_empty() {
+        return Err(Par2Error::Repair(format!(
+            "no complete PAR2 recovery set covers incomplete files {}",
+            uncovered.join(", ")
+        )));
+    }
+    if let Some((needed, available)) = short {
+        return Err(Par2Error::InsufficientRecovery { needed, available });
+    }
+    if usable.is_empty() {
+        return Err(Par2Error::Malformed(skipped.join("; ")));
+    }
+
+    let mut outcome = Par2Outcome::Verified;
+    let mut recovered_bytes = 0u64;
+    let mut promoted_outputs = Vec::new();
+    for set in &usable {
+        check_cancel(cancel)?;
+        check_active_time(request)?;
+        let result = verify_or_repair_one_set(
+            &set.request,
+            &set.data_by_name,
+            &set.parity,
+            cancel,
+            SetMode::Apply,
+        )?;
+        if result.report.outcome == Par2Outcome::Repaired {
+            outcome = Par2Outcome::Repaired;
+        }
+        recovered_bytes = recovered_bytes.saturating_add(result.report.recovered_bytes);
+        promoted_outputs.extend(result.promoted_outputs);
+    }
+    Ok(Par2RepairResult {
+        report: Par2Report {
+            outcome,
+            recovered_bytes,
+        },
+        promoted_outputs,
+    })
+}
+
+fn verify_or_repair_one_set(
+    request: &Par2RepairRequest,
+    data_by_name: &HashMap<String, &Par2InputFile>,
+    parity: &ValidatedParityFiles,
+    cancel: Option<&CancellationToken>,
+    mode: SetMode,
+) -> Result<Par2RepairResult, Par2Error> {
+    let limits = request.limits;
     let (file_set, source) = parse_index(
         &parity.files,
-        &data_by_name,
+        data_by_name,
         &request.required_incomplete_names,
         limits,
     )?;
@@ -131,7 +349,7 @@ pub fn verify_or_repair_with_cancel(
         .values()
         .map(|file| file.filename.as_str())
         .collect::<HashSet<_>>();
-    stage_data_files(&probe, &file_set, &data_by_name, Some(&all_names), cancel)?;
+    stage_data_files(&probe, &file_set, data_by_name, Some(&all_names), cancel)?;
 
     check_cancel(cancel)?;
     check_active_time(request)?;
@@ -152,7 +370,10 @@ pub fn verify_or_repair_with_cancel(
                 moved.insert(name.clone());
             }
         }
-        promoted_outputs.extend(promote_outputs(&probe, &moved, &data_by_name, cancel)?);
+        if mode == SetMode::CheckOnly {
+            return Ok(checked_result(Par2Outcome::Verified));
+        }
+        promoted_outputs.extend(promote_outputs(&probe, &moved, data_by_name, cancel)?);
         return Ok(Par2RepairResult {
             report: Par2Report {
                 outcome: Par2Outcome::Verified,
@@ -167,6 +388,9 @@ pub fn verify_or_repair_with_cancel(
             needed: verification.blocks_needed(),
             available: verification.recovery_blocks_available,
         });
+    }
+    if mode == SetMode::CheckOnly {
+        return Ok(checked_result(Par2Outcome::Repaired));
     }
 
     let intact: HashSet<&str> = verification
@@ -191,7 +415,7 @@ pub fn verify_or_repair_with_cancel(
     let repair_dir = stage.path().join("repair");
     fs::create_dir(&repair_dir)?;
     stage_parity_files(&repair_dir, &request.parity_files, cancel)?;
-    stage_data_files(&repair_dir, &file_set, &data_by_name, Some(&intact), cancel)?;
+    stage_data_files(&repair_dir, &file_set, data_by_name, Some(&intact), cancel)?;
     check_cancel(cancel)?;
     check_active_time(request)?;
     let repair = repair_from_verify_with_cancel(&file_set, &repair_dir, &verification, cancel)
@@ -213,7 +437,7 @@ pub fn verify_or_repair_with_cancel(
                 .map(|file| file.filename.clone()),
         )
         .collect();
-    let promoted_outputs = promote_outputs(&repair_dir, &changed_names, &data_by_name, cancel)?;
+    let promoted_outputs = promote_outputs(&repair_dir, &changed_names, data_by_name, cancel)?;
     Ok(Par2RepairResult {
         report: Par2Report {
             outcome: Par2Outcome::Repaired,
@@ -221,6 +445,16 @@ pub fn verify_or_repair_with_cancel(
         },
         promoted_outputs,
     })
+}
+
+fn checked_result(outcome: Par2Outcome) -> Par2RepairResult {
+    Par2RepairResult {
+        report: Par2Report {
+            outcome,
+            recovered_bytes: 0,
+        },
+        promoted_outputs: Vec::new(),
+    }
 }
 
 fn check_cancel(cancel: Option<&CancellationToken>) -> Result<(), Par2Error> {
@@ -942,7 +1176,7 @@ fn metadata_memory_limit() -> u64 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct ParityStats {
     bytes: u64,
     packets: u64,
@@ -951,6 +1185,7 @@ struct ParityStats {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ParityFileStats {
+    recovery_set_id: [u8; 16],
     packets: u64,
     recovery_blocks: u64,
     metadata_bytes: u64,
@@ -961,6 +1196,8 @@ struct ParityFileStats {
 #[derive(Debug, Clone)]
 struct ValidatedParityFile {
     path: PathBuf,
+    set_id: [u8; 16],
+    stats: ParityStats,
 }
 
 #[derive(Debug, Clone)]
@@ -1105,7 +1342,7 @@ fn validate_input_files(
     for input in inputs {
         validate_simple_filename(&input.manifest_name)?;
         if !portable_names.insert(portable_filename_key(&input.manifest_name)) {
-            return Err(Par2Error::Malformed(format!(
+            return Err(Par2Error::UnusableNames(format!(
                 "NZB output name {} collides on case-insensitive filesystems",
                 input.manifest_name
             )));
@@ -1127,7 +1364,7 @@ fn validate_input_files(
             )));
         }
         if by_name.insert(input.manifest_name.clone(), input).is_some() {
-            return Err(Par2Error::Malformed(format!(
+            return Err(Par2Error::UnusableNames(format!(
                 "duplicate NZB output name {}",
                 input.manifest_name
             )));
@@ -1163,7 +1400,15 @@ fn validate_parity_files(paths: &[PathBuf]) -> Result<ValidatedParityFiles, Par2
         recovery_blocks = recovery_blocks
             .checked_add(stats.recovery_blocks)
             .ok_or_else(|| Par2Error::Limits("PAR2 recovery block count overflowed".into()))?;
-        files.push(ValidatedParityFile { path: path.clone() });
+        files.push(ValidatedParityFile {
+            path: path.clone(),
+            set_id: stats.recovery_set_id,
+            stats: ParityStats {
+                bytes: size,
+                packets: stats.packets,
+                recovery_blocks: stats.recovery_blocks,
+            },
+        });
     }
     if bytes > MAX_PAR2_INPUT_BYTES {
         return Err(Par2Error::Limits("parity input is too large".into()));
@@ -1240,6 +1485,7 @@ fn validate_par2_packets(path: &Path) -> Result<ParityFileStats, Par2Error> {
             }
         } else {
             recovery_set_id = Some(packet_set_id);
+            stats.recovery_set_id = packet_set_id;
         }
         let packet_type: [u8; 16] = packet_prefix[16..]
             .try_into()
@@ -1817,6 +2063,7 @@ pub(crate) mod tests {
     const TYPE_FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
     const TYPE_IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
     const TYPE_RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
+    const FIXTURE_SLICE_BYTES: usize = 4;
 
     fn build_packet(set_id: [u8; 16], packet_type: &[u8; 16], body: &[u8]) -> Vec<u8> {
         let mut data = Vec::with_capacity(32 + body.len());
@@ -1841,48 +2088,68 @@ pub(crate) mod tests {
         data: &[u8],
         recovery: bool,
     ) -> Vec<PathBuf> {
-        let set_id = [0x5a; 16];
-        let file_id = [0x11; 16];
-        let slice_size = 4usize;
+        write_set_fixture(
+            parity_dir, [0x5a; 16], [0x11; 16], name, "sample", data, recovery,
+        )
+    }
+
+    fn index_packets(set_id: [u8; 16], files: &[([u8; 16], &str, &[u8])]) -> Vec<u8> {
         let mut index = Vec::new();
         let mut main = Vec::new();
-        main.extend_from_slice(&(slice_size as u64).to_le_bytes());
-        main.extend_from_slice(&1u32.to_le_bytes());
-        main.extend_from_slice(&file_id);
+        main.extend_from_slice(&(FIXTURE_SLICE_BYTES as u64).to_le_bytes());
+        main.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (file_id, _, _) in files {
+            main.extend_from_slice(file_id);
+        }
         index.extend_from_slice(&build_packet(set_id, TYPE_MAIN, &main));
 
-        let mut desc = Vec::new();
-        desc.extend_from_slice(&file_id);
-        desc.extend_from_slice(&md5(data));
-        desc.extend_from_slice(&md5(&data[..data.len().min(16_384)]));
-        desc.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        desc.extend_from_slice(name.as_bytes());
-        desc.push(0);
-        while desc.len() % 4 != 0 {
+        for (file_id, name, data) in files {
+            let mut desc = Vec::new();
+            desc.extend_from_slice(file_id);
+            desc.extend_from_slice(&md5(data));
+            desc.extend_from_slice(&md5(&data[..data.len().min(16_384)]));
+            desc.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            desc.extend_from_slice(name.as_bytes());
             desc.push(0);
-        }
-        index.extend_from_slice(&build_packet(set_id, TYPE_FILE_DESC, &desc));
+            while desc.len() % 4 != 0 {
+                desc.push(0);
+            }
+            index.extend_from_slice(&build_packet(set_id, TYPE_FILE_DESC, &desc));
 
-        let mut ifsc = Vec::new();
-        ifsc.extend_from_slice(&file_id);
-        let mut blocks = Vec::new();
-        for chunk in data.chunks(slice_size) {
-            let mut block = vec![0u8; slice_size];
-            block[..chunk.len()].copy_from_slice(chunk);
-            ifsc.extend_from_slice(&md5(&block));
-            ifsc.extend_from_slice(&crate::engine::usenet_pipeline::crc32(&block).to_le_bytes());
-            blocks.push(block);
+            let mut ifsc = Vec::new();
+            ifsc.extend_from_slice(file_id);
+            for chunk in data.chunks(FIXTURE_SLICE_BYTES) {
+                let mut block = vec![0u8; FIXTURE_SLICE_BYTES];
+                block[..chunk.len()].copy_from_slice(chunk);
+                ifsc.extend_from_slice(&md5(&block));
+                ifsc.extend_from_slice(
+                    &crate::engine::usenet_pipeline::crc32(&block).to_le_bytes(),
+                );
+            }
+            index.extend_from_slice(&build_packet(set_id, TYPE_IFSC, &ifsc));
         }
-        index.extend_from_slice(&build_packet(set_id, TYPE_IFSC, &ifsc));
-        let index_path = parity_dir.join("sample.par2");
+        index
+    }
+
+    fn write_set_fixture(
+        parity_dir: &Path,
+        set_id: [u8; 16],
+        file_id: [u8; 16],
+        name: &str,
+        parity_base: &str,
+        data: &[u8],
+        recovery: bool,
+    ) -> Vec<PathBuf> {
+        let index = index_packets(set_id, &[(file_id, name, data)]);
+        let index_path = parity_dir.join(format!("{parity_base}.par2"));
         fs::write(&index_path, &index).unwrap();
         if !recovery {
             return vec![index_path];
         }
 
-        let mut recovery_data = vec![0u8; slice_size];
-        for block in blocks {
-            for (target, value) in recovery_data.iter_mut().zip(block) {
+        let mut recovery_data = vec![0u8; FIXTURE_SLICE_BYTES];
+        for chunk in data.chunks(FIXTURE_SLICE_BYTES) {
+            for (target, value) in recovery_data.iter_mut().zip(chunk) {
                 *target ^= value;
             }
         }
@@ -1890,7 +2157,7 @@ pub(crate) mod tests {
         recovery_body.extend_from_slice(&recovery_data);
         let mut volume = index;
         volume.extend_from_slice(&build_packet(set_id, TYPE_RECOVERY, &recovery_body));
-        let volume_path = parity_dir.join("sample.vol00+1.par2");
+        let volume_path = parity_dir.join(format!("{parity_base}.vol00+1.par2"));
         fs::write(&volume_path, volume).unwrap();
         vec![index_path, volume_path]
     }
@@ -1912,6 +2179,82 @@ pub(crate) mod tests {
             active_started_at: None,
             active_elapsed_before_repair: None,
         }
+    }
+
+    fn two_set_request(dir: &Path, parity: &Path, a_recovery: bool) -> Par2RepairRequest {
+        let mut parity_files = write_set_fixture(
+            parity,
+            [0x5a; 16],
+            [0x11; 16],
+            "a.bin",
+            "a",
+            b"ABCDEFGH",
+            a_recovery,
+        );
+        parity_files.extend(write_set_fixture(
+            parity,
+            [0x6b; 16],
+            [0x22; 16],
+            "b.bin",
+            "b",
+            b"IJKLMNOP",
+            true,
+        ));
+        let mut request = repair_request(dir, parity_files);
+        request.data_files = ["a.bin", "b.bin"]
+            .into_iter()
+            .map(|name| Par2InputFile {
+                manifest_name: name.into(),
+                source_path: dir.join(format!("{name}.part")),
+                output_path: dir.join(name),
+                expected_size: Some(8),
+            })
+            .collect();
+        request.required_incomplete_names =
+            BTreeSet::from(["a.bin".to_string(), "b.bin".to_string()]);
+        request
+    }
+
+    fn unusable_set_request(dir: &Path, parity: &Path) -> Par2RepairRequest {
+        let a_index = parity.join("a.par2");
+        fs::write(
+            &a_index,
+            index_packets(
+                [0x5a; 16],
+                &[
+                    ([0x11; 16], "a.bin", b"ABCDEFGH".as_slice()),
+                    ([0x44; 16], "missing.bin", b"QRSTUVWX".as_slice()),
+                ],
+            ),
+        )
+        .unwrap();
+        let b_index = parity.join("b.par2");
+        fs::write(
+            &b_index,
+            index_packets(
+                [0x6b; 16],
+                &[
+                    ([0x22; 16], "b.bin", b"IJKLMNOP".as_slice()),
+                    ([0x33; 16], "c.bin", b"YZ012345".as_slice()),
+                ],
+            ),
+        )
+        .unwrap();
+        let mut request = repair_request(dir, vec![a_index, b_index]);
+        request.data_files = ["a.bin", "b.bin", "c.bin"]
+            .into_iter()
+            .map(|name| Par2InputFile {
+                manifest_name: name.into(),
+                source_path: dir.join(format!("{name}.part")),
+                output_path: dir.join(name),
+                expected_size: Some(8),
+            })
+            .collect();
+        request.required_incomplete_names.clear();
+        fs::write(dir.join("a.bin.part"), b"ABCDEFGH").unwrap();
+        fs::write(dir.join("b.bin.part"), b"IJKLMNOP").unwrap();
+        fs::write(dir.join("c.bin.part"), b"YZ012345").unwrap();
+        request
     }
 
     fn test_limits(max_expanded_bytes: u64) -> ArchiveLimits {
@@ -2013,6 +2356,181 @@ pub(crate) mod tests {
 
         assert!(matches!(error, Par2Error::InsufficientRecovery { .. }));
         assert_eq!(fs::read(dir.path().join("data.bin.part")).unwrap(), partial);
+    }
+
+    #[test]
+    fn two_sets_are_both_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let mut request = two_set_request(dir.path(), parity.path(), true);
+        request.required_incomplete_names.clear();
+        fs::write(dir.path().join("a.bin.part"), b"ABCDEFGH").unwrap();
+        fs::write(dir.path().join("b.bin.part"), b"IJKLMNOP").unwrap();
+
+        let result = verify_or_repair(&request).unwrap();
+
+        assert_eq!(result.report.outcome, Par2Outcome::Verified);
+        assert!(result.promoted_outputs.contains(&dir.path().join("a.bin")));
+        assert!(result.promoted_outputs.contains(&dir.path().join("b.bin")));
+        assert_eq!(fs::read(dir.path().join("a.bin")).unwrap(), b"ABCDEFGH");
+        assert_eq!(fs::read(dir.path().join("b.bin")).unwrap(), b"IJKLMNOP");
+    }
+
+    #[test]
+    fn incomplete_files_in_different_sets_are_both_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let request = two_set_request(dir.path(), parity.path(), true);
+        fs::write(dir.path().join("a.bin.part"), b"ABCD\0\0\0\0").unwrap();
+        fs::write(dir.path().join("b.bin.part"), b"IJKL\0\0\0\0").unwrap();
+
+        let result = verify_or_repair(&request).unwrap();
+
+        assert_eq!(result.report.outcome, Par2Outcome::Repaired);
+        assert_eq!(fs::read(dir.path().join("a.bin")).unwrap(), b"ABCDEFGH");
+        assert_eq!(fs::read(dir.path().join("b.bin")).unwrap(), b"IJKLMNOP");
+    }
+
+    #[test]
+    fn one_set_short_of_recovery_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let mut request = two_set_request(dir.path(), parity.path(), false);
+        request.parity_files.reverse();
+        fs::write(dir.path().join("a.bin.part"), b"ABCD\0\0\0\0").unwrap();
+        fs::write(dir.path().join("b.bin.part"), b"IJKL\0\0\0\0").unwrap();
+
+        let error = verify_or_repair(&request).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Par2Error::InsufficientRecovery {
+                    needed: 1,
+                    available: 0
+                }
+            ),
+            "{error}"
+        );
+        assert!(!dir.path().join("a.bin").exists());
+        assert!(!dir.path().join("b.bin").exists());
+        assert_eq!(
+            fs::read(dir.path().join("a.bin.part")).unwrap(),
+            b"ABCD\0\0\0\0"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("b.bin.part")).unwrap(),
+            b"IJKL\0\0\0\0"
+        );
+    }
+
+    #[test]
+    fn a_file_no_set_covers_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let mut request = two_set_request(dir.path(), parity.path(), true);
+        fs::write(dir.path().join("a.bin.part"), b"ABCD\0\0\0\0").unwrap();
+        fs::write(dir.path().join("b.bin.part"), b"IJKL\0\0\0\0").unwrap();
+        fs::write(dir.path().join("c.bin.part"), b"\0\0\0\0").unwrap();
+        request.data_files.push(Par2InputFile {
+            manifest_name: "c.bin".into(),
+            source_path: dir.path().join("c.bin.part"),
+            output_path: dir.path().join("c.bin"),
+            expected_size: Some(4),
+        });
+        request
+            .required_incomplete_names
+            .insert("c.bin".to_string());
+
+        let error = verify_or_repair(&request).unwrap_err();
+
+        assert!(matches!(error, Par2Error::Repair(_)), "{error}");
+        assert!(error.to_string().contains("covers incomplete files c.bin"));
+        assert!(!dir.path().join("a.bin").exists());
+        assert!(!dir.path().join("b.bin").exists());
+    }
+
+    #[test]
+    fn a_single_set_request_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let complete = b"ABCDEFGH";
+        let parity_files = write_set_fixture(
+            parity.path(),
+            [0x7c; 16],
+            [0x33; 16],
+            "data.bin",
+            "single",
+            complete,
+            true,
+        );
+        let partial = b"ABCD\0\0\0\0";
+        fs::write(dir.path().join("data.bin.part"), partial).unwrap();
+
+        let result = verify_or_repair(&repair_request(dir.path(), parity_files)).unwrap();
+
+        assert_eq!(result.report.outcome, Par2Outcome::Repaired);
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), complete);
+        assert_eq!(fs::read(dir.path().join("data.bin.part")).unwrap(), partial);
+    }
+
+    #[test]
+    fn the_set_scan_does_not_parse_unvalidated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let mut request = two_set_request(dir.path(), parity.path(), true);
+        fs::write(dir.path().join("a.bin.part"), b"ABCD\0\0\0\0").unwrap();
+        fs::write(dir.path().join("b.bin.part"), b"IJKL\0\0\0\0").unwrap();
+        let excess = parity.path().join("excess.par2");
+        let mut bytes = Vec::new();
+        for exponent in 0..=MAX_PAR2_RECOVERY_BLOCKS {
+            bytes.extend_from_slice(&build_packet(
+                [0x7c; 16],
+                TYPE_RECOVERY,
+                &exponent.to_le_bytes(),
+            ));
+        }
+        fs::write(&excess, bytes).unwrap();
+        request.parity_files.push(excess);
+
+        let error = verify_or_repair(&request).unwrap_err();
+
+        assert!(matches!(error, Par2Error::Limits(_)), "{error}");
+        assert!(!dir.path().join("a.bin").exists());
+        assert!(!dir.path().join("b.bin").exists());
+    }
+
+    #[test]
+    fn an_unusable_set_is_skipped_when_nothing_needs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let request = unusable_set_request(dir.path(), parity.path());
+
+        let result = verify_or_repair(&request).unwrap();
+
+        assert_eq!(result.report.outcome, Par2Outcome::Verified);
+        assert!(result.promoted_outputs.contains(&dir.path().join("b.bin")));
+        assert!(result.promoted_outputs.contains(&dir.path().join("c.bin")));
+        assert!(!dir.path().join("a.bin").exists());
+    }
+
+    #[test]
+    fn an_unusable_set_that_covers_an_incomplete_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity = tempfile::tempdir().unwrap();
+        let mut request = unusable_set_request(dir.path(), parity.path());
+        fs::write(dir.path().join("a.bin.part"), b"ABCD\0\0\0\0").unwrap();
+        request
+            .required_incomplete_names
+            .insert("a.bin".to_string());
+
+        let error = verify_or_repair(&request).unwrap_err();
+
+        assert!(matches!(error, Par2Error::Repair(_)), "{error}");
+        assert!(error.to_string().contains("covers incomplete files a.bin"));
+        assert!(!dir.path().join("a.bin").exists());
+        assert!(!dir.path().join("b.bin").exists());
+        assert!(!dir.path().join("c.bin").exists());
     }
 
     #[test]
@@ -2350,7 +2868,7 @@ pub(crate) mod tests {
 
         let error = validate_input_files(&inputs, test_limits(10)).unwrap_err();
 
-        assert!(matches!(error, Par2Error::Malformed(_)));
+        assert!(matches!(error, Par2Error::UnusableNames(_)));
     }
 
     #[test]

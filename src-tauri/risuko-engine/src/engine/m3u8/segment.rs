@@ -15,6 +15,7 @@ use super::parser::Segment;
 use crate::engine::speed_limiter::SpeedLimiter;
 
 const SEGMENT_MAX_RETRIES: u32 = 5;
+const MAX_ENCRYPTED_SEGMENT_BYTES: usize = 512 << 20;
 const SEGMENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const KEY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROGRESS_FILENAME: &str = ".m3u8.progress";
@@ -60,6 +61,29 @@ impl ProgressState {
 
     pub fn cleanup(&self) {
         let _ = std::fs::remove_file(&self.progress_path);
+    }
+}
+
+struct AttemptError {
+    message: String,
+    retryable: bool,
+}
+
+impl AttemptError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+impl From<String> for AttemptError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
     }
 }
 
@@ -277,11 +301,14 @@ async fn download_single_segment(
             }
             Err(e) => {
                 crate::engine::util::atomic_saturating_sub(&ctx.completed, added);
+                if !e.retryable {
+                    return Err(format!("Segment {} failed: {}", segment.url, e.message));
+                }
                 retries += 1;
                 if retries >= SEGMENT_MAX_RETRIES {
                     return Err(format!(
-                        "Segment {} failed after {SEGMENT_MAX_RETRIES} retries: {e}",
-                        segment.url
+                        "Segment {} failed after {SEGMENT_MAX_RETRIES} retries: {}",
+                        segment.url, e.message
                     ));
                 }
                 let delay = std::time::Duration::from_millis(500 * 2u64.pow(retries - 1));
@@ -291,13 +318,28 @@ async fn download_single_segment(
     }
 }
 
+fn expected_body_len(remaining: Option<u64>, content_length: Option<u64>) -> u64 {
+    match (remaining, content_length) {
+        (Some(left), Some(len)) => left.min(len),
+        (Some(left), None) => left,
+        (None, len) => len.unwrap_or(0),
+    }
+}
+
+fn encrypted_segment_too_large() -> AttemptError {
+    AttemptError::fatal(format!(
+        "Encrypted segment exceeds {} MiB",
+        MAX_ENCRYPTED_SEGMENT_BYTES >> 20
+    ))
+}
+
 async fn attempt_segment_download(
     ctx: &SegmentCtx,
     segment: &Segment,
     sequence_number: u64,
     output_path: &Path,
     added: &mut u64,
-) -> Result<u64, String> {
+) -> Result<u64, AttemptError> {
     let client = &ctx.client;
     let mut request = client.get(&segment.url);
 
@@ -316,14 +358,17 @@ async fn attempt_segment_download(
         .map_err(|e| format!("Segment request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Segment HTTP {}", resp.status()));
+        return Err(format!("Segment HTTP {}", resp.status()).into());
     }
 
     let mut remaining: Option<u64> = None;
     if let Some((offset, length)) = ranged {
         if resp.status() != risuko_http::StatusCode::PARTIAL_CONTENT {
             if offset != 0 {
-                return Err(format!("Segment server ignored Range ({})", resp.status()));
+                return Err(AttemptError::fatal(format!(
+                    "Segment server ignored Range ({})",
+                    resp.status()
+                )));
             }
             remaining = Some(length);
         }
@@ -334,7 +379,11 @@ async fn attempt_segment_download(
         .as_ref()
         .filter(|enc| enc.method == "AES-128");
 
-    let capacity = resp.content_length().unwrap_or(0).min(64 << 20) as usize;
+    let expected = expected_body_len(remaining, resp.content_length());
+    if encryption.is_some() && expected > MAX_ENCRYPTED_SEGMENT_BYTES as u64 {
+        return Err(encrypted_segment_too_large());
+    }
+    let capacity = expected.min(64 << 20) as usize;
     let mut stream = resp.bytes_stream();
     let mut file = tokio::fs::File::create(output_path)
         .await
@@ -366,6 +415,9 @@ async fn attempt_segment_download(
         ctx.throttle.acquire(len).await;
 
         if encryption.is_some() {
+            if ciphertext.len() + len > MAX_ENCRYPTED_SEGMENT_BYTES {
+                return Err(encrypted_segment_too_large());
+            }
             ciphertext.extend_from_slice(chunk);
         } else {
             file.write_all(chunk)
@@ -419,6 +471,98 @@ mod tests {
         assert_eq!(estimate_total(0, 0, 10), 0);
         assert_eq!(estimate_total(300, 3, 10), 1000);
         assert_eq!(estimate_total(u64::MAX, 1, 4), u64::MAX);
+    }
+
+    async fn serve_ok_head(content_length: u64) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    async fn fail_one_segment(segment: Segment) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_segments(
+                &[segment],
+                0,
+                dir.path(),
+                &Client::builder().build().unwrap(),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+                CancellationToken::new(),
+                Arc::new(SpeedLimiter::new(0)),
+                Arc::new(SpeedLimiter::new(0)),
+                1,
+            ),
+        )
+        .await
+        .expect("a segment that can never succeed must not be retried with backoff");
+        result.err().expect("the segment must fail")
+    }
+
+    #[tokio::test]
+    async fn an_oversized_encrypted_segment_fails_at_once_without_retries() {
+        let (port, requests) = serve_ok_head(MAX_ENCRYPTED_SEGMENT_BYTES as u64 + 1).await;
+        let message = fail_one_segment(Segment {
+            url: format!("http://127.0.0.1:{port}/seg.ts"),
+            byte_range: None,
+            encryption: Some(super::super::parser::EncryptionInfo {
+                method: "AES-128".into(),
+                key_uri: format!("http://127.0.0.1:{port}/key"),
+                iv: None,
+            }),
+        })
+        .await;
+        assert!(message.contains("exceeds 512 MiB"), "{message}");
+        assert!(!message.contains("retries"), "{message}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_a_mid_file_range_fails_at_once() {
+        let (port, requests) = serve_ok_head(4096).await;
+        let message = fail_one_segment(Segment {
+            url: format!("http://127.0.0.1:{port}/seg.ts"),
+            byte_range: Some(super::super::parser::ByteRange {
+                length: 1024,
+                offset: 2048,
+            }),
+            encryption: None,
+        })
+        .await;
+        assert!(message.contains("ignored Range"), "{message}");
+        assert!(!message.contains("retries"), "{message}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_server_that_ignores_range_is_judged_by_the_requested_length() {
+        let whole_file = 600 << 20;
+        assert_eq!(expected_body_len(Some(1000), Some(whole_file)), 1000);
+        assert_eq!(expected_body_len(Some(1000), None), 1000);
+        assert_eq!(expected_body_len(None, Some(whole_file)), whole_file);
+        assert_eq!(expected_body_len(None, None), 0);
     }
 
     #[test]

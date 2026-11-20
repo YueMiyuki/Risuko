@@ -17,7 +17,6 @@ pub use sink::{
 pub struct UploadFileSnapshot {
     pub local_path: std::path::PathBuf,
     pub remote_relative: String,
-    pub size: u64,
     pub category: Option<String>,
 }
 

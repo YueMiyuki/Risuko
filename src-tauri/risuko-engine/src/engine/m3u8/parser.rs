@@ -203,6 +203,15 @@ fn check_supported_keys(segments: &[m3u8_rs::MediaSegment]) -> Result<(), String
                 if key.uri.is_none() {
                     return Err("Unsupported HLS encryption: AES-128 key has no URI".to_string());
                 }
+                if key
+                    .iv
+                    .as_deref()
+                    .is_some_and(|iv| parse_hex_iv(iv).is_none())
+                {
+                    return Err(
+                        "Unsupported HLS encryption: AES-128 key has an invalid IV".to_string()
+                    );
+                }
             }
             m3u8_rs::KeyMethod::SampleAES => {
                 return Err(format!(
@@ -242,10 +251,10 @@ fn parse_hex_iv(iv_str: &str) -> Option<Vec<u8>> {
         .strip_prefix("0x")
         .or_else(|| iv_str.strip_prefix("0X"))
         .unwrap_or(iv_str);
-    if hex.len() != 32 {
+    if hex.is_empty() || hex.len() > 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    hex::decode(hex).ok()
+    hex::decode(format!("{hex:0>32}")).ok()
 }
 
 #[cfg(test)]
@@ -253,11 +262,12 @@ mod tests {
     use super::*;
 
     async fn serve_body(len: usize) -> String {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.read(&mut [0u8; 4096]).await;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
                 );
@@ -318,6 +328,30 @@ mod tests {
         assert_eq!(bytes.len(), 16);
         assert_eq!(bytes[15], 1);
         assert_eq!(bytes[0], 0);
+    }
+
+    #[test]
+    fn short_hex_ivs_are_left_padded() {
+        let one = parse_hex_iv("0x1").unwrap();
+        assert_eq!(one.len(), 16);
+        assert_eq!(one[15], 1);
+        assert!(one[..15].iter().all(|b| *b == 0));
+        let abc = parse_hex_iv("ABCDEF").unwrap();
+        assert_eq!(abc.len(), 16);
+        assert_eq!(abc[13..], [0xAB, 0xCD, 0xEF]);
+        assert!(abc[..13].iter().all(|b| *b == 0));
+        assert!(parse_hex_iv("0x").is_none());
+        assert!(parse_hex_iv("0xZZ").is_none());
+        assert!(parse_hex_iv(&"1".repeat(33)).is_none());
+    }
+
+    #[test]
+    fn playlists_with_an_unparsable_iv_are_rejected() {
+        let pl = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+            #EXT-X-KEY:METHOD=AES-128,URI=\"https://e.com/k\",IV=0xZZ\n\
+            #EXTINF:4.0,\ns.ts\n#EXT-X-ENDLIST\n";
+        let err = parse_playlist_bytes(pl.as_bytes(), "https://e.com/a.m3u8").err();
+        assert!(err.is_some_and(|e| e.contains("invalid IV")));
     }
 
     #[test]

@@ -11,7 +11,6 @@ risuko-bt = { workspace = true }
 risuko-share = { workspace = true }
 risuko-cli = { workspace = true }
 tauri = { workspace = true }
-tauri-plugin-store = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-shell = { workspace = true }
@@ -46,9 +45,6 @@ windows-native-keyring-store = "1"
 windows-sys = { version = "0.61", features = [
 	"Win32_Foundation",
 	"Win32_Storage_FileSystem",
-	"Win32_System_Threading",
-	"Win32_UI_Shell",
-	"Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]

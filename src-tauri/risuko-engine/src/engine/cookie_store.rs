@@ -156,7 +156,7 @@ impl CookieStore {
     }
 }
 
-fn host_of(target_url: &str) -> Option<String> {
+pub(crate) fn host_of(target_url: &str) -> Option<String> {
     if let Ok(url) = url::Url::parse(target_url) {
         return url.host_str().map(|s| s.to_ascii_lowercase());
     }
@@ -171,7 +171,7 @@ fn host_of(target_url: &str) -> Option<String> {
     }
 }
 
-fn host_matches(request_host: &str, entry_host: &str) -> bool {
+pub(crate) fn host_matches(request_host: &str, entry_host: &str) -> bool {
     let r = request_host.to_ascii_lowercase();
     let e = entry_host.to_ascii_lowercase();
     if r == e {
@@ -205,9 +205,10 @@ pub fn eligible_cookies(cookies: &[StoredCookie]) -> Vec<&StoredCookie> {
         .collect()
 }
 
-pub fn cookies_to_header(cookies: &[StoredCookie]) -> String {
+pub fn cookies_to_header_for(cookies: &[StoredCookie], secure_transport: bool) -> String {
     eligible_cookies(cookies)
         .into_iter()
+        .filter(|c| secure_transport || !c.secure)
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ")
@@ -324,7 +325,26 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(cookies_to_header(&cs), "a=1; b=two");
+        assert_eq!(cookies_to_header_for(&cs, true), "a=1; b=two");
+    }
+
+    #[test]
+    fn cookies_to_header_for_drops_secure_cookies_over_plain_http() {
+        let cs = vec![
+            StoredCookie {
+                name: "s".into(),
+                value: "1".into(),
+                secure: true,
+                ..Default::default()
+            },
+            StoredCookie {
+                name: "p".into(),
+                value: "2".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(cookies_to_header_for(&cs, true), "s=1; p=2");
+        assert_eq!(cookies_to_header_for(&cs, false), "p=2");
     }
 
     #[test]
@@ -354,7 +374,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(cookies_to_header(&cs), "good=ok");
+        assert_eq!(cookies_to_header_for(&cs, true), "good=ok");
         assert_eq!(
             eligible_cookies(&cs)
                 .into_iter()

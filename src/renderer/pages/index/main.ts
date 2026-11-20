@@ -3,6 +3,7 @@ import { type AppConfig, redactProxySettings } from "@shared/types/config";
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
 import { createApp } from "vue";
+import { toast } from "vue-sonner";
 import VueVirtualScroller from "vue-virtual-scroller";
 import { commands } from "@/components/CommandManager/instance";
 import { getLocaleManager } from "@/components/Locale";
@@ -16,6 +17,7 @@ import UiTooltip from "@/components/ui/compat/UiTooltip.vue";
 import router from "@/router";
 import store from "@/store";
 import { useAuthStore } from "@/store/auth";
+import { TASK_FILE_RE } from "@/store/batchQueue";
 import { usePreferenceStore } from "@/store/preference";
 import { useSyncStore } from "@/store/sync";
 import {
@@ -179,9 +181,16 @@ async function init(config: AppConfig) {
 			try {
 				const parsed = new URL(url);
 				parsed.searchParams.delete("token");
+				parsed.searchParams.delete("code");
 				return parsed.toString();
 			} catch {
-				return url.replace(/([?&])token=[^&]*/gi, "$1token=[REDACTED]");
+				return url.replace(/([?&])(token|code)=[^&]*/gi, "$1$2=[REDACTED]");
+			}
+		};
+
+		const openTaskFile = (path: string) => {
+			if (TASK_FILE_RE.test(path)) {
+				commands.execute("application:new-bt-task-with-file", { path });
 			}
 		};
 
@@ -217,17 +226,41 @@ async function init(config: AppConfig) {
 					continue;
 				}
 
+				if (url.startsWith("file://")) {
+					try {
+						openTaskFile(
+							decodeURIComponent(new URL(url).pathname).replace(
+								/^\/([A-Za-z]:)/,
+								"$1",
+							),
+						);
+					} catch (err) {
+						logger.warn("[Risuko] malformed file link:", err);
+					}
+					continue;
+				}
+
+				if (!/^(risuko|mo):/i.test(url)) {
+					commands.execute("application:new-task", { uri: url });
+					continue;
+				}
+
 				if (!url.startsWith("risuko://auth?")) {
 					continue;
 				}
 				try {
-					const parsed = new URL(url);
-					const token = parsed.searchParams.get("token");
-					if (token) {
-						logger.info("[Risuko] deep-link token found, logging in");
-						await authStore.handleDeepLinkToken(token);
-					} else {
-						logger.warn("[Risuko] deep-link URL missing token");
+					const outcome = await authStore.completeLogin(
+						new URL(url).searchParams.get("code"),
+					);
+					if (outcome === "failed") {
+						toast.error(
+							i18n.t(
+								authStore.serverConfig?.loginHandoff === false
+									? "sync.login-server-outdated"
+									: "sync.login-link-fail",
+							),
+							{ duration: 10_000 },
+						);
 					}
 				} catch (err) {
 					logger.warn(
@@ -259,6 +292,13 @@ async function init(config: AppConfig) {
 			logger.info("[Risuko] deep-link listener registered");
 		} catch (err) {
 			logger.warn("[Risuko] deep-link plugin not available:", err);
+		}
+
+		const startupFile = await invoke<string | null>("take_startup_file").catch(
+			() => null,
+		);
+		if (startupFile) {
+			openTaskFile(startupFile);
 		}
 
 		const syncStore = useSyncStore();

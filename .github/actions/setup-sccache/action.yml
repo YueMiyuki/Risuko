@@ -1,0 +1,34 @@
+name: Setup sccache on the R2 build cache
+description: Install sccache and start it against the shared R2 bucket
+
+inputs:
+  access-key-id:
+    description: R2 access key id for the build cache
+    required: true
+  secret-access-key:
+    description: R2 secret access key for the build cache
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      with:
+        version: v0.18.0
+
+    - name: Start sccache on the R2 build cache
+      continue-on-error: true
+      shell: bash
+      env:
+        SCCACHE_BUCKET: risuko-build-cache
+        SCCACHE_ENDPOINT: https://84f15756736ca53a547ffa05d311056f.r2.cloudflarestorage.com
+        SCCACHE_REGION: auto
+        SCCACHE_IDLE_TIMEOUT: "0"
+        AWS_ACCESS_KEY_ID: ${{ inputs.access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.secret-access-key }}
+      run: |
+        set -euo pipefail
+        sccache --start-server
+        sccache --show-stats
+        echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"

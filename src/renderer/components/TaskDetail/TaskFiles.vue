@@ -230,6 +230,14 @@ export default {
 		},
 	},
 	watch: {
+		files: {
+			immediate: true,
+			handler() {
+				if (this.mode === "ADD") {
+					this.toggleAllSelection();
+				}
+			},
+		},
 		selectedFileIndex() {
 			this.$emit("selection-change", this.selectedFileIndex);
 		},
@@ -266,9 +274,6 @@ export default {
 			this.selectedIndices = new Set(
 				(this.files as TaskFileRow[]).map((f) => f.idx),
 			);
-		},
-		clearSelection() {
-			this.selectedIndices = new Set();
 		},
 		toggleSelection(rows: TaskFileRow[]) {
 			this.selectedIndices = isEmpty(rows)

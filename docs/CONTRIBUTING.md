@@ -14,13 +14,18 @@ Each locale directory contains TypeScript files split by feature area:
 
 - about.ts
 - app.ts
+- cloudSinks.ts
 - edit.ts
+- health.ts
 - help.ts
 - index.ts
 - menu.ts
 - preferences.ts
+- rss.ts
+- share.ts
 - subnav.ts
+- sync.ts
 - task.ts
 - window.ts
 
-Menu translations live in these same files (not in `src/main/menus`).
+Menu translations live in these same files.

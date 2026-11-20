@@ -1,40 +1,7 @@
-use crate::engine::archive_safety::ArchiveSafetyError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-pub(crate) fn decode_yenc_line(input: &[u8], output: &mut Vec<u8>) -> Result<(), &'static str> {
-    let mut index = 0;
-    while index < input.len() {
-        let mut value = input[index];
-        index += 1;
-        if value == b'=' {
-            if index >= input.len() {
-                return Err("truncated yEnc escape");
-            }
-            value = input[index].wrapping_sub(64);
-            index += 1;
-        }
-        output.push(value.wrapping_sub(42));
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub enum ArchivePipelineError {
-    Safety(ArchiveSafetyError),
-}
-
-impl std::fmt::Display for ArchivePipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Safety(err) => write!(f, "archive safety: {err:?}"),
-        }
-    }
-}
-
-impl std::error::Error for ArchivePipelineError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

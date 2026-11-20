@@ -108,13 +108,16 @@ impl Client {
         }
 
         let body = std::mem::replace(&mut rb.body, ReqBody::Empty);
+        let deadline = timeout.and_then(|d| tokio::time::Instant::now().checked_add(d));
         let fut = self.send_with_redirects(rb.method, url, headers, body);
-        match timeout {
-            Some(d) => tokio::time::timeout(d, fut)
+        let mut response = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, fut)
                 .await
-                .map_err(|_| Error::Timeout)?,
-            None => fut.await,
-        }
+                .map_err(|_| Error::Timeout)??,
+            None => fut.await?,
+        };
+        response.set_deadline(deadline);
+        Ok(response)
     }
 
     async fn send_with_redirects(
@@ -152,6 +155,12 @@ impl Client {
             let next = url
                 .join(&location)
                 .map_err(|e| Error::Redirect(e.to_string()))?;
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(Error::Redirect(format!(
+                    "unsupported redirect scheme: {}",
+                    next.scheme()
+                )));
+            }
             if self.inner.redirect.allow.is_some_and(|allow| !allow(&next)) {
                 return Err(Error::Redirect(format!(
                     "redirect target not allowed: {}",
@@ -272,11 +281,11 @@ impl Client {
             .headers
             .get(http::header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(|s| s.trim().to_ascii_lowercase());
         let should_decode = match encoding.as_deref() {
             Some("gzip" | "x-gzip") => self.inner.auto_gzip,
             Some("br") => self.inner.auto_brotli,
-            Some("deflate") => self.inner.auto_deflate,
+            Some("deflate" | "x-deflate") => self.inner.auto_deflate,
             _ => false,
         };
 
@@ -571,17 +580,40 @@ fn build_tls(danger_accept_invalid: bool, http1_only: bool) -> Arc<ClientConfig>
         .clone()
 }
 
+pub fn tls_roots() -> Arc<RootCertStore> {
+    static ROOTS: std::sync::OnceLock<Arc<RootCertStore>> = std::sync::OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let loaded = rustls_native_certs::load_native_certs();
+            let added = add_system_certs(&mut roots, loaded.certs);
+            tracing::debug!("added {added} system certificates to the TLS roots");
+            if added == 0 {
+                if let Some(error) = loaded.errors.first() {
+                    tracing::warn!("could not read the system certificate store: {error}");
+                }
+            }
+            Arc::new(roots)
+        })
+        .clone()
+}
+
+fn add_system_certs(roots: &mut RootCertStore, certs: Vec<CertificateDer<'static>>) -> usize {
+    certs
+        .into_iter()
+        .filter_map(|cert| roots.add(cert).ok())
+        .count()
+}
+
 fn make_tls(danger_accept_invalid: bool, http1_only: bool) -> ClientConfig {
     static INSTALL_PROVIDER: std::sync::Once = std::sync::Once::new();
     INSTALL_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let mut config = ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(tls_roots())
         .with_no_client_auth();
     config.alpn_protocols = if http1_only {
         vec![b"http/1.1".to_vec()]
@@ -668,6 +700,24 @@ mod tests {
     }
 
     #[test]
+    fn tls_roots_hold_at_least_the_bundled_authorities() {
+        assert!(tls_roots().len() >= webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
+    #[test]
+    fn tls_roots_are_built_once() {
+        assert!(Arc::ptr_eq(&tls_roots(), &tls_roots()));
+    }
+
+    #[test]
+    fn certificates_that_are_not_trust_anchors_are_skipped() {
+        let mut roots = RootCertStore::empty();
+        let garbage = CertificateDer::from(vec![0u8, 1, 2, 3]);
+        assert_eq!(add_system_certs(&mut roots, vec![garbage]), 0);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
     fn build_tls_advertises_h2_then_http11_alpn() {
         let config = build_tls(false, false);
         assert_eq!(
@@ -700,9 +750,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("Connect"),
+            error.to_string().contains("blocked"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_errors_keep_their_cause() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert_ne!(message, "request error: client error (Connect)");
+        assert!(
+            message.to_lowercase().contains("refused"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_rejection_keeps_its_cause() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ));
+        let client = Client::builder()
+            .proxy(Proxy::all(format!("http://{address}")).unwrap())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let error = client
+            .get("https://example.test/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::ProxyAuthentication(_)),
+            "unexpected error: {error}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -726,7 +825,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("Connect"),
+            error.to_string().contains("blocked"),
             "unexpected error: {error}"
         );
         let contacted = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
@@ -1003,6 +1102,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_literal_proxy_hosts_reach_the_resolver_unbracketed() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let client = Client::builder()
+            .resolver_arc(Arc::new(RoutingResolver(HashMap::new())))
+            .proxy(Proxy::all(format!("http://[::1]:{port}")).unwrap())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        tokio::select! {
+            accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept()) => {
+                assert!(matches!(accepted, Ok(Ok(_))), "proxy was never contacted");
+            }
+            result = client.get("http://example.test/").send() => {
+                panic!("proxy was never contacted: {result:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_to_another_scheme_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_once(
+            listener,
+            b"HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1/x.iso\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ));
+        let client = Client::builder().build().unwrap();
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported redirect scheme"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_encoding_is_matched_case_insensitively() {
+        let body: [u8; 22] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 255, 203, 207, 6, 0, 71, 221, 220, 121, 2, 0, 0, 0,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: GZIP\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let server = tokio::spawn(serve_once(listener, response));
+        let client = Client::builder().gzip(true).build().unwrap();
+        let text = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(text, "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redirect_accepts_utf8_location_and_truncated_body() {
         let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let first_port = first.local_addr().unwrap().port();
@@ -1120,6 +1287,68 @@ mod tests {
             .unwrap();
         assert_eq!(&bytes[..], b"abcd");
         server.await.unwrap();
+    }
+
+    async fn serve_stalled_bodies(listener: TcpListener) {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab")
+                    .await
+                    .unwrap();
+                while socket.read(&mut chunk).await.is_ok_and(|read| read > 0) {}
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_also_bounds_the_body() {
+        use futures_util::StreamExt;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(serve_stalled_bodies(listener));
+            let client = Client::builder().build().unwrap();
+            let get = || {
+                client
+                    .get(format!("http://127.0.0.1:{port}/"))
+                    .timeout(Duration::from_millis(300))
+            };
+
+            let started = tokio::time::Instant::now();
+            let error = get()
+                .send()
+                .await
+                .unwrap()
+                .bytes_limited(1024)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Timeout), "unexpected error: {error}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            let started = tokio::time::Instant::now();
+            assert_eq!(get().send().await.unwrap().snippet(1024).await, "ab");
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            let mut stream = std::pin::pin!(get().send().await.unwrap().bytes_stream());
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(&first[..], b"ab");
+            server.abort();
+        })
+        .await
+        .expect("body read outlived the request timeout");
     }
 
     #[tokio::test]

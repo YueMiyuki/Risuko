@@ -5,7 +5,6 @@ import ts from "typescript";
 import {
 	buildPreferenceSearchEntries,
 	filterPreferenceSearchEntries,
-	getRouteForKey,
 	normalizeSearchText,
 	resolvePreferenceSearchTarget,
 } from "./search.ts";
@@ -136,22 +135,6 @@ const translations = {
 	"cloudSinks.s3Bucket": "Bucket",
 	"sync.cloud-sync-auto": "Auto-sync",
 };
-
-test("routes settings to the preference tab that owns them", () => {
-	assert.equal(getRouteForKey("preferences.enable-proxy"), "advanced");
-	assert.equal(getRouteForKey("preferences.bt-create-subfolder"), "advanced");
-	assert.equal(getRouteForKey("preferences.bt-ban-corrupt-peers"), "advanced");
-	assert.equal(
-		getRouteForKey("preferences.bt-ban-corrupt-strikes"),
-		"advanced",
-	);
-	assert.equal(getRouteForKey("preferences.theme-dark"), "appearance");
-	assert.equal(getRouteForKey("preferences.usenet-max-entries"), "usenet");
-	assert.equal(getRouteForKey("cloudSinks.s3Bucket"), "cloud-sinks");
-	assert.equal(getRouteForKey("sync.cloud-sync-auto"), "sync");
-	assert.equal(getRouteForKey("share.tools"), null);
-	assert.equal(getRouteForKey("preferences.speed-limit-enabled"), "basic");
-});
 
 test("searches translated labels, translation keys, and fallback settings", () => {
 	const entries = buildPreferenceSearchEntries(

@@ -214,10 +214,7 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
     }
 
     let mut keys: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-    let mut all_cookies = Vec::new();
-    let mut last_err = None;
-    let mut failed = 0usize;
-    for cookie_db in &all_dbs {
+    let reads = all_dbs.iter().map(|cookie_db| {
         tracing::debug!(target: "risuko_cookies", "chromium: using db path {}", cookie_db.display());
 
         let local_state = paths::find_local_state(cookie_db);
@@ -234,20 +231,13 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
             }
         };
 
-        match read_cookies_from_db(cookie_db, master_key, host) {
-            Ok(mut cookies) => all_cookies.append(&mut cookies),
-            Err(e) => {
-                tracing::debug!(target: "risuko_cookies", "chromium: skipping db {}: {}", cookie_db.display(), e);
-                failed += 1;
-                last_err = Some(e);
-            }
+        let read = read_cookies_from_db(cookie_db, master_key, host);
+        if let Err(e) = &read {
+            tracing::debug!(target: "risuko_cookies", "chromium: skipping db {}: {}", cookie_db.display(), e);
         }
-    }
-    if failed == all_dbs.len() {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-    }
+        read
+    });
+    let all_cookies = merge_db_reads(reads)?;
 
     tracing::debug!(target: "risuko_cookies",
         "chromium: scanned {} db(s), host_filter={:?} -> total kept={}",
@@ -257,11 +247,41 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
     Ok(all_cookies)
 }
 
+type DbRead = (Vec<Cookie>, usize);
+
+fn merge_db_reads(reads: impl IntoIterator<Item = Result<DbRead>>) -> Result<Vec<Cookie>> {
+    let mut cookies = Vec::new();
+    let mut app_bound = 0usize;
+    let mut total = 0usize;
+    let mut failed = 0usize;
+    let mut last_err = None;
+    for read in reads {
+        total += 1;
+        match read {
+            Ok((mut found, refused)) => {
+                cookies.append(&mut found);
+                app_bound += refused;
+            }
+            Err(e) => {
+                failed += 1;
+                last_err = Some(e);
+            }
+        }
+    }
+    if failed == total {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    app_bound_outcome(cookies.len(), app_bound)?;
+    Ok(cookies)
+}
+
 fn read_cookies_from_db(
     db_path: &std::path::Path,
     master_key: Option<&[u8]>,
     host: Option<&str>,
-) -> Result<Vec<Cookie>> {
+) -> Result<DbRead> {
     let temp = paths::copy_db_snapshot(db_path)?;
 
     let conn = Connection::open(temp.db_path())?;
@@ -294,6 +314,7 @@ fn read_cookies_from_db(
     let mut skipped_domain = 0usize;
     let mut decrypted_ok = 0usize;
     let mut decrypted_fail = 0usize;
+    let mut app_bound = 0usize;
     let mut no_key = 0usize;
 
     for raw in cookie_iter.flatten() {
@@ -331,6 +352,9 @@ fn read_cookies_from_db(
                     Err(e) => {
                         tracing::trace!(target: "risuko_cookies", "chromium: decrypt failed for '{}' host_key={}: {}", raw.name, raw.domain, e);
                         decrypted_fail += 1;
+                        if e.to_string().contains(crate::APP_BOUND_UNSUPPORTED) {
+                            app_bound += 1;
+                        }
                         continue;
                     }
                 }
@@ -367,7 +391,17 @@ fn read_cookies_from_db(
         tracing::trace!(target: "risuko_cookies", "chromium: kept cookie name={} domain={} value_len={}", c.name, c.domain, c.value.len());
     }
 
-    Ok(cookies)
+    Ok((cookies, app_bound))
+}
+
+fn app_bound_outcome(kept: usize, app_bound: usize) -> Result<()> {
+    if kept == 0 && app_bound > 0 {
+        eyre::bail!("{}", crate::APP_BOUND_UNSUPPORTED);
+    }
+    if app_bound > 0 {
+        tracing::warn!(target: "risuko_cookies", "chromium: {app_bound} app-bound cookie(s) could not be read");
+    }
+    Ok(())
 }
 
 struct RawCookie {
@@ -426,7 +460,75 @@ fn decrypt_cookie_value(encrypted: &[u8], master_key: &[u8]) -> Result<Vec<u8>> 
 
 #[cfg(test)]
 mod tests {
-    use super::strip_host_hash;
+    use super::{app_bound_outcome, merge_db_reads, strip_host_hash, Cookie, DbRead};
+    use eyre::Result;
+
+    fn cookie(name: &str) -> Cookie {
+        Cookie {
+            name: name.to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: false,
+            expires: None,
+        }
+    }
+
+    fn only_app_bound(count: usize) -> Result<DbRead> {
+        Ok((Vec::new(), count))
+    }
+
+    fn nothing() -> Result<DbRead> {
+        Ok((Vec::new(), 0))
+    }
+
+    #[test]
+    fn app_bound_cookies_in_one_profile_are_not_hidden_by_an_empty_one() {
+        let refused = merge_db_reads(vec![only_app_bound(3), nothing()])
+            .err()
+            .expect("no cookies were readable")
+            .to_string();
+        assert!(refused.contains(crate::APP_BOUND_UNSUPPORTED));
+
+        let refused = merge_db_reads(vec![
+            nothing(),
+            only_app_bound(1),
+            Err(eyre::eyre!("locked")),
+        ])
+        .err()
+        .expect("no cookies were readable")
+        .to_string();
+        assert!(refused.contains(crate::APP_BOUND_UNSUPPORTED));
+    }
+
+    #[test]
+    fn readable_cookies_from_another_profile_win_over_app_bound_ones() {
+        let merged = merge_db_reads(vec![only_app_bound(3), Ok((vec![cookie("a")], 0))]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merge_db_reads(vec![nothing(), nothing()])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unreadable_profiles_only_fail_when_every_profile_does() {
+        assert!(merge_db_reads(vec![Err(eyre::eyre!("locked")), nothing()])
+            .unwrap()
+            .is_empty());
+        let err = merge_db_reads(vec![Err(eyre::eyre!("first")), Err(eyre::eyre!("last"))])
+            .err()
+            .expect("every profile failed");
+        assert_eq!(err.to_string(), "last");
+    }
+
+    #[test]
+    fn a_host_with_only_app_bound_cookies_reports_them_as_unsupported() {
+        let refused = app_bound_outcome(0, 3).unwrap_err().to_string();
+        assert!(refused.contains(crate::APP_BOUND_UNSUPPORTED));
+        assert!(app_bound_outcome(2, 3).is_ok());
+        assert!(app_bound_outcome(0, 0).is_ok());
+    }
 
     #[test]
     fn host_hash_stripped_for_v24_encrypted() {

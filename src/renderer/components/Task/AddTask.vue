@@ -388,7 +388,13 @@ import {
 } from "@/store/batchQueue";
 import { usePreferenceStore } from "@/store/preference";
 import { useTaskStore } from "@/store/task";
-import { buildOption, initTaskForm, type TaskForm } from "@/utils/task";
+import {
+	approveCompletionScript,
+	buildOption,
+	initTaskForm,
+	type TaskForm,
+	taskCompletionScript,
+} from "@/utils/task";
 import { decodeThunderLink } from "@/utils/thunder";
 
 interface FileLikeWithPath {
@@ -890,7 +896,7 @@ export default {
 					if (typeof path !== "string" || !path) {
 						continue;
 					}
-					const item = batchItemForFilePath(path, segmentName(path));
+					const item = batchItemForFilePath(path);
 					if (item) {
 						items.push(item);
 					}
@@ -924,6 +930,14 @@ export default {
 		},
 		onNewTaskShowDownloadingChange(enable: boolean) {
 			this.form.newTaskShowDownloading = !!enable;
+		},
+		explicitSelection(item: BatchQueueItem): string {
+			const selection = item.selectFile;
+			return selection &&
+				selection !== SELECTED_ALL_FILES &&
+				selection !== NONE_SELECTED_FILES
+				? selection
+				: "";
 		},
 		buildSharedOptions(type = ADD_TASK_TYPE.URI, includeFileName = false) {
 			const base = buildOption(type, this.form);
@@ -1029,6 +1043,13 @@ export default {
 			this.uriPreparing = false;
 			this.submitting = true;
 
+			const script = taskCompletionScript(this.form);
+			if (script && !(await approveCompletionScript(script))) {
+				this.submitting = false;
+				toast.error(this.$t("task.completion-script-not-approved"));
+				return;
+			}
+
 			const torrentItems = items.filter(
 				(it) => it.kind === "torrent" && it.path,
 			);
@@ -1062,14 +1083,25 @@ export default {
 				}
 			}
 
-			if (torrentItems.length > 0) {
-				const r = await this.submitPathBatch(torrentItems, () =>
+			const torrentGroups = [
+				torrentItems.filter((it) => !this.explicitSelection(it)),
+				...torrentItems
+					.filter((it) => this.explicitSelection(it))
+					.map((it) => [it]),
+			].filter((group) => group.length > 0);
+			for (const group of torrentGroups) {
+				const options = this.buildSharedOptions(
+					ADD_TASK_TYPE.TORRENT,
+					torrentItems.length === 1,
+				);
+				const selection = this.explicitSelection(group[0]);
+				if (selection) {
+					options.selectFile = selection;
+				}
+				const r = await this.submitPathBatch(group, () =>
 					taskStore.addTorrents({
-						paths: torrentItems.map((it) => it.path as string),
-						options: this.buildSharedOptions(
-							ADD_TASK_TYPE.TORRENT,
-							torrentItems.length === 1,
-						),
+						paths: group.map((it) => it.path as string),
+						options,
 					}),
 				);
 				okCount += r.ok;
@@ -1109,13 +1141,9 @@ export default {
 						.map((s) => s.trim())
 						.filter(Boolean);
 					const sharedOpts = this.buildSharedOptions();
-					const sel = it.selectFile;
-					if (
-						sel &&
-						sel !== SELECTED_ALL_FILES &&
-						sel !== NONE_SELECTED_FILES
-					) {
-						sharedOpts.selectFile = sel;
+					const selection = this.explicitSelection(it);
+					if (selection) {
+						sharedOpts.selectFile = selection;
 					}
 					if (it.forceYtdlp) {
 						sharedOpts.forceYtdlp = true;
@@ -1166,25 +1194,13 @@ export default {
 				appStore.enqueueBatchItems(remaining);
 			}
 		},
-		onCookiesImported({
-			result,
-		}: {
-			result: { cookieHeader: string; userAgent: string };
-		}) {
-			if (result.cookieHeader) {
-				this.form.cookie = result.cookieHeader;
-			}
+		onCookiesImported({ result }: { result: { userAgent: string } }) {
 			if (result.userAgent && !(this.form.userAgent || "").trim()) {
 				this.form.userAgent = result.userAgent;
 			}
 		},
 	},
 };
-
-function segmentName(path: string): string {
-	const segs = `${path}`.split(/[/\\]/);
-	return segs[segs.length - 1] || path;
-}
 
 function isLikelyTaskLink(line: string): boolean {
 	const lower = line.toLowerCase();

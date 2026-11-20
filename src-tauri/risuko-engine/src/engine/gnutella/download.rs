@@ -51,6 +51,7 @@ pub async fn run_gnutella_download(
             file_name: &link.file_name,
             default_name: "gnutella-download",
             dir,
+            auto_rename: opts.get_bool("auto-file-renaming").unwrap_or(true),
         },
         completed,
         speed,
@@ -96,6 +97,7 @@ pub(crate) struct UrnFetch<'a> {
     pub file_name: &'a str,
     pub default_name: &'a str,
     pub dir: &'a str,
+    pub auto_rename: bool,
 }
 
 pub(crate) async fn run_urn_fetch(
@@ -106,8 +108,7 @@ pub(crate) async fn run_urn_fetch(
     cancel_token: CancellationToken,
     proxy: risuko_http::ProxyConnector,
 ) -> Result<PathBuf, GnutellaError> {
-    let out_path = urn_out_path(req.dir, req.file_name, req.urn, req.default_name);
-    let fetch_path = out_path.clone();
+    let fetch_path = urn_out_path(req.dir, req.file_name, req.urn, req.default_name);
     connections.store(1, Ordering::Relaxed);
     let fetch = fetch_by_urn_with_proxy(
         req.host,
@@ -116,6 +117,7 @@ pub(crate) async fn run_urn_fetch(
         req.urn,
         req.file_size,
         &fetch_path,
+        req.auto_rename,
         completed.clone(),
         cancel_token,
         proxy,
@@ -136,8 +138,7 @@ pub(crate) async fn run_urn_fetch(
     };
     connections.store(0, Ordering::Relaxed);
     speed.store(0, Ordering::Relaxed);
-    result?;
-    Ok(out_path)
+    result
 }
 
 #[cfg(test)]

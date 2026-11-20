@@ -14,7 +14,7 @@ const MAX_TORRENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_TORRENT_PREVIEW_PAGE_SIZE: usize = 300;
 const MAX_TORRENT_PREVIEW_PAGE_SIZE: usize = 2_000;
 const TEMP_DOWNLOAD_SUFFIX: &str = ".part";
-use crate::engine::CHUNK_META_SUFFIX;
+use crate::engine::{CHUNK_META_SUFFIX, RESUME_META_SUFFIX};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -260,6 +260,7 @@ pub fn trash_item(path: String) -> Result<bool, String> {
     }
     if path.ends_with(TEMP_DOWNLOAD_SUFFIX) {
         let _ = std::fs::remove_file(format!("{}{}", path, CHUNK_META_SUFFIX));
+        let _ = std::fs::remove_file(format!("{}{}", path, RESUME_META_SUFFIX));
     }
     Ok(existed)
 }
@@ -339,6 +340,55 @@ fn normalize_torrent_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
+enum V2OnlyLayout {
+    Single(i64),
+    Multi(Vec<bencode::Value>),
+}
+
+fn v2_only_layout(bytes: &[u8], info: &bencode::Value) -> Option<V2OnlyLayout> {
+    if info.get(b"file tree").is_none()
+        || info.get(b"files").is_some()
+        || info.get(b"length").is_some()
+    {
+        return None;
+    }
+
+    let meta = risuko_bt::parse_torrent(bytes).ok()?;
+    let files: Vec<&risuko_bt::TorrentMetaInfo> = meta
+        .info
+        .files
+        .iter()
+        .filter(|file| !file.padding)
+        .collect();
+    let to_length = |length: u64| i64::try_from(length).unwrap_or(i64::MAX);
+    if meta.info.single_file_mode {
+        let total = files.iter().map(|file| file.length).sum();
+        return Some(V2OnlyLayout::Single(to_length(total)));
+    }
+
+    let entries = files
+        .iter()
+        .map(|file| {
+            bencode::Value::Dict(vec![
+                (
+                    b"length".to_vec(),
+                    bencode::Value::Int(to_length(file.length)),
+                ),
+                (
+                    b"path".to_vec(),
+                    bencode::Value::List(
+                        file.path
+                            .iter()
+                            .map(|part| bencode::Value::Bytes(part.clone().into_bytes()))
+                            .collect(),
+                    ),
+                ),
+            ])
+        })
+        .collect();
+    Some(V2OnlyLayout::Multi(entries))
+}
+
 pub(crate) fn inspect_torrent_metadata(
     bytes: &[u8],
     fallback: &str,
@@ -358,6 +408,9 @@ pub(crate) fn inspect_torrent_metadata(
     let is_multi_file = matches!(
         info.get(b"files").and_then(bencode::Value::as_list),
         Some(files) if !files.is_empty()
+    ) || matches!(
+        v2_only_layout(bytes, info),
+        Some(V2OnlyLayout::Multi(entries)) if !entries.is_empty()
     );
 
     let name = risuko_bt::torrent_name(info)
@@ -594,94 +647,98 @@ fn resolve_torrent_from_bytes(
         .unwrap_or_else(|| file_name.to_string());
     let normalized_root_name = normalize_torrent_path(&root_name);
 
-    if let Some(files_value) = info.get(b"files") {
-        if let Some(raw_files) = files_value.as_list() {
-            let visible_files: Vec<&bencode::Value> = raw_files
-                .iter()
-                .filter(|item| !risuko_bt::is_padding_entry(item))
-                .collect();
-            let raw_files = visible_files.as_slice();
-            let file_count = raw_files.len();
-            if !force_preview && file_count > MAX_TORRENT_PREVIEW_FILES {
-                return Ok(ResolvedTorrentPayload {
-                    files: Vec::new(),
-                    items: Vec::new(),
-                    file_count,
-                    items_total: 0,
-                    next_offset: 0,
-                    preview_disabled: true,
-                    preview_reason: "count".to_string(),
-                });
-            }
+    let v2_layout = v2_only_layout(bytes, info);
+    let listed_files = match &v2_layout {
+        Some(V2OnlyLayout::Multi(entries)) => Some(entries.as_slice()),
+        _ => info.get(b"files").and_then(bencode::Value::as_list),
+    };
 
-            let all_segments = torrent_file_segments(raw_files);
-
-            if force_preview {
-                let parent_segments = normalize_parent_segments(parent_path, &normalized_root_name);
-                let items = collect_direct_children(
-                    raw_files,
-                    &all_segments,
-                    &normalized_root_name,
-                    &parent_segments,
-                );
-                let items_total = items.len();
-                let safe_offset = offset.min(items_total);
-                let paged_items = items
-                    .into_iter()
-                    .skip(safe_offset)
-                    .take(limit)
-                    .collect::<Vec<_>>();
-                let next_offset = safe_offset + paged_items.len();
-                return Ok(ResolvedTorrentPayload {
-                    files: Vec::new(),
-                    items: paged_items,
-                    file_count,
-                    items_total,
-                    next_offset,
-                    preview_disabled: false,
-                    preview_reason: String::new(),
-                });
-            }
-
-            let mut files = Vec::with_capacity(file_count);
-            for (item, segments) in raw_files.iter().zip(all_segments.iter()) {
-                if item.as_dict().is_none() {
-                    continue;
-                }
-
-                let length = as_length(item.get(b"length"));
-
-                let relative_path = normalize_torrent_path(&segments.join("/"));
-                let full_path = if relative_path.is_empty() {
-                    normalized_root_name.clone()
-                } else {
-                    normalize_torrent_path(&format!("{}/{}", normalized_root_name, relative_path))
-                };
-                if full_path.is_empty() {
-                    continue;
-                }
-
-                let name = segments
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| root_name.clone());
-                files.push(ResolvedTorrentFile {
-                    path: full_path,
-                    length,
-                    name,
-                });
-            }
-
+    if let Some(raw_files) = listed_files {
+        let visible_files: Vec<&bencode::Value> = raw_files
+            .iter()
+            .filter(|item| !risuko_bt::is_padding_entry(item))
+            .collect();
+        let raw_files = visible_files.as_slice();
+        let file_count = raw_files.len();
+        if !force_preview && file_count > MAX_TORRENT_PREVIEW_FILES {
             return Ok(ResolvedTorrentPayload {
-                files,
+                files: Vec::new(),
                 items: Vec::new(),
                 file_count,
                 items_total: 0,
                 next_offset: 0,
+                preview_disabled: true,
+                preview_reason: "count".to_string(),
+            });
+        }
+
+        let all_segments = torrent_file_segments(raw_files);
+
+        if force_preview {
+            let parent_segments = normalize_parent_segments(parent_path, &normalized_root_name);
+            let items = collect_direct_children(
+                raw_files,
+                &all_segments,
+                &normalized_root_name,
+                &parent_segments,
+            );
+            let items_total = items.len();
+            let safe_offset = offset.min(items_total);
+            let paged_items = items
+                .into_iter()
+                .skip(safe_offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let next_offset = safe_offset + paged_items.len();
+            return Ok(ResolvedTorrentPayload {
+                files: Vec::new(),
+                items: paged_items,
+                file_count,
+                items_total,
+                next_offset,
                 preview_disabled: false,
                 preview_reason: String::new(),
             });
         }
+
+        let mut files = Vec::with_capacity(file_count);
+        for (item, segments) in raw_files.iter().zip(all_segments.iter()) {
+            if item.as_dict().is_none() {
+                continue;
+            }
+
+            let length = as_length(item.get(b"length"));
+
+            let relative_path = normalize_torrent_path(&segments.join("/"));
+            let full_path = if relative_path.is_empty() {
+                normalized_root_name.clone()
+            } else {
+                normalize_torrent_path(&format!("{}/{}", normalized_root_name, relative_path))
+            };
+            if full_path.is_empty() {
+                continue;
+            }
+
+            let name = segments
+                .last()
+                .cloned()
+                .unwrap_or_else(|| root_name.clone());
+            files.push(ResolvedTorrentFile {
+                path: full_path,
+                length,
+                name,
+            });
+        }
+
+        return Ok(ResolvedTorrentPayload {
+            files,
+            items: Vec::new(),
+            file_count,
+            items_total: 0,
+            next_offset: 0,
+            preview_disabled: false,
+            preview_reason: String::new(),
+        });
     }
 
     let single_name = if normalized_root_name.is_empty() {
@@ -690,7 +747,10 @@ fn resolve_torrent_from_bytes(
         root_name
     };
     let single_path = normalize_torrent_path(&single_name);
-    let length = as_length(info.get(b"length"));
+    let length = match &v2_layout {
+        Some(V2OnlyLayout::Single(length)) => *length,
+        _ => as_length(info.get(b"length")),
+    };
 
     if force_preview {
         let parent_segments = normalize_parent_segments(parent_path, &normalized_root_name);
@@ -1462,5 +1522,155 @@ mod tests {
         let payload = resolve_torrent_from_bytes(&bytes, "x", true, None, 0, 100).unwrap();
         let names: Vec<&str> = payload.items.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["a\u{fffd}", "a\u{fffd} (1)"]);
+    }
+
+    fn created_album(version: risuko_bt::core::MetaVersion) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("album");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.bin"), vec![1u8; 3000]).unwrap();
+        std::fs::write(root.join("sub").join("b.bin"), vec![2u8; 5000]).unwrap();
+        risuko_bt::create::create_torrent(
+            &root,
+            &risuko_bt::create::CreateOptions {
+                version,
+                piece_length: Some(16 * 1024),
+                ..Default::default()
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap()
+        .bytes
+    }
+
+    fn v2_only_album() -> Vec<u8> {
+        let bytes = created_album(risuko_bt::core::MetaVersion::V2);
+        assert_v2_only(&bytes);
+        bytes
+    }
+
+    fn v2_only_solo() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("solo.bin");
+        std::fs::write(&file, vec![3u8; 4000]).unwrap();
+        let bytes = risuko_bt::create::create_torrent(
+            &file,
+            &risuko_bt::create::CreateOptions {
+                version: risuko_bt::core::MetaVersion::V2,
+                piece_length: Some(16 * 1024),
+                ..Default::default()
+            },
+            |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap()
+        .bytes;
+        assert_v2_only(&bytes);
+        bytes
+    }
+
+    fn assert_v2_only(bytes: &[u8]) {
+        let root = bencode::decode(bytes).unwrap().value;
+        let info = root.get(b"info").unwrap();
+        assert!(info.get(b"file tree").is_some());
+        assert!(info.get(b"files").is_none());
+        assert!(info.get(b"length").is_none());
+    }
+
+    #[test]
+    fn v2_only_multi_file_torrent_lists_its_files() {
+        let bytes = v2_only_album();
+        let payload = resolve_torrent_from_bytes(&bytes, "x.torrent", false, None, 0, 100).unwrap();
+        assert_eq!(payload.file_count, 2);
+        assert!(!payload.preview_disabled);
+        let mut listed: Vec<(&str, i64)> = payload
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.length))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, [("album/a.bin", 3000), ("album/sub/b.bin", 5000)]);
+    }
+
+    #[test]
+    fn v2_only_preview_order_matches_the_engine() {
+        let bytes = v2_only_album();
+        let meta = risuko_bt::parse_torrent(&bytes).unwrap();
+        let engine: Vec<String> = meta
+            .info
+            .files
+            .iter()
+            .filter(|f| !f.padding)
+            .map(|f| format!("{}/{}", meta.info.name, f.path.join("/")))
+            .collect();
+        let payload = resolve_torrent_from_bytes(&bytes, "x", false, None, 0, 100).unwrap();
+        let previewed: Vec<&str> = payload.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(previewed, engine);
+    }
+
+    #[test]
+    fn v2_only_multi_file_torrent_pages_like_v1() {
+        let summarize = |bytes: &[u8]| {
+            let payload = resolve_torrent_from_bytes(bytes, "x", true, None, 0, 100).unwrap();
+            payload
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item.path.clone(),
+                        item.item_type.clone(),
+                        item.length,
+                        item.index,
+                        item.select_ranges.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let v2 = summarize(&v2_only_album());
+        let v1 = summarize(&created_album(risuko_bt::core::MetaVersion::V1));
+        assert_eq!(v2.len(), 2);
+        assert_eq!(v2[0].0, "album/sub");
+        assert_eq!(v2[1].0, "album/a.bin");
+        assert_eq!(v2, v1);
+    }
+
+    #[test]
+    fn v2_only_single_file_torrent_reports_its_length() {
+        let bytes = v2_only_solo();
+        let payload = resolve_torrent_from_bytes(&bytes, "x.torrent", false, None, 0, 100).unwrap();
+        assert_eq!(payload.file_count, 1);
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].path, "solo.bin");
+        assert_eq!(payload.files[0].length, 4000);
+    }
+
+    #[test]
+    fn hybrid_torrent_keeps_the_version_1_listing() {
+        let bytes = created_album(risuko_bt::core::MetaVersion::Hybrid);
+        let root = bencode::decode(&bytes).unwrap().value;
+        let info = root.get(b"info").unwrap();
+        assert!(info.get(b"file tree").is_some());
+        assert!(info.get(b"files").is_some());
+        assert!(v2_only_layout(&bytes, info).is_none());
+        let payload = resolve_torrent_from_bytes(&bytes, "x", false, None, 0, 100).unwrap();
+        let listed: Vec<(&str, i64)> = payload
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.length))
+            .collect();
+        assert_eq!(listed, [("album/a.bin", 3000), ("album/sub/b.bin", 5000)]);
+    }
+
+    #[test]
+    fn inspect_reports_v2_only_layouts() {
+        assert_eq!(
+            inspect_torrent_metadata(&v2_only_album(), "x").unwrap(),
+            (true, "album".to_string())
+        );
+        assert_eq!(
+            inspect_torrent_metadata(&v2_only_solo(), "x").unwrap(),
+            (false, "solo.bin".to_string())
+        );
     }
 }
