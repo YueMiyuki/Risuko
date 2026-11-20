@@ -214,8 +214,7 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
     }
 
     let mut keys: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-    let mut reads = Vec::with_capacity(all_dbs.len());
-    for cookie_db in &all_dbs {
+    let reads = all_dbs.iter().map(|cookie_db| {
         tracing::debug!(target: "risuko_cookies", "chromium: using db path {}", cookie_db.display());
 
         let local_state = paths::find_local_state(cookie_db);
@@ -236,8 +235,8 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
         if let Err(e) = &read {
             tracing::debug!(target: "risuko_cookies", "chromium: skipping db {}: {}", cookie_db.display(), e);
         }
-        reads.push(read);
-    }
+        read
+    });
     let all_cookies = merge_db_reads(reads)?;
 
     tracing::debug!(target: "risuko_cookies",
@@ -250,13 +249,14 @@ pub fn extract_cookies(config: &BrowserConfig, host: Option<&str>) -> Result<Vec
 
 type DbRead = (Vec<Cookie>, usize);
 
-fn merge_db_reads(reads: Vec<Result<DbRead>>) -> Result<Vec<Cookie>> {
-    let total = reads.len();
+fn merge_db_reads(reads: impl IntoIterator<Item = Result<DbRead>>) -> Result<Vec<Cookie>> {
     let mut cookies = Vec::new();
     let mut app_bound = 0usize;
+    let mut total = 0usize;
     let mut failed = 0usize;
     let mut last_err = None;
     for read in reads {
+        total += 1;
         match read {
             Ok((mut found, refused)) => {
                 cookies.append(&mut found);

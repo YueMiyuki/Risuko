@@ -8,6 +8,7 @@ import {
 	emptyRule,
 	episodeKind,
 	hasEmptyEpisodeList,
+	hasInvalidSeasons,
 	mbToBytes,
 	parseEpisodeList,
 	parseNumberList,
@@ -53,6 +54,19 @@ test("episode lists reject the whole field when any token is not a positive inte
 	assert.deepEqual(parseEpisodeList("1, 0"), []);
 	assert.deepEqual(parseEpisodeList("2, 5.5"), []);
 	assert.deepEqual(parseEpisodeList("9007199254740993"), []);
+});
+
+test("seasons reject the whole field when any token is not a positive integer", () => {
+	assert.deepEqual(parseSeasons(" 1, 3 "), [1, 3]);
+	assert.equal(parseSeasons("1-3"), null);
+	assert.equal(parseSeasons("2, x"), null);
+	assert.equal(hasInvalidSeasons(""), false);
+	assert.equal(hasInvalidSeasons("  "), false);
+	assert.equal(hasInvalidSeasons("2, 4"), false);
+	assert.equal(hasInvalidSeasons("1-3"), true);
+	assert.equal(hasInvalidSeasons("2, x"), true);
+	assert.equal(hasInvalidSeasons("0"), true);
+	assert.equal(hasInvalidSeasons("1.5"), true);
 });
 
 test("only a specific selector with no episodes counts as an empty list", () => {

@@ -365,7 +365,10 @@ async fn attempt_segment_download(
     if let Some((offset, length)) = ranged {
         if resp.status() != risuko_http::StatusCode::PARTIAL_CONTENT {
             if offset != 0 {
-                return Err(format!("Segment server ignored Range ({})", resp.status()).into());
+                return Err(AttemptError::fatal(format!(
+                    "Segment server ignored Range ({})",
+                    resp.status()
+                )));
             }
             remaining = Some(length);
         }
@@ -470,9 +473,7 @@ mod tests {
         assert_eq!(estimate_total(u64::MAX, 1, 4), u64::MAX);
     }
 
-    async fn serve_oversized_head(
-        content_length: u64,
-    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn serve_ok_head(content_length: u64) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -497,19 +498,8 @@ mod tests {
         (port, requests)
     }
 
-    #[tokio::test]
-    async fn an_oversized_encrypted_segment_fails_at_once_without_retries() {
-        let (port, requests) = serve_oversized_head(MAX_ENCRYPTED_SEGMENT_BYTES as u64 + 1).await;
+    async fn fail_one_segment(segment: Segment) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let segment = Segment {
-            url: format!("http://127.0.0.1:{port}/seg.ts"),
-            byte_range: None,
-            encryption: Some(super::super::parser::EncryptionInfo {
-                method: "AES-128".into(),
-                key_uri: format!("http://127.0.0.1:{port}/key"),
-                iv: None,
-            }),
-        };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             download_segments(
@@ -527,9 +517,41 @@ mod tests {
             ),
         )
         .await
-        .expect("an oversized segment must not be retried with backoff");
-        let message = result.err().expect("oversized segment must fail");
+        .expect("a segment that can never succeed must not be retried with backoff");
+        result.err().expect("the segment must fail")
+    }
+
+    #[tokio::test]
+    async fn an_oversized_encrypted_segment_fails_at_once_without_retries() {
+        let (port, requests) = serve_ok_head(MAX_ENCRYPTED_SEGMENT_BYTES as u64 + 1).await;
+        let message = fail_one_segment(Segment {
+            url: format!("http://127.0.0.1:{port}/seg.ts"),
+            byte_range: None,
+            encryption: Some(super::super::parser::EncryptionInfo {
+                method: "AES-128".into(),
+                key_uri: format!("http://127.0.0.1:{port}/key"),
+                iv: None,
+            }),
+        })
+        .await;
         assert!(message.contains("exceeds 512 MiB"), "{message}");
+        assert!(!message.contains("retries"), "{message}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_a_mid_file_range_fails_at_once() {
+        let (port, requests) = serve_ok_head(4096).await;
+        let message = fail_one_segment(Segment {
+            url: format!("http://127.0.0.1:{port}/seg.ts"),
+            byte_range: Some(super::super::parser::ByteRange {
+                length: 1024,
+                offset: 2048,
+            }),
+            encryption: None,
+        })
+        .await;
+        assert!(message.contains("ignored Range"), "{message}");
         assert!(!message.contains("retries"), "{message}");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }

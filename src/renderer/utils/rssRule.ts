@@ -52,10 +52,14 @@ export function parseNumberList(text: string): number[] {
 		.filter((value) => Number.isSafeInteger(value) && value > 0);
 }
 
-export function parseEpisodeList(text: string): number[] {
+function parseStrictNumberList(text: string): number[] | null {
 	const tokens = text.split(/[,\s]+/).filter((token) => token !== "");
 	const values = parseNumberList(text);
-	return values.length === tokens.length ? values : [];
+	return values.length === tokens.length ? values : null;
+}
+
+export function parseEpisodeList(text: string): number[] {
+	return parseStrictNumberList(text) ?? [];
 }
 
 export function hasEmptyEpisodeList(selector: EpisodeSelector | null): boolean {
@@ -63,8 +67,12 @@ export function hasEmptyEpisodeList(selector: EpisodeSelector | null): boolean {
 }
 
 export function parseSeasons(text: string): number[] | null {
-	const seasons = parseNumberList(text);
-	return seasons.length > 0 ? seasons : null;
+	const seasons = parseStrictNumberList(text);
+	return seasons && seasons.length > 0 ? seasons : null;
+}
+
+export function hasInvalidSeasons(text: string): boolean {
+	return parseStrictNumberList(text) === null;
 }
 
 export function bytesToMb(bytes: number | null): number {

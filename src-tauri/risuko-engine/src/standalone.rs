@@ -306,24 +306,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_secret_that_cannot_be_saved_still_protects_rpc() {
-        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        std::os::unix::fs::symlink(root.path().join("missing"), &config_dir).unwrap();
+        assert!(!crate::config::ensure_rpc_secret_on_disk(&config_dir));
 
-        let dir = tempfile::tempdir().unwrap();
-        let locked = std::fs::Permissions::from_mode(0o555);
-        std::fs::set_permissions(dir.path(), locked).unwrap();
-        let can_write = std::fs::File::create(dir.path().join("probe")).is_ok();
-
-        let secret = (!can_write).then(|| {
-            let guarded = load_options_with_rpc_secret(dir.path(), true).rpc_secret();
-            let unguarded = load_options_with_rpc_secret(dir.path(), false).rpc_secret();
-            (guarded, unguarded)
-        });
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        if let Some((guarded, unguarded)) = secret {
-            assert_eq!(guarded.len(), 64);
-            assert!(unguarded.is_empty());
-        }
+        let guarded = load_options_with_rpc_secret(&config_dir, true).rpc_secret();
+        assert_eq!(guarded.len(), 64);
+        assert!(load_options_with_rpc_secret(&config_dir, false)
+            .rpc_secret()
+            .is_empty());
+        assert!(!root.path().join("missing").exists());
     }
 
     #[tokio::test]

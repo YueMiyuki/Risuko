@@ -355,26 +355,21 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failed_cleanup_is_reported_and_never_rewrites_the_fallback() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("usenet-credentials.json");
         save_fallback(&path, "primary", &json!({"password": "old"})).unwrap();
         save_fallback(&path, "backup", &json!({"password": "other"})).unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o500)).unwrap();
-        let enforced = std::fs::File::create(dir.path().join("probe")).is_err();
-        let result = clear_stale_fallback(&path, "primary");
-        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o700)).unwrap();
+        let lock = dir.path().join(".usenet-credentials.json.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let error = clear_stale_fallback(&path, "primary").unwrap_err();
 
-        if enforced {
-            assert!(result.unwrap_err().contains("could not be cleared"));
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-        }
+        assert!(error.contains("could not be cleared"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[cfg(unix)]

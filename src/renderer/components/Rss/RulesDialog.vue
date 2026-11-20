@@ -156,8 +156,13 @@
                 <Input
                   :model-value="seasonsText"
                   :placeholder="$t('rss.rule-placeholder-seasons')"
+                  :aria-invalid="seasonsInvalid"
+                  :aria-describedby="seasonsInvalid ? 'rss-seasons-error' : undefined"
                   @update:model-value="updateSeasons(String($event))"
                 />
+                <p v-if="seasonsInvalid" id="rss-seasons-error" class="rss-field-error">
+                  {{ $t('rss.rule-seasons-invalid') }}
+                </p>
               </div>
               <div class="rss-field">
                 <label>{{ $t('rss.rule-episode-selector') }}</label>
@@ -214,7 +219,7 @@
 
             <TabsContent value="test" class="rss-tab-pane">
               <div class="rss-dry-toolbar">
-                <Button size="sm" variant="outline" :disabled="dryRunBusy" @click="runDryRun">
+                <Button size="sm" variant="outline" :disabled="dryRunBusy || seasonsInvalid" @click="runDryRun">
                   <RefreshCw v-if="dryRunBusy" :size="14" class="animate-spin" />
                   <Play v-else :size="14" />
                   {{ $t('rss.rule-dry-run') }}
@@ -310,6 +315,7 @@ import {
 	countMatched,
 	emptyRule,
 	hasEmptyEpisodeList,
+	hasInvalidSeasons,
 	mbToBytes,
 	parseSeasons,
 	sanitizeRule,
@@ -379,10 +385,14 @@ export default {
 		rules(): RssRule[] {
 			return sortRulesByPriority(useRssStore().rules);
 		},
+		seasonsInvalid(): boolean {
+			return hasInvalidSeasons(this.seasonsText);
+		},
 		isValid(): boolean {
 			return (
 				!!this.form &&
 				this.form.name.trim().length > 0 &&
+				!this.seasonsInvalid &&
 				!hasEmptyEpisodeList(this.form.episodes)
 			);
 		},
@@ -527,7 +537,7 @@ export default {
 			}
 		},
 		async runDryRun() {
-			if (!this.form) {
+			if (!this.form || this.seasonsInvalid) {
 				return;
 			}
 			this.dryRunBusy = true;
@@ -694,6 +704,11 @@ export default {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.rss-field-error {
+  font-size: 12px;
+  color: var(--destructive);
 }
 
 .rss-field > label {

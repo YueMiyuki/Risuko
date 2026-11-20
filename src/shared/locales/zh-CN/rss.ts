@@ -112,6 +112,7 @@ export default {
 	"rule-episodes-specific": "指定集数",
 	"rule-placeholder-episodes": "1, 5, 12",
 	"rule-episodes-invalid": "请输入以逗号分隔的整数集数，例如 1, 5, 12",
+	"rule-seasons-invalid": "请输入以逗号分隔的整数季数，例如 1, 2, 3",
 	"rule-chip-earlier": "前移",
 	"rule-chip-later": "后移",
 	"rule-chip-remove": "移除",

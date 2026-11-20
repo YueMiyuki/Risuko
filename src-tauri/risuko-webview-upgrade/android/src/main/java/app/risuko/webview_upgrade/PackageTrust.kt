@@ -21,6 +21,7 @@ internal object PackageTrust {
             "DA2E1B4AB9926BC7B081D4E9E57E3C9EC77EE51F5F0F767EE84C131C574E20EE",
     )
 
+    @Suppress("PackageManagerGetSignatures")
     fun verifiedPackageInfo(context: Context, packageName: String): PackageInfo? = try {
         val packageInfo = context.packageManager.getPackageInfo(packageName, infoFlags())
         if (isSystemPackage(packageInfo) || hasPinnedSigner(packageInfo)) packageInfo else null

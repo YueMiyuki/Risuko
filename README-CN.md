@@ -94,7 +94,7 @@ git clone https://github.com/YueMiyuki/Risuko
 
 ### 安装依赖
 
-需要 Node.js >= 22。
+需要 Node.js >= 22.18、pnpm，以及较新的 Rust 稳定版工具链（发布构建使用当前的 stable 通道）。
 
 ```bash
 cd risuko

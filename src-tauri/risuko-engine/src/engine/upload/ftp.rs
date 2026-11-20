@@ -16,16 +16,15 @@ fn ftp_error(context: &str, error: &suppaftp::FtpError) -> UploadError {
     use suppaftp::FtpError;
     let message = format!("{context}: {error}");
     match error {
-        FtpError::UnexpectedResponse(reply) if reply.status.code() >= 500 => {
+        FtpError::UnexpectedResponse(reply) if reply.body.first() == Some(&b'5') => {
             UploadError::fatal(message)
         }
-        FtpError::UnexpectedResponse(_)
-        | FtpError::ConnectionError(_)
-        | FtpError::SecureError(_)
-        | FtpError::BadResponse => UploadError::transient(message),
-        FtpError::InvalidAddress(_) | FtpError::DataConnectionAlreadyOpen => {
-            UploadError::fatal(message)
+        FtpError::UnexpectedResponse(_) | FtpError::ConnectionError(_) | FtpError::BadResponse => {
+            UploadError::transient(message)
         }
+        FtpError::SecureError(_)
+        | FtpError::InvalidAddress(_)
+        | FtpError::DataConnectionAlreadyOpen => UploadError::fatal(message),
     }
 }
 
@@ -82,20 +81,20 @@ impl FtpSink {
         crate::engine::ftp::tls::ftps_tls_connector(self.cfg.insecure)
     }
 
-    async fn connect_secure(&self) -> Result<AsyncRustlsFtpStream, String> {
+    async fn connect_secure(&self) -> Result<AsyncRustlsFtpStream, UploadError> {
         let addr = format!("{}:{}", self.cfg.host, self.cfg.port);
         let connector = self.tls_connector();
         let mut ftp = if is_implicit_ftps_port(self.cfg.port) {
             AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &self.cfg.host)
                 .await
-                .map_err(|e| format!("FTPS connect failed: {e}"))?
+                .map_err(|e| ftp_error("FTPS connect failed", &e))?
         } else {
             AsyncRustlsFtpStream::connect(&addr)
                 .await
-                .map_err(|e| format!("FTPS connect failed: {e}"))?
+                .map_err(|e| ftp_error("FTPS connect failed", &e))?
                 .into_secure(connector, &self.cfg.host)
                 .await
-                .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))?
+                .map_err(|e| ftp_error("FTPS AUTH TLS failed", &e))?
         };
         ftp.set_passive_nat_workaround(true);
         Ok(ftp)
@@ -212,11 +211,10 @@ impl UploadSink for FtpSink {
         if self.cfg.secure {
             let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, self.connect_secure())
                 .await
-                .map_err(|_| UploadError::transient("FTPS connect timed out"))?
-                .map_err(UploadError::transient)?;
+                .map_err(|_| UploadError::transient("FTPS connect timed out"))??;
             ftp.login(&user, &pass)
                 .await
-                .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
+                .map_err(|e| ftp_error("FTP login failed", &e))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
                 .map_err(|e| ftp_error("FTP binary mode", &e))?;
@@ -231,7 +229,7 @@ impl UploadSink for FtpSink {
             ftp.set_passive_nat_workaround(true);
             ftp.login(&user, &pass)
                 .await
-                .map_err(|e| UploadError::fatal(format!("FTP login failed: {e}")))?;
+                .map_err(|e| ftp_error("FTP login failed", &e))?;
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .await
                 .map_err(|e| ftp_error("FTP binary mode", &e))?;
@@ -252,7 +250,7 @@ impl UploadSink for FtpSink {
 
         tokio::time::timeout(Duration::from_secs(20), async move {
             if secure {
-                let mut ftp = self.connect_secure().await?;
+                let mut ftp = self.connect_secure().await.map_err(|e| e.message)?;
                 ftp.login(&user, &pass)
                     .await
                     .map_err(|e| format!("FTP login failed: {e}"))?;
@@ -294,16 +292,16 @@ mod tests {
     fn reply(code: u32) -> suppaftp::FtpError {
         suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response {
             status: suppaftp::Status::from(code),
-            body: b"reply".to_vec(),
+            body: format!("{code} reply").into_bytes(),
         })
     }
 
     #[test]
     fn permanent_replies_are_fatal_and_temporary_ones_retry() {
-        for code in [550, 553, 552, 530] {
+        for code in [550, 553, 552, 530, 532, 534, 554] {
             assert!(!ftp_error("x", &reply(code)).retryable, "{code}");
         }
-        for code in [421, 425, 426, 451] {
+        for code in [421, 425, 426, 451, 431] {
             assert!(ftp_error("x", &reply(code)).retryable, "{code}");
         }
     }
@@ -317,6 +315,12 @@ mod tests {
         assert!(ftp_error("x", &suppaftp::FtpError::BadResponse).retryable);
         let invalid = "nope".parse::<std::net::IpAddr>().unwrap_err();
         assert!(!ftp_error("x", &suppaftp::FtpError::InvalidAddress(invalid)).retryable);
+    }
+
+    #[test]
+    fn tls_failures_are_not_retried() {
+        let rejected = suppaftp::FtpError::SecureError("invalid peer certificate".into());
+        assert!(!ftp_error("x", &rejected).retryable);
     }
 
     #[test]

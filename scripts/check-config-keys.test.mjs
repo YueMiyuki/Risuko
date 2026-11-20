@@ -271,5 +271,6 @@ test("the key check runs without native TypeScript support", (t) => {
 		return;
 	}
 	assert.doesNotMatch(result.stderr, /ERR_UNKNOWN_FILE_EXTENSION/);
+	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /^\d+ user keys, \d+ system keys/);
 });
