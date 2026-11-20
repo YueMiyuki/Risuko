@@ -351,6 +351,7 @@ html.platform-android .task-page-size .task-page-size-trigger {
 	border-radius: var(--android-radius-sm) !important;
 }
 html.platform-android .task-item {
+	--task-item-head-height: 72px;
 	height: 88px;
 	min-height: 88px;
 	margin: 0;
@@ -363,7 +364,8 @@ html.platform-android .task-item {
 	overflow: hidden;
 	transition: background-color 0.18s ease;
 }
-html.platform-android .task-item.has-files {
+html.platform-android .task-item.has-files,
+html.platform-android .task-item.has-mirrors {
 	height: auto;
 	min-height: 88px;
 }
@@ -376,7 +378,8 @@ html.platform-android .task-item--card {
 	border-radius: var(--android-radius-lg);
 	background: var(--android-surface-container);
 }
-html.platform-android .task-item--card.has-files {
+html.platform-android .task-item--card.has-files,
+html.platform-android .task-item--card.has-mirrors {
 	height: auto;
 	min-height: 128px;
 }

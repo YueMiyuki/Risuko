@@ -90,6 +90,7 @@
 	}
 
 	.task-item {
+		--task-item-head-height: 48px;
 		position: relative;
 		display: flex;
 		height: 64px;
@@ -106,7 +107,8 @@
 	.task-item.selected {
 		background-color: var(--primary-soft);
 	}
-	.task-item.has-files {
+	.task-item.has-files,
+	.task-item.has-mirrors {
 		height: auto;
 		min-height: 64px;
 	}
@@ -118,6 +120,19 @@
 		justify-content: center;
 		gap: 6px;
 		padding: 8px 0;
+	}
+	.task-item-head {
+		display: flex;
+		flex-direction: column;
+		gap: inherit;
+		flex-shrink: 0;
+	}
+	.task-item.has-mirrors:not(.task-item--card) .task-item-main {
+		justify-content: flex-start;
+	}
+	.task-item.has-mirrors:not(.task-item--card) .task-item-head {
+		height: var(--task-item-head-height);
+		justify-content: center;
 	}
 	.task-item-row {
 		display: flex;
@@ -196,7 +211,8 @@
 		background: var(--primary-soft);
 		border-color: color-mix(in srgb, var(--primary) 35%, transparent);
 	}
-	.task-item--card.has-files {
+	.task-item--card.has-files,
+	.task-item--card.has-mirrors {
 		height: auto;
 		min-height: 82px;
 	}
@@ -292,6 +308,40 @@
 	.task-file-row.is-complete .task-file-name,
 	.task-file-row.is-complete .task-file-pct {
 		opacity: 0.7;
+	}
+	.task-mirrors {
+		display: grid;
+		grid-template-rows: 0fr;
+		margin-top: -6px;
+		transition:
+			grid-template-rows var(--dur-3) var(--ease-out),
+			margin-top var(--dur-3) var(--ease-out);
+	}
+	.task-mirrors.is-open {
+		grid-template-rows: 1fr;
+		margin-top: 0;
+	}
+	.task-mirrors-inner {
+		min-height: 0;
+		overflow: hidden;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.task-mirrors {
+			transition: none;
+		}
+	}
+	.task-mirror-meta {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.task-mirror-stat {
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
+	}
+	.task-mirror-failing {
+		color: var(--danger);
 	}
 
 	.task-actions {

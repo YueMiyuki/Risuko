@@ -5,6 +5,14 @@ interface FileUri {
 	status: string;
 }
 
+export interface TaskMirror {
+	uri: string;
+	completedLength: string;
+	downloadSpeed: string;
+	connections: string;
+	status: "active" | "idle" | "failing";
+}
+
 export interface DownloadFile {
 	index: string;
 	path: string;
@@ -91,6 +99,7 @@ export interface DownloadTask {
 	usenetWarning?: string;
 	usenetRepairFailure?: UsenetRepairFailure;
 	chunkProgress?: { completedLength: string; totalLength: string }[];
+	mirrors?: TaskMirror[];
 }
 
 export interface PeerInfo {

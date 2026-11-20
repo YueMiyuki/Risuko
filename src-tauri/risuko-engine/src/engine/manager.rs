@@ -24,9 +24,9 @@ use super::routing::{resolve_routing, strip_part_suffix, TaskRoutingRule};
 use super::session::SessionManager;
 use super::speed_limiter::{parse_speed_limit, SpeedLimiter};
 use super::task::{
-    generate_gid, ChunkProgress, DownloadFile, DownloadTask, Ed2kKadTaskStatus, FileUri, PeerInfo,
-    TaskFileStamp, TaskKind, TaskPatch, TaskStatus, UpdateTaskOutcome, UsenetRepairFailure,
-    UsenetTaskData, UsenetTaskFile, UsenetTaskOptions, UsenetTaskSegment,
+    generate_gid, ChunkProgress, DownloadFile, DownloadTask, Ed2kKadTaskStatus, FileUri,
+    MirrorStat, PeerInfo, TaskFileStamp, TaskKind, TaskPatch, TaskStatus, UpdateTaskOutcome,
+    UsenetRepairFailure, UsenetTaskData, UsenetTaskFile, UsenetTaskOptions, UsenetTaskSegment,
 };
 use super::torrent::{self, TorrentEngine};
 use super::upload::UploadFileSnapshot;
@@ -598,6 +598,7 @@ struct ActiveDownload {
     metalink_files: Vec<(usize, Counters)>,
     kad_status: Arc<parking_lot::Mutex<Option<KadLookupStatus>>>,
     ed2k_upload: Option<Arc<UploadStats>>,
+    mirrors: Option<Arc<http::MirrorTracker>>,
 }
 
 #[derive(Clone)]
@@ -642,8 +643,16 @@ impl Counters {
             metalink_files: Vec::new(),
             kad_status: Arc::new(parking_lot::Mutex::new(None)),
             ed2k_upload: None,
+            mirrors: None,
         }
     }
+}
+
+fn mirror_progress(task: &DownloadTask, tracker: &http::MirrorTracker) -> Vec<MirrorStat> {
+    if task.uris.len() < 2 {
+        return Vec::new();
+    }
+    tracker.snapshot()
 }
 
 fn chunk_progress(chunks: &[Arc<AtomicU64>], total: u64) -> Vec<ChunkProgress> {
@@ -3228,21 +3237,18 @@ impl TaskManager {
             (0..split).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let adopted_filename: Arc<parking_lot::Mutex<Option<String>>> =
             Arc::new(parking_lot::Mutex::new(None));
+        let mirror_tracker = Arc::new(http::MirrorTracker::default());
 
         let (worker_epoch, starting) =
             self.publish_starting_worker(&gid, counters.cancel_token.clone());
         tokio::spawn(async move {
-            register_active_download(
-                &active,
-                &starting,
-                gid.clone(),
-                counters.to_active(
-                    worker_epoch,
-                    chunk_completed.clone(),
-                    adopted_filename.clone(),
-                ),
-            )
-            .await;
+            let mut active_download = counters.to_active(
+                worker_epoch,
+                chunk_completed.clone(),
+                adopted_filename.clone(),
+            );
+            active_download.mirrors = Some(Arc::clone(&mirror_tracker));
+            register_active_download(&active, &starting, gid.clone(), active_download).await;
 
             if finish_if_startup_aborted(
                 &tasks,
@@ -3266,7 +3272,7 @@ impl TaskManager {
             }
 
             let c = counters.clone();
-            let download_result = http::run_http_download_multi(
+            let download_result = http::run_http_download_tracked(
                 &uris,
                 &dir,
                 &out,
@@ -3280,6 +3286,7 @@ impl TaskManager {
                 task_speed_limiter,
                 chunk_completed.clone(),
                 adopted_filename,
+                &mirror_tracker,
             )
             .await;
 
@@ -3299,6 +3306,7 @@ impl TaskManager {
                     } else {
                         task.chunk_progress.clear();
                     }
+                    task.mirror_progress = mirror_progress(task, &mirror_tracker);
                 },
                 |task, path| {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -4100,6 +4108,9 @@ impl TaskManager {
                                 chunk_progress(&ad.chunk_completed, task.total_length);
                         } else {
                             task.chunk_progress.clear();
+                        }
+                        if let Some(tracker) = &ad.mirrors {
+                            task.mirror_progress = mirror_progress(task, tracker);
                         }
 
                         if let Some(f) = task
@@ -6672,10 +6683,16 @@ impl TaskManager {
                     .uris
                     .iter()
                     .map(|u| {
+                        let speed = task
+                            .mirror_progress
+                            .iter()
+                            .find(|m| m.uri == u.uri)
+                            .map(|m| m.speed)
+                            .unwrap_or(0);
                         serde_json::json!({
                             "uri": u.uri,
                             "currentUri": u.uri,
-                            "downloadSpeed": "0",
+                            "downloadSpeed": speed.to_string(),
                         })
                     })
                     .collect();
@@ -9600,6 +9617,7 @@ mod tests {
                 metalink_files: Vec::new(),
                 kad_status: Arc::new(parking_lot::Mutex::new(None)),
                 ed2k_upload: None,
+                mirrors: None,
             },
         );
         let starting_token = CancellationToken::new();

@@ -12,6 +12,12 @@
             <component :is="kindIcon" :size="14" class="shrink-0 text-muted-foreground" />
             <span class="min-w-0 flex-1 truncate text-sm" :title="item.label">{{ item.label }}</span>
             <span
+              v-if="mirrors.length"
+              class="shrink-0 rounded-full bg-muted/60 px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+            >
+              {{ $t('task.mirror-sources', { count: mirrors.length + 1 }) }}
+            </span>
+            <span
               v-if="statusChip"
               class="ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium"
               :class="statusChipClass"
@@ -187,7 +193,7 @@
 <script lang="ts">
 import { FileArchive, Link2, Magnet, Video, X } from "@lucide/vue";
 import type { MediaFormat } from "@shared/types/task";
-import { bytesToSize } from "@shared/utils";
+import { bytesToSize, isMirrorUrl } from "@shared/utils";
 import api from "@/api";
 import MagnetFiles from "@/components/Task/MagnetFiles.vue";
 import SelectTorrent from "@/components/Task/SelectTorrent.vue";
@@ -265,16 +271,7 @@ export default {
 		},
 		canAddMirror(): boolean {
 			const candidate = this.mirrorDraft.trim();
-			let parsed: URL;
-			try {
-				parsed = new URL(candidate);
-			} catch {
-				return false;
-			}
-			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-				return false;
-			}
-			if (!parsed.hostname) {
+			if (!isMirrorUrl(candidate)) {
 				return false;
 			}
 			const lower = candidate.toLowerCase();
