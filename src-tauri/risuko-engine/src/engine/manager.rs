@@ -656,6 +656,16 @@ fn mirror_progress(task: &DownloadTask, tracker: &http::MirrorTracker) -> Vec<Mi
     tracker.snapshot()
 }
 
+fn settle_mirror_progress(
+    task: &mut DownloadTask,
+    worker_uris: &[String],
+    tracker: &http::MirrorTracker,
+) {
+    if task.uris == worker_uris {
+        task.mirror_progress = mirror_progress(task, tracker);
+    }
+}
+
 fn chunk_progress(chunks: &[Arc<AtomicU64>], total: u64) -> Vec<ChunkProgress> {
     if chunks.is_empty() {
         return Vec::new();
@@ -3316,7 +3326,7 @@ impl TaskManager {
                     } else {
                         task.chunk_progress.clear();
                     }
-                    task.mirror_progress = mirror_progress(task, &mirror_tracker);
+                    settle_mirror_progress(task, &uris, &mirror_tracker);
                 },
                 |task, path| {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -11782,6 +11792,56 @@ mod tests {
         let other = vec!["https://c.test/f".into(), "https://d.test/f".into()];
         apply_task_patch(&mut task, Some(other), None, None, &[], None);
         assert!(task.mirror_progress.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_finish_after_a_uri_edit_keeps_mirror_stats_cleared() {
+        let stat = |uri: &str| MirrorStat {
+            uri: uri.into(),
+            ..Default::default()
+        };
+        let worker_uris: Vec<String> = vec!["https://a.test/f".into(), "https://b.test/f".into()];
+        let tracker = crate::engine::http::MirrorTracker::with_stats(vec![
+            stat("https://a.test/f"),
+            stat("https://b.test/f"),
+        ]);
+        let mut task = make_task("m2", TaskStatus::Paused);
+        task.uris = worker_uris.clone();
+
+        let mut unedited = task.clone();
+        settle_mirror_progress(&mut unedited, &worker_uris, &tracker);
+        assert_eq!(unedited.mirror_progress.len(), 2);
+
+        let manager = make_test_manager(vec![task]);
+        let counters = Counters::new(0, 0);
+        let worker_epoch = next_worker_epoch();
+        manager
+            .active_downloads
+            .write()
+            .await
+            .insert("m2".into(), counters.to_active_plain(worker_epoch));
+        {
+            let mut tasks = manager.tasks.write().await;
+            let edited = vec!["https://c.test/f".into(), "https://d.test/f".into()];
+            apply_task_patch(&mut tasks[0], Some(edited), None, None, &[], None);
+        }
+
+        finish_task(
+            &manager.tasks,
+            &manager.active_downloads,
+            &manager.events,
+            "m2",
+            worker_epoch,
+            "http",
+            &counters,
+            Err("cancelled".into()),
+            |task| settle_mirror_progress(task, &worker_uris, &tracker),
+            |task, _| task.total_length,
+            |_, error| classify_error(error, "http"),
+        )
+        .await;
+
+        assert!(manager.tasks.read().await[0].mirror_progress.is_empty());
     }
 
     #[tokio::test]

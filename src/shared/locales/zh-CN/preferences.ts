@@ -187,9 +187,9 @@ export default {
 	"uri-selector-feedback": "反馈式（跳过失败的镜像）",
 	"uri-selector-inorder": "顺序（按列表顺序尝试）",
 	"uri-selector-adaptive": "自适应（优先最快）",
-	"send-auth-to-all-mirrors": "向所有镜像发送登录信息",
+	"send-auth-to-all-mirrors": "向所有 HTTPS 镜像发送登录信息",
 	"send-auth-to-all-mirrors-tips":
-		"将任务的 Authorization 请求头发送给所有镜像。关闭时，只有协议、主机和端口与第一个链接相同的镜像才会收到。",
+		"将任务的 Authorization 请求头发送给所有 HTTPS 镜像。关闭时，只有协议、主机和端口与第一个链接相同的镜像才会收到。",
 	"unit-seconds": "秒",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "存储",

@@ -18,8 +18,13 @@ const parseUrl = (uri: string): URL | null => {
 	}
 };
 
-const isShared = (values: string[], i: number): boolean =>
-	values.filter((value) => value === values[i]).length > 1;
+const countValues = (values: string[]): Map<string, number> => {
+	const counts = new Map<string, number>();
+	for (const value of values) {
+		counts.set(value, (counts.get(value) ?? 0) + 1);
+	}
+	return counts;
+};
 
 export const buildMirrorRows = (
 	mirrors: TaskMirror[] | undefined,
@@ -33,11 +38,16 @@ export const buildMirrorRows = (
 	const paths = urls.map((url, i) =>
 		url ? `${url.host}${url.pathname}` : list[i].uri,
 	);
+	const hostCounts = countValues(hosts);
+	const pathCounts = countValues(paths);
 	return list.map((mirror, i) => {
 		const url = urls[i];
 		let label = hosts[i];
-		if (url && isShared(hosts, i)) {
-			label = isShared(paths, i) ? `${paths[i]}${url.search}` : paths[i];
+		if (url && (hostCounts.get(hosts[i]) ?? 0) > 1) {
+			label =
+				(pathCounts.get(paths[i]) ?? 0) > 1
+					? `${paths[i]}${url.search}`
+					: paths[i];
 		}
 		return {
 			key: `${i}:${mirror.uri}`,

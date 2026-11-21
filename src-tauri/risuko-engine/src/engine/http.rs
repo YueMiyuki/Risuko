@@ -981,7 +981,7 @@ fn headers_for_uri(
         .get("send-auth-to-all-mirrors")
         .and_then(json_bool)
         .unwrap_or(false);
-    if !shared_auth && uri != primary && !same_origin(uri, primary) {
+    if uri != primary && !same_origin(uri, primary) && !(shared_auth && is_https_uri(uri)) {
         headers.remove(risuko_http::header::AUTHORIZATION);
     }
     if let Some(scope) = options.get(COOKIE_HOST_OPTION).and_then(Value::as_str) {
@@ -2367,6 +2367,14 @@ impl Drop for MirrorTrackerAttachment<'_> {
 }
 
 impl MirrorTracker {
+    #[cfg(test)]
+    pub(crate) fn with_stats(stats: Vec<MirrorStat>) -> Self {
+        Self {
+            last: parking_lot::Mutex::new(stats),
+            ..Self::default()
+        }
+    }
+
     fn attach(&self, pool: Arc<MirrorPool>) -> MirrorTrackerAttachment<'_> {
         *self.sample.lock() = None;
         *self.pool.lock() = Some(pool);
@@ -4245,18 +4253,27 @@ mod tests {
     }
 
     #[test]
-    fn authorization_reaches_every_mirror_when_shared() {
+    fn shared_authorization_reaches_only_https_mirrors() {
         let base = h(&[("authorization", "Bearer t")]);
         let mut options = Map::new();
         options.insert("no-netrc".into(), Value::Bool(true));
         options.insert("send-auth-to-all-mirrors".into(), Value::Bool(true));
-        for uri in ["https://b.test/f", "http://a.test/f"] {
-            let headers = headers_for_uri(&base, uri, "https://a.test/f", &options);
-            assert_eq!(
-                headers.get(risuko_http::header::AUTHORIZATION).unwrap(),
-                "Bearer t"
-            );
+        let auth = |uri: &str, primary: &str| {
+            headers_for_uri(&base, uri, primary, &options)
+                .get(risuko_http::header::AUTHORIZATION)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let primary = "https://a.test/f";
+        for uri in ["https://b.test/f", "HTTPS://c.test/f"] {
+            assert_eq!(auth(uri, primary).as_deref(), Some("Bearer t"));
         }
+        for uri in ["http://a.test/f", "http://b.test/f", "HTTP://c.test/f"] {
+            assert_eq!(auth(uri, primary), None);
+        }
+        assert_eq!(
+            auth("http://a.test/g", "http://a.test/f").as_deref(),
+            Some("Bearer t")
+        );
     }
 
     #[test]
