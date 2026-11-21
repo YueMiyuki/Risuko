@@ -56,6 +56,16 @@
   <url type="vcs-browser">https://github.com/YueMiyuki/Risuko</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="1.3.0" date="2026-11-21">
+      <description>
+        <ul>
+          <li>chore(js): declare node engine constraint in platform npm packages</li>
+          <li>fix: keep rpc, scripts, and torrent writes inside their limits</li>
+          <li>feat: balance multi-mirror downloads by speed and add a Mirrors tab</li>
+          <li>Update deps</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.2.0" date="2026-11-09">
       <description>
         <ul>
