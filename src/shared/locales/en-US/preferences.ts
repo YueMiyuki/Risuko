@@ -200,6 +200,9 @@ export default {
 	"uri-selector-feedback": "Feedback (drop slow/failing mirrors)",
 	"uri-selector-inorder": "In order (try mirrors left-to-right)",
 	"uri-selector-adaptive": "Adaptive (prefer fastest)",
+	"send-auth-to-all-mirrors": "Send login to all HTTPS mirrors",
+	"send-auth-to-all-mirrors-tips":
+		"Send a task's Authorization header to every HTTPS mirror. When off, only mirrors with the same scheme, host and port as the first link get it.",
 	"unit-seconds": "seconds",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Storage",

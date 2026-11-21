@@ -32,88 +32,121 @@
       </DialogHeader>
 
       <div class="atd-scroll min-h-0 flex-1 overflow-y-auto">
-        <div class="flex flex-col gap-2 px-4 pt-3">
-          <Textarea
-            ref="uri"
-            auto-complete="off"
-            rows="3"
-            :placeholder="$t('task.uri-task-tips')"
-            v-model="uriDraft"
-            class="resize-none text-xs"
-            :disabled="submitting || uriPreparing"
-            @paste="handleUriPaste"
-            @keydown.enter.exact="handleUriEnter"
-            @keydown.enter.meta.exact="handleUriSubmitShortcut"
-            @keydown.enter.ctrl.exact="handleUriSubmitShortcut"
-          />
-          <div
-            class="flex items-center justify-center gap-2 rounded-md border border-dashed border-border/60 px-3 py-2.5 text-xs text-muted-foreground transition-colors"
-            :class="{ 'border-primary/60 bg-primary/5': dragOver }"
-            @dragover.prevent
-            @dragenter.prevent="dragOver = true"
-            @dragleave.prevent="dragOver = false"
-            @drop.prevent="handleDrop"
-          >
-            <FileArchive :size="13" />
-            <span>{{ $t('task.batch-drop-hint') }}</span>
-            <button
-              v-if="isRenderer"
-              type="button"
-              class="ml-1 rounded-md border border-border/60 px-2 py-0.5 text-[11px] hover:bg-muted"
-              :title="$t('app.browse')"
-              :aria-label="$t('app.browse')"
-              :disabled="submitting || uriPreparing"
-              @click="browseTorrentFiles"
-            >
-              {{ $t('app.browse') }}
-            </button>
+        <Tabs v-model="activeTab" class="gap-0">
+          <div class="px-4 pt-3">
+            <TabsList class="w-full justify-start">
+              <TabsTrigger value="links" :disabled="submitting || uriPreparing">{{ $t('task.add-tab-links') }}</TabsTrigger>
+              <TabsTrigger value="mirrors" :disabled="submitting || uriPreparing">{{ $t('task.add-tab-mirrors') }}</TabsTrigger>
+            </TabsList>
           </div>
-          <div
-            v-if="showTorrentNetworkInterferenceWarning"
-            role="note"
-            class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300"
-          >
-            <TriangleAlert :size="14" class="mt-0.5 shrink-0" aria-hidden="true" />
-            <span>{{ $t('task.torrent-network-interference-warning') }}</span>
-          </div>
-        </div>
-
-        <div class="mt-3 mb-12 px-4">
-          <div
-            v-if="queue.length === 0"
-            class="flex min-h-30 items-center justify-center rounded-md border border-dashed border-border/40 text-xs text-muted-foreground"
-          >
-            {{ $t('task.batch-queue-empty') }}
-          </div>
-          <Accordion
-            v-else
-            type="multiple"
-            v-model="openItemIds"
-            class="flex flex-col gap-2"
-          >
-            <AnimatePresence>
-              <Motion
-                v-for="item in queue"
-                :key="item.id"
-                tag="div"
-                layout
-                :initial="motionInitial"
-                :animate="motionAnimate"
-                :exit="motionExit"
-                :transition="motionTransition"
+          <TabsContent value="links" force-mount class="mt-0 data-[state=inactive]:hidden">
+            <div class="flex flex-col gap-2 px-4 pt-3">
+              <Textarea
+                ref="uri"
+                auto-complete="off"
+                rows="3"
+                :placeholder="$t('task.uri-task-tips')"
+                v-model="uriDraft"
+                class="resize-none text-xs"
+                :disabled="submitting || uriPreparing"
+                @paste="handleUriPaste"
+                @keydown.enter.exact="handleUriEnter"
+                @keydown.enter.meta.exact="handleUriSubmitShortcut"
+                @keydown.enter.ctrl.exact="handleUriSubmitShortcut"
+              />
+              <div
+                class="flex items-center justify-center gap-2 rounded-md border border-dashed border-border/60 px-3 py-2.5 text-xs text-muted-foreground transition-colors"
+                :class="{ 'border-primary/60 bg-primary/5': dragOver }"
+                @dragover.prevent
+                @dragenter.prevent="dragOver = true"
+                @dragleave.prevent="dragOver = false"
+                @drop.prevent="handleDrop"
               >
-                <batch-item-card
-                  :item="item"
+                <FileArchive :size="13" />
+                <span>{{ $t('task.batch-drop-hint') }}</span>
+                <button
+                  v-if="isRenderer"
+                  type="button"
+                  class="ml-1 rounded-md border border-border/60 px-2 py-0.5 text-[11px] hover:bg-muted"
+                  :title="$t('app.browse')"
+                  :aria-label="$t('app.browse')"
                   :disabled="submitting || uriPreparing"
-                  @remove="removeItem"
-                  @update:select-file="updateSelection"
-                  @update:media="updateMedia"
-                  @update:mirrors="updateMirrors"
-                />
-              </Motion>
-            </AnimatePresence>
-          </Accordion>
-        </div>
+                  @click="browseTorrentFiles"
+                >
+                  {{ $t('app.browse') }}
+                </button>
+              </div>
+              <div
+                v-if="showTorrentNetworkInterferenceWarning"
+                role="note"
+                class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300"
+              >
+                <TriangleAlert :size="14" class="mt-0.5 shrink-0" aria-hidden="true" />
+                <span>{{ $t('task.torrent-network-interference-warning') }}</span>
+              </div>
+            </div>
+
+            <div class="mt-3 mb-12 px-4">
+              <div
+                v-if="queue.length === 0"
+                class="flex min-h-30 items-center justify-center rounded-md border border-dashed border-border/40 text-xs text-muted-foreground"
+              >
+                {{ $t('task.batch-queue-empty') }}
+              </div>
+              <Accordion
+                v-else
+                type="multiple"
+                v-model="openItemIds"
+                class="flex flex-col gap-2"
+              >
+                <AnimatePresence>
+                  <Motion
+                    v-for="item in queue"
+                    :key="item.id"
+                    tag="div"
+                    layout
+                    :initial="motionInitial"
+                    :animate="motionAnimate"
+                    :exit="motionExit"
+                    :transition="motionTransition"
+                  >
+                    <batch-item-card
+                      :item="item"
+                      :disabled="submitting || uriPreparing"
+                      @remove="removeItem"
+                      @update:select-file="updateSelection"
+                      @update:media="updateMedia"
+                      @update:mirrors="updateMirrors"
+                    />
+                  </Motion>
+                </AnimatePresence>
+              </Accordion>
+            </div>
+          </TabsContent>
+          <TabsContent value="mirrors" class="mt-0">
+            <div class="mb-6 flex flex-col gap-2 px-4 pt-3">
+              <Textarea
+                v-model="mirrorText"
+                auto-complete="off"
+                rows="6"
+                :aria-label="$t('task.add-tab-mirrors')"
+                :placeholder="$t('task.mirror-list-placeholder')"
+                class="resize-none font-mono text-xs"
+                :disabled="submitting"
+                @keydown.enter.meta.exact="handleMirrorSubmitShortcut"
+                @keydown.enter.ctrl.exact="handleMirrorSubmitShortcut"
+              />
+              <div class="text-[11px] leading-relaxed text-muted-foreground">{{ $t('task.mirror-list-hint') }}</div>
+              <div v-if="mirrorList.rejected.length" role="alert" class="break-all text-[11px] text-destructive">
+                {{ $t('task.mirror-list-rejected') }}
+                <span class="font-mono">{{ mirrorList.rejected[0] }}</span>
+              </div>
+              <div v-else-if="mirrorList.uris.length > 1" class="text-[11px] text-muted-foreground">
+                {{ $t('task.mirror-sources', { count: mirrorList.uris.length }) }}
+              </div>
+            </div>
+          </TabsContent>
+        </Tabs>
 
         <div class="border-t border-border/60 px-4 py-3">
           <div class="grid grid-cols-[1fr_88px] gap-2">
@@ -352,10 +385,13 @@ import {
 } from "@shared/constants";
 import {
 	detectUriProtocol,
+	isMediaUri,
+	parseMirrorList,
 	splitTaskLinks,
 	splitTaskLinksWithRenames,
 } from "@shared/utils";
 import logger from "@shared/utils/logger";
+import type { MirrorList } from "@shared/utils/mirrorLinks";
 import { buildOuts } from "@shared/utils/rename";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
@@ -378,6 +414,7 @@ import {
 import { Input } from "@/components/ui/input";
 import LoadingOverlay from "@/components/ui/LoadingOverlay.vue";
 import NumberInput from "@/components/ui/NumberInput.vue";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import is from "@/shims/platform";
 import { useAppStore } from "@/store/app";
@@ -420,6 +457,10 @@ export default {
 		DialogFooter,
 		Input,
 		Textarea,
+		Tabs,
+		TabsContent,
+		TabsList,
+		TabsTrigger,
 		Accordion,
 		AnimatePresence,
 		Motion,
@@ -440,6 +481,8 @@ export default {
 		return {
 			form: {} as TaskForm,
 			uriDraft: "",
+			activeTab: "links",
+			mirrorText: "",
 			uriCommit: Promise.resolve() as Promise<void>,
 			uriGeneration: 0,
 			uriCommitVersion: 0,
@@ -476,6 +519,12 @@ export default {
 				? { duration: 0 }
 				: { type: "spring", stiffness: 360, damping: 30 };
 		},
+		mirrorList(): MirrorList {
+			return parseMirrorList(this.mirrorText, isMediaUri);
+		},
+		mirrorTab(): boolean {
+			return this.activeTab === "mirrors";
+		},
 		draftLinkCount(): number {
 			return splitTaskLinks(this.uriDraft || "").length;
 		},
@@ -488,6 +537,12 @@ export default {
 			);
 		},
 		canSubmit(): boolean {
+			if (this.mirrorTab) {
+				return (
+					this.mirrorList.uris.length > 0 &&
+					this.mirrorList.rejected.length === 0
+				);
+			}
 			return this.queue.length > 0 || this.draftLinkCount > 0;
 		},
 		hasSchedulableQueueItem(): boolean {
@@ -506,9 +561,15 @@ export default {
 			return !!this.form.startAt && this.hasTorrentQueueItem;
 		},
 		submitCount(): number {
+			if (this.mirrorTab) {
+				return this.mirrorList.uris.length > 0 ? 1 : 0;
+			}
 			return this.queue.length + this.draftLinkCount;
 		},
 		cookiePickerUrl(): string {
+			if (this.mirrorTab) {
+				return this.mirrorList.uris[0] || "";
+			}
 			const fromDraft = splitTaskLinks(this.uriDraft || "").find((u) =>
 				/^https?:\/\//i.test(u),
 			);
@@ -629,6 +690,8 @@ export default {
 		async handleOpen() {
 			const generation = this.beginUriCommitSession();
 			this.showAdvanced = false;
+			this.activeTab = "links";
+			this.mirrorText = "";
 			this.form = initTaskForm({
 				app: useAppStore().$state,
 				preference: usePreferenceStore().$state,
@@ -748,6 +811,12 @@ export default {
 		handleUriEnter(ev: KeyboardEvent) {
 			ev.preventDefault();
 			void this.commitUriDraft();
+		},
+		handleMirrorSubmitShortcut(ev: KeyboardEvent) {
+			ev.preventDefault();
+			if (!this.submitting && this.canSubmit) {
+				void this.submitForm();
+			}
 		},
 		handleUriSubmitShortcut(ev: KeyboardEvent) {
 			ev.preventDefault();
@@ -1004,8 +1073,49 @@ export default {
 			}
 			return { ok, fail };
 		},
+		async submitMirrors() {
+			const { uris } = this.mirrorList;
+			this.submitting = true;
+			const script = taskCompletionScript(this.form);
+			if (script && !(await approveCompletionScript(script))) {
+				this.submitting = false;
+				toast.error(this.$t("task.completion-script-not-approved"));
+				return;
+			}
+			const out = `${this.form.out || ""}`.trim();
+			try {
+				await useTaskStore().addUri({
+					uris,
+					outs: out ? [out] : [],
+					options: this.buildSharedOptions() as Record<string, string>,
+				});
+			} catch (err: unknown) {
+				this.submitting = false;
+				toast.error(this.normalizeAddTaskError(err));
+				return;
+			}
+			this.submitting = false;
+			this.mirrorText = "";
+			toast.success(this.$t("task.batch-all-success", { count: 1 }));
+			if (this.queue.length > 0 || (this.uriDraft || "").trim()) {
+				this.activeTab = "links";
+				return;
+			}
+			useAppStore().hideAddTaskDialog();
+			if (this.form.newTaskShowDownloading) {
+				this.$router
+					.push({ path: "/task/active" })
+					.catch((err: unknown) => logger.log(err));
+			}
+		},
 		async submitForm() {
 			if (this.submitting || this.uriPreparing) {
+				return;
+			}
+			if (this.mirrorTab) {
+				if (this.canSubmit) {
+					await this.submitMirrors();
+				}
 				return;
 			}
 			const appStore = useAppStore();
@@ -1175,6 +1285,12 @@ export default {
 
 			if (failCount === 0) {
 				toast.success(this.$t("task.batch-all-success", { count: okCount }));
+				if ((this.mirrorText || "").trim()) {
+					appStore.resetBatchQueue();
+					this.openItemIds = [];
+					this.activeTab = "mirrors";
+					return;
+				}
 				appStore.hideAddTaskDialog();
 				if (this.form.newTaskShowDownloading) {
 					this.$router

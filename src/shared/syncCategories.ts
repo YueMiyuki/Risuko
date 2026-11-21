@@ -103,6 +103,7 @@ const namedCategories: SyncCategory[] = [
 			"seed-time",
 			"split",
 			"uri-selector",
+			"send-auth-to-all-mirrors",
 			"user-agent",
 			"load-cookies",
 			"bt-create-subfolder",

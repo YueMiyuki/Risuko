@@ -30,6 +30,7 @@ export const TASK_LIST_KEYS = [
 	"usenetStage",
 	"usenetWarning",
 	"usenetRepairFailure",
+	"mirrors",
 ];
 
 export const TASK_LIST_LIGHT_KEYS = TASK_LIST_KEYS.filter(

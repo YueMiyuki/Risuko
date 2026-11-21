@@ -226,6 +226,33 @@ pub struct ChunkProgress {
     pub total: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MirrorState {
+    Active,
+    #[default]
+    Idle,
+    Failing,
+}
+
+impl MirrorState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MirrorState::Active => "active",
+            MirrorState::Idle => "idle",
+            MirrorState::Failing => "failing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorStat {
+    pub uri: String,
+    pub completed: u64,
+    pub speed: u64,
+    pub connections: u32,
+    pub state: MirrorState,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct DownloadTask {
     pub gid: String,
@@ -294,6 +321,8 @@ pub struct DownloadTask {
     pub schedule_missed: bool,
     #[serde(skip, default)]
     pub chunk_progress: Vec<ChunkProgress>,
+    #[serde(skip, default)]
+    pub mirror_progress: Vec<MirrorStat>,
     #[serde(skip, default)]
     pub bt_files_cache: Option<(u64, bool)>,
     #[serde(skip, default)]
@@ -940,6 +969,35 @@ impl DownloadTask {
             m.insert("chunkProgress".into(), Value::Array(chunks));
         }
 
+        if !self.mirror_progress.is_empty() {
+            let mirrors: Vec<Value> = self
+                .mirror_progress
+                .iter()
+                .map(|mirror| {
+                    let mut mm = Map::new();
+                    mm.insert("uri".into(), Value::String(mirror.uri.clone()));
+                    mm.insert(
+                        "completedLength".into(),
+                        Value::String(mirror.completed.to_string()),
+                    );
+                    mm.insert(
+                        "downloadSpeed".into(),
+                        Value::String(mirror.speed.to_string()),
+                    );
+                    mm.insert(
+                        "connections".into(),
+                        Value::String(mirror.connections.to_string()),
+                    );
+                    mm.insert(
+                        "status".into(),
+                        Value::String(mirror.state.as_str().to_string()),
+                    );
+                    Value::Object(mm)
+                })
+                .collect();
+            m.insert("mirrors".into(), Value::Array(mirrors));
+        }
+
         Value::Object(m)
     }
 }
@@ -955,6 +1013,33 @@ use crate::engine::util::now_ms;
 mod tests {
     use super::*;
     use serde_json::{json, Map};
+
+    #[test]
+    fn rpc_status_lists_mirrors_only_when_known() {
+        let mut task = DownloadTask {
+            gid: "g".into(),
+            ..Default::default()
+        };
+        assert!(task.to_rpc_status(&[]).get("mirrors").is_none());
+        task.mirror_progress = vec![MirrorStat {
+            uri: "https://a.test/f".into(),
+            completed: 1024,
+            speed: 512,
+            connections: 3,
+            state: MirrorState::Active,
+        }];
+        let status = task.to_rpc_status(&["mirrors".to_string()]);
+        assert_eq!(
+            status["mirrors"],
+            json!([{
+                "uri": "https://a.test/f",
+                "completedLength": "1024",
+                "downloadSpeed": "512",
+                "connections": "3",
+                "status": "active"
+            }])
+        );
+    }
 
     #[test]
     fn gid_is_16_hex_chars() {

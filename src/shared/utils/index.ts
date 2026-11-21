@@ -21,6 +21,7 @@ import { toKebabCasePreserveNumbers } from "./configKeyCase";
 import { buildMagnetLink } from "./magnetLink";
 
 export { bytesToSize } from "./format";
+export { isMirrorUrl, parseMirrorList } from "./mirrorLinks";
 export { formatUsenetRepairFailure } from "./usenet";
 
 export const getApiErrorMessage = (

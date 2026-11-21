@@ -306,6 +306,7 @@ const ADVANCED_KEYS = [
 	"preferences.uri-selector-feedback",
 	"preferences.uri-selector-inorder",
 	"preferences.uri-selector-adaptive",
+	"preferences.send-auth-to-all-mirrors",
 	"preferences.storage",
 	"preferences.file-allocation",
 	"preferences.file-allocation-falloc",

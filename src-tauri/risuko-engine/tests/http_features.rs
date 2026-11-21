@@ -13,8 +13,11 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use risuko_engine::engine::http::{run_http_download_multi, PIECE_SIZE};
+use risuko_engine::engine::http::{
+    run_http_download_multi, run_http_download_tracked, MirrorTracker, PIECE_SIZE,
+};
 use risuko_engine::engine::speed_limiter::SpeedLimiter;
+use risuko_engine::engine::task::MirrorState;
 use risuko_engine::engine::{CHUNK_META_SUFFIX, RESUME_META_SUFFIX};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1904,4 +1907,356 @@ async fn a_fresh_single_connection_download_records_the_validator() {
     let record = tmp.path().join(format!("out.bin.part{RESUME_META_SUFFIX}"));
     let meta: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
     assert_eq!(meta["etag"], "\"v1\"");
+}
+
+struct ThrottledState {
+    payload: Arc<Vec<u8>>,
+    bytes_per_sec: usize,
+    range_hits: AtomicU64,
+    in_flight: AtomicU64,
+    hit_times: parking_lot::Mutex<Vec<std::time::Instant>>,
+}
+
+impl ThrottledState {
+    fn new(payload: Arc<Vec<u8>>, bytes_per_sec: usize) -> Arc<Self> {
+        Arc::new(Self {
+            payload,
+            bytes_per_sec,
+            range_hits: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            hit_times: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+async fn spawn_throttled_server(st: Arc<ThrottledState>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let len = st.payload.len();
+                let (start, end) = req
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .map(|r| {
+                        let mut it = r.trim().split('-');
+                        let s = it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                        let e = it
+                            .next()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(len - 1)
+                            .min(len - 1);
+                        (s, e)
+                    })
+                    .unwrap_or((0, len - 1));
+                st.range_hits.fetch_add(1, Ordering::SeqCst);
+                st.hit_times.lock().push(std::time::Instant::now());
+                let body = &st.payload[start..=end];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                     Content-Range: bytes {start}-{end}/{len}\r\nAccept-Ranges: bytes\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let step = (st.bytes_per_sec / 20).max(1);
+                st.in_flight.fetch_add(1, Ordering::SeqCst);
+                for part in body.chunks(step) {
+                    if stream.write_all(part).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                st.in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn slow_mirror_hands_its_pieces_to_a_fast_one() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 8));
+    let expected = payload_sha256_hex(&payload);
+    let fast = CountingState::healthy(payload.clone(), 0);
+    let slow = ThrottledState::new(payload.clone(), 32 * 1024);
+    let addr_fast = spawn_counting_server(fast.clone()).await;
+    let addr_slow = spawn_throttled_server(slow.clone()).await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_fast}/file.bin"),
+        format!("http://{addr_slow}/file.bin"),
+    ];
+    let options = options_with(vec![("checksum", json!(format!("sha-256={expected}")))]);
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+
+    let started = std::time::Instant::now();
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_http_download_multi(
+            &uris,
+            &dir,
+            "file.bin",
+            &options,
+            total,
+            completed.clone(),
+            speed,
+            conns,
+            ct,
+            gl,
+            tl,
+            cc,
+            std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        ),
+    )
+    .await
+    .expect("the slow mirror must not hold the download hostage")
+    .expect("download should succeed");
+    let elapsed = started.elapsed();
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    assert_eq!(completed.load(Ordering::Relaxed), payload.len() as u64);
+    assert!(
+        slow.range_hits.load(Ordering::SeqCst) > 0,
+        "slow mirror was never used"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "download waited on the slow mirror: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn inorder_skips_a_dead_first_mirror() {
+    let payload = Arc::new(make_payload());
+    let expected = payload_sha256_hex(&payload);
+    let good = spawn_good_server(payload.clone()).await;
+    let broken = spawn_broken_server().await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{broken}/file.bin"),
+        format!("http://{good}/file.bin"),
+    ];
+    let options = options_with(vec![
+        ("uri-selector", json!("inorder")),
+        ("checksum", json!(format!("sha-256={expected}"))),
+    ]);
+
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_mirrors(&uris, &dir, &options),
+    )
+    .await
+    .expect("inorder must move past the dead mirror")
+    .expect("download should succeed from the second mirror");
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+}
+
+#[tokio::test]
+async fn pieces_move_to_the_live_mirror_when_one_dies_midway() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 8));
+    let expected = payload_sha256_hex(&payload);
+    let live = CountingState::healthy(payload.clone(), 5);
+    let dying = Arc::new(CountingState {
+        payload: payload.clone(),
+        range_hits: AtomicU64::new(0),
+        in_flight: AtomicU64::new(0),
+        max_in_flight: AtomicU64::new(0),
+        fail_after: Some(3),
+        override_total: None,
+        delay_ms: 5,
+    });
+    let addr_live = spawn_counting_server(live.clone()).await;
+    let addr_dying = spawn_counting_server(dying.clone()).await;
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_dying}/file.bin"),
+        format!("http://{addr_live}/file.bin"),
+    ];
+    let options = options_with(vec![("checksum", json!(format!("sha-256={expected}")))]);
+
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_mirrors(&uris, &dir, &options),
+    )
+    .await
+    .expect("download should not hang on a dead mirror")
+    .expect("the live mirror should finish the download");
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    assert!(
+        dying.hits() > 3,
+        "the dying mirror should have been tried after it died"
+    );
+    assert!(live.hits() > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaimed_pieces_do_not_go_back_to_the_slow_mirror() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 8));
+    let expected = payload_sha256_hex(&payload);
+    let fast = CountingState::healthy(payload.clone(), 0);
+    let slow = ThrottledState::new(payload.clone(), 32 * 1024);
+    let addr_fast = spawn_counting_server(fast.clone()).await;
+    let addr_slow = spawn_throttled_server(slow.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_slow}/file.bin"),
+        format!("http://{addr_fast}/file.bin"),
+    ];
+    let options = options_with(vec![
+        ("split", json!("16")),
+        ("checksum", json!(format!("sha-256={expected}"))),
+    ]);
+
+    let started = std::time::Instant::now();
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_mirrors(&uris, &dir, &options),
+    )
+    .await
+    .expect("the slow mirror must not hold the download hostage")
+    .expect("download should succeed");
+    let elapsed = started.elapsed();
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    let hits = slow.hit_times.lock().clone();
+    assert!(hits.len() > 1, "slow mirror never served a piece");
+    let late = hits
+        .iter()
+        .filter(|t| t.duration_since(started) > std::time::Duration::from_millis(1500))
+        .count();
+    assert_eq!(late, 0, "a reclaimed piece went back to the slow mirror");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "download waited on the slow mirror: {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_mirror_gives_its_connections_to_a_fast_one() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 32));
+    let expected = payload_sha256_hex(&payload);
+    let slow = ThrottledState::new(payload.clone(), 32 * 1024);
+    let fast = ThrottledState::new(payload.clone(), 1024 * 1024);
+    let addr_slow = spawn_throttled_server(slow.clone()).await;
+    let addr_fast = spawn_throttled_server(fast.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_slow}/file.bin"),
+        format!("http://{addr_fast}/file.bin"),
+    ];
+    let options = options_with(vec![
+        ("split", json!("8")),
+        ("checksum", json!(format!("sha-256={expected}"))),
+    ]);
+
+    let sampler = {
+        let slow = slow.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+            slow.in_flight.load(Ordering::SeqCst)
+        })
+    };
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(40),
+        run_mirrors(&uris, &dir, &options),
+    )
+    .await
+    .expect("download should finish")
+    .expect("download should succeed");
+    let slow_mid_download = sampler.await.unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    assert!(
+        slow_mid_download <= 1,
+        "the slow mirror still held {slow_mid_download} connections mid-download"
+    );
+}
+
+#[tokio::test]
+async fn each_mirror_reports_the_bytes_it_served() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 8));
+    let a = CountingState::healthy(payload.clone(), 5);
+    let b = CountingState::healthy(payload.clone(), 5);
+    let addr_a = spawn_counting_server(a.clone()).await;
+    let addr_b = spawn_counting_server(b.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_a}/file.bin"),
+        format!("http://{addr_b}/file.bin"),
+    ];
+    let options = options_with(vec![]);
+    let tracker = MirrorTracker::default();
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+    let path = run_http_download_tracked(
+        &uris,
+        &dir,
+        "file.bin",
+        &options,
+        total,
+        completed,
+        speed,
+        conns,
+        ct,
+        gl,
+        tl,
+        cc,
+        std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        &tracker,
+    )
+    .await
+    .expect("download should succeed");
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    let mirrors = tracker.snapshot();
+    assert_eq!(
+        mirrors.iter().map(|m| m.uri.as_str()).collect::<Vec<_>>(),
+        uris.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        mirrors.iter().map(|m| m.completed).sum::<u64>(),
+        payload.len() as u64
+    );
+    assert!(mirrors.iter().all(|m| m.completed > 0));
+    assert!(mirrors
+        .iter()
+        .all(|m| m.speed == 0 && m.connections == 0 && m.state == MirrorState::Idle));
 }

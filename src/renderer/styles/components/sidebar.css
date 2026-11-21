@@ -63,7 +63,12 @@
 		flex: 1 1 auto;
 		min-height: 0;
 		overflow-y: auto;
+		overflow-x: hidden;
+		scrollbar-width: none;
 		padding: 0 12px;
+	}
+	.sidebar-nav::-webkit-scrollbar {
+		display: none;
 	}
 	.sidebar-group {
 		list-style: none;

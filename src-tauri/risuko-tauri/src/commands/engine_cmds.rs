@@ -640,7 +640,9 @@ pub async fn add_metalinks_by_paths(
 }
 
 fn is_plain_http_mirror_uri(uri: &str, options: &Map<String, Value>) -> bool {
-    let is_http = uri.starts_with("http://") || uri.starts_with("https://");
+    let is_http = uri.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
     if !is_http || is_nzb_url(uri) {
         return false;
     }
@@ -1424,6 +1426,14 @@ mod tests {
         ));
         assert!(is_plain_http_mirror_uri(
             "https://mirror.example.org/path/file.zip",
+            &opts
+        ));
+        assert!(is_plain_http_mirror_uri(
+            "HTTPS://mirror.example.org/path/file.zip",
+            &opts
+        ));
+        assert!(!is_plain_http_mirror_uri(
+            "HTTPS://www.youtube.com/watch?v=abc",
             &opts
         ));
     }

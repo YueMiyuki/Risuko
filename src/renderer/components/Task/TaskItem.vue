@@ -2,51 +2,92 @@
   <div
     :key="task._displayKey || task.gid"
     class="task-item"
-    :class="{ 'is-active': shouldPulse, 'is-complete': isComplete, selected: selected, 'has-files': isMultiFileBT, 'task-item--card': isCardView, 'has-drag-handle': showDragHandle }"
+    :class="{ 'is-active': shouldPulse, 'is-complete': isComplete, selected: selected, 'has-files': isMultiFileBT, 'has-mirrors': mirrorsExpanded, 'task-item--card': isCardView, 'has-drag-handle': showDragHandle }"
     v-on:dblclick="onDbClick"
   >
     <div class="task-item-main">
-      <div class="task-item-row">
-        <span
-          v-if="showDragHandle"
-          class="task-drag-handle"
-          tabindex="0"
-          role="slider"
-          aria-orientation="vertical"
-          :aria-valuemin="1"
-          :aria-valuemax="positionCount"
-          :aria-valuenow="position"
-          :aria-valuetext="`${position} / ${positionCount}`"
-          :aria-label="$t('task.reorder-handle')"
-          @pointerdown.stop="onHandleDown"
-          @keydown="onHandleKeydown"
-          @mousedown.stop
-          @touchstart.stop
-          @click.stop
-          @dblclick.stop
-        >
-          <GripVertical :size="14" />
-        </span>
-        <span class="task-status-dot" :class="`status-${taskStatus}`"></span>
-        <div class="task-name" :title="taskFullName">
-          <span class="task-name-text">{{ taskFullName }}</span>
+      <div class="task-item-head">
+        <div class="task-item-row">
           <span
-            v-if="task.tag"
-            class="task-tag"
-            :style="tagStyle"
+            v-if="showDragHandle"
+            class="task-drag-handle"
+            tabindex="0"
+            role="slider"
+            aria-orientation="vertical"
+            :aria-valuemin="1"
+            :aria-valuemax="positionCount"
+            :aria-valuenow="position"
+            :aria-valuetext="`${position} / ${positionCount}`"
+            :aria-label="$t('task.reorder-handle')"
+            @pointerdown.stop="onHandleDown"
+            @keydown="onHandleKeydown"
+            @mousedown.stop
+            @touchstart.stop
+            @click.stop
+            @dblclick.stop
           >
-            {{ task.tag }}
+            <GripVertical :size="14" />
           </span>
+          <span class="task-status-dot" :class="`status-${taskStatus}`"></span>
+          <div class="task-name" :title="taskFullName">
+            <span class="task-name-text">{{ taskFullName }}</span>
+            <span
+              v-if="task.tag"
+              class="task-tag"
+              :style="tagStyle"
+            >
+              {{ task.tag }}
+            </span>
+          </div>
+          <task-item-actions v-if="!isAndroidCard" mode="LIST" :task="task" />
         </div>
-        <task-item-actions v-if="!isAndroidCard" mode="LIST" :task="task" />
+        <div class="task-card-progress">
+          <task-progress
+            :completed="Number(task.completedLength)"
+            :total="Number(task.totalLength)"
+            :status="taskStatus"
+          />
+          <task-progress-info :task="task" />
+        </div>
       </div>
-      <div class="task-card-progress">
-        <task-progress
-          :completed="Number(task.completedLength)"
-          :total="Number(task.totalLength)"
-          :status="taskStatus"
-        />
-        <task-progress-info :task="task" />
+      <div
+        v-if="mirrorRows.length"
+        class="task-mirrors"
+        :class="{ 'is-open': showMirrors }"
+        :inert="!showMirrors"
+        @click.stop
+      >
+        <div class="task-mirrors-inner">
+          <div class="task-files">
+            <div class="task-files-list">
+              <div
+                v-for="mirror in mirrorRows"
+                :key="mirror.key"
+                class="task-file-row"
+                :class="`is-${mirror.status}`"
+              >
+                <div class="task-file-head">
+                  <span class="task-file-name" :title="mirror.uri">{{ mirror.label }}</span>
+                  <span class="task-file-pct">{{ mirrorPercent(mirror) }}%</span>
+                </div>
+                <task-progress
+                  :completed="mirror.completed"
+                  :total="Number(task.totalLength)"
+                  :status="mirrorBarStatus(mirror)"
+                />
+                <div class="task-file-meta task-mirror-meta">
+                  <span>{{ formatBytes(mirror.completed) }}</span>
+                  <span v-if="mirror.status === 'failing'" class="task-mirror-failing">{{ $t('task.mirror-failing') }}</span>
+                  <span v-else-if="isActive && mirror.status === 'idle'">{{ $t('task.mirror-idle') }}</span>
+                  <template v-else-if="isActive">
+                    <span class="task-mirror-stat"><ArrowDown :size="10" />{{ formatBytes(mirror.speed) }}/s</span>
+                    <span class="task-mirror-stat" :title="$t('task.task-connections')"><Network :size="10" />{{ mirror.connections }}</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
       <div v-if="isMultiFileBT" class="task-files">
         <button
@@ -90,7 +131,13 @@
 </template>
 
 <script lang="ts">
-import { ChevronDown, ChevronRight, GripVertical } from "@lucide/vue";
+import {
+	ArrowDown,
+	ChevronDown,
+	ChevronRight,
+	GripVertical,
+	Network,
+} from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
 import {
 	bytesToSize,
@@ -104,9 +151,12 @@ import is from "@/shims/platform";
 import { usePreferenceStore } from "@/store/preference";
 import { useTaskStore } from "@/store/task";
 import { getTaskFullPath, openItem } from "@/utils/native";
+import { buildMirrorRows, type MirrorRow } from "@/utils/taskMirrors";
 import TaskItemActions from "./TaskItemActions.vue";
 import TaskProgress from "./TaskProgress.vue";
 import TaskProgressInfo from "./TaskProgressInfo.vue";
+
+const MIRROR_PANEL_MS = 200;
 
 export default {
 	name: "task-item",
@@ -114,9 +164,11 @@ export default {
 		[TaskItemActions.name]: TaskItemActions,
 		[TaskProgress.name]: TaskProgress,
 		[TaskProgressInfo.name]: TaskProgressInfo,
+		ArrowDown,
 		ChevronDown,
 		ChevronRight,
 		GripVertical,
+		Network,
 	},
 	props: {
 		task: {
@@ -143,6 +195,8 @@ export default {
 	data() {
 		return {
 			filesExpanded: true,
+			mirrorsClosing: false,
+			mirrorsTimer: 0,
 		};
 	},
 	computed: {
@@ -196,6 +250,15 @@ export default {
 		taskStatus() {
 			return getDisplayTaskStatus(this.task);
 		},
+		mirrorRows(): MirrorRow[] {
+			return buildMirrorRows(this.task.mirrors);
+		},
+		showMirrors(): boolean {
+			return this.selected && this.mirrorRows.length > 0;
+		},
+		mirrorsExpanded(): boolean {
+			return this.showMirrors || this.mirrorsClosing;
+		},
 		isActive() {
 			return this.taskStatus === TASK_STATUS.ACTIVE;
 		},
@@ -223,6 +286,20 @@ export default {
 				color: `hsl(${hue} 45% 45%)`,
 			};
 		},
+	},
+	watch: {
+		showMirrors(open: boolean) {
+			clearTimeout(this.mirrorsTimer);
+			this.mirrorsClosing = !open;
+			if (!open) {
+				this.mirrorsTimer = window.setTimeout(() => {
+					this.mirrorsClosing = false;
+				}, MIRROR_PANEL_MS);
+			}
+		},
+	},
+	beforeUnmount() {
+		clearTimeout(this.mirrorsTimer);
 	},
 	methods: {
 		onHandleDown(event) {
@@ -274,6 +351,21 @@ export default {
 		},
 		formatBytes(value) {
 			return bytesToSize(value);
+		},
+		mirrorPercent(mirror: MirrorRow) {
+			return formatProgressPercent(
+				Number(this.task.totalLength),
+				mirror.completed,
+			);
+		},
+		mirrorBarStatus(mirror: MirrorRow) {
+			if (mirror.status === "failing") {
+				return TASK_STATUS.ERROR;
+			}
+			if (this.isActive && mirror.status === "idle") {
+				return TASK_STATUS.PAUSED;
+			}
+			return this.taskStatus;
 		},
 	},
 };

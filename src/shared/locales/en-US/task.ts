@@ -367,6 +367,15 @@ export default {
 	"mirror-placeholder": "Mirror URL (same file, another server)",
 	"mirror-hint":
 		"Add mirror URLs that point to the same file to download from multiple sources in parallel.",
+	"mirror-sources": "{{count}} sources",
+	"mirror-failing": "Failing",
+	"mirror-idle": "Not in use",
+	"add-tab-links": "Links",
+	"add-tab-mirrors": "Mirrors",
+	"mirror-list-placeholder": "Mirror URLs of one file, one per line",
+	"mirror-list-hint":
+		"Every link must point to the same file. Its pieces download from all mirrors at once, and a mirror that fails or slows down hands its pieces to the others.",
+	"mirror-list-rejected": "Not a plain http(s) file link:",
 	"detail-tab-general": "General",
 	"detail-tab-activity": "Activity",
 	"detail-tab-trackers": "Trackers",

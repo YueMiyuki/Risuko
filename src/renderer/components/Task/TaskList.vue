@@ -151,7 +151,8 @@ export default {
 			}
 			return !this.paginatedTaskList.some((task) => {
 				const files = Array.isArray(task.files) ? task.files : [];
-				return checkTaskIsBT(task) && files.length > 1;
+				const mirrors = Array.isArray(task.mirrors) ? task.mirrors : [];
+				return (checkTaskIsBT(task) && files.length > 1) || mirrors.length > 1;
 			});
 		},
 		canDrag() {

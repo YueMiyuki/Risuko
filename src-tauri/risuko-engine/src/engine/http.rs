@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::options::json_bool;
 use super::resume_meta::{self, ResumeMeta};
 use super::speed_limiter::{parse_speed_limit, SpeedEma, SpeedLimiter, MIN_EMA_SAMPLE_SECS};
+use super::task::{MirrorStat, MirrorState};
 use risuko_bt::limiter::Throttle;
 
 const PART_SUFFIX: &str = ".part";
@@ -31,6 +32,9 @@ const MAX_FILENAME_BYTES: usize = 255 - PART_SUFFIX.len() - CHUNK_META_SUFFIX.le
 const META_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const PARTIAL_ERROR_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 const PARTIAL_ERROR_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+const RECLAIM_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+const RECLAIM_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const RECLAIM_RECONNECT_SECS: f64 = 1.0;
 const STALE_PART_REMOVED: &str = "stale partial file removed";
 use super::CHUNK_META_SUFFIX;
 
@@ -950,19 +954,52 @@ fn build_mirror_headers(
 ) -> Vec<HeaderMap> {
     all_uris
         .iter()
-        .map(|u| headers_for_uri(base_headers, u, options))
+        .map(|u| headers_for_uri(base_headers, u, primary_uri(all_uris, u), options))
         .collect()
 }
 
 pub(crate) const COOKIE_HOST_OPTION: &str = "risuko-cookie-host";
+pub(crate) const COOKIE_HTTP_OPTION: &str = "risuko-cookie-http";
 
-fn headers_for_uri(base_headers: &HeaderMap, uri: &str, options: &Map<String, Value>) -> HeaderMap {
+fn primary_uri<'a>(all_uris: &'a [String], fallback: &'a str) -> &'a str {
+    all_uris.first().map_or(fallback, String::as_str)
+}
+
+fn is_https_uri(uri: &str) -> bool {
+    uri.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+}
+
+fn headers_for_uri(
+    base_headers: &HeaderMap,
+    uri: &str,
+    primary: &str,
+    options: &Map<String, Value>,
+) -> HeaderMap {
     let mut headers = base_headers.clone();
+    let shared_auth = options
+        .get("send-auth-to-all-mirrors")
+        .and_then(json_bool)
+        .unwrap_or(false);
+    if uri != primary && !same_origin(uri, primary) && !(shared_auth && is_https_uri(uri)) {
+        headers.remove(risuko_http::header::AUTHORIZATION);
+    }
     if let Some(scope) = options.get(COOKIE_HOST_OPTION).and_then(Value::as_str) {
         let in_scope = super::cookie_store::host_of(uri)
             .is_some_and(|host| super::cookie_store::host_matches(&host, scope));
         if !in_scope {
             headers.remove(risuko_http::header::COOKIE);
+        } else if !is_https_uri(uri) {
+            if let Some(plain) = options.get(COOKIE_HTTP_OPTION).and_then(Value::as_str) {
+                match HeaderValue::from_str(plain) {
+                    Ok(value) if !plain.is_empty() => {
+                        headers.insert(risuko_http::header::COOKIE, value);
+                    }
+                    _ => {
+                        headers.remove(risuko_http::header::COOKIE);
+                    }
+                }
+            }
         }
     }
     apply_netrc_auth(&mut headers, uri, options);
@@ -984,6 +1021,43 @@ pub async fn run_http_download_multi(
     task_limiter: Arc<SpeedLimiter>,
     chunk_completed: Vec<Arc<AtomicU64>>,
     adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
+) -> Result<PathBuf, String> {
+    let tracker = MirrorTracker::default();
+    run_http_download_tracked(
+        uris,
+        dir,
+        out,
+        options,
+        total,
+        completed,
+        speed,
+        connections,
+        cancel_token,
+        global_limiter,
+        task_limiter,
+        chunk_completed,
+        adopted_filename,
+        &tracker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_http_download_tracked(
+    uris: &[String],
+    dir: &str,
+    out: &str,
+    options: &Map<String, Value>,
+    total: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    speed: Arc<AtomicU64>,
+    connections: Arc<AtomicU32>,
+    cancel_token: CancellationToken,
+    global_limiter: Arc<SpeedLimiter>,
+    task_limiter: Arc<SpeedLimiter>,
+    chunk_completed: Vec<Arc<AtomicU64>>,
+    adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
+    tracker: &MirrorTracker,
 ) -> Result<PathBuf, String> {
     if uris.is_empty() {
         return Err("no URIs provided".to_string());
@@ -1032,6 +1106,7 @@ pub async fn run_http_download_multi(
             chunk_completed.clone(),
             adopted_filename.clone(),
             false,
+            tracker,
         )
         .await;
 
@@ -1078,6 +1153,7 @@ async fn run_single_uri_download(
     chunk_completed: Vec<Arc<AtomicU64>>,
     adopted_filename: Arc<parking_lot::Mutex<Option<String>>>,
     is_stale_retry: bool,
+    tracker: &MirrorTracker,
 ) -> Result<PathBuf, String> {
     tracing::info!(
         "Starting download: uri={}, dir={dir}, out={out}",
@@ -1149,7 +1225,7 @@ async fn run_single_uri_download(
         client.clone()
     };
     let base_headers = build_headers(options);
-    let headers = headers_for_uri(&base_headers, uri, options);
+    let headers = headers_for_uri(&base_headers, uri, primary_uri(all_uris, uri), options);
     let stall = StallWatchdog::from_options(options);
     let falloc_mode = {
         let mode = super::falloc::Mode::from_option(options.get("file-allocation"));
@@ -1356,6 +1432,7 @@ async fn run_single_uri_download(
                         .as_ref()
                         .map(|f| (uri.to_string(), f.clone())),
                     (&piece_checksums, &whole_checksum),
+                    tracker,
                 )
                 .await;
                 match result {
@@ -1394,6 +1471,7 @@ async fn run_single_uri_download(
         resume_meta::delete(&part_path);
     }
     connections.store(1, Ordering::Relaxed);
+    tracker.clear();
 
     // Reuse the probe's Range shape; some signed-URL CDNs (e.g. Quark) reject a plain GET with 412
     let probe_confirmed_range = is_http
@@ -1489,6 +1567,7 @@ async fn run_single_uri_download(
                 chunk_completed,
                 adopted_filename,
                 true,
+                tracker,
             ))
             .await;
         }
@@ -1889,6 +1968,36 @@ fn endpoint_key(uri: &str) -> String {
     }
 }
 
+struct PieceLease {
+    mirror: usize,
+    started: std::time::Instant,
+    start_completed: u32,
+    length: u32,
+    completed: Arc<AtomicU32>,
+    stop: CancellationToken,
+}
+
+impl PieceLease {
+    fn mature(&self, now: std::time::Instant) -> bool {
+        !self.stop.is_cancelled() && now.duration_since(self.started) >= RECLAIM_MIN_AGE
+    }
+
+    fn rate(&self, now: std::time::Instant) -> f64 {
+        let done = self
+            .completed
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.start_completed);
+        f64::from(done) / now.duration_since(self.started).as_secs_f64().max(0.001)
+    }
+
+    fn remaining(&self) -> f64 {
+        f64::from(
+            self.length
+                .saturating_sub(self.completed.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 struct MirrorPool {
     uris: Vec<String>,
     keys: Vec<String>,
@@ -1898,6 +2007,10 @@ struct MirrorPool {
     max_conn_per_server: usize,
     resolved: parking_lot::Mutex<Vec<Option<String>>>,
     changed: AtomicBool,
+    rebalance: bool,
+    endgame: AtomicBool,
+    leases: parking_lot::Mutex<std::collections::HashMap<usize, PieceLease>>,
+    settled: Vec<AtomicU64>,
 }
 
 impl MirrorPool {
@@ -1907,7 +2020,9 @@ impl MirrorPool {
         max_conn_per_server: usize,
         probed: Option<(String, String)>,
     ) -> Self {
-        let keys = uris.iter().map(|u| endpoint_key(u)).collect();
+        let keys: Vec<String> = uris.iter().map(|u| endpoint_key(u)).collect();
+        let rebalance = strategy != super::uri_selector::Strategy::Inorder
+            && keys.iter().collect::<std::collections::HashSet<_>>().len() > 1;
         let resolved = uris
             .iter()
             .map(|u| match &probed {
@@ -1917,6 +2032,7 @@ impl MirrorPool {
                 _ => None,
             })
             .collect();
+        let settled = uris.iter().map(|_| AtomicU64::new(0)).collect();
         Self {
             resolved: parking_lot::Mutex::new(resolved),
             changed: AtomicBool::new(false),
@@ -1926,6 +2042,10 @@ impl MirrorPool {
             stats: parking_lot::Mutex::new(super::uri_selector::ServerStats::default()),
             active: parking_lot::Mutex::new(std::collections::HashMap::new()),
             max_conn_per_server: max_conn_per_server.max(1),
+            rebalance,
+            endgame: AtomicBool::new(false),
+            leases: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            settled,
         }
     }
 
@@ -1949,31 +2069,64 @@ impl MirrorPool {
             .filter(|&i| {
                 let k = &self.keys[i];
                 let at_cap = active.get(k).copied().unwrap_or(0) >= self.max_conn_per_server;
-                let blacklisted = self.strategy != super::uri_selector::Strategy::Inorder
-                    && !all_blacklisted
-                    && stats.is_blacklisted(k);
+                let blacklisted = !all_blacklisted && stats.is_blacklisted(k);
                 !at_cap && !blacklisted
             })
             .collect();
         let chosen = *eligible.first()?;
         let active_of = |i: usize| active.get(&self.keys[i]).copied().unwrap_or(0);
         let ema_of = |i: usize| stats.get(&self.keys[i]).map(|s| s.ema_bps).unwrap_or(0.0);
-        let chosen = match self.strategy {
-            super::uri_selector::Strategy::Inorder => eligible[0],
-            super::uri_selector::Strategy::Adaptive => *eligible
+        let chosen = if self.rebalance {
+            let rates = self.rates(&stats, &self.leases.lock(), std::time::Instant::now());
+            let by_rate = |a: &usize, b: &usize| {
+                rates[*a]
+                    .unwrap_or(0.0)
+                    .partial_cmp(&rates[*b].unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.cmp(a))
+            };
+            let fastest = eligible
                 .iter()
-                .min_by(|&&a, &&b| {
-                    active_of(a).cmp(&active_of(b)).then(
-                        ema_of(b)
-                            .partial_cmp(&ema_of(a))
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                })
-                .unwrap_or(&chosen),
-            super::uri_selector::Strategy::Feedback => *eligible
-                .iter()
-                .min_by_key(|&&i| (active_of(i), i))
-                .unwrap_or(&chosen),
+                .copied()
+                .filter(|&i| rates[i].is_some())
+                .max_by(by_rate);
+            match fastest {
+                Some(i) if self.endgame.load(Ordering::Acquire) => i,
+                _ => {
+                    let known_max = rates.iter().flatten().copied().fold(0.0, f64::max);
+                    let fallback = if known_max > 0.0 { known_max } else { 1.0 };
+                    let load = |i: usize| {
+                        (active_of(i) + 1) as f64 / rates[i].unwrap_or(fallback).max(1.0)
+                    };
+                    *eligible
+                        .iter()
+                        .min_by(|&&a, &&b| {
+                            load(a)
+                                .partial_cmp(&load(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.cmp(&b))
+                        })
+                        .unwrap_or(&chosen)
+                }
+            }
+        } else {
+            match self.strategy {
+                super::uri_selector::Strategy::Inorder => eligible[0],
+                super::uri_selector::Strategy::Adaptive => *eligible
+                    .iter()
+                    .min_by(|&&a, &&b| {
+                        active_of(a).cmp(&active_of(b)).then(
+                            ema_of(b)
+                                .partial_cmp(&ema_of(a))
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                    })
+                    .unwrap_or(&chosen),
+                super::uri_selector::Strategy::Feedback => *eligible
+                    .iter()
+                    .min_by_key(|&&i| (active_of(i), i))
+                    .unwrap_or(&chosen),
+            }
         };
         let key = self.keys[chosen].clone();
         *active.entry(key.clone()).or_insert(0) += 1;
@@ -2021,6 +2174,286 @@ impl MirrorPool {
     fn record_failure(&self, key: &str) {
         self.stats.lock().record_failure(key);
     }
+
+    fn lease(&self, piece: usize, lease: PieceLease) {
+        self.leases.lock().insert(piece, lease);
+    }
+
+    fn end_lease(&self, piece: usize) {
+        let mut leases = self.leases.lock();
+        if let Some(lease) = leases.remove(&piece) {
+            let done = lease
+                .completed
+                .load(Ordering::Relaxed)
+                .saturating_sub(lease.start_completed);
+            if let Some(settled) = self.settled.get(lease.mirror) {
+                settled.fetch_add(u64::from(done), Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn mirror_usage(&self) -> Vec<(u64, u32, bool)> {
+        let stats = self.stats.lock();
+        let leases = self.leases.lock();
+        let mut usage: Vec<(u64, u32, bool)> = self
+            .settled
+            .iter()
+            .zip(&self.keys)
+            .map(|(settled, key)| {
+                (
+                    settled.load(Ordering::Relaxed),
+                    0,
+                    stats.is_blacklisted(key),
+                )
+            })
+            .collect();
+        for lease in leases.values() {
+            if let Some(slot) = usage.get_mut(lease.mirror) {
+                let done = lease
+                    .completed
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(lease.start_completed);
+                slot.0 += u64::from(done);
+                slot.1 += 1;
+            }
+        }
+        usage
+    }
+
+    fn rates(
+        &self,
+        stats: &super::uri_selector::ServerStats,
+        leases: &std::collections::HashMap<usize, PieceLease>,
+        now: std::time::Instant,
+    ) -> Vec<Option<f64>> {
+        let mut live: std::collections::HashMap<&str, (f64, u32)> =
+            std::collections::HashMap::new();
+        for lease in leases.values().filter(|l| l.mature(now)) {
+            let entry = live
+                .entry(self.keys[lease.mirror].as_str())
+                .or_insert((0.0, 0));
+            entry.0 += lease.rate(now);
+            entry.1 += 1;
+        }
+        self.keys
+            .iter()
+            .map(|k| match live.get(k.as_str()) {
+                Some(&(sum, n)) => Some(sum / f64::from(n)),
+                None => stats.get(k).map(|s| s.ema_bps).filter(|&r| r > 0.0),
+            })
+            .collect()
+    }
+
+    fn has_room(
+        &self,
+        key: &str,
+        stats: &super::uri_selector::ServerStats,
+        active: &std::collections::HashMap<String, usize>,
+    ) -> bool {
+        !stats.is_blacklisted(key)
+            && active.get(key).copied().unwrap_or(0) < self.max_conn_per_server
+    }
+
+    fn rebalance_tick(&self) -> bool {
+        if !self.rebalance {
+            return false;
+        }
+        if self.endgame.load(Ordering::Acquire) {
+            self.reclaim_slowest()
+        } else {
+            self.shed_slow_connection()
+        }
+    }
+
+    fn shed_slow_connection(&self) -> bool {
+        let stats = self.stats.lock();
+        let active = self.active.lock();
+        let leases = self.leases.lock();
+        let now = std::time::Instant::now();
+        let rates = self.rates(&stats, &leases, now);
+        let mut by_key: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+        for (i, rate) in rates.iter().enumerate() {
+            if let Some(rate) = rate {
+                by_key.insert(self.keys[i].as_str(), *rate);
+            }
+        }
+        if by_key.len() < 2 {
+            return false;
+        }
+        let best = by_key
+            .iter()
+            .filter(|(k, _)| self.has_room(k, &stats, &active))
+            .map(|(_, &r)| r)
+            .fold(0.0, f64::max);
+        let rate_sum: f64 = by_key.values().sum();
+        let total: usize = active.values().sum();
+        if best <= 0.0 || rate_sum <= 0.0 {
+            return false;
+        }
+        let over_share = |key: &str| {
+            let Some(&rate) = by_key.get(key) else {
+                return false;
+            };
+            let held = active.get(key).copied().unwrap_or(0);
+            let share = (total as f64 * rate / rate_sum).ceil().max(1.0) as usize;
+            rate * 2.0 < best && held > share
+        };
+        let victim = leases
+            .iter()
+            .filter(|(_, l)| l.mature(now) && over_share(&self.keys[l.mirror]))
+            .min_by(|a, b| {
+                a.1.rate(now)
+                    .partial_cmp(&b.1.rate(now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some((piece, lease)) = victim else {
+            return false;
+        };
+        tracing::info!(
+            "Moving piece {piece} off slow mirror {}",
+            self.keys[lease.mirror]
+        );
+        lease.stop.cancel();
+        true
+    }
+
+    fn reclaim_slowest(&self) -> bool {
+        let stats = self.stats.lock();
+        let active = self.active.lock();
+        let leases = self.leases.lock();
+        let now = std::time::Instant::now();
+        let rates = self.rates(&stats, &leases, now);
+        let mut reclaimed = false;
+        for (piece, lease) in leases.iter() {
+            let remaining = lease.remaining();
+            if !lease.mature(now) || remaining <= 0.0 {
+                continue;
+            }
+            let victim_key = &self.keys[lease.mirror];
+            let alt_rate = (0..self.uris.len())
+                .filter(|&i| {
+                    let k = &self.keys[i];
+                    k != victim_key && self.has_room(k, &stats, &active)
+                })
+                .filter_map(|i| rates[i])
+                .fold(0.0, f64::max);
+            let eta_here = remaining / lease.rate(now).max(1.0);
+            let eta_alt = remaining / alt_rate.max(f64::MIN_POSITIVE) + RECLAIM_RECONNECT_SECS;
+            if alt_rate > 0.0 && eta_here > eta_alt * 2.0 {
+                tracing::info!("Reclaiming piece {piece} from slow mirror {victim_key}");
+                lease.stop.cancel();
+                reclaimed = true;
+            }
+        }
+        reclaimed
+    }
+}
+
+const MIRROR_SPEED_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Default)]
+pub struct MirrorTracker {
+    pool: parking_lot::Mutex<Option<Arc<MirrorPool>>>,
+    last: parking_lot::Mutex<Vec<MirrorStat>>,
+    sample: parking_lot::Mutex<Option<(std::time::Instant, Vec<u64>)>>,
+}
+
+struct MirrorTrackerAttachment<'a>(&'a MirrorTracker);
+
+impl Drop for MirrorTrackerAttachment<'_> {
+    fn drop(&mut self) {
+        self.0.detach();
+    }
+}
+
+impl MirrorTracker {
+    #[cfg(test)]
+    pub(crate) fn with_stats(stats: Vec<MirrorStat>) -> Self {
+        Self {
+            last: parking_lot::Mutex::new(stats),
+            ..Self::default()
+        }
+    }
+
+    fn attach(&self, pool: Arc<MirrorPool>) -> MirrorTrackerAttachment<'_> {
+        *self.sample.lock() = None;
+        *self.pool.lock() = Some(pool);
+        MirrorTrackerAttachment(self)
+    }
+
+    fn clear(&self) {
+        *self.pool.lock() = None;
+        *self.sample.lock() = None;
+        self.last.lock().clear();
+    }
+
+    fn detach(&self) {
+        let mut stats = self.snapshot();
+        for stat in &mut stats {
+            stat.speed = 0;
+            stat.connections = 0;
+            if stat.state == MirrorState::Active {
+                stat.state = MirrorState::Idle;
+            }
+        }
+        *self.pool.lock() = None;
+        *self.sample.lock() = None;
+        *self.last.lock() = stats;
+    }
+
+    pub fn snapshot(&self) -> Vec<MirrorStat> {
+        let Some(pool) = self.pool.lock().clone() else {
+            return self.last.lock().clone();
+        };
+        let usage = pool.mirror_usage();
+        let now = std::time::Instant::now();
+        let mut last = self.last.lock();
+        let mut sample = self.sample.lock();
+        let speeds: Vec<u64> = match sample.as_ref() {
+            Some((at, _)) if now.duration_since(*at) < MIRROR_SPEED_WINDOW => usage
+                .iter()
+                .enumerate()
+                .map(|(i, _)| last.get(i).map(|s| s.speed).unwrap_or(0))
+                .collect(),
+            Some((at, prev)) if prev.len() == usage.len() => {
+                let secs = now.duration_since(*at).as_secs_f64();
+                let speeds = usage
+                    .iter()
+                    .zip(prev)
+                    .map(|(u, p)| (u.0.saturating_sub(*p) as f64 / secs) as u64)
+                    .collect();
+                *sample = Some((now, usage.iter().map(|u| u.0).collect()));
+                speeds
+            }
+            _ => {
+                *sample = Some((now, usage.iter().map(|u| u.0).collect()));
+                vec![0; usage.len()]
+            }
+        };
+        let stats: Vec<MirrorStat> = pool
+            .uris
+            .iter()
+            .zip(usage)
+            .zip(speeds)
+            .map(
+                |((uri, (completed, connections, failing)), speed)| MirrorStat {
+                    uri: uri.clone(),
+                    completed,
+                    speed,
+                    connections,
+                    state: if failing {
+                        MirrorState::Failing
+                    } else if connections > 0 {
+                        MirrorState::Active
+                    } else {
+                        MirrorState::Idle
+                    },
+                },
+            )
+            .collect();
+        *last = stats.clone();
+        stats
+    }
 }
 
 async fn run_multi_chunk(
@@ -2052,6 +2485,7 @@ async fn run_multi_chunk(
         &Option<super::hasher::PieceChecksums>,
         &Option<super::hasher::WholeChecksum>,
     ),
+    tracker: &MirrorTracker,
 ) -> Result<PathBuf, String> {
     total.store(content_length, Ordering::Relaxed);
 
@@ -2181,6 +2615,7 @@ async fn run_multi_chunk(
         probed_url,
     ));
     let worker_token = cancel_token.child_token();
+    let _tracked = tracker.attach(Arc::clone(&pool));
     let mirror_headers = Arc::new(mirror_headers.to_vec());
     let piece_etag = if multi_mirror {
         None
@@ -2196,6 +2631,22 @@ async fn run_multi_chunk(
     let effective_workers = split
         .min(max_conn_per_server.saturating_mul(pool.distinct_endpoints()))
         .max(1);
+    let balancer = pool.rebalance.then(|| {
+        let pool = Arc::clone(&pool);
+        let stop = worker_token.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RECLAIM_CHECK_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        pool.rebalance_tick();
+                    }
+                }
+            }
+        })
+    });
 
     let mut workers = futures_util::stream::FuturesUnordered::new();
     for w in 0..effective_workers {
@@ -2243,6 +2694,9 @@ async fn run_multi_chunk(
     }
 
     speed_task.abort();
+    if let Some(balancer) = balancer {
+        balancer.abort();
+    }
     // Let the save task finish so no save lands after delete_chunk_meta below
     save_stop.cancel();
     let _ = save_task.await;
@@ -2366,6 +2820,7 @@ async fn piece_worker(
         let idx = match queue.claim_next() {
             Some(i) => i,
             None if queue.has_inflight() => {
+                pool.endgame.store(true, Ordering::Release);
                 tokio::select! {
                     _ = cancel_token.cancelled() => return Err("Download cancelled".to_string()),
                     _ = queue.wait_for_change() => {}
@@ -2423,6 +2878,18 @@ async fn piece_worker(
         let headers = &headers;
         let started = std::time::Instant::now();
         let mut observed_url: Option<String> = None;
+        let transfer = cancel_token.child_token();
+        pool.lease(
+            idx,
+            PieceLease {
+                mirror: mirror_idx,
+                started,
+                start_completed: already,
+                length: piece_length,
+                completed: Arc::clone(&piece_completed),
+                stop: transfer.clone(),
+            },
+        );
 
         let outcome = download_piece_stream(
             client,
@@ -2431,7 +2898,7 @@ async fn piece_worker(
             range,
             &file,
             &completed,
-            &cancel_token,
+            &transfer,
             &throttle,
             expected_etag.as_deref(),
             expected_last_modified.as_deref(),
@@ -2442,6 +2909,7 @@ async fn piece_worker(
             &mut observed_url,
         )
         .await;
+        pool.end_lease(idx);
         pool.release(&mirror_key);
         if !used_resolved {
             if let Some(final_url) = observed_url.as_deref() {
@@ -2451,6 +2919,18 @@ async fn piece_worker(
 
         let now_completed = piece_completed.load(Ordering::Relaxed);
         let downloaded = (now_completed as u64).saturating_sub(already as u64);
+
+        if matches!(outcome, Err(PieceDownloadError::Cancelled)) && !cancel_token.is_cancelled() {
+            if downloaded > 0 {
+                pool.record_success(&mirror_key, downloaded, started.elapsed().as_secs_f64());
+            }
+            if now_completed >= piece_length {
+                queue.complete(idx);
+            } else {
+                queue.release(idx);
+            }
+            continue;
+        }
 
         match outcome {
             Ok(()) => {
@@ -3698,7 +4178,7 @@ mod tests {
         let mut options = Map::new();
         options.insert("no-netrc".into(), Value::Bool(true));
         let has_cookie = |uri: &str, options: &Map<String, Value>| {
-            headers_for_uri(&base, uri, options).contains_key(risuko_http::header::COOKIE)
+            headers_for_uri(&base, uri, uri, options).contains_key(risuko_http::header::COOKIE)
         };
         assert!(has_cookie("https://mirror.test/f", &options));
 
@@ -3710,6 +4190,90 @@ mod tests {
         assert!(has_cookie("https://dl.example.com/f", &options));
         assert!(!has_cookie("https://example.com.evil.test/f", &options));
         assert!(!has_cookie("https://mirror.test/f", &options));
+    }
+
+    #[test]
+    fn secure_cookies_stay_off_plain_http_mirrors() {
+        let mut base = HeaderMap::new();
+        base.insert(
+            risuko_http::header::COOKIE,
+            HeaderValue::from_static("s=1; p=2"),
+        );
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        options.insert(
+            COOKIE_HOST_OPTION.into(),
+            Value::String("example.com".into()),
+        );
+        options.insert(COOKIE_HTTP_OPTION.into(), Value::String("p=2".into()));
+        let primary = "https://example.com/f";
+        let cookie = |uri: &str, options: &Map<String, Value>| {
+            headers_for_uri(&base, uri, primary, options)
+                .get(risuko_http::header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(cookie(primary, &options).as_deref(), Some("s=1; p=2"));
+        assert_eq!(
+            cookie("HTTP://dl.example.com/f", &options).as_deref(),
+            Some("p=2")
+        );
+        assert_eq!(cookie("http://mirror.test/f", &options), None);
+
+        options.insert(COOKIE_HTTP_OPTION.into(), Value::String(String::new()));
+        assert_eq!(cookie("http://example.com/f", &options), None);
+    }
+
+    #[test]
+    fn authorization_reaches_only_mirrors_on_the_primary_origin() {
+        let base = h(&[("authorization", "Bearer t"), ("user-agent", "ua")]);
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        let primary = "https://a.test/f";
+        let has_auth = |uri: &str| {
+            headers_for_uri(&base, uri, primary, &options)
+                .contains_key(risuko_http::header::AUTHORIZATION)
+        };
+        assert!(has_auth(primary));
+        assert!(has_auth("https://A.test:443/other/f"));
+        assert!(!has_auth("https://b.test/f"));
+        assert!(!has_auth("http://a.test/f"));
+        assert!(!has_auth("https://a.test:8443/f"));
+
+        let all = vec![primary.to_string(), "https://b.test/f".to_string()];
+        let per_mirror = build_mirror_headers(&all, &base, &options);
+        assert!(per_mirror[0].contains_key(risuko_http::header::AUTHORIZATION));
+        assert!(!per_mirror[1].contains_key(risuko_http::header::AUTHORIZATION));
+        assert_eq!(per_mirror[1].get("user-agent").unwrap(), "ua");
+
+        let with_creds = headers_for_uri(&base, "https://u:p@b.test/f", primary, &Map::new());
+        assert_eq!(
+            with_creds.get(risuko_http::header::AUTHORIZATION).unwrap(),
+            "Basic dTpw"
+        );
+    }
+
+    #[test]
+    fn shared_authorization_reaches_only_https_mirrors() {
+        let base = h(&[("authorization", "Bearer t")]);
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        options.insert("send-auth-to-all-mirrors".into(), Value::Bool(true));
+        let auth = |uri: &str, primary: &str| {
+            headers_for_uri(&base, uri, primary, &options)
+                .get(risuko_http::header::AUTHORIZATION)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let primary = "https://a.test/f";
+        for uri in ["https://b.test/f", "HTTPS://c.test/f"] {
+            assert_eq!(auth(uri, primary).as_deref(), Some("Bearer t"));
+        }
+        for uri in ["http://a.test/f", "http://b.test/f", "HTTP://c.test/f"] {
+            assert_eq!(auth(uri, primary), None);
+        }
+        assert_eq!(
+            auth("http://a.test/g", "http://a.test/f").as_deref(),
+            Some("Bearer t")
+        );
     }
 
     #[test]
@@ -4462,6 +5026,260 @@ mod tests {
             pool.record_failure("a.test:80");
         }
         assert_eq!(pool.acquire().map(|p| p.0), Some(1));
+    }
+
+    #[test]
+    fn inorder_pool_skips_a_blacklisted_first_mirror() {
+        use super::super::uri_selector::Strategy;
+        let pool = MirrorPool::new(
+            vec!["http://a.test/f".to_string(), "http://b.test/f".to_string()],
+            Strategy::Inorder,
+            4,
+            None,
+        );
+        assert_eq!(pool.acquire().map(|p| p.0), Some(0));
+        pool.release("a.test:80");
+        for _ in 0..3 {
+            pool.record_failure("a.test:80");
+        }
+        assert_eq!(pool.acquire().map(|p| p.0), Some(1));
+    }
+
+    fn two_mirror_pool() -> MirrorPool {
+        MirrorPool::new(
+            vec![
+                "http://fast.test/f".to_string(),
+                "http://slow.test/f".to_string(),
+            ],
+            super::super::uri_selector::Strategy::Feedback,
+            16,
+            None,
+        )
+    }
+
+    fn lease_at(
+        pool: &MirrorPool,
+        piece: usize,
+        mirror: usize,
+        age: std::time::Duration,
+        done: u32,
+    ) -> CancellationToken {
+        let stop = CancellationToken::new();
+        pool.leases.lock().insert(
+            piece,
+            PieceLease {
+                mirror,
+                started: std::time::Instant::now() - age,
+                start_completed: 0,
+                length: PIECE_SIZE as u32,
+                completed: Arc::new(AtomicU32::new(done)),
+                stop: stop.clone(),
+            },
+        );
+        stop
+    }
+
+    fn picks(pool: &MirrorPool, n: usize) -> Vec<usize> {
+        (0..n).map(|_| pool.acquire().unwrap().0).collect()
+    }
+
+    #[test]
+    fn unmeasured_mirrors_share_connections_evenly() {
+        assert_eq!(picks(&two_mirror_pool(), 4), vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn connections_follow_measured_speed() {
+        let pool = two_mirror_pool();
+        pool.record_success("fast.test:80", 2_000_000, 1.0);
+        pool.record_success("slow.test:80", 1_000_000, 1.0);
+        let chosen = picks(&pool, 9);
+        assert_eq!(chosen.iter().filter(|&&i| i == 0).count(), 6);
+        assert_eq!(chosen.iter().filter(|&&i| i == 1).count(), 3);
+    }
+
+    #[test]
+    fn an_untested_mirror_counts_as_fast_as_the_best_measured_one() {
+        let pool = MirrorPool::new(
+            vec![
+                "http://fast.test/f".to_string(),
+                "http://slow.test/f".to_string(),
+                "http://new.test/f".to_string(),
+            ],
+            super::super::uri_selector::Strategy::Feedback,
+            16,
+            None,
+        );
+        pool.record_success("fast.test:80", 1_000_000, 1.0);
+        pool.record_success("slow.test:80", 10_000, 1.0);
+        assert_eq!(picks(&pool, 4), vec![0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn endgame_prefers_the_fastest_measured_mirror() {
+        let pool = two_mirror_pool();
+        pool.record_success("slow.test:80", 1_000_000, 1.0);
+        pool.record_success("fast.test:80", 1_100_000, 1.0);
+        assert_eq!(picks(&pool, 2), vec![0, 1]);
+        pool.release("fast.test:80");
+        pool.release("slow.test:80");
+        pool.active.lock().insert("fast.test:80".to_string(), 5);
+        assert_eq!(pool.acquire().map(|p| p.0), Some(1));
+        pool.release("slow.test:80");
+        pool.endgame.store(true, Ordering::Relaxed);
+        assert_eq!(pool.acquire().map(|p| p.0), Some(0));
+    }
+
+    #[test]
+    fn a_crawling_mirror_sheds_connections_down_to_one() {
+        let pool = two_mirror_pool();
+        pool.record_success("fast.test:80", 4 * 1024 * 1024, 1.0);
+        pool.active.lock().insert("fast.test:80".to_string(), 4);
+        pool.active.lock().insert("slow.test:80".to_string(), 3);
+        let stops: Vec<CancellationToken> = (0..3)
+            .map(|i| lease_at(&pool, i, 1, std::time::Duration::from_secs(3), 96 * 1024))
+            .collect();
+        assert!(pool.rebalance_tick());
+        assert_eq!(stops.iter().filter(|s| s.is_cancelled()).count(), 1);
+
+        pool.active.lock().insert("slow.test:80".to_string(), 1);
+        pool.leases.lock().retain(|_, l| !l.stop.is_cancelled());
+        pool.leases.lock().remove(&2);
+        let before = stops.iter().filter(|s| s.is_cancelled()).count();
+        assert!(!pool.rebalance_tick(), "a mirror keeps its last connection");
+        assert_eq!(stops.iter().filter(|s| s.is_cancelled()).count(), before);
+    }
+
+    #[test]
+    fn comparable_mirrors_keep_their_connections() {
+        let pool = two_mirror_pool();
+        pool.record_success("fast.test:80", 1024 * 1024, 1.0);
+        pool.active.lock().insert("fast.test:80".to_string(), 1);
+        pool.active.lock().insert("slow.test:80".to_string(), 3);
+        let stops: Vec<CancellationToken> = (0..3)
+            .map(|i| lease_at(&pool, i, 1, std::time::Duration::from_secs(2), 1200 * 1024))
+            .collect();
+        assert!(!pool.rebalance_tick());
+        assert!(stops.iter().all(|s| !s.is_cancelled()));
+    }
+
+    #[test]
+    fn a_piece_crawling_on_a_slow_mirror_is_reclaimed_in_the_endgame() {
+        let pool = two_mirror_pool();
+        pool.endgame.store(true, Ordering::Relaxed);
+        pool.record_success("fast.test:80", 10 * 1024 * 1024, 1.0);
+        let first = lease_at(&pool, 1, 1, std::time::Duration::from_secs(3), 4096);
+        let second = lease_at(&pool, 2, 1, std::time::Duration::from_secs(3), 8192);
+        assert!(pool.rebalance_tick());
+        assert!(first.is_cancelled() && second.is_cancelled());
+        assert!(!pool.rebalance_tick(), "a piece is reclaimed once");
+    }
+
+    #[test]
+    fn young_leases_and_near_done_pieces_are_left_alone_in_the_endgame() {
+        let pool = two_mirror_pool();
+        pool.endgame.store(true, Ordering::Relaxed);
+        pool.record_success("fast.test:80", 1024 * 1024, 1.0);
+        let young = lease_at(&pool, 0, 1, std::time::Duration::from_millis(500), 0);
+        let nearly = lease_at(
+            &pool,
+            1,
+            1,
+            std::time::Duration::from_secs(2),
+            PIECE_SIZE as u32 - 200 * 1024,
+        );
+        assert!(!pool.rebalance_tick());
+        assert!(!young.is_cancelled() && !nearly.is_cancelled());
+    }
+
+    #[test]
+    fn a_single_endpoint_never_rebalances() {
+        let pool = MirrorPool::new(
+            vec!["http://a.test/f".to_string(), "http://a.test/g".to_string()],
+            super::super::uri_selector::Strategy::Feedback,
+            4,
+            None,
+        );
+        assert!(!pool.rebalance);
+        let stop = lease_at(&pool, 0, 1, std::time::Duration::from_secs(3), 0);
+        pool.endgame.store(true, Ordering::Relaxed);
+        assert!(!pool.rebalance_tick());
+        assert!(!stop.is_cancelled());
+    }
+
+    #[test]
+    fn mirror_usage_counts_live_and_finished_bytes() {
+        let pool = two_mirror_pool();
+        let completed = Arc::new(AtomicU32::new(100));
+        pool.lease(
+            3,
+            PieceLease {
+                mirror: 1,
+                started: std::time::Instant::now(),
+                start_completed: 100,
+                length: PIECE_SIZE as u32,
+                completed: Arc::clone(&completed),
+                stop: CancellationToken::new(),
+            },
+        );
+        completed.store(600, Ordering::Relaxed);
+        assert_eq!(pool.mirror_usage(), vec![(0, 0, false), (500, 1, false)]);
+
+        completed.store(900, Ordering::Relaxed);
+        pool.end_lease(3);
+        assert_eq!(pool.mirror_usage(), vec![(0, 0, false), (800, 0, false)]);
+
+        for _ in 0..3 {
+            pool.record_failure("fast.test:80");
+        }
+        assert_eq!(pool.mirror_usage()[0], (0, 0, true));
+    }
+
+    #[test]
+    fn tracker_reports_per_mirror_state_and_keeps_totals_after_detach() {
+        let pool = Arc::new(two_mirror_pool());
+        let tracker = MirrorTracker::default();
+        assert!(tracker.snapshot().is_empty());
+        {
+            let _attached = tracker.attach(Arc::clone(&pool));
+            let completed = Arc::new(AtomicU32::new(0));
+            pool.lease(
+                0,
+                PieceLease {
+                    mirror: 0,
+                    started: std::time::Instant::now(),
+                    start_completed: 0,
+                    length: PIECE_SIZE as u32,
+                    completed: Arc::clone(&completed),
+                    stop: CancellationToken::new(),
+                },
+            );
+            completed.store(4096, Ordering::Relaxed);
+            for _ in 0..3 {
+                pool.record_failure("slow.test:80");
+            }
+            let live = tracker.snapshot();
+            assert_eq!(live[0].uri, "http://fast.test/f");
+            assert_eq!(
+                (live[0].completed, live[0].connections, live[0].state),
+                (4096, 1, MirrorState::Active)
+            );
+            assert_eq!(live[1].state, MirrorState::Failing);
+        }
+        let kept = tracker.snapshot();
+        assert_eq!(
+            (
+                kept[0].completed,
+                kept[0].connections,
+                kept[0].speed,
+                kept[0].state
+            ),
+            (4096, 0, 0, MirrorState::Idle)
+        );
+        assert_eq!(kept[1].state, MirrorState::Failing);
+
+        tracker.clear();
+        assert!(tracker.snapshot().is_empty());
     }
 
     #[test]
