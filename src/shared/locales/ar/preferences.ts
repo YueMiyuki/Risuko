@@ -147,7 +147,6 @@ export default {
 	"file-category-document": "مستند",
 	"file-category-compressed": "مضغوط",
 	"file-category-program": "برنامج",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"~/Downloads نظراً لقيود آلية تحديد الصلاحيات في متجر أبل، يستحسن ضبط مجلد التحميل الافتراضي إلى",
 	"transfer-settings": "النقل",

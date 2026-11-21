@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Dokumentum",
 	"file-category-compressed": "Tömörített",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Az App Store korlátozása miatt ajánlott a ~/Downloads mappába tenni a letöltéseket",
 	"transfer-settings": "Transmission",

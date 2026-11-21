@@ -154,7 +154,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Comprimido",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Debido a las restricciones de la tienda de aplicaciones, la ruta por defecto se recomienda que sea ~/Downloads",
 	"transfer-settings": "Transferencia",

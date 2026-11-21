@@ -3,7 +3,6 @@ export default {
 	"add-task": "Legg til oppgave",
 	"primary-navigation": "Hovednavigasjon",
 	"nav-tasks": "Oppgaver",
-	"nav-rss": "RSS",
 	"nav-health": "Helse",
 	"nav-settings": "Innstillinger",
 	"nav-share": "Del",

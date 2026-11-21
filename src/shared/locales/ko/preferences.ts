@@ -147,7 +147,6 @@ export default {
 	"file-category-document": "문서",
 	"file-category-compressed": "압축 파일",
 	"file-category-program": "프로그램",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store의 샌드박스 권한 제한으로 인해 기본 다운로드 폴더는 ~/Downloads로 설정하는 것이 좋습니다.",
 	"transfer-settings": "전송",

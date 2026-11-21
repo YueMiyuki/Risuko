@@ -94,8 +94,7 @@ html.platform-android .panel .panel-header {
 
 html.platform-android .panel-header > .subnav-switch-trigger,
 html.platform-android .panel-header > .task-mobile-subnav-switcher,
-html.platform-android .panel-header > .task-title,
-html.platform-android .panel-header > .rss-title {
+html.platform-android .panel-header > .task-title {
 	flex: 1 1 0;
 	min-width: 0;
 }
@@ -179,7 +178,7 @@ html.platform-android .android-bottom-nav {
 	bottom: 0;
 	z-index: 80;
 	display: grid;
-	grid-template-columns: 1fr 1fr 56px 1fr 1fr;
+	grid-template-columns: 1fr 56px 1fr 1fr;
 	align-items: center;
 	height: calc(var(--android-bottom-bar) + env(safe-area-inset-bottom));
 	padding: 0 8px env(safe-area-inset-bottom);
@@ -279,39 +278,6 @@ html.platform-android .task-list {
 	overflow-y: visible;
 	height: auto;
 	padding: 8px 14px 18px;
-}
-html.platform-android .rss-body {
-	flex-direction: column;
-}
-html.platform-android .rss-feed-column {
-	flex: 0 0 auto;
-	border-right: 0;
-	border-bottom: 1px solid var(--border);
-}
-html.platform-android .rss-feed-column .rss-feed-items {
-	flex-direction: row;
-	gap: 8px;
-	overflow-x: auto;
-	padding: 8px 14px;
-	scrollbar-width: none;
-}
-html.platform-android .rss-feed-column .rss-feed-items::-webkit-scrollbar {
-	display: none;
-}
-html.platform-android .rss-feed-column .rss-feed-item {
-	flex: 0 0 auto;
-	min-height: 44px;
-	height: auto;
-	padding: 8px 14px;
-	border-radius: 999px;
-	background: var(--android-surface-container);
-}
-html.platform-android .rss-feed-column .rss-feed-item.active {
-	background: var(--android-primary-container);
-	color: var(--android-on-primary-container);
-}
-html.platform-android .rss-feed-column .rss-feed-footer {
-	display: none;
 }
 
 html.platform-android .task-toolbar {
@@ -989,14 +955,6 @@ html.platform-android .subnav-switch-trigger svg {
 	height: 20px !important;
 	opacity: 1;
 	color: var(--android-on-surface-variant);
-}
-
-html.platform-android .rss-title {
-	display: block;
-	font-size: var(--android-text-headline);
-	font-weight: 700;
-	color: var(--android-on-surface);
-	margin: 0;
 }
 
 html.platform-android .panel-header .task-title {

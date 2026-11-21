@@ -140,7 +140,6 @@ export default {
 	"file-category-document": "เอกสาร",
 	"file-category-compressed": "ไฟล์บีบอัด",
 	"file-category-program": "โปรแกรม",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"เนื่องจากข้อจำกัดการอนุญาตแซนด์บ็อกซ์ของ App Store แนะนำให้ตั้งค่าไดเร็กทอรีดาวน์โหลดเริ่มต้นเป็น ~/Downloads",
 	"transfer-settings": "การส่งผ่าน",

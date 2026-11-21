@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Dokument",
 	"file-category-compressed": "Komprimiert",
 	"file-category-program": "Programm",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Aufgrund der Einschränkungen durch Sandbox-Berechtigungen im App Store wird der Download Ordner als Standard empfohlen",
 	"transfer-settings": "Übertragung",

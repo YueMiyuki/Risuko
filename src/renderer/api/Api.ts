@@ -6,7 +6,6 @@ import type {
 	LogLevel,
 	LogReadResult,
 } from "@shared/types/log";
-import type { RssRule } from "@shared/types/rss";
 import type {
 	DownloadStatsMinuteInput,
 	DownloadStatsQuery,
@@ -630,82 +629,6 @@ export default class Api {
 
 	batchPauseTask(params: { gids?: string[] } = {}) {
 		return this.multicall("risuko.pause", params);
-	}
-
-	addRssFeed(url: string) {
-		return invoke("add_rss_feed", { url });
-	}
-
-	removeRssFeed(feedId: string) {
-		return invoke("remove_rss_feed", { feedId });
-	}
-
-	refreshRssFeed(feedId: string) {
-		return invoke("refresh_rss_feed", { feedId });
-	}
-
-	refreshAllRssFeeds() {
-		return invoke("refresh_all_rss_feeds");
-	}
-
-	getRssFeeds() {
-		return invoke("get_rss_feeds");
-	}
-
-	getRssItems(feedId: string) {
-		return invoke("get_rss_items", { feedId });
-	}
-
-	updateRssFeedSettings(feedId: string, interval?: number, isActive?: boolean) {
-		return invoke("update_rss_feed_settings", { feedId, interval, isActive });
-	}
-
-	addRssRule(rule: RssRule) {
-		return invoke("add_rss_rule", { rule });
-	}
-
-	updateRssRule(rule: RssRule) {
-		return invoke("update_rss_rule", { rule });
-	}
-
-	dryRunRssRule(rule: RssRule, sampleSize?: number) {
-		return invoke("dry_run_rss_rule", { rule, sampleSize });
-	}
-
-	removeRssRule(ruleId: string) {
-		return invoke("remove_rss_rule", { ruleId });
-	}
-
-	getRssRules() {
-		return invoke("get_rss_rules");
-	}
-
-	deleteRssItems(itemsByFeed: [string, string[]][]) {
-		return invoke("delete_rss_items", { itemsByFeed });
-	}
-
-	clearRssDownload(feedId: string, itemId: string) {
-		return invoke("clear_rss_download", { feedId, itemId });
-	}
-
-	readRssDownload(feedId: string, itemId: string) {
-		return invoke("read_rss_download", { feedId, itemId }) as Promise<string>;
-	}
-
-	downloadRssItemTracked(
-		feedId: string,
-		itemId: string,
-		options?: Record<string, unknown>,
-	) {
-		return invoke("download_rss_item_tracked", { feedId, itemId, options });
-	}
-
-	markRssItemRead(feedId: string, itemId: string) {
-		return invoke("mark_rss_item_read", { feedId, itemId });
-	}
-
-	markRssItemsRead(entries: [string, string][]) {
-		return invoke("mark_rss_items_read", { entries });
 	}
 
 	listUploadSinks() {

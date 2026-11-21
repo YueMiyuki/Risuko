@@ -139,7 +139,6 @@ export default {
 	"file-category-document": "文件",
 	"file-category-compressed": "壓縮檔",
 	"file-category-program": "程式",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"因 App Store 的沙盒權限限制，建議將預設下載路徑設定為您的「下載」資料夾",
 	"transfer-settings": "傳輸設定",

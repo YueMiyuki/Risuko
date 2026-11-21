@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Dokumen",
 	"file-category-compressed": "Terkompresi",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Karena pembatasan dari App Store, direktori unduhan default direkomendasikan untuk disetel ke ~/Downloads",
 	"transfer-settings": "Transfer Setting",

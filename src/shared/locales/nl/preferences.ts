@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Gecomprimeerd",
 	"file-category-program": "Programma",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Door de sandbox permissie restricties van de App Store wordt aangeraden om ~/Downloads als standaard downloadmap in te stellen",
 	"transfer-settings": "Transmissie",

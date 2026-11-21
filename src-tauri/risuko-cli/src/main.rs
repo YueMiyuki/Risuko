@@ -51,9 +51,6 @@ pub enum Command {
     /// Manage configuration
     Config(ConfigCommand),
 
-    /// Manage RSS feeds
-    Rss(RssCommand),
-
     /// Start headless engine (RPC server only, no GUI)
     Serve(ServeArgs),
 
@@ -191,59 +188,6 @@ pub enum ConfigAction {
     },
 }
 
-#[derive(clap::Args)]
-pub struct RssCommand {
-    #[command(subcommand)]
-    pub action: RssAction,
-}
-
-#[derive(Subcommand)]
-pub enum RssAction {
-    /// Add an RSS feed
-    Add {
-        /// Feed URL
-        url: String,
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-    /// List all RSS feeds
-    List {
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh all RSS feeds
-    Refresh {
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-    /// Remove an RSS feed
-    Remove {
-        /// Feed ID
-        id: String,
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -292,7 +236,6 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Peers(args) => commands::peers(args).await,
         Command::Purge(args) => commands::purge(args).await,
         Command::Config(cmd) => commands::config(cmd).await,
-        Command::Rss(cmd) => commands::rss(cmd).await,
         Command::Serve(args) => shared::serve(&commands::HOST, args).await,
         Command::Shutdown(args) => commands::shutdown(args).await,
         Command::CreateTorrent(args) => commands::create_torrent(args).await,

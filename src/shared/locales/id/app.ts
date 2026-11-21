@@ -3,7 +3,6 @@ export default {
 	"add-task": "Tambah Tugas",
 	"primary-navigation": "Navigasi utama",
 	"nav-tasks": "Tugas",
-	"nav-rss": "RSS",
 	"nav-health": "Kesehatan",
 	"nav-settings": "Pengaturan",
 	"nav-share": "Bagikan",

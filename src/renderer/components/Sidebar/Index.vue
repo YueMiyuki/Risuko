@@ -148,7 +148,6 @@ import {
 	Pause,
 	Play,
 	Plus,
-	Rss,
 	Settings2,
 	Share2,
 	Square,
@@ -250,7 +249,6 @@ export default {
 		},
 		appItems() {
 			return [
-				{ key: "rss", icon: Rss, label: "app.nav-rss", route: "/rss" },
 				{ key: "share", icon: Share2, label: "app.nav-share", route: "/share" },
 				{
 					key: "health",
@@ -267,9 +265,6 @@ export default {
 			}
 			if (path.startsWith("/task/")) {
 				return `task:${this.$route.params.status || "all"}`;
-			}
-			if (path.startsWith("/rss")) {
-				return "rss";
 			}
 			if (path.startsWith("/share")) {
 				return "share";

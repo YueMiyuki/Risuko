@@ -3,7 +3,6 @@ export default {
 	"add-task": "Aggiungi Attività",
 	"primary-navigation": "Navigazione principale",
 	"nav-tasks": "Attività",
-	"nav-rss": "RSS",
 	"nav-health": "Stato",
 	"nav-settings": "Impostazioni",
 	"nav-share": "Condividi",

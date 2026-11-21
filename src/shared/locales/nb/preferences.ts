@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Dokument",
 	"file-category-compressed": "Komprimert",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"På grunn av begrensninger for tillatelse av sandkasse i App Store, anbefales standard nedlastningskatalog å settes til ~ / Nedlastinger",
 	"transfer-settings": "Overføring",

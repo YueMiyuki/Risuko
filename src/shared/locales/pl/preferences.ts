@@ -151,7 +151,6 @@ export default {
 	"file-category-document": "Dokument",
 	"file-category-compressed": "Skompresowane",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Z powodu restrykcji dostępu spowodowanych trybem piaskownicy w App Store, domyślną rekomendowaną lokalizacją pobrań jest ~/Downloads",
 	"transfer-settings": "Przesyłanie",

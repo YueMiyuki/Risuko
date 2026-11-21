@@ -3,7 +3,6 @@ export default {
 	"add-task": "افزودن وظیفه",
 	"primary-navigation": "ناوبری اصلی",
 	"nav-tasks": "وظایف",
-	"nav-rss": "RSS",
 	"nav-health": "سلامت",
 	"nav-settings": "تنظیمات",
 	"nav-share": "اشتراک‌گذاری",

@@ -157,7 +157,6 @@ export default {
 	"file-category-document": "Έγγραφο",
 	"file-category-compressed": "Συμπιεσμένα",
 	"file-category-program": "Πρόγραμμα",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Λόγω των περιορισμών δικαιωμάτων του App Store,ο προεπιλεγμένος φάκελος λήψεων συστήνεται να είναι το ~/Downloads",
 	"transfer-settings": "Μετάδοση",

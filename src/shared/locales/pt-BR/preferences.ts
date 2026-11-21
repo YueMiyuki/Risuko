@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Compactado",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Devido às restrições de permissões do sandbox da App Store, recomenda-se que o diretório de download padrão seja definido como o diretório de downloads",
 	"transfer-settings": "Transmissão",

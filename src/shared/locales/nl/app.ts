@@ -3,7 +3,6 @@ export default {
 	"add-task": "Taak toevoegen",
 	"primary-navigation": "Hoofdnavigatie",
 	"nav-tasks": "Taken",
-	"nav-rss": "RSS",
 	"nav-health": "Status",
 	"nav-settings": "Voorkeuren",
 	"nav-share": "Delen",

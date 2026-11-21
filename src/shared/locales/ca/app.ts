@@ -3,7 +3,6 @@ export default {
 	"add-task": "Afegir tasca",
 	"primary-navigation": "Navegació principal",
 	"nav-tasks": "Tasques",
-	"nav-rss": "RSS",
 	"nav-health": "Salut",
 	"nav-settings": "Preferències",
 	"nav-share": "Comparteix",

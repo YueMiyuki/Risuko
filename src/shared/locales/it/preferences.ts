@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Compressi",
 	"file-category-program": "Programma",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"A causa delle restrizioni imposte dall'App Store, è raccomandato impostare la directory di default su ~/Downloads",
 	"transfer-settings": "Trasmissione dati",

@@ -11,7 +11,6 @@ pub mod event_cmds;
 pub mod file_cmds;
 pub mod health_cmds;
 pub mod panel_cmds;
-pub mod rss_cmds;
 pub mod share_cmds;
 pub mod stats_cmds;
 pub mod torrent_create_cmds;

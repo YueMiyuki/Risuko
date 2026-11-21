@@ -7,7 +7,7 @@
         <Transition name="page" mode="out-in">
           <component
             :is="Component"
-            :key="route.path.startsWith('/preference') ? 'preference' : route.path.startsWith('/rss') ? 'rss' : 'task'"
+            :key="route.path.startsWith('/preference') ? 'preference' : 'task'"
             class="page-view"
           />
         </Transition>
@@ -17,10 +17,6 @@
       <button class="android-nav-item" :class="{ active: routePath.startsWith('/task') || routePath === '/' }" @click="nav('/task')">
         <ListTodo :size="22" />
         <span>{{ $t('app.nav-tasks') }}</span>
-      </button>
-      <button class="android-nav-item" :class="{ active: routePath.startsWith('/rss') }" @click="nav('/rss')">
-        <Rss :size="22" />
-        <span>{{ $t('app.nav-rss') }}</span>
       </button>
       <button class="android-fab" :aria-label="$t('app.add-task')" @click="showAddTask">
         <Plus :size="24" />
@@ -43,7 +39,7 @@
 </template>
 
 <script lang="ts">
-import { ListTodo, Plus, Rss, Settings2, Share2 } from "@lucide/vue";
+import { ListTodo, Plus, Settings2, Share2 } from "@lucide/vue";
 import { ADD_TASK_TYPE } from "@shared/constants";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "vue-sonner";
@@ -70,7 +66,6 @@ export default {
 		[Dragger.name]: Dragger,
 		ListTodo,
 		Plus,
-		Rss,
 		Settings2,
 		Share2,
 	},

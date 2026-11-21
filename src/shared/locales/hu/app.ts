@@ -3,7 +3,6 @@ export default {
 	"add-task": "Feladat hozzáadása",
 	"primary-navigation": "Fő navigáció",
 	"nav-tasks": "Feladatok",
-	"nav-rss": "RSS",
 	"nav-health": "Állapot",
 	"nav-settings": "Beállítások",
 	"nav-share": "Megosztás",

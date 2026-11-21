@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Comprimate",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Datorită restricțiilor privind permisiunea sandbox-ului din App Store, se recomandă ca directorul de descărcare implicit să fie setat la ~/Downloads",
 	"transfer-settings": "Transmitere",

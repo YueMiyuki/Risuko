@@ -3,7 +3,6 @@ export default {
 	"add-task": "เพิ่มงาน",
 	"primary-navigation": "การนำทางหลัก",
 	"nav-tasks": "งาน",
-	"nav-rss": "RSS",
 	"nav-health": "สถานะระบบ",
 	"nav-settings": "การตั้งค่า",
 	"nav-share": "แชร์",

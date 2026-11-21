@@ -3,7 +3,6 @@ export default {
 	"add-task": "Thêm tác vụ",
 	"primary-navigation": "Điều hướng chính",
 	"nav-tasks": "Tác vụ",
-	"nav-rss": "RSS",
 	"nav-health": "Tình trạng",
 	"nav-settings": "Cài đặt",
 	"nav-share": "Chia sẻ",

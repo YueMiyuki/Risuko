@@ -6,7 +6,6 @@ import health from "./health";
 import help from "./help";
 import menu from "./menu";
 import preferences from "./preferences";
-import rss from "./rss";
 import share from "./share";
 import subnav from "./subnav";
 import sync from "./sync";
@@ -22,7 +21,6 @@ export default {
 	help,
 	menu,
 	preferences,
-	rss,
 	share,
 	subnav,
 	sync,

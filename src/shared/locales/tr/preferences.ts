@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Belge",
 	"file-category-compressed": "Sıkıştırılmış",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store'un sanal alan izinleri kısıtlamaları nedeniyle, varsayılan indirme dizininin İndirilenler dizinine ayarlanması önerilir.",
 	"transfer-settings": "İletim",

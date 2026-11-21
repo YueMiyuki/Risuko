@@ -148,7 +148,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Compressed",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Due to sandbox permission restrictions of the App Store, the default download directory is recommended to be set to ~/Downloads",
 	"transfer-settings": "Transmission",

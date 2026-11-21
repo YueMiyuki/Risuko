@@ -3,7 +3,6 @@ export default {
 	"add-task": "タスクを追加",
 	"primary-navigation": "メインナビゲーション",
 	"nav-tasks": "タスク",
-	"nav-rss": "RSS",
 	"nav-health": "ヘルスチェック",
 	"nav-settings": "設定",
 	"nav-share": "共有",

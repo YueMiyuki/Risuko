@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Документ",
 	"file-category-compressed": "Архіви",
 	"file-category-program": "Програма",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Через обмеження в App Store, рекомендовано встановити шлях за замовчуванням ~/Downloads",
 	"transfer-settings": "Передача",

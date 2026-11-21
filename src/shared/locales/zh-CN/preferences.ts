@@ -137,7 +137,6 @@ export default {
 	"file-category-document": "文档",
 	"file-category-compressed": "压缩包",
 	"file-category-program": "程序",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"因 App Store 的沙箱权限限制，默认下载路径建议设置为您的「下载」目录",
 	"transfer-settings": "传输设置",

@@ -3,7 +3,6 @@ export default {
 	"add-task": "Προσθήκη Εργασίας",
 	"primary-navigation": "Κύρια πλοήγηση",
 	"nav-tasks": "Εργασίες",
-	"nav-rss": "RSS",
 	"nav-health": "Υγεία",
 	"nav-settings": "Ρυθμίσεις",
 	"nav-share": "Κοινή χρήση",

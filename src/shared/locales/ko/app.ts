@@ -3,7 +3,6 @@ export default {
 	"add-task": "작업 추가",
 	"primary-navigation": "기본 탐색",
 	"nav-tasks": "작업",
-	"nav-rss": "RSS",
 	"nav-health": "상태 점검",
 	"nav-settings": "설정",
 	"nav-share": "공유",

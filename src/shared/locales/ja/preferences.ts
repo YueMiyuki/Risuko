@@ -153,7 +153,6 @@ export default {
 	"file-category-document": "ドキュメント",
 	"file-category-compressed": "圧縮ファイル",
 	"file-category-program": "プログラム",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store の Sandbox 制限のため，デフォルトディレクトリ設定は「Download」を推奨します。",
 	"transfer-settings": "転送設定",

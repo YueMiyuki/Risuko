@@ -151,7 +151,6 @@ export default {
 	"file-category-document": "سند",
 	"file-category-compressed": "فشرده",
 	"file-category-program": "برنامه",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"بخاطر محدودیت‌های دسترسی سندباکس از اپ استور، پیشنهاد می‌شود شاخه پیش‌فرض دانلود بر روی ~/Downloads تنظیم شده باشد.",
 	"transfer-settings": "انتقال",

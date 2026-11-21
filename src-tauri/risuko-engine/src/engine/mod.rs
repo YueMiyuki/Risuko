@@ -20,7 +20,6 @@ pub(crate) mod resume_meta;
 pub mod routing;
 pub mod rpc;
 pub mod rpc_paths;
-pub mod rss;
 pub mod session;
 pub mod speed_limiter;
 pub(crate) mod ssh_auth;

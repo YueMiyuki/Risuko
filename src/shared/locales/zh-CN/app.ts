@@ -3,7 +3,6 @@ export default {
 	"add-task": "新建任务",
 	"primary-navigation": "主导航",
 	"nav-tasks": "任务",
-	"nav-rss": "RSS",
 	"nav-health": "健康",
 	"nav-settings": "设置",
 	"nav-share": "分享",

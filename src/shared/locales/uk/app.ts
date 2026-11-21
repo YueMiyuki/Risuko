@@ -3,7 +3,6 @@ export default {
 	"add-task": "Додати завдання",
 	"primary-navigation": "Головна навігація",
 	"nav-tasks": "Завдання",
-	"nav-rss": "RSS",
 	"nav-health": "Стан",
 	"nav-settings": "Налаштування",
 	"nav-share": "Обмін",

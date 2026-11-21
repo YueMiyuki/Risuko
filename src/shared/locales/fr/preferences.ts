@@ -154,7 +154,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Archive",
 	"file-category-program": "Programme",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"En raison des restrictions d'autorisations du bac à sable de l'App Store, il est recommandé de définir le répertoire de téléchargement par défaut sur le répertoire Téléchargements.",
 	"transfer-settings": "Transmission",

@@ -25,11 +25,6 @@ export default createRouter({
 					props: true,
 				},
 				{
-					path: "/rss",
-					name: "rss",
-					component: () => import("@/components/Rss/Index.vue"),
-				},
-				{
 					path: "/share",
 					name: "share",
 					component: () => import("@/components/Share/Index.vue"),

@@ -3,7 +3,6 @@ export default {
 	"add-task": "إضافة تحميل",
 	"primary-navigation": "التنقل الرئيسي",
 	"nav-tasks": "التحميلات",
-	"nav-rss": "RSS",
 	"nav-health": "السلامة",
 	"nav-settings": "الإعدادات",
 	"nav-share": "المشاركة",

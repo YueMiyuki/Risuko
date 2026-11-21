@@ -3,7 +3,6 @@ export default {
 	"add-task": "Görev Ekle",
 	"primary-navigation": "Ana gezinme",
 	"nav-tasks": "Görevler",
-	"nav-rss": "RSS",
 	"nav-health": "Sağlık",
 	"nav-settings": "Ayarlar",
 	"nav-share": "Paylaş",

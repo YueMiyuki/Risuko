@@ -153,7 +153,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Comprimit",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Degut a les restriccions de la botiga d'aplicacions, la ruta per defecte es recomana que sigui ~/Downloads",
 	"transfer-settings": "Transmission",

@@ -150,7 +150,6 @@ export default {
 	"file-category-document": "Tài liệu",
 	"file-category-compressed": "Tệp nén",
 	"file-category-program": "Chương trình",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Do các hạn chế cấp phép sandbox của App Store, thư mục tải xuống mặc định được khuyến nghị đặt tại ~/Downloads",
 	"transfer-settings": "Tốc độ truyền",

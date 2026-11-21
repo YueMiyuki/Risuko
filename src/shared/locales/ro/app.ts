@@ -3,7 +3,6 @@ export default {
 	"add-task": "Adaugă sarcină",
 	"primary-navigation": "Navigare principală",
 	"nav-tasks": "Sarcini",
-	"nav-rss": "RSS",
 	"nav-health": "Stare",
 	"nav-settings": "Setări",
 	"nav-share": "Partajare",
