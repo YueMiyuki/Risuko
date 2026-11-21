@@ -47,6 +47,19 @@ test("anything that is not a plain http file link is rejected", () => {
 	);
 });
 
+test("an upper-case scheme is stored lower-case and still checked for media", () => {
+	assert.deepEqual(
+		parseMirrorList(
+			"HTTPS://A.test/f.iso Http://b.test/f.iso HTTPS://www.youtube.test/watch?v=1",
+			(uri) => uri.startsWith("https://www.youtube."),
+		),
+		{
+			uris: ["https://A.test/f.iso", "http://b.test/f.iso"],
+			rejected: ["HTTPS://www.youtube.test/watch?v=1"],
+		},
+	);
+});
+
 test("only http and https links count as mirrors", () => {
 	assert.equal(isMirrorUrl("https://a.test/f"), true);
 	assert.equal(isMirrorUrl(" http://a.test "), true);

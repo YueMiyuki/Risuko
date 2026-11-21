@@ -65,3 +65,16 @@ test("mirrors on one host are told apart by path", () => {
 		["a.test/one/f.iso", "a.test/two/f.iso", "not a url"],
 	);
 });
+
+test("mirrors on one host and path are told apart by query", () => {
+	const rows = buildMirrorRows([
+		mirror("https://a.test/f.iso?sig=1"),
+		mirror("https://a.test/f.iso?sig=2"),
+		mirror("https://a.test/g.iso?sig=3"),
+		mirror("https://b.test/f.iso?sig=4"),
+	]);
+	assert.deepEqual(
+		rows.map((row) => row.label),
+		["a.test/f.iso?sig=1", "a.test/f.iso?sig=2", "a.test/g.iso", "b.test"],
+	);
+});

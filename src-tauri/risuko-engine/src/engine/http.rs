@@ -954,19 +954,52 @@ fn build_mirror_headers(
 ) -> Vec<HeaderMap> {
     all_uris
         .iter()
-        .map(|u| headers_for_uri(base_headers, u, options))
+        .map(|u| headers_for_uri(base_headers, u, primary_uri(all_uris, u), options))
         .collect()
 }
 
 pub(crate) const COOKIE_HOST_OPTION: &str = "risuko-cookie-host";
+pub(crate) const COOKIE_HTTP_OPTION: &str = "risuko-cookie-http";
 
-fn headers_for_uri(base_headers: &HeaderMap, uri: &str, options: &Map<String, Value>) -> HeaderMap {
+fn primary_uri<'a>(all_uris: &'a [String], fallback: &'a str) -> &'a str {
+    all_uris.first().map_or(fallback, String::as_str)
+}
+
+fn is_https_uri(uri: &str) -> bool {
+    uri.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+}
+
+fn headers_for_uri(
+    base_headers: &HeaderMap,
+    uri: &str,
+    primary: &str,
+    options: &Map<String, Value>,
+) -> HeaderMap {
     let mut headers = base_headers.clone();
+    let shared_auth = options
+        .get("send-auth-to-all-mirrors")
+        .and_then(json_bool)
+        .unwrap_or(false);
+    if !shared_auth && uri != primary && !same_origin(uri, primary) {
+        headers.remove(risuko_http::header::AUTHORIZATION);
+    }
     if let Some(scope) = options.get(COOKIE_HOST_OPTION).and_then(Value::as_str) {
         let in_scope = super::cookie_store::host_of(uri)
             .is_some_and(|host| super::cookie_store::host_matches(&host, scope));
         if !in_scope {
             headers.remove(risuko_http::header::COOKIE);
+        } else if !is_https_uri(uri) {
+            if let Some(plain) = options.get(COOKIE_HTTP_OPTION).and_then(Value::as_str) {
+                match HeaderValue::from_str(plain) {
+                    Ok(value) if !plain.is_empty() => {
+                        headers.insert(risuko_http::header::COOKIE, value);
+                    }
+                    _ => {
+                        headers.remove(risuko_http::header::COOKIE);
+                    }
+                }
+            }
         }
     }
     apply_netrc_auth(&mut headers, uri, options);
@@ -1192,7 +1225,7 @@ async fn run_single_uri_download(
         client.clone()
     };
     let base_headers = build_headers(options);
-    let headers = headers_for_uri(&base_headers, uri, options);
+    let headers = headers_for_uri(&base_headers, uri, primary_uri(all_uris, uri), options);
     let stall = StallWatchdog::from_options(options);
     let falloc_mode = {
         let mode = super::falloc::Mode::from_option(options.get("file-allocation"));
@@ -1438,6 +1471,7 @@ async fn run_single_uri_download(
         resume_meta::delete(&part_path);
     }
     connections.store(1, Ordering::Relaxed);
+    tracker.clear();
 
     // Reuse the probe's Range shape; some signed-URL CDNs (e.g. Quark) reject a plain GET with 412
     let probe_confirmed_range = is_http
@@ -2337,6 +2371,12 @@ impl MirrorTracker {
         *self.sample.lock() = None;
         *self.pool.lock() = Some(pool);
         MirrorTrackerAttachment(self)
+    }
+
+    fn clear(&self) {
+        *self.pool.lock() = None;
+        *self.sample.lock() = None;
+        self.last.lock().clear();
     }
 
     fn detach(&self) {
@@ -4130,7 +4170,7 @@ mod tests {
         let mut options = Map::new();
         options.insert("no-netrc".into(), Value::Bool(true));
         let has_cookie = |uri: &str, options: &Map<String, Value>| {
-            headers_for_uri(&base, uri, options).contains_key(risuko_http::header::COOKIE)
+            headers_for_uri(&base, uri, uri, options).contains_key(risuko_http::header::COOKIE)
         };
         assert!(has_cookie("https://mirror.test/f", &options));
 
@@ -4142,6 +4182,81 @@ mod tests {
         assert!(has_cookie("https://dl.example.com/f", &options));
         assert!(!has_cookie("https://example.com.evil.test/f", &options));
         assert!(!has_cookie("https://mirror.test/f", &options));
+    }
+
+    #[test]
+    fn secure_cookies_stay_off_plain_http_mirrors() {
+        let mut base = HeaderMap::new();
+        base.insert(
+            risuko_http::header::COOKIE,
+            HeaderValue::from_static("s=1; p=2"),
+        );
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        options.insert(
+            COOKIE_HOST_OPTION.into(),
+            Value::String("example.com".into()),
+        );
+        options.insert(COOKIE_HTTP_OPTION.into(), Value::String("p=2".into()));
+        let primary = "https://example.com/f";
+        let cookie = |uri: &str, options: &Map<String, Value>| {
+            headers_for_uri(&base, uri, primary, options)
+                .get(risuko_http::header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(cookie(primary, &options).as_deref(), Some("s=1; p=2"));
+        assert_eq!(
+            cookie("HTTP://dl.example.com/f", &options).as_deref(),
+            Some("p=2")
+        );
+        assert_eq!(cookie("http://mirror.test/f", &options), None);
+
+        options.insert(COOKIE_HTTP_OPTION.into(), Value::String(String::new()));
+        assert_eq!(cookie("http://example.com/f", &options), None);
+    }
+
+    #[test]
+    fn authorization_reaches_only_mirrors_on_the_primary_origin() {
+        let base = h(&[("authorization", "Bearer t"), ("user-agent", "ua")]);
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        let primary = "https://a.test/f";
+        let has_auth = |uri: &str| {
+            headers_for_uri(&base, uri, primary, &options)
+                .contains_key(risuko_http::header::AUTHORIZATION)
+        };
+        assert!(has_auth(primary));
+        assert!(has_auth("https://A.test:443/other/f"));
+        assert!(!has_auth("https://b.test/f"));
+        assert!(!has_auth("http://a.test/f"));
+        assert!(!has_auth("https://a.test:8443/f"));
+
+        let all = vec![primary.to_string(), "https://b.test/f".to_string()];
+        let per_mirror = build_mirror_headers(&all, &base, &options);
+        assert!(per_mirror[0].contains_key(risuko_http::header::AUTHORIZATION));
+        assert!(!per_mirror[1].contains_key(risuko_http::header::AUTHORIZATION));
+        assert_eq!(per_mirror[1].get("user-agent").unwrap(), "ua");
+
+        let with_creds = headers_for_uri(&base, "https://u:p@b.test/f", primary, &Map::new());
+        assert_eq!(
+            with_creds.get(risuko_http::header::AUTHORIZATION).unwrap(),
+            "Basic dTpw"
+        );
+    }
+
+    #[test]
+    fn authorization_reaches_every_mirror_when_shared() {
+        let base = h(&[("authorization", "Bearer t")]);
+        let mut options = Map::new();
+        options.insert("no-netrc".into(), Value::Bool(true));
+        options.insert("send-auth-to-all-mirrors".into(), Value::Bool(true));
+        for uri in ["https://b.test/f", "http://a.test/f"] {
+            let headers = headers_for_uri(&base, uri, "https://a.test/f", &options);
+            assert_eq!(
+                headers.get(risuko_http::header::AUTHORIZATION).unwrap(),
+                "Bearer t"
+            );
+        }
     }
 
     #[test]
@@ -5145,6 +5260,9 @@ mod tests {
             (4096, 0, 0, MirrorState::Idle)
         );
         assert_eq!(kept[1].state, MirrorState::Failing);
+
+        tracker.clear();
+        assert!(tracker.snapshot().is_empty());
     }
 
     #[test]

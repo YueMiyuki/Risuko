@@ -18,6 +18,9 @@ const parseUrl = (uri: string): URL | null => {
 	}
 };
 
+const isShared = (values: string[], i: number): boolean =>
+	values.filter((value) => value === values[i]).length > 1;
+
 export const buildMirrorRows = (
 	mirrors: TaskMirror[] | undefined,
 ): MirrorRow[] => {
@@ -27,13 +30,19 @@ export const buildMirrorRows = (
 	}
 	const urls = list.map((m) => parseUrl(m.uri));
 	const hosts = urls.map((url, i) => url?.host || list[i].uri);
+	const paths = urls.map((url, i) =>
+		url ? `${url.host}${url.pathname}` : list[i].uri,
+	);
 	return list.map((mirror, i) => {
-		const shared = hosts.filter((host) => host === hosts[i]).length > 1;
 		const url = urls[i];
+		let label = hosts[i];
+		if (url && isShared(hosts, i)) {
+			label = isShared(paths, i) ? `${paths[i]}${url.search}` : paths[i];
+		}
 		return {
 			key: `${i}:${mirror.uri}`,
 			uri: mirror.uri,
-			label: shared && url ? `${url.host}${url.pathname}` : hosts[i],
+			label,
 			completed: Number(mirror.completedLength) || 0,
 			speed: Number(mirror.downloadSpeed) || 0,
 			connections: Number(mirror.connections) || 0,

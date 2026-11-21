@@ -144,6 +144,7 @@
 		"sftp-user",
 		"split",
 		"uri-selector",
+		"send-auth-to-all-mirrors",
 		"user-agent"
 	],
 	"startupOnly": [

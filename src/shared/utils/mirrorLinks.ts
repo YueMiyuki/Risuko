@@ -21,6 +21,9 @@ const isPlainFileUrl = (uri: string): boolean => {
 	return !STREAM_OR_INDEX_SUFFIXES.some((suffix) => path.endsWith(suffix));
 };
 
+const lowerScheme = (uri: string): string =>
+	uri.replace(/^[a-z][a-z\d+.-]*:/i, (scheme) => scheme.toLowerCase());
+
 export interface MirrorList {
 	uris: string[];
 	rejected: string[];
@@ -39,8 +42,9 @@ export const parseMirrorList = (
 			continue;
 		}
 		seen.add(key);
-		if (isPlainFileUrl(token) && !isMedia(token)) {
-			uris.push(token);
+		const uri = lowerScheme(token);
+		if (isPlainFileUrl(uri) && !isMedia(uri)) {
+			uris.push(uri);
 		} else {
 			rejected.push(token);
 		}

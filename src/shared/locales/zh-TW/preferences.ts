@@ -189,6 +189,9 @@ export default {
 	"uri-selector-feedback": "回饋式（跳過失敗的鏡像）",
 	"uri-selector-inorder": "順序（依列表順序嘗試）",
 	"uri-selector-adaptive": "自適應（優先最快）",
+	"send-auth-to-all-mirrors": "向所有鏡像傳送登入資訊",
+	"send-auth-to-all-mirrors-tips":
+		"將任務的 Authorization 標頭傳送給所有鏡像。關閉時，只有協定、主機和連接埠與第一個連結相同的鏡像才會收到。",
 	"unit-seconds": "秒",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "儲存",

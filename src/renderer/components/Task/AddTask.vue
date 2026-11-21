@@ -1097,7 +1097,7 @@ export default {
 			this.submitting = false;
 			this.mirrorText = "";
 			toast.success(this.$t("task.batch-all-success", { count: 1 }));
-			if (this.queue.length > 0) {
+			if (this.queue.length > 0 || (this.uriDraft || "").trim()) {
 				this.activeTab = "links";
 				return;
 			}
@@ -1285,6 +1285,12 @@ export default {
 
 			if (failCount === 0) {
 				toast.success(this.$t("task.batch-all-success", { count: okCount }));
+				if ((this.mirrorText || "").trim()) {
+					appStore.resetBatchQueue();
+					this.openItemIds = [];
+					this.activeTab = "mirrors";
+					return;
+				}
 				appStore.hideAddTaskDialog();
 				if (this.form.newTaskShowDownloading) {
 					this.$router

@@ -748,6 +748,22 @@
             <div class="form-info" style="margin-top: 8px">
               {{ $t('preferences.lowest-speed-limit-help') }}
             </div>
+            <div class="settings-row" style="margin-top: 8px">
+              <div class="settings-row-content">
+                <div class="settings-row-title">
+                  {{ $t('preferences.send-auth-to-all-mirrors') }}
+                </div>
+                <div class="settings-row-description">
+                  {{ $t('preferences.send-auth-to-all-mirrors-tips') }}
+                </div>
+              </div>
+              <div class="settings-row-action">
+                <ui-checkbox
+                  :model-value="!!form.sendAuthToAllMirrors"
+                  @change="(val) => setAdvancedBoolean('sendAuthToAllMirrors', val)"
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1791,6 +1807,7 @@ const initForm = (config) => {
 		loadCookies,
 		netrcPath,
 		noNetrc,
+		sendAuthToAllMirrors,
 		dhtListenPort,
 		ed2KEnableKad,
 		ed2KEnableUpload,
@@ -1858,6 +1875,7 @@ const initForm = (config) => {
 		loadCookies: loadCookies || "",
 		netrcPath: netrcPath || "",
 		noNetrc: parseBooleanConfig(noNetrc, false),
+		sendAuthToAllMirrors: parseBooleanConfig(sendAuthToAllMirrors, false),
 		dhtListenPort,
 		ed2kEnableKad: parseBooleanConfig(ed2kEnableKad ?? ed2KEnableKad, true),
 		ed2kEnableUpload: parseBooleanConfig(

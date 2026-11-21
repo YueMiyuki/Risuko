@@ -328,6 +328,7 @@ fn apply_task_patch(
             uris_changed = true;
             primary_uri_changed = uris.first().cloned().unwrap_or_default() != old_primary;
             task.uris = uris.clone();
+            task.mirror_progress.clear();
             if let Some(file) = task.files.first_mut() {
                 file.uris = uris
                     .iter()
@@ -3153,6 +3154,15 @@ impl TaskManager {
                     "apply_stored_cookies: injecting cookie header ({} bytes)",
                     cookie_header.len(),
                 );
+                if is_https {
+                    let plain = super::cookie_store::cookies_to_header_for(&entry.cookies, false);
+                    if plain != cookie_header {
+                        merged.insert(
+                            super::http::COOKIE_HTTP_OPTION.to_string(),
+                            Value::String(plain),
+                        );
+                    }
+                }
                 merged.insert("cookie".to_string(), Value::String(cookie_header));
                 merged.insert(
                     super::http::COOKIE_HOST_OPTION.to_string(),
@@ -11739,6 +11749,39 @@ mod tests {
             Some("s=1; p=2")
         );
         assert_eq!(header("http://site.example/f").as_deref(), Some("p=2"));
+
+        let http_variant = |uri: &str| {
+            let mut merged = Map::new();
+            TaskManager::apply_stored_cookies_from(&store, &[uri.to_string()], &mut merged);
+            merged
+                .get(crate::engine::http::COOKIE_HTTP_OPTION)
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+        assert_eq!(
+            http_variant("https://site.example/f").as_deref(),
+            Some("p=2")
+        );
+        assert_eq!(http_variant("http://site.example/f"), None);
+    }
+
+    #[test]
+    fn changing_uris_drops_stale_mirror_stats() {
+        let stat = |uri: &str| MirrorStat {
+            uri: uri.into(),
+            ..Default::default()
+        };
+        let mut task = make_task("m1", TaskStatus::Paused);
+        task.uris = vec!["https://a.test/f".into(), "https://b.test/f".into()];
+        task.mirror_progress = vec![stat("https://a.test/f"), stat("https://b.test/f")];
+
+        let same = task.uris.clone();
+        apply_task_patch(&mut task, Some(same), None, None, &[], None);
+        assert_eq!(task.mirror_progress.len(), 2);
+
+        let other = vec!["https://c.test/f".into(), "https://d.test/f".into()];
+        apply_task_patch(&mut task, Some(other), None, None, &[], None);
+        assert!(task.mirror_progress.is_empty());
     }
 
     #[tokio::test]
