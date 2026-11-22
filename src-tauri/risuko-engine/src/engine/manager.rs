@@ -2897,6 +2897,11 @@ impl TaskManager {
             {
                 return;
             }
+            let speed_task = http::spawn_speed_tracker(
+                counters.completed.clone(),
+                counters.speed.clone(),
+                counters.cancel_token.clone(),
+            );
             let result = super::usenet_worker::run_usenet_download_with_resolver_and_capacity(
                 &task_snapshot,
                 &merged_options,
@@ -2930,6 +2935,8 @@ impl TaskManager {
                 })),
             )
             .await;
+            speed_task.abort();
+            counters.speed.store(0, Ordering::Relaxed);
             let repair_failure = result
                 .as_ref()
                 .err()
