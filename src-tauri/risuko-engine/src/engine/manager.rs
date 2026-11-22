@@ -2897,8 +2897,9 @@ impl TaskManager {
             {
                 return;
             }
+            let received = Arc::new(AtomicU64::new(0));
             let speed_task = http::spawn_speed_tracker(
-                counters.completed.clone(),
+                received.clone(),
                 counters.speed.clone(),
                 counters.cancel_token.clone(),
             );
@@ -2907,6 +2908,7 @@ impl TaskManager {
                 &merged_options,
                 counters.completed.clone(),
                 counters.total.clone(),
+                received,
                 counters.cancel_token.clone(),
                 super::usenet_credential_resolver().await,
                 connection_capacity,
