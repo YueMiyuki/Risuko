@@ -517,6 +517,14 @@ struct StallWatchdog {
 }
 
 impl StallWatchdog {
+    fn disabled() -> Self {
+        Self {
+            lowest_speed: 0,
+            timeout: std::time::Duration::ZERO,
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn from_options(options: &Map<String, Value>) -> Self {
         let lowest_speed = options
             .get("lowest-speed-limit")
@@ -3798,6 +3806,20 @@ async fn verify_part(
     verify_output(part_path, len, integrity.0, integrity.1).await
 }
 
+pub(super) fn spawn_speed_tracker(
+    completed: Arc<AtomicU64>,
+    speed: Arc<AtomicU64>,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_speed_tracker(
+        completed,
+        speed,
+        Arc::new(AtomicU64::new(0)),
+        cancel_token,
+        StallWatchdog::disabled(),
+    ))
+}
+
 async fn run_speed_tracker(
     completed: Arc<AtomicU64>,
     speed: Arc<AtomicU64>,
@@ -5540,5 +5562,28 @@ mod tests {
         apply_remote_file_time(&missing_path, "Sun, 06 Nov 1994 08:49:37 GMT");
 
         assert!(!missing_path.exists());
+    }
+
+    #[tokio::test]
+    async fn speed_tracker_publishes_the_rate_and_clears_it_on_cancel() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let speed = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let handle = spawn_speed_tracker(completed.clone(), speed.clone(), cancel.clone());
+
+        let mut seen = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed.fetch_add(25_000, Ordering::Relaxed);
+            seen = speed.load(Ordering::Relaxed);
+            if seen > 0 {
+                break;
+            }
+        }
+        assert!(seen > 0, "speed stayed at zero");
+
+        cancel.cancel();
+        handle.await.unwrap();
+        assert_eq!(speed.load(Ordering::Relaxed), 0);
     }
 }
