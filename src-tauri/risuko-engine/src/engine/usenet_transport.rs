@@ -413,6 +413,9 @@ impl NntpConnection {
             let newline = available.iter().position(|byte| *byte == b'\n');
             let take = newline.map_or(available.len(), |index| index + 1);
             unpaid += take;
+            if let Some(received) = &received {
+                received.fetch_add(take as u64, Ordering::Relaxed);
+            }
             let Some(index) = newline else {
                 if partial.len().saturating_add(take) > MAX_LINE {
                     return Err(NntpError::ResponseTooLong);
@@ -436,16 +439,11 @@ impl NntpConnection {
                 done
             };
             if finished {
-                pay(throttle.as_ref(), received.as_deref(), unpaid).await;
+                pay(throttle.as_ref(), unpaid).await;
                 break;
             }
             if unpaid >= THROTTLE_BATCH_BYTES {
-                pay(
-                    throttle.as_ref(),
-                    received.as_deref(),
-                    std::mem::take(&mut unpaid),
-                )
-                .await;
+                pay(throttle.as_ref(), std::mem::take(&mut unpaid)).await;
             }
         }
         Ok(bytes)
@@ -564,10 +562,7 @@ fn nodelay(stream: TcpStream) -> Result<TcpStream, NntpError> {
     Ok(stream)
 }
 
-async fn pay(throttle: Option<&Throttle>, received: Option<&AtomicU64>, bytes: usize) {
-    if let Some(received) = received {
-        received.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
+async fn pay(throttle: Option<&Throttle>, bytes: usize) {
     if let Some(throttle) = throttle {
         throttle.acquire(bytes).await;
     }
@@ -1387,6 +1382,34 @@ mod tests {
         connection.set_received_counter(received.clone());
         connection.article("id@example").await.unwrap();
         assert_eq!(received.load(Ordering::Relaxed), wire_bytes);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_article_read_still_counts_the_bytes_it_received() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let truncated = "first line\r\nsecond li";
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 ready\r\n").await.unwrap();
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            let response = format!("220 follows\r\n{truncated}");
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut p = profile("plain", 0);
+        p.port = port;
+        let mut connection = NntpConnection::connect(&p, None).await.unwrap();
+        let received = Arc::new(AtomicU64::new(0));
+        connection.set_received_counter(received.clone());
+        assert!(connection.article("id@example").await.is_err());
+        assert_eq!(received.load(Ordering::Relaxed), truncated.len() as u64);
         server.await.unwrap();
     }
 
