@@ -157,7 +157,7 @@ fn has_parent_step(path: &str) -> bool {
     })
 }
 
-// Win32 drops trailing dots and spaces from the last name of a path only
+// Win32 trims trailing dots and spaces from the last name only, and resolve() probes every ancestor as a last name
 fn has_trimmed_name(path: &Path) -> bool {
     path.components().any(|part| match part {
         Component::Normal(name) => name.to_string_lossy().ends_with(['.', ' ']),
