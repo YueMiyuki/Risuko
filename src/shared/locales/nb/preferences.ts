@@ -204,7 +204,7 @@ export default {
 	"uri-selector-adaptive": "Adaptiv (foretrekk raskeste)",
 	"send-auth-to-all-mirrors": "Send innlogging til alle HTTPS-speil",
 	"send-auth-to-all-mirrors-tips":
-		"Sender autorisasjonshodet til en oppgave til hvert HTTPS-speil. Når av, får bare speil med samme skjema, vert og port som den første lenken det.",
+		"Sender autorisasjonshodet til en oppgave til hvert HTTPS-speil. Når av, sendes det bare til speil med samme skjema, vert og port som oppgavens første lenke.",
 	"unit-seconds": "sekunder",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Lagring",

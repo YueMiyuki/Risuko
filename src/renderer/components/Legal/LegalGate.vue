@@ -47,13 +47,13 @@ export default {
 	watch: {
 		showGate(open) {
 			if (open) {
-				this.$nextTick(() => this.$refs.agree?.focus());
+				void this.$nextTick().then(() => this.$refs.agree?.focus());
 			}
 		},
 	},
 	mounted() {
 		if (this.showGate) {
-			this.$nextTick(() => this.$refs.agree?.focus());
+			void this.$nextTick().then(() => this.$refs.agree?.focus());
 		}
 	},
 	methods: {

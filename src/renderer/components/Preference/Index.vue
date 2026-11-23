@@ -319,7 +319,7 @@ export default {
 			if (this.$route.query.setting !== settingKey) {
 				return;
 			}
-			this.$nextTick(() => {
+			void this.$nextTick().then(() => {
 				if (this.$route.query.setting !== settingKey) {
 					return;
 				}

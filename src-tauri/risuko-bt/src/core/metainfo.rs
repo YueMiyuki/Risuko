@@ -537,11 +537,15 @@ pub(crate) fn is_safe_component(s: &str) -> bool {
 }
 
 pub fn sanitize_windows_component(s: &str) -> String {
+    sanitize_windows(s, true)
+}
+
+fn sanitize_windows(s: &str, replace_invisible: bool) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
             if c.is_control()
-                || risuko_util::is_invisible_format_char(c)
+                || (replace_invisible && risuko_util::is_invisible_format_char(c))
                 || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
             {
                 '_'
@@ -594,6 +598,14 @@ pub fn fs_component(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub fn legacy_fs_component(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(sanitize_windows(s, false))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 fn storage_ignores_case() -> bool {
     cfg!(any(windows, target_os = "macos", target_os = "android"))
 }
@@ -627,6 +639,11 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
         .filter(|&i| !skipped(i))
         .map(|i| disk_path_key(&paths[i]))
         .collect();
+    let folders: HashSet<String> = (0..paths.len())
+        .filter(|&i| !skipped(i))
+        .flat_map(|i| (1..paths[i].len()).map(move |depth| (i, depth)))
+        .map(|(i, depth)| disk_path_key(&paths[i][..depth]))
+        .collect();
     let mut seen: HashSet<String> = HashSet::with_capacity(taken.len());
     let mut next_suffix: HashMap<String, usize> = HashMap::new();
     for (i, &is_skipped) in skipped_at.iter().enumerate() {
@@ -634,7 +651,7 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
             continue;
         }
         let key = disk_path_key(&paths[i]);
-        if !seen.contains(&key) {
+        if !seen.contains(&key) && !folders.contains(&key) {
             seen.insert(key);
             continue;
         }
@@ -649,7 +666,7 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
             }
             *next += 1;
             let ck = disk_path_key(&candidate);
-            if taken.insert(ck.clone()) {
+            if !folders.contains(&ck) && taken.insert(ck.clone()) {
                 seen.insert(ck);
                 paths[i] = candidate;
                 break;
@@ -1667,6 +1684,36 @@ mod tests {
             assert!(matches!(plain, std::borrow::Cow::Borrowed(_)));
             assert_eq!(plain, "plain name.txt");
         }
+    }
+
+    #[test]
+    fn a_file_named_like_the_folder_of_another_file_is_renamed() {
+        let path = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let mut paths = vec![path(&["docs", "a.txt"]), path(&["docs"])];
+        dedupe_paths(&mut paths, &[false, false]);
+        assert_eq!(paths, [path(&["docs", "a.txt"]), path(&["docs (1)"])]);
+
+        let mut paths = vec![
+            path(&["a\u{200B}"]),
+            path(&["a_", "x.txt"]),
+            path(&["a_ (1)", "y.txt"]),
+        ];
+        dedupe_paths(&mut paths, &[false, false, false]);
+        assert_eq!(paths[0], path(&["a\u{200B} (2)"]));
+        assert_eq!(paths[1], path(&["a_", "x.txt"]));
+        assert_eq!(paths[2], path(&["a_ (1)", "y.txt"]));
+    }
+
+    #[test]
+    fn the_earlier_disk_name_keeps_invisible_format_characters() {
+        let name = "report\u{202E}gpj.exe";
+        if cfg!(windows) {
+            assert_eq!(legacy_fs_component("a:b\u{200B}"), "a_b\u{200B}");
+        } else {
+            assert_eq!(legacy_fs_component(name), name);
+        }
+        assert_eq!(legacy_fs_component("plain"), fs_component("plain"));
+        assert_ne!(legacy_fs_component(name), fs_component(name));
     }
 
     #[test]

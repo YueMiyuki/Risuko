@@ -118,6 +118,15 @@ fn openable_local_path(path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(any(target_os = "android", test))]
+fn openable_android_target(path: &str) -> Result<(), String> {
+    if path.starts_with('/') || path.starts_with("content://") || path.starts_with("file://") {
+        Ok(())
+    } else {
+        Err("Only downloaded files can be opened".to_string())
+    }
+}
+
 #[tauri::command]
 pub fn reveal_in_folder(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -219,6 +228,7 @@ pub fn open_path(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         let _ = handle;
+        openable_android_target(&path)?;
         let mime = guess_android_mime(&path);
         return crate::commands::android_intent::open_file(&path, &mime);
     }
@@ -1694,6 +1704,26 @@ mod tests {
             "",
         ] {
             assert!(openable_local_path(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn android_open_path_takes_only_local_files_and_content_uris() {
+        for path in [
+            "/storage/emulated/0/Download/a.mp4",
+            "content://media/external/file/7",
+            "file:///storage/emulated/0/Download/a.mp4",
+        ] {
+            assert!(openable_android_target(path).is_ok(), "{path:?}");
+        }
+        for path in [
+            "https://example.com",
+            "http://example.com/a.apk",
+            "intent://scan/#Intent;scheme=zxing;end",
+            "relative/file",
+            "",
+        ] {
+            assert!(openable_android_target(path).is_err(), "{path:?}");
         }
     }
 

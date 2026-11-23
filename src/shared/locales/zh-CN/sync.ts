@@ -5,6 +5,8 @@ export default {
 	"cloud-sync-server-url": "服务器地址",
 	"cloud-sync-server-url-placeholder": "https://api.risuko.app",
 	"cloud-sync-server-url-description": "输入你自托管的 Risuko 同步后端地址。",
+	"cloud-sync-server-url-unencrypted":
+		"此地址未加密，登录令牌会以明文发送。除非服务器运行在本设备上，否则请使用 https。",
 	"server-connected": "已连接到同步服务器",
 	"server-unreachable": "无法连接到同步服务器",
 	"cloud-sync-categories": "同步分类",

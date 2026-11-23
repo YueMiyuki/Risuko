@@ -178,7 +178,7 @@ html.platform-android .android-bottom-nav {
 	bottom: 0;
 	z-index: 80;
 	display: grid;
-	grid-template-columns: 1fr 56px 1fr 1fr;
+	grid-template-columns: 1fr 1fr 1fr 56px;
 	align-items: center;
 	height: calc(var(--android-bottom-bar) + env(safe-area-inset-bottom));
 	padding: 0 8px env(safe-area-inset-bottom);

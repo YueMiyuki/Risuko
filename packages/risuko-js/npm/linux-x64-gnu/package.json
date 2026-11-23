@@ -23,5 +23,8 @@
 	],
 	"libc": [
 		"glibc"
-	]
+	],
+	"engines": {
+		"node": ">= 22"
+	}
 }

@@ -286,6 +286,78 @@ mod tests {
         format!("http://127.0.0.1:{port}/")
     }
 
+    async fn serve_and_record(
+        body: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let head = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = head.clone();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            *seen.lock().unwrap() = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (port, head)
+    }
+
+    #[tokio::test]
+    async fn playlist_requests_carry_the_credentials_of_their_own_origin() {
+        let (master_port, master_head) =
+            serve_and_record("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nlow.m3u8\n").await;
+        let (media_port, media_head) =
+            serve_and_record("#EXTM3U\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n").await;
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "header".into(),
+            serde_json::json!(["Authorization: Bearer t"]),
+        );
+        options.insert("cookie".into(), "sid=abc".into());
+        options.insert(
+            crate::engine::http::COOKIE_HOST_OPTION.into(),
+            "127.0.0.1".into(),
+        );
+        options.insert("no-netrc".into(), true.into());
+        let master_url = format!("http://127.0.0.1:{master_port}/a.m3u8");
+        let headers = RequestHeaders::new(&options, &master_url);
+        let client = risuko_http::Client::builder().build().unwrap();
+
+        let master = fetch_and_parse_playlist(&master_url, &client, &headers)
+            .await
+            .unwrap();
+        assert!(matches!(master, ParsedPlaylist::Master { .. }));
+        let media_url = format!("http://127.0.0.1:{media_port}/low.m3u8");
+        let media = fetch_and_parse_playlist(&media_url, &client, &headers)
+            .await
+            .unwrap();
+        assert!(matches!(media, ParsedPlaylist::Media { .. }));
+
+        let master_head = master_head.lock().unwrap().clone();
+        let media_head = media_head.lock().unwrap().clone();
+        assert!(
+            master_head.contains("authorization: bearer t"),
+            "{master_head}"
+        );
+        assert!(master_head.contains("cookie: sid=abc"), "{master_head}");
+        assert!(!media_head.contains("authorization:"), "{media_head}");
+        assert!(media_head.contains("cookie: sid=abc"), "{media_head}");
+    }
+
     #[tokio::test]
     async fn oversized_playlists_are_rejected() {
         let url = serve_body(MAX_PLAYLIST_BYTES + 1).await;

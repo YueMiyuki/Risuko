@@ -305,7 +305,7 @@ fn keeps_response(
 }
 
 fn votes_as_gateway(responder: Ipv4Addr, gateway: Option<Ipv4Addr>) -> bool {
-    gateway.is_none_or(|gateway| gateway == responder)
+    gateway == Some(responder)
 }
 
 async fn ssdp_discover(
@@ -859,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_gateway_is_always_heard_and_only_it_votes() {
+    fn the_default_gateway_has_its_own_cap_and_only_it_votes() {
         let router = Ipv4Addr::new(192, 168, 1, 1);
         let other = Ipv4Addr::new(192, 168, 1, 77);
         assert!(keeps_response(0, 8, router, Some(router)));
@@ -870,7 +870,8 @@ mod tests {
         assert!(!keeps_response(0, 8, other, None));
         assert!(votes_as_gateway(router, Some(router)));
         assert!(!votes_as_gateway(other, Some(router)));
-        assert!(votes_as_gateway(other, None));
+        assert!(!votes_as_gateway(other, None));
+        assert!(!votes_as_gateway(router, None));
     }
 
     #[test]

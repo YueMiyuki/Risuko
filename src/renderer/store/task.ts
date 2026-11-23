@@ -488,6 +488,7 @@ export const useTaskStore = defineStore("task", {
 					const lightData = (await api.fetchTaskList({
 						type: fetchType,
 						keys: TASK_LIST_LIGHT_KEYS,
+						activeKeys: TASK_LIST_KEYS,
 					})) as DownloadTask[];
 					if (isStale()) {
 						return [];
@@ -495,9 +496,6 @@ export const useTaskStore = defineStore("task", {
 					const merged = mergeRowFiles(
 						this.taskList,
 						filterListRows(type, lightData),
-						type === "all"
-							? (row) => row.status === TASK_STATUS.ACTIVE
-							: undefined,
 					);
 					if (merged.missing.length === 0) {
 						rows = merged.rows;

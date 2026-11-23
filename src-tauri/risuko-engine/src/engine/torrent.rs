@@ -1146,6 +1146,77 @@ pub fn adopt_stripped_v2_layout(data: &[u8], options: &Map<String, Value>) -> us
     moved
 }
 
+pub fn adopt_legacy_disk_names(data: &[u8], options: &Map<String, Value>) -> usize {
+    use bt::core::metainfo::{fs_component, legacy_fs_component};
+    let Ok(meta) = bt::parse_torrent(data) else {
+        return 0;
+    };
+    let info = &meta.info;
+    let Some(dir) = options.get("dir").and_then(Value::as_str).map(Path::new) else {
+        return 0;
+    };
+    let in_subfolder = !info.single_file_mode
+        && options
+            .get("bt-create-subfolder")
+            .and_then(super::options::json_bool)
+            .unwrap_or(true);
+    let (root, legacy_root) = if in_subfolder {
+        (
+            dir.join(&*fs_component(&info.name)),
+            dir.join(&*legacy_fs_component(&info.name)),
+        )
+    } else {
+        (dir.to_path_buf(), dir.to_path_buf())
+    };
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    let mut moved = 0;
+    let mut old_root = legacy_root.clone();
+    if root != legacy_root && !exists(&root) && legacy_root.is_dir() {
+        match std::fs::rename(&legacy_root, &root) {
+            Ok(()) => {
+                moved += 1;
+                old_root = root.clone();
+            }
+            Err(e) => tracing::warn!(
+                "could not move {} to {}: {e}",
+                legacy_root.display(),
+                root.display()
+            ),
+        }
+    }
+    for file in &info.files {
+        if file.padding || file.length == 0 || file.path.is_empty() {
+            continue;
+        }
+        let (mut new, mut old) = (root.clone(), old_root.clone());
+        for component in &file.path {
+            new.push(&*fs_component(component));
+            old.push(&*legacy_fs_component(component));
+        }
+        if new == old
+            || exists(&new)
+            || !std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_file() && m.len() <= file.length)
+        {
+            continue;
+        }
+        let renamed = new
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::rename(&old, &new));
+        if let Err(e) = renamed {
+            tracing::warn!("could not move {} to {}: {e}", old.display(), new.display());
+            continue;
+        }
+        moved += 1;
+        for parent in old.ancestors().skip(1) {
+            if parent == dir || parent == root || std::fs::remove_dir(parent).is_err() {
+                break;
+            }
+        }
+    }
+    moved
+}
+
 pub fn disk_component(name: &str) -> String {
     bt::core::metainfo::fs_component(name).into_owned()
 }
@@ -1693,6 +1764,99 @@ mod tests {
         assert_eq!(std::fs::read(root.join("Pack/a.bin")).unwrap(), b"new!");
     }
 
+    fn v1_torrent(name: &str, files: &[(&[&str], &[u8])]) -> Vec<u8> {
+        use bt::bencode::{encode_to_vec, Value as B};
+        let entries = files
+            .iter()
+            .map(|(path, body)| {
+                B::Dict(vec![
+                    (b"length".to_vec(), B::Int(body.len() as i64)),
+                    (
+                        b"path".to_vec(),
+                        B::List(
+                            path.iter()
+                                .map(|c| B::Bytes(c.as_bytes().to_vec()))
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+        let total: usize = files.iter().map(|(_, body)| body.len()).sum();
+        let info = B::Dict(vec![
+            (b"files".to_vec(), B::List(entries)),
+            (b"name".to_vec(), B::Bytes(name.as_bytes().to_vec())),
+            (b"piece length".to_vec(), B::Int(16384)),
+            (
+                b"pieces".to_vec(),
+                B::Bytes(vec![0; 20 * total.div_ceil(16384).max(1)]),
+            ),
+        ]);
+        encode_to_vec(&B::Dict(vec![(b"info".to_vec(), info)]))
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn restore_moves_files_saved_under_names_with_invisible_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("downloads");
+        let torrent = v1_torrent(
+            "Pack\u{200B}",
+            &[
+                (&["a\u{202E}.bin"], b"aaaa"),
+                (&["sub\u{FEFF}", "b.bin"], b"bbbbbb"),
+                (&["plain.bin"], b"cc"),
+            ],
+        );
+        let old = downloads.join("Pack\u{200B}");
+        write(&old.join("a\u{202E}.bin"), b"aa");
+        write(&old.join("sub\u{FEFF}/b.bin"), b"bbbbbb");
+        write(&old.join("plain.bin"), b"cc");
+        write(&old.join(".parts/kept"), b"p");
+
+        assert_eq!(
+            adopt_legacy_disk_names(&torrent, &dir_options(&downloads)),
+            3
+        );
+        let root = downloads.join("Pack_");
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(root.join("a_.bin")).unwrap(), b"aa");
+        assert_eq!(std::fs::read(root.join("sub_/b.bin")).unwrap(), b"bbbbbb");
+        assert_eq!(std::fs::read(root.join("plain.bin")).unwrap(), b"cc");
+        assert_eq!(std::fs::read(root.join(".parts/kept")).unwrap(), b"p");
+        assert!(!root.join("sub\u{FEFF}").exists());
+        assert_eq!(
+            adopt_legacy_disk_names(&torrent, &dir_options(&downloads)),
+            0
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn restore_leaves_earlier_names_alone_when_the_current_ones_are_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("downloads");
+        let torrent = v1_torrent(
+            "Pack",
+            &[(&["a\u{200B}.bin"], b"aaaa"), (&["b\u{200B}.bin"], b"bbbb")],
+        );
+        let root = downloads.join("Pack");
+        write(&root.join("a\u{200B}.bin"), b"old!");
+        write(&root.join("a_.bin"), b"new!");
+        write(&root.join("b\u{200B}.bin"), b"longer than the torrent says");
+        assert_eq!(
+            adopt_legacy_disk_names(&torrent, &dir_options(&downloads)),
+            0
+        );
+        assert_eq!(std::fs::read(root.join("a_.bin")).unwrap(), b"new!");
+        assert!(root.join("a\u{200B}.bin").exists());
+        assert!(root.join("b\u{200B}.bin").exists());
+
+        let plain = v1_torrent("Plain", &[(&["a.bin"], b"aaaa")]);
+        write(&downloads.join("Plain/a.bin"), b"aaaa");
+        assert_eq!(adopt_legacy_disk_names(&plain, &dir_options(&downloads)), 0);
+    }
+
     #[test]
     fn disk_path_maps_each_component() {
         let win = |c: &str| bt::core::metainfo::sanitize_windows_component(c);
@@ -1943,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_outside_the_file_list_is_no_selection() {
+    fn a_selection_matching_no_file_selects_everything() {
         use std::collections::HashSet;
         assert_eq!(selection_within(vec![99], 3), None);
         assert_eq!(selection_within(vec![], 3), None);

@@ -106,26 +106,28 @@ test("merged rows keep the order of the light rows", () => {
 	assert.deepEqual(missing, ["n"]);
 });
 
-test("a row the predicate matches is missing even when its status is unchanged", () => {
-	const filesA = [{ path: "a" }];
+test("a light row that brings its own files keeps them and is not missing", () => {
+	const stale = [{ path: "old" }];
+	const fresh = [{ path: "new" }];
 	const filesB = [{ path: "b" }];
 	const { rows, missing } = mergeRowFiles<Row>(
 		[
-			{ gid: "a", status: "active", files: filesA },
+			{ gid: "a", status: "active", files: stale },
 			{ gid: "b", status: "complete", files: filesB },
 		],
 		[
-			{ gid: "a", status: "active" },
+			{ gid: "a", status: "active", files: fresh },
+			{ gid: "n", status: "active", files: [] },
 			{ gid: "b", status: "complete" },
 		],
-		(row) => row.status === "active",
 	);
-	assert.deepEqual(missing, ["a"]);
-	assert.equal(rows[0].files, undefined);
-	assert.equal(rows[1].files, filesB);
+	assert.deepEqual(missing, []);
+	assert.equal(rows[0].files, fresh);
+	assert.deepEqual(rows[1].files, []);
+	assert.equal(rows[2].files, filesB);
 });
 
-test("without a predicate an active row with an unchanged status keeps its files", () => {
+test("an active row with an unchanged status and no files of its own keeps the held ones", () => {
 	const filesA = [{ path: "a" }];
 	const { rows, missing } = mergeRowFiles<Row>(
 		[{ gid: "a", status: "active", files: filesA }],

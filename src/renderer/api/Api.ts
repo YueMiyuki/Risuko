@@ -486,6 +486,7 @@ export default class Api {
 			offset?: number;
 			num?: number;
 			keys?: string[];
+			activeKeys?: string[];
 		} = {},
 	) {
 		const { type } = params;
@@ -504,11 +505,16 @@ export default class Api {
 	}
 
 	async fetchAllTaskList(
-		params: { offset?: number; num?: number; keys?: string[] } = {},
+		params: {
+			offset?: number;
+			num?: number;
+			keys?: string[];
+			activeKeys?: string[];
+		} = {},
 	) {
-		const { keys } = params;
+		const { keys, activeKeys = keys } = params;
 		const [active, waiting, scheduled, stopped] = await Promise.all([
-			invoke<DownloadTask[]>("tell_active", { keys }),
+			invoke<DownloadTask[]>("tell_active", { keys: activeKeys }),
 			this.fetchWaitingTaskList(params),
 			this.fetchScheduledTaskList(params),
 			this.fetchStoppedTaskList(params),

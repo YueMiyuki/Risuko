@@ -365,7 +365,7 @@ export default {
 	"mirror-placeholder": "رابط المرآة (نفس الملف، خادم آخر)",
 	"mirror-hint":
 		"أضف روابط مرآة تشير إلى نفس الملف للتنزيل من عدة مصادر في وقت واحد.",
-	"mirror-sources": "{{count}} مصدر",
+	"mirror-sources": "المصادر: {{count}}",
 	"mirror-failing": "فاشلة",
 	"mirror-idle": "غير مستخدمة",
 	"add-tab-links": "الروابط",
@@ -412,9 +412,9 @@ export default {
 	"seeding-global-off": "حاليًا: عدم البذر",
 	"seeding-global-forever": "حاليًا: البذر حتى الإيقاف",
 	"seeding-global-ratio": "حاليًا: الإيقاف عند النسبة {{ratio}}",
-	"seeding-global-minutes": "حاليًا: الإيقاف بعد {{minutes}} دقيقة",
+	"seeding-global-minutes": "حاليًا: الإيقاف بعد {{minutes}} د",
 	"seeding-global-both":
-		"حاليًا: الإيقاف عند النسبة {{ratio}} أو بعد {{minutes}} دقيقة",
+		"حاليًا: الإيقاف عند النسبة {{ratio}} أو بعد {{minutes}} د",
 	"seeding-limits-hint":
 		"يتوقف البذر عند أول حد يتم بلوغه. القيمة 0 تعني عدم وجود حد من هذا النوع.",
 	"seeding-limits-required": "أدخل نسبة أو عدد دقائق أكبر من 0",

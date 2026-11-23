@@ -83,3 +83,30 @@ test("no files at all give no folder to trash", () => {
 		files: [],
 	});
 });
+
+test("a folder name that is not a plain child name never gives a folder to trash", () => {
+	for (const name of ["..", ".", "../up", "a/b", "a\\b", "/abs"]) {
+		const targets = torrentTrashTargets("/dl", name, [
+			`/dl/${name}/a.mkv`,
+			"/dl/../a.mkv",
+		]);
+		assert.equal(targets.folder, null, name);
+	}
+});
+
+test("a file path that climbs out of the torrent folder means no folder is trashed", () => {
+	const targets = torrentTrashTargets("/dl", "Show", [
+		"/dl/Show/a.mkv",
+		"/dl/Show/../../etc/b.mkv",
+	]);
+	assert.equal(targets.folder, null);
+});
+
+test("spaces at the ends of names are kept", () => {
+	const targets = torrentTrashTargets("/dl", " Show ", [
+		"/dl/ Show /a.mkv ",
+		"/dl/ Show / b.mkv",
+	]);
+	assert.equal(targets.folder, "/dl/ Show ");
+	assert.deepEqual(targets.files, ["/dl/ Show /a.mkv ", "/dl/ Show / b.mkv"]);
+});

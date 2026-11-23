@@ -50,6 +50,10 @@ function readLimit(value: unknown): number {
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+function readMinutes(value: unknown): number {
+	return Math.round(readLimit(value));
+}
+
 function isPresent(value: unknown): boolean {
 	return value !== undefined && value !== null;
 }
@@ -67,7 +71,7 @@ export function seedingRuleOptions(
 			return { keepSeeding: "false", seedTime: "0", seedRatio: "0" };
 		case "limits": {
 			const nextRatio = readLimit(ratio);
-			const nextMinutes = Math.round(readLimit(minutes));
+			const nextMinutes = readMinutes(minutes);
 			if (nextRatio <= 0 && nextMinutes <= 0) {
 				return null;
 			}
@@ -97,7 +101,7 @@ export function seedingChoiceOf(
 		};
 	}
 	const ratio = readLimit(options.seedRatio);
-	const minutes = readLimit(options.seedTime);
+	const minutes = readMinutes(options.seedTime);
 	const keep = readFlag(options.keepSeeding);
 	if (keep === null) {
 		return {
@@ -123,7 +127,7 @@ export function globalSeedingSummary({
 	seedRatio?: unknown;
 }): GlobalSeedingSummary {
 	const ratio = readLimit(seedRatio);
-	const minutes = readLimit(seedTime);
+	const minutes = readMinutes(seedTime);
 	const keep = readFlag(keepSeeding) === true || ratio > 0 || minutes > 0;
 	let kind: GlobalSeedingKind = "forever";
 	if (!keep) {

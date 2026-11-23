@@ -290,8 +290,7 @@ export const moveTaskFilesToTrash = async (
 			btFolderName(bittorrent),
 			files.map((file) => file?.path || ""),
 		);
-		let trashed = 0;
-		let failed = 0;
+		let fileFailures = 0;
 		let folderTrashed = false;
 		if (targets.folder) {
 			logger.info(`[Risuko] trashing torrent folder: "${targets.folder}"`);
@@ -301,12 +300,10 @@ export const moveTaskFilesToTrash = async (
 				});
 				if (found) {
 					logger.info(`[Risuko] trashed torrent folder: "${targets.folder}"`);
-					trashed++;
 					folderTrashed = true;
 				}
 			} catch (err) {
 				logger.warn(`[Risuko] trash torrent folder failed: ${err}`);
-				failed++;
 			}
 		}
 		if (!folderTrashed) {
@@ -315,16 +312,15 @@ export const moveTaskFilesToTrash = async (
 					const found: boolean = await invoke("trash_item", { path: filePath });
 					if (found) {
 						logger.info(`[Risuko] trashed: "${filePath}"`);
-						trashed++;
 					}
 				} catch (fileErr) {
 					logger.warn(`[Risuko] trash file "${filePath}" failed: ${fileErr}`);
-					failed++;
+					fileFailures++;
 				}
 			}
 		}
 		await cleanupGeneratedTorrentSidecars(task);
-		return !(failed > 0 && trashed === 0);
+		return fileFailures === 0;
 	}
 
 	const path = getTaskFullPath(task);

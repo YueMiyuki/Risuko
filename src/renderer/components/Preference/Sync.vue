@@ -28,6 +28,10 @@
                     @change="saveServerUrl"
                   />
                 </div>
+                <div v-if="serverUnencrypted" class="sync-status-line sync-status--err">
+                  <TriangleAlert :size="14" class="sync-status-icon" />
+                  {{ $t('sync.cloud-sync-server-url-unencrypted') }}
+                </div>
               </div>
             </div>
 
@@ -250,6 +254,7 @@ import {
 	DownloadCloud,
 	Loader2,
 	RefreshCw,
+	TriangleAlert,
 	UploadCloud,
 	User,
 	XCircle,
@@ -263,7 +268,7 @@ import { Input } from "@/components/ui/input";
 import { useAuthStore } from "@/store/auth";
 import { usePreferenceStore } from "@/store/preference";
 import { useSyncStore } from "@/store/sync";
-import { sameSyncServer } from "@/utils/syncServer";
+import { sameSyncServer, sendsTokenUnencrypted } from "@/utils/syncServer";
 
 export default defineComponent({
 	name: "preference-sync",
@@ -282,6 +287,7 @@ export default defineComponent({
 		Loader2,
 		Activity,
 		ChevronRight,
+		TriangleAlert,
 	},
 	data() {
 		const preferenceStore = usePreferenceStore();
@@ -305,6 +311,9 @@ export default defineComponent({
 	computed: {
 		selectedCategories(): string[] {
 			return this.syncStore.getSelectedCategories();
+		},
+		serverUnencrypted(): boolean {
+			return sendsTokenUnencrypted(this.serverUrl);
 		},
 		lastSyncText(): string {
 			const lastAt = this.syncStore.lastSyncAt;
@@ -346,10 +355,7 @@ export default defineComponent({
 			usePreferenceStore().save({ cloudSyncCategories: [] });
 		},
 		async saveServerUrl() {
-			if (
-				!sameSyncServer(this.serverUrl, this.authStore.serverUrl) &&
-				this.authStore.isLoggedIn
-			) {
+			if (!sameSyncServer(this.serverUrl, this.authStore.serverUrl)) {
 				await this.authStore.logout();
 			}
 			await usePreferenceStore().save({ cloudSyncServerUrl: this.serverUrl });

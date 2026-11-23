@@ -68,7 +68,6 @@ export function mergeRowFiles<
 >(
 	previous: readonly T[],
 	light: readonly T[],
-	alwaysFresh: (row: T) => boolean = () => false,
 ): { rows: T[]; missing: string[] } {
 	const held = new Map<string, T>();
 	for (const row of previous) {
@@ -78,8 +77,11 @@ export function mergeRowFiles<
 	}
 	const missing: string[] = [];
 	const rows = light.map((row) => {
+		if (Array.isArray(row.files)) {
+			return row;
+		}
 		const old = held.get(row.gid);
-		if (old && old.status === row.status && !alwaysFresh(row)) {
+		if (old && old.status === row.status) {
 			return { ...row, files: old.files };
 		}
 		missing.push(row.gid);

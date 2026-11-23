@@ -437,11 +437,11 @@ export default {
 	"seeding-limits-required": "Voer een ratio of een aantal minuten boven 0 in",
 	"seeding-for": "Seedduur",
 	"seeding-applies-after-download": "Dit geldt zodra de download klaar is.",
-	"seeding-stops-now": "Deze taak stopt met seeden zodra je opslaat.",
+	"seeding-stops-now": "Deze taak stopt met seeden zodra u opslaat.",
 	"seeding-limit-reached":
-		"Deze taak heeft deze limiet al bereikt en stopt met seeden zodra je opslaat.",
+		"Deze taak heeft deze limiet al bereikt en stopt met seeden zodra u opslaat.",
 	"seeding-in-place-note":
-		"Torrents die je hebt gemaakt blijven seeden tot je ze stopt.",
+		"Torrents die u hebt gemaakt blijven seeden tot u ze stopt.",
 	"seeding-ed2k-sharing-off":
 		"Delen via eD2K staat uit in Voorkeuren, dus deze taak uploadt niet.",
 	"seeding-leftover-values":

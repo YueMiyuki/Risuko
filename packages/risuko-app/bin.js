@@ -36,8 +36,13 @@ const appArgs = [];
 
 for (let i = 0; i < rawArgs.length; i++) {
 	const arg = rawArgs[i];
-	if ((arg === "--version" || arg === "-v") && rawArgs[i + 1]) {
-		version = rawArgs[++i].replace(/^v/, "");
+	if (arg === "--version" || arg === "-v") {
+		const value = rawArgs[++i];
+		if (value === undefined) {
+			console.error(`${arg} needs a version such as 1.2.0`);
+			process.exit(1);
+		}
+		version = value.replace(/^v/, "");
 		if (!parseVersion(version)) {
 			console.error(
 				`Invalid version "${version}": expected a version such as 1.2.0`,

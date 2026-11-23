@@ -423,14 +423,17 @@ impl FilesystemStorage {
         };
         let file = &self.layout.files()[idx];
         let ranges = boundary_ranges(file.offset, file.length, self.piece_length);
+        let copy_from = shadow_path.clone();
+        let shadow = task::spawn_blocking(move || open_part_file(&copy_from))
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))??;
         let real = self.handle(idx, true).await?;
         let target = [(idx, Arc::clone(&real))];
-        let copy_from = shadow_path.clone();
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         self.pause_at_write_hold().await;
         let copied = task::spawn_blocking(move || -> io::Result<()> {
-            let Some(shadow) = open_part_file(&copy_from)? else {
+            let Some(shadow) = shadow else {
                 return Ok(());
             };
             let shadow_len = shadow.metadata()?.len();
@@ -1631,15 +1634,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn mode_bits_are_enforced(unreadable: &Path) -> bool {
+        let enforced = std::fs::File::open(unreadable).is_err();
+        if !enforced {
+            eprintln!(
+                "SKIPPED: this process opens files whatever their mode (running as root?), so nothing was checked"
+            );
+        }
+        enforced
+    }
+
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_part_file_is_an_error() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let path = file_with_mode(tmp.path(), "0", 0o000);
-        let opened_anyway = std::fs::File::open(&path).is_ok();
+        let enforced = mode_bits_are_enforced(&path);
         let result = open_part_file(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        if opened_anyway {
+        if !enforced {
             return;
         }
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
@@ -1683,7 +1697,7 @@ mod tests {
         assert!(part.exists());
 
         std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::File::open(&part).is_ok() {
+        if !mode_bits_are_enforced(&part) {
             std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600)).unwrap();
             return;
         }
@@ -1693,6 +1707,7 @@ mod tests {
         assert!(failed.is_err());
         assert!(storage.is_shadowed(0));
         assert!(part.exists());
+        assert!(!root.join("a.bin").exists());
 
         storage.promote_file(0).await.unwrap();
         assert_eq!(

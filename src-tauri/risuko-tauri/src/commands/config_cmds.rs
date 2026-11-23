@@ -477,6 +477,7 @@ fn has_signed_updater_pubkey(config: Option<&Value>) -> bool {
 const MAX_TRACKER_SOURCE_URLS: usize = 64;
 const MAX_TRACKER_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKER_SOURCE_CONCURRENCY: usize = 8;
+const TRACKER_SOURCE_REFUSED: &str = "Tracker source address is not allowed";
 
 #[tauri::command]
 pub async fn fetch_tracker_sources(
@@ -507,12 +508,23 @@ pub async fn fetch_tracker_sources(
         requests.push((target, configured_proxy.clone()));
     }
 
-    Ok(fetch_tracker_source_requests(requests, risuko_bt::webseed::is_allowed_destination).await)
+    Ok(fetch_tracker_source_requests(requests, PUBLIC_TRACKER_SOURCES).await)
 }
+
+#[derive(Clone, Copy)]
+struct TrackerSourceGuard {
+    url: fn(&Url) -> bool,
+    address: fn(IpAddr) -> bool,
+}
+
+const PUBLIC_TRACKER_SOURCES: TrackerSourceGuard = TrackerSourceGuard {
+    url: risuko_bt::webseed::is_allowed_webseed_url,
+    address: risuko_bt::webseed::is_allowed_destination,
+};
 
 async fn fetch_tracker_source_requests(
     requests: Vec<(Url, Option<(String, NoProxy)>)>,
-    destination_filter: fn(IpAddr) -> bool,
+    guard: TrackerSourceGuard,
 ) -> Vec<String> {
     let mut pending = stream::iter(requests.into_iter().enumerate().map(
         |(index, (target, proxy))| async move {
@@ -520,7 +532,7 @@ async fn fetch_tracker_source_requests(
             (
                 index,
                 host,
-                fetch_one_tracker_source(target, proxy, destination_filter).await,
+                fetch_one_tracker_source(target, proxy, guard).await,
             )
         },
     ))
@@ -540,16 +552,20 @@ async fn fetch_tracker_source_requests(
 async fn fetch_one_tracker_source(
     target: Url,
     configured_proxy: Option<(String, NoProxy)>,
-    destination_filter: fn(IpAddr) -> bool,
+    guard: TrackerSourceGuard,
 ) -> Result<String, String> {
+    // A proxy resolves names itself, so the address filter never sees them
+    if !(guard.url)(&target) {
+        return Err(TRACKER_SOURCE_REFUSED.to_string());
+    }
     let mut builder = risuko_http::Client::builder()
         .user_agent(risuko_engine::engine::USER_AGENT)
-        .redirect(risuko_http::Policy::limited(10))
+        .redirect(risuko_http::Policy::limited(10).allow_only(guard.url))
         .timeout(Duration::from_secs(30))
         .gzip(true)
         .brotli(true)
         .deflate(true)
-        .direct_address_filter(destination_filter);
+        .direct_address_filter(guard.address);
     if let Some((server, bypass)) = configured_proxy {
         let configured = risuko_http::Proxy::all(server)
             .map_err(|e| format!("Invalid configured proxy: {e}"))?;
@@ -690,8 +706,15 @@ fn is_open_at_login_enabled(handle: &AppHandle) -> Result<bool, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    const ANY_SOURCE: TrackerSourceGuard = TrackerSourceGuard {
+        url: |_| true,
+        address: |_| true,
+    };
 
     #[test]
     fn normalize_proxy_bypass_empty() {
@@ -1478,7 +1501,7 @@ mod tests {
         });
 
         let target = Url::parse(&format!("http://{address}/trackers.txt")).unwrap();
-        let error = fetch_one_tracker_source(target, None, |_| true)
+        let error = fetch_one_tracker_source(target, None, ANY_SOURCE)
             .await
             .unwrap_err();
         assert_eq!(error, "Tracker source response is too large");
@@ -1510,7 +1533,7 @@ mod tests {
         let second = Url::parse(&format!("http://{address}/second")).unwrap();
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            fetch_tracker_source_requests(vec![(first, None), (second, None)], |_| true),
+            fetch_tracker_source_requests(vec![(first, None), (second, None)], ANY_SOURCE),
         )
         .await
         .expect("tracker fetches should overlap instead of waiting serially");
@@ -1535,10 +1558,78 @@ mod tests {
         });
 
         let target = Url::parse(&format!("http://127.0.0.1:{port}/list.txt")).unwrap();
-        let result =
-            fetch_one_tracker_source(target, None, risuko_bt::webseed::is_allowed_destination)
-                .await;
-        assert!(result.is_err());
+        let by_address = TrackerSourceGuard {
+            address: risuko_bt::webseed::is_allowed_destination,
+            ..ANY_SOURCE
+        };
+        let error = fetch_one_tracker_source(target.clone(), None, by_address)
+            .await
+            .unwrap_err();
+        assert!(error.contains("blocked"), "unexpected error: {error}");
+        let error = fetch_one_tracker_source(target, None, PUBLIC_TRACKER_SOURCES)
+            .await
+            .unwrap_err();
+        assert_eq!(error, TRACKER_SOURCE_REFUSED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tracker_list_on_this_machine_is_refused_before_it_reaches_a_proxy() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        for target in [
+            "http://127.0.0.1:8080/list.txt",
+            "http://[::1]/list.txt",
+            "http://192.168.1.1/list.txt",
+            "http://localhost/list.txt",
+            "http://router.lan/list.txt",
+        ] {
+            let error = fetch_one_tracker_source(
+                Url::parse(target).unwrap(),
+                Some((proxy_url.clone(), NoProxy::parse(""))),
+                PUBLIC_TRACKER_SOURCES,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, TRACKER_SOURCE_REFUSED, "{target}");
+        }
+        let reached = tokio::time::timeout(Duration::from_millis(50), proxy.accept()).await;
+        assert!(reached.is_err(), "a refused address was sent to the proxy");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_refused_address_is_not_followed() {
+        fn all_but_the_inside(url: &Url) -> bool {
+            url.path() != "/inside"
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                served.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /inside\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let guard = TrackerSourceGuard {
+            url: all_but_the_inside,
+            ..ANY_SOURCE
+        };
+        let target = Url::parse(&format!("http://{address}/list.txt")).unwrap();
+        let error = fetch_one_tracker_source(target, None, guard)
+            .await
+            .unwrap_err();
+        assert!(error.contains("redirect target not allowed"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }

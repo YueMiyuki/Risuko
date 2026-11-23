@@ -77,7 +77,8 @@ fn is_counter(haystack: &str, start: usize, end: usize) -> bool {
         return true;
     }
     let list_item = |c: char| c.is_ascii_digit() || c == ',' || c == ' ';
-    before.trim_end_matches(list_item).ends_with(":[")
+    before.contains("unavailable segments:")
+        && before.trim_end_matches(list_item).ends_with(":[")
         && haystack[end..]
             .trim_start_matches(list_item)
             .starts_with(']')
@@ -549,6 +550,10 @@ mod tests {
                 ErrorCode::HTTP_RANGE_NOT_SATISFIABLE,
             ),
             ("HTTP error: 502 Bad Gateway", ErrorCode::HTTP_SERVER_ERROR),
+            (
+                "mirrors answered with status:[503]",
+                ErrorCode::HTTP_SERVICE_UNAVAILABLE,
+            ),
         ];
         for (msg, expected) in cases {
             assert_eq!(classify_error(msg, "http"), expected, "{msg}");

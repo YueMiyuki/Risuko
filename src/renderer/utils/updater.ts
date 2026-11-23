@@ -248,14 +248,6 @@ async function askToInstall(
 		}
 		await update.install();
 
-		if (showFeedback()) {
-			toast.info(
-				translate("app.update-relaunching"),
-				feedbackToastId === undefined
-					? undefined
-					: { id: feedbackToastId, duration: Number.POSITIVE_INFINITY },
-			);
-		}
 		const relaunchPrompt = await confirm({
 			title: translate("app.check-for-updates-title"),
 			message: translate("app.update-relaunch"),
@@ -271,6 +263,14 @@ async function askToInstall(
 			return;
 		}
 
+		if (showFeedback()) {
+			toast.info(
+				translate("app.update-relaunching"),
+				feedbackToastId === undefined
+					? undefined
+					: { id: feedbackToastId, duration: Number.POSITIVE_INFINITY },
+			);
+		}
 		await invoke("relaunch_app");
 	} catch (error) {
 		if (exitsOnInstall) {

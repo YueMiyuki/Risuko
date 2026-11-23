@@ -416,11 +416,12 @@ export default {
 					mediaTitle: info.title || "",
 				});
 			} catch (err: unknown) {
-				const message =
+				const raw =
 					typeof err === "string"
 						? err
 						: (err as { message?: string })?.message ||
 							this.$t("task.media-format-error");
+				const message = raw.startsWith("task.") ? this.$t(raw) : raw;
 				this.$emit("update:media", this.item.id, {
 					mediaInfoState: "error",
 					mediaInfoError: message,

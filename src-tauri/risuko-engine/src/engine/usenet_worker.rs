@@ -106,6 +106,7 @@ struct NntpArticleSource {
     cancel: CancellationToken,
     proxy: Option<risuko_http::ProxyConnector>,
     throttle: Throttle,
+    received: Arc<AtomicU64>,
     pipeline_depth: usize,
 }
 
@@ -698,6 +699,7 @@ impl NntpArticleSource {
             ) => connection?,
         };
         connection.set_throttle(self.throttle.clone());
+        connection.set_received_counter(self.received.clone());
         Ok(connection)
     }
 }
@@ -894,6 +896,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
     options: &Map<String, Value>,
     completed: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
     cancel: CancellationToken,
     resolver: Arc<dyn UsenetCredentialResolver>,
     connection_capacity: Arc<ProviderConnectionCapacityRegistry>,
@@ -926,6 +929,7 @@ pub(crate) async fn run_usenet_download_with_resolver_and_capacity(
         cancel: cancel.clone(),
         proxy: proxy.clone(),
         throttle: throttle.clone(),
+        received: received.clone(),
         pipeline_depth: PIPELINE_DEPTH,
     };
     let assembly_limits = YencAssemblyLimits::new(
@@ -1743,6 +1747,7 @@ mod tests {
             cancel: CancellationToken::new(),
             proxy: None,
             throttle: Throttle::unlimited(),
+            received: Arc::new(AtomicU64::new(0)),
             pipeline_depth: PIPELINE_DEPTH,
         }
     }
@@ -3667,6 +3672,7 @@ mod tests {
                 &scenario.options,
                 completed,
                 total.clone(),
+                Arc::new(AtomicU64::new(0)),
                 CancellationToken::new(),
                 Arc::new(AnonymousCredentialResolver),
                 Arc::new(ProviderConnectionCapacityRegistry::default()),
@@ -3684,6 +3690,110 @@ mod tests {
             dir,
             scenario,
         )
+    }
+
+    struct TransferCounts {
+        completed: u64,
+        received: u64,
+        requested: Vec<String>,
+    }
+
+    async fn run_for_transfer_counts(
+        dir: &Path,
+        articles: HashMap<String, Vec<u8>>,
+    ) -> (
+        Result<UsenetDownloadOutput, UsenetDownloadError>,
+        TransferCounts,
+    ) {
+        let (port, requested) = spawn_article_server(articles).await;
+        let task = DownloadTask {
+            dir: dir.to_string_lossy().into_owned(),
+            usenet: Some(UsenetTaskData {
+                files: vec![UsenetTaskFile {
+                    name: "data.bin".into(),
+                    subject: "data.bin".into(),
+                    groups: Vec::new(),
+                    segments: vec![
+                        UsenetTaskSegment {
+                            number: 1,
+                            bytes: 4,
+                            message_id: "half-1@t".into(),
+                        },
+                        UsenetTaskSegment {
+                            number: 2,
+                            bytes: 4,
+                            message_id: "half-2@t".into(),
+                        },
+                    ],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut options = Map::new();
+        options.insert(
+            "usenet-profiles".into(),
+            serde_json::to_value(vec![profile("primary", port, 0)]).unwrap(),
+        );
+        let completed = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(AtomicU64::new(0));
+        let result = timeout(
+            Duration::from_secs(20),
+            run_usenet_download_with_resolver_and_capacity(
+                &task,
+                &options,
+                completed.clone(),
+                Arc::new(AtomicU64::new(0)),
+                received.clone(),
+                CancellationToken::new(),
+                Arc::new(AnonymousCredentialResolver),
+                Arc::new(ProviderConnectionCapacityRegistry::default()),
+                Throttle::unlimited(),
+                None,
+            ),
+        )
+        .await
+        .expect("usenet run timed out");
+        let requested = requested.lock().unwrap().clone();
+        (
+            result,
+            TransferCounts {
+                completed: completed.load(Ordering::Relaxed),
+                received: received.load(Ordering::Relaxed),
+                requested,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn received_counts_fetched_article_bytes_and_not_restored_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"ABCDEFGH";
+        let first = yenc_article("data.bin", &data[..4], Some((1, 4, 8)));
+        let second = yenc_article("data.bin", &data[4..], Some((5, 8, 8)));
+        let wire_bytes = |article: &[u8]| (article.len() + b".\r\n".len()) as u64;
+
+        let (result, counts) = run_for_transfer_counts(
+            dir.path(),
+            HashMap::from([("half-1@t".to_string(), first.clone())]),
+        )
+        .await;
+        assert!(result.is_err(), "the second half is missing");
+        assert_eq!(counts.received, wire_bytes(&first));
+
+        let (result, counts) = run_for_transfer_counts(
+            dir.path(),
+            HashMap::from([
+                ("half-1@t".to_string(), first),
+                ("half-2@t".to_string(), second.clone()),
+            ]),
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(counts.requested, ["half-2@t"]);
+        assert_eq!(counts.completed, 8);
+        assert_eq!(counts.received, wire_bytes(&second));
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), data);
     }
 
     #[tokio::test]
@@ -3981,6 +4091,7 @@ mod tests {
                     run_usenet_download_with_resolver_and_capacity(
                         &task,
                         &options,
+                        Arc::new(AtomicU64::new(0)),
                         Arc::new(AtomicU64::new(0)),
                         Arc::new(AtomicU64::new(0)),
                         CancellationToken::new(),

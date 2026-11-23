@@ -507,7 +507,7 @@ export default {
 				return 0;
 			}
 			const normalized = Math.trunc(index);
-			return normalized > 0 ? normalized : 0;
+			return Math.max(normalized, 0);
 		},
 		normalizePreviewRange(range: PreviewIndexRange): PreviewIndexRange | null {
 			const totalCount = Number(this.previewTotalCount || 0);

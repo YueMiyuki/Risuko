@@ -18,9 +18,6 @@
         <ListTodo :size="22" />
         <span>{{ $t('app.nav-tasks') }}</span>
       </button>
-      <button class="android-fab" :aria-label="$t('app.add-task')" @click="showAddTask">
-        <Plus :size="24" />
-      </button>
       <button class="android-nav-item" :class="{ active: routePath.startsWith('/share') }" @click="nav('/share')">
         <Share2 :size="22" />
         <span>{{ $t('app.nav-share') }}</span>
@@ -28,6 +25,9 @@
       <button class="android-nav-item" :class="{ active: routePath.startsWith('/preference') }" @click="nav('/preference')">
         <Settings2 :size="22" />
         <span>{{ $t('app.nav-settings') }}</span>
+      </button>
+      <button class="android-fab" :aria-label="$t('app.add-task')" @click="showAddTask">
+        <Plus :size="24" />
       </button>
     </nav>
     <add-task-dialog :visible="addTaskVisible" :type="addTaskType" />

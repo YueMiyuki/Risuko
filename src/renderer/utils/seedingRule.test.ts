@@ -178,3 +178,18 @@ test("a global ratio seeds even with the switch off", () => {
 		{ kind: "ratio", ratio: 1, minutes: 0 },
 	);
 });
+
+test("minutes below half a minute read as no time limit, as the engine reads them", () => {
+	const state = seedingChoiceOf({ keepSeeding: "true", seedTime: "0.4" });
+	assert.equal(state.choice, "forever");
+	assert.equal(state.minutes, 0);
+	assert.equal(
+		seedingChoiceOf({ keepSeeding: "true", seedTime: "1.6" }).minutes,
+		2,
+	);
+	assert.deepEqual(globalSeedingSummary({ keepSeeding: true, seedTime: 0.4 }), {
+		kind: "forever",
+		ratio: 0,
+		minutes: 0,
+	});
+});

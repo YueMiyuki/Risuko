@@ -7,6 +7,8 @@ export default {
 	"cloud-sync-server-url-placeholder": "https://api.risuko.app",
 	"cloud-sync-server-url-description":
 		"Enter the URL of your self-hosted Risuko sync backend.",
+	"cloud-sync-server-url-unencrypted":
+		"This address is not encrypted, so your sign-in token is sent as plain text. Use https unless the server runs on this device.",
 	"server-connected": "Connected to sync server",
 	"server-unreachable": "Cannot reach sync server",
 	"cloud-sync-categories": "Sync Categories",

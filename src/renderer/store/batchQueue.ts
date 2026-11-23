@@ -52,6 +52,7 @@ export interface BatchQueueItem {
 	status: BatchItemStatus;
 	gid?: string;
 	error?: string;
+	refusal?: string;
 }
 
 const createFileBatchItem = (
@@ -129,7 +130,7 @@ export const createUriBatchItem = (
 		resolveState: isMagnet ? "idle" : "ready",
 		selectFile: SELECTED_ALL_FILES,
 		status: refused ? "failed" : "queued",
-		...(refused ? { error: mediaRefusal } : {}),
+		...(refused ? { error: mediaRefusal, refusal: mediaRefusal } : {}),
 		isMedia: media && !refused,
 		mediaInfoState: "idle",
 	};

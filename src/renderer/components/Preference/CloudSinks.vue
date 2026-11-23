@@ -987,16 +987,18 @@ function sameSinkServer(a: SinkConfig, b: SinkConfig): boolean {
 	return false;
 }
 
+const blank = (value?: string): boolean => !value?.trim();
+
 function secretMissing(config: SinkConfig): boolean {
 	switch (config.kind) {
 		case "webdav":
-			return !!config.username && !config.password;
+			return !blank(config.username) && blank(config.password);
 		case "s3":
-			return !config.secretAccessKey;
+			return blank(config.secretAccessKey);
 		case "sftp":
-			return !config.password && !config.privateKey;
+			return blank(config.password) && blank(config.privateKey);
 		case "ftp":
-			return !!config.username && !config.password;
+			return !blank(config.username) && blank(config.password);
 	}
 }
 
@@ -1165,28 +1167,23 @@ export default defineComponent({
 				f.webdav.endpoint = c.endpoint;
 				f.webdav.basePath = c.basePath ?? "";
 				f.webdav.username = c.username ?? "";
-				f.webdav.password = c.password ?? "";
 				f.webdav.insecure = !!c.insecure;
 			} else if (c.kind === "s3") {
 				f.s3.endpoint = c.endpoint;
 				f.s3.region = c.region;
 				f.s3.bucket = c.bucket;
 				f.s3.accessKeyId = c.accessKeyId;
-				f.s3.secretAccessKey = c.secretAccessKey ?? "";
 				f.s3.prefix = c.prefix ?? "";
 				f.s3.forcePathStyle = !!c.forcePathStyle;
 			} else if (c.kind === "sftp") {
 				f.sftp.host = c.host;
 				f.sftp.port = c.port || 22;
 				f.sftp.username = c.username;
-				f.sftp.password = c.password ?? "";
-				f.sftp.privateKey = c.privateKey ?? "";
 				f.sftp.basePath = c.basePath ?? "";
 			} else if (c.kind === "ftp") {
 				f.ftp.host = c.host;
 				f.ftp.port = c.port || 21;
 				f.ftp.username = c.username ?? "";
-				f.ftp.password = c.password ?? "";
 				f.ftp.basePath = c.basePath ?? "";
 				f.ftp.secure = !!c.secure;
 				f.ftp.insecure = !!c.insecure;
@@ -1436,9 +1433,22 @@ export default defineComponent({
 				.getSavedCredentials()
 				.find((c: SavedCredential) => c.id === record.id);
 			if (existing) {
+				const sameServer =
+					existing.host === mapped.host &&
+					existing.protocol === mapped.protocol;
 				const credential: SavedCredential = {
 					...existing,
 					...mapped,
+					...(sameServer
+						? {
+								ftpPasswd: mapped.ftpPasswd || existing.ftpPasswd,
+								sftpPrivateKey:
+									mapped.sftpPrivateKey || existing.sftpPrivateKey,
+								sftpPrivateKeyContent:
+									mapped.sftpPrivateKeyContent ||
+									existing.sftpPrivateKeyContent,
+							}
+						: {}),
 					createdAt: existing.createdAt,
 					lastUsedAt: existing.lastUsedAt,
 				};

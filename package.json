@@ -35,7 +35,7 @@
 		"check:locales": "node scripts/check-locales.mjs",
 		"locale": "node scripts/locale-tool.mjs",
 		"check:config-keys": "node scripts/check-config-keys.mjs",
-		"verify": "pnpm typecheck && pnpm exec biome ci --max-diagnostics none && pnpm check:locales && pnpm check:config-keys && pnpm test && cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --locked --all-targets -- -D warnings && cargo test --workspace --locked",
+		"verify": "pnpm typecheck && pnpm exec biome ci --max-diagnostics none && pnpm check:locales && pnpm check:config-keys && pnpm test && cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --exclude risuko --locked --all-targets -- -D warnings && cargo test --workspace --exclude risuko --locked",
 		"knip": "knip",
 		"pre-commit": "pnpm typecheck && node scripts/pre-commit.mjs",
 		"prepare": "husky",

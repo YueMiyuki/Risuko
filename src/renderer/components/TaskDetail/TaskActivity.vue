@@ -370,7 +370,7 @@ export default {
 		},
 	},
 	mounted() {
-		this.$nextTick(() => {
+		void this.$nextTick().then(() => {
 			this.updateGraphicWidth();
 		});
 	},

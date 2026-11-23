@@ -768,14 +768,9 @@ pub async fn add_uri(
             .unwrap_or_else(|| infer_out_from_uri_inner(uri));
 
         let kind = uri_kind(uri, &task_options);
-        let is_media =
-            engine::media::is_media_uri(uri) || engine::media::is_force_ytdlp(&task_options);
-        let is_m3u8 = engine::m3u8::is_m3u8_uri(uri);
-        let is_legacy_p2p = engine::adc::is_adc_uri(uri)
-            || engine::gnutella::is_gnutella_uri(uri)
-            || engine::g2::is_g2_uri(uri)
-            || engine::gift::is_gift_uri(uri);
-        if !is_m3u8 && !is_media && !is_legacy_p2p {
+        let names_its_own_output =
+            matches!(kind, UriKind::M3u8 | UriKind::Media | UriKind::LegacyP2p(_));
+        if !names_its_own_output {
             let temp_out = ensure_temp_download_suffix(&preferred_out);
             if !temp_out.is_empty() {
                 task_options.insert("out".to_string(), Value::String(temp_out));
@@ -851,9 +846,7 @@ pub async fn get_media_info(
     options: Option<Value>,
 ) -> Result<engine::media::MediaInfo, String> {
     if !media_downloads_supported() {
-        return Err(
-            "Media-site downloads need yt-dlp, which is not available on Android".to_string(),
-        );
+        return Err("task.media-unsupported-android".to_string());
     }
     let normalized = url.trim().to_string();
     if normalized.is_empty() {

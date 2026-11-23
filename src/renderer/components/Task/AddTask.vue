@@ -726,7 +726,7 @@ export default {
 			if (!hasSeededUri && !(this.uriDraft || "").trim()) {
 				void this.tryFillFromClipboard(generation);
 			}
-			this.$nextTick(() => {
+			void this.$nextTick().then(() => {
 				if (this.isUriCommitCurrent(generation)) {
 					this.focusUriInput();
 				}
@@ -805,7 +805,7 @@ export default {
 			this.uriDraft = "";
 		},
 		handleUriPaste() {
-			this.$nextTick(() => {
+			void this.$nextTick().then(() => {
 				void this.commitUriDraft();
 			});
 		},
@@ -1166,8 +1166,11 @@ export default {
 				return;
 			}
 
+			const refusedItems = items.filter((it) => it.refusal);
 			const { selectable, empty } = splitBySelection(
-				items.filter((it) => !(it.kind === "torrent" && !it.path)),
+				items.filter(
+					(it) => !it.refusal && !(it.kind === "torrent" && !it.path),
+				),
 				NONE_SELECTED_FILES,
 			);
 			const torrentItems = selectable.filter(
@@ -1189,8 +1192,14 @@ export default {
 			let failCount = 0;
 
 			for (const it of items) {
-				appStore.updateBatchItem(it.id, { status: "submitting", error: "" });
+				appStore.updateBatchItem(
+					it.id,
+					it.refusal
+						? { status: "failed", error: it.refusal }
+						: { status: "submitting", error: "" },
+				);
 			}
+			failCount += refusedItems.length;
 
 			if (invalidTorrentItems.length > 0) {
 				const invalidMsg = this.$t("task.new-task-torrent-required");

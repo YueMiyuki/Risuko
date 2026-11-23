@@ -3061,11 +3061,18 @@ impl TaskManager {
             {
                 return;
             }
+            let received = Arc::new(AtomicU64::new(0));
+            let speed_task = http::spawn_speed_tracker(
+                received.clone(),
+                counters.speed.clone(),
+                counters.cancel_token.clone(),
+            );
             let result = super::usenet_worker::run_usenet_download_with_resolver_and_capacity(
                 &task_snapshot,
                 &merged_options,
                 counters.completed.clone(),
                 counters.total.clone(),
+                received,
                 counters.cancel_token.clone(),
                 super::usenet_credential_resolver().await,
                 connection_capacity,
@@ -3094,6 +3101,8 @@ impl TaskManager {
                 })),
             )
             .await;
+            speed_task.abort();
+            counters.speed.store(0, Ordering::Relaxed);
             let repair_failure = result
                 .as_ref()
                 .err()
@@ -4752,12 +4761,19 @@ impl TaskManager {
             };
             let moved = tokio::task::spawn_blocking({
                 let (data, merged) = (data.clone(), merged.clone());
-                move || torrent::adopt_stripped_v2_layout(&data, &merged)
+                move || {
+                    let renamed = if seeds_in_place(&merged) {
+                        0
+                    } else {
+                        torrent::adopt_legacy_disk_names(&data, &merged)
+                    };
+                    renamed + torrent::adopt_stripped_v2_layout(&data, &merged)
+                }
             })
             .await
             .ok();
             if let Some(moved) = moved.filter(|moved| *moved > 0) {
-                tracing::info!("[task:{gid}] moved {moved} file(s) out of the v1.1.0 layout");
+                tracing::info!("[task:{gid}] moved {moved} file(s) out of an earlier layout");
             }
             let verified_files = if moved == Some(0) {
                 verified_files

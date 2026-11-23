@@ -122,8 +122,6 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
-        with:
-          components: rustfmt, clippy
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32

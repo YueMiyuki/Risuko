@@ -43,6 +43,8 @@ pub enum CreateError {
     BadPieceLength,
     #[error("{pieces} pieces would be needed, more than the {limit} a torrent may have; choose a larger piece size")]
     TooManyPieces { pieces: u64, limit: u64 },
+    #[error("{files} files each need a piece of their own in a v2 or hybrid torrent, more than the {limit} pieces a torrent may have; add fewer files or create a v1 torrent")]
+    TooManyFiles { files: u64, limit: u64 },
     #[error("{} changed while it was being hashed", .0.display())]
     Changed(PathBuf),
     #[error("cancelled")]
@@ -129,12 +131,20 @@ fn check_piece_count(
     file_lengths: impl Iterator<Item = u64>,
 ) -> Result<(), CreateError> {
     let piece = piece_length as u64;
-    let (total, aligned) = file_lengths.fold((0u64, 0u64), |(total, aligned), length| {
-        (
-            total.saturating_add(length),
-            aligned.saturating_add(length.div_ceil(piece)),
-        )
-    });
+    let (total, aligned, files) =
+        file_lengths.fold((0u64, 0u64, 0u64), |(total, aligned, files), length| {
+            (
+                total.saturating_add(length),
+                aligned.saturating_add(length.div_ceil(piece)),
+                files + u64::from(length > 0),
+            )
+        });
+    if version.has_v2() && files > MAX_PIECES {
+        return Err(CreateError::TooManyFiles {
+            files,
+            limit: MAX_PIECES,
+        });
+    }
     let by_total = total.div_ceil(piece);
     let pieces = match version {
         MetaVersion::V1 => by_total,
@@ -191,7 +201,6 @@ pub fn plan(root: &Path, opts: &CreateOptions) -> Result<Plan, CreateError> {
         Some(_) => return Err(CreateError::BadPieceLength),
         None => auto_piece_length(total_length),
     };
-    check_piece_count(opts.version, piece_length, files.iter().map(|f| f.length))?;
     Ok(Plan {
         root,
         name,
@@ -253,6 +262,7 @@ impl Plan {
             piece_length,
             total_length,
         } = self;
+        check_piece_count(opts.version, piece_length, files.iter().map(|f| f.length))?;
         let has_v1 = opts.version.has_v1();
         let has_v2 = opts.version.has_v2();
         let pad_files = opts.version == MetaVersion::Hybrid;
@@ -1349,15 +1359,50 @@ mod tests {
                 limit: MAX_PIECES
             })
         ));
-        let many = || std::iter::repeat_n(1u64, 4_194_305);
-        assert!(matches!(
-            check_piece_count(MetaVersion::V2, MIN_PIECE_LENGTH, many()),
-            Err(CreateError::TooManyPieces { .. })
-        ));
-        assert!(matches!(
-            check_piece_count(MetaVersion::Hybrid, MIN_PIECE_LENGTH, many()),
-            Err(CreateError::TooManyPieces { .. })
-        ));
+        let two_pieces_each = || std::iter::repeat_n(MIN_PIECE_LENGTH as u64 + 1, 2_097_153);
+        for version in [MetaVersion::V2, MetaVersion::Hybrid] {
+            assert!(matches!(
+                check_piece_count(version, MIN_PIECE_LENGTH, two_pieces_each()),
+                Err(CreateError::TooManyPieces {
+                    pieces: 4_194_306,
+                    limit: MAX_PIECES
+                })
+            ));
+            assert!(check_piece_count(version, 2 * MIN_PIECE_LENGTH, two_pieces_each()).is_ok());
+        }
+    }
+
+    #[test]
+    fn more_files_than_pieces_is_refused_whatever_the_piece_size() {
+        let many = || std::iter::repeat_n(1u64, 4_194_305).chain([0, 0]);
+        for version in [MetaVersion::V2, MetaVersion::Hybrid] {
+            for piece_length in [MIN_PIECE_LENGTH, MAX_PIECE_LENGTH] {
+                let refused = check_piece_count(version, piece_length, many());
+                assert!(
+                    matches!(
+                        refused,
+                        Err(CreateError::TooManyFiles {
+                            files: 4_194_305,
+                            limit: MAX_PIECES
+                        })
+                    ),
+                    "{version:?} {piece_length}"
+                );
+                assert!(!refused.unwrap_err().to_string().contains("piece size"));
+            }
+        }
         assert!(check_piece_count(MetaVersion::V1, MIN_PIECE_LENGTH, many()).is_ok());
+    }
+
+    #[test]
+    fn the_piece_count_is_checked_for_the_version_being_created_not_when_planning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("one.bin");
+        std::fs::write(&root, b"x").unwrap();
+        let mut planned = plan(&root, &CreateOptions::default()).unwrap();
+        planned.piece_length = MIN_PIECE_LENGTH;
+        planned.files[0].length = 64 * 1024 * 1024 * 1024 + 1;
+        let made = planned.create(&opts(MetaVersion::V1), |_, _| {}, &AtomicBool::new(false));
+        assert!(matches!(made, Err(CreateError::TooManyPieces { .. })));
     }
 }
