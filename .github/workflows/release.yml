@@ -29,7 +29,7 @@ jobs:
       android_abis: ${{ steps.targets.outputs.android_abis }}
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload release metadata
         if: github.event_name == 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: release-meta
           path: release-meta.json
@@ -101,17 +101,17 @@ jobs:
       SCCACHE_ENABLED: ${{ secrets.R2_CACHE_ACCESS_KEY_ID != '' }}
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24
           cache: pnpm
@@ -120,16 +120,16 @@ jobs:
         run: node scripts/set-version.mjs "${{ needs.meta.outputs.version }}"
 
       - name: Setup Java
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880
         with:
           distribution: temurin
           java-version: 17
 
       - name: Cache Gradle dependencies
-        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
         with:
           packages: platform-tools
 
@@ -149,7 +149,7 @@ jobs:
           targets: ${{ needs.meta.outputs.android_rust_targets }}
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266
         with:
           workspaces: "src-tauri -> target"
           key: android
@@ -239,7 +239,7 @@ jobs:
 
       - name: Upload Android APKs to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           files: dist/android/*.apk
@@ -248,7 +248,7 @@ jobs:
 
       - name: Upload Android APK artifacts (manual builds)
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: app-android
           path: dist/android/*.apk
@@ -265,17 +265,17 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24
           cache: pnpm
@@ -296,7 +296,7 @@ jobs:
           arch: ${{ matrix.target == 'i686-pc-windows-msvc' && 'x86' || 'amd64' }}
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266
         with:
           workspaces: "src-tauri -> target"
           key: ${{ matrix.target }}
@@ -361,7 +361,7 @@ jobs:
 
       - name: Build release artifacts (tag)
         if: github.event_name == 'release'
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: --target ${{ matrix.target }} ${{ matrix.tauri_args }}
           includeUpdaterJson: false
@@ -440,14 +440,14 @@ jobs:
 
       - name: Upload updater fragment
         if: github.event_name == 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: updater-fragment-${{ matrix.target }}
           path: fragments/*.json
 
       - name: Upload standardized app bundle to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           files: |
@@ -460,7 +460,7 @@ jobs:
 
       - name: Upload Linux packages for the APT/RPM repos
         if: runner.os == 'Linux' && github.event_name == 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: linux-packages-${{ matrix.target }}
           path: ${{ env.LINUX_PACKAGE_ASSETS }}
@@ -468,7 +468,7 @@ jobs:
 
       - name: Upload standardized app bundle artifact (manual builds)
         if: github.event_name != 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: app-${{ env.APP_PLATFORM_LABEL }}
           path: |
@@ -495,7 +495,7 @@ jobs:
 
       - name: Upload Windows portable exe to GitHub Release
         if: runner.os == 'Windows' && github.event_name == 'release'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           files: |
@@ -507,7 +507,7 @@ jobs:
 
       - name: Upload Windows portable exe artifact (manual builds)
         if: runner.os == 'Windows' && github.event_name != 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: app-portable-${{ env.APP_PLATFORM_LABEL }}
           path: |
@@ -580,7 +580,7 @@ jobs:
 
       - name: Upload risuko-cli packages for the APT/RPM repos
         if: runner.os == 'Linux' && github.event_name == 'release'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: linux-packages-cli-${{ matrix.target }}
           path: cli-packages/
@@ -598,7 +598,7 @@ jobs:
 
       - name: Upload risuko-cli to GitHub Release
         if: github.event_name == 'release' && matrix.target != 'i686-pc-windows-msvc'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           files: ${{ env.CLI_ASSET }}
@@ -607,7 +607,7 @@ jobs:
 
       - name: Upload risuko-cli artifact (manual builds)
         if: github.event_name != 'release' && matrix.target != 'i686-pc-windows-msvc'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: risuko-cli-${{ matrix.target }}
           path: ${{ env.CLI_ASSET }}
@@ -642,17 +642,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24
 
       - name: Download updater fragments
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           path: fragments
           pattern: updater-fragment-*
@@ -762,7 +762,7 @@ jobs:
 
       - name: Check out release branch
         if: steps.branch.outputs.name != ''
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ steps.branch.outputs.name }}
 
