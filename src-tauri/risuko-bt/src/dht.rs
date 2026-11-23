@@ -6032,7 +6032,8 @@ mod tests {
         let path = dir.path().join("dht-routing.state");
         let external = ExternalIp::new();
         let dht = direct_dht(&path, &external).await;
-        let nodes: Vec<(Id20, SocketAddr)> = (1..=3u8)
+        // K nodes keep the lookup that follows regeneration off the public routers
+        let nodes: Vec<(Id20, SocketAddr)> = (1..=K as u8)
             .map(|index| {
                 (
                     Id20([index; 20]),

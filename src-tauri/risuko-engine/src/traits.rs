@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 const ATOMIC_TEMP_PREFIX: &str = ".risuko-atomic-";
 const ATOMIC_TEMP_SUFFIX: &str = ".tmp";
 const STALE_ATOMIC_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const PERSIST_RETRY_LIMIT: u32 = 10;
+const PERSIST_RETRY_LIMIT: u32 = 5;
 
 pub(crate) fn process_may_be_running(pid: u32) -> bool {
     #[cfg(unix)]
@@ -174,7 +174,7 @@ pub fn write_file_atomically_with(
             {
                 temp = error.file;
                 attempt += 1;
-                std::thread::sleep(Duration::from_millis(u64::from(attempt) * 20));
+                std::thread::sleep(Duration::from_millis(u64::from(attempt) * 10));
             }
             Err(error) => {
                 return Err(format!(

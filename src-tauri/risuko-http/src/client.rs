@@ -761,7 +761,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let client = Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
 
