@@ -157,9 +157,17 @@ fn has_parent_step(path: &str) -> bool {
     })
 }
 
+// Win32 drops trailing dots and spaces from the last name of a path only
+fn has_trimmed_name(path: &Path) -> bool {
+    path.components().any(|part| match part {
+        Component::Normal(name) => name.to_string_lossy().ends_with(['.', ' ']),
+        _ => false,
+    })
+}
+
 fn dir_is_inside(dir: &str, roots: &[PathBuf]) -> bool {
     let path = Path::new(dir);
-    if !path.is_absolute() || has_parent_step(dir) {
+    if !path.is_absolute() || has_parent_step(dir) || (cfg!(windows) && has_trimmed_name(path)) {
         return false;
     }
     let Some((existing, resolved)) = resolve(path) else {
@@ -295,6 +303,16 @@ mod tests {
         let roots = vec![root.clone()];
         assert!(check_save_dir(&format!("{} ", text(&root)), &roots).is_err());
         assert!(check_save_dir(&format!("{} /x", text(&root)), &roots).is_err());
+    }
+
+    #[test]
+    fn names_ending_in_a_dot_or_space_are_spotted() {
+        for path in ["/dl /x", "/dl.", "/dl/sub ", "/dl../x", "/dl/new./x"] {
+            assert!(has_trimmed_name(Path::new(path)), "{path:?}");
+        }
+        for path in ["/dl/x", "/dl/.hidden", "/dl/a. b/x", "/dl/./x", "/"] {
+            assert!(!has_trimmed_name(Path::new(path)), "{path:?}");
+        }
     }
 
     #[test]
@@ -467,35 +485,29 @@ mod tests {
 
     #[test]
     fn category_and_routing_folders_count_as_roots() {
+        let data = if cfg!(windows) { "C:\\data" } else { "/data" };
+        let dir = |name: &str| text(&Path::new(data).join(name));
         let options = options(json!({
-            "dir": "/data/dl",
+            "dir": dir("dl"),
             "file-category-dirs": {
-                "video": " /data/video ",
+                "video": format!(" {} ", dir("video")),
                 "music": "",
                 "image": "relative/images"
             },
             "task-routing-rules": [
-                {"id": "a", "label": "ISO", "pattern": "*.iso", "dir": "/data/iso"},
-                {"id": "b", "label": "Off", "pattern": "*.x", "dir": "/data/off", "enabled": false},
+                {"id": "a", "label": "ISO", "pattern": "*.iso", "dir": dir("iso")},
+                {"id": "b", "label": "Off", "pattern": "*.x", "dir": dir("off"), "enabled": false},
                 {"id": "c", "label": "Empty", "pattern": "*.y", "dir": ""}
             ]
         }));
         let mut base = download_roots(&options);
         base.sort();
-        assert_eq!(
-            base,
-            vec![PathBuf::from("/data/dl"), PathBuf::from("/data/video")]
-        );
+        assert_eq!(base, ["dl", "video"].map(|name| PathBuf::from(dir(name))));
         let mut all = allowed_roots(&options);
         all.sort();
         assert_eq!(
             all,
-            vec![
-                PathBuf::from("/data/dl"),
-                PathBuf::from("/data/iso"),
-                PathBuf::from("/data/off"),
-                PathBuf::from("/data/video"),
-            ]
+            ["dl", "iso", "off", "video"].map(|name| PathBuf::from(dir(name)))
         );
     }
 

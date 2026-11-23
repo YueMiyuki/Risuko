@@ -145,6 +145,7 @@ jobs:
       - name: Setup Rust Android targets
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
+          toolchain: nightly-2026-10-22
           targets: ${{ needs.meta.outputs.android_rust_targets }}
 
       - name: Cache cargo registry
@@ -285,6 +286,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
+          toolchain: nightly-2026-10-22
           targets: ${{ matrix.target }}
 
       - name: MSVC environment

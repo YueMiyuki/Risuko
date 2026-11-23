@@ -1445,7 +1445,13 @@ mod tests {
 
     #[test]
     fn file_stamps_round_trip_to_the_nanosecond() {
-        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_794_000_000, 123_456_789);
+        // SystemTime on Windows counts in 100 ns steps
+        let nanos = if cfg!(windows) {
+            123_456_700
+        } else {
+            123_456_789
+        };
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_794_000_000, nanos);
         let stamps = vec![bt_stamp(&["pack", "a.bin"], modified)];
         let stored = TaskFileStamp::from_stamps(&stamps);
         assert_eq!(
@@ -1454,7 +1460,7 @@ mod tests {
                 path: vec!["pack".into(), "a.bin".into()],
                 length: 4096,
                 modified_secs: 1_794_000_000,
-                modified_nanos: 123_456_789,
+                modified_nanos: nanos,
             }]
         );
         let task = DownloadTask {

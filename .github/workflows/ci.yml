@@ -70,6 +70,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
+          toolchain: nightly-2026-10-22
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
@@ -105,15 +106,10 @@ jobs:
     name: Rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            experimental: false
-          - os: windows-latest
-            experimental: true
+        os: [macos-latest, windows-latest]
     steps:
       - name: Check out Git repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -122,6 +118,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: nightly-2026-10-22
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32

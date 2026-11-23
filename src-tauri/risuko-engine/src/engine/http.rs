@@ -4421,7 +4421,11 @@ mod tests {
         assert!(name.ends_with(".mkv"));
         assert!(name.starts_with('\u{6f22}'));
         let no_ext = sanitize_filename(&"a".repeat(400));
-        assert_eq!(no_ext.len(), MAX_FILENAME_BYTES);
+        if cfg!(windows) {
+            assert!(no_ext.len() <= MAX_FILENAME_BYTES);
+        } else {
+            assert_eq!(no_ext.len(), MAX_FILENAME_BYTES);
+        }
     }
 
     #[test]

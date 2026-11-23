@@ -9792,6 +9792,10 @@ mod tests {
         task
     }
 
+    fn part_in_dl(name: &str) -> Value {
+        Value::String(Path::new("/dl").join(name).to_string_lossy().into_owned())
+    }
+
     #[tokio::test]
     async fn only_other_unfinished_downloads_of_another_file_reserve_their_part() {
         let with_progress = |gid: &str, status, uri: &str| {
@@ -9823,7 +9827,7 @@ mod tests {
         ]);
 
         let reserved = reserved_part_paths(&mgr.tasks, "me", Some(mine)).await;
-        assert_eq!(reserved, vec![Value::String("/dl/f.bin.part".into()); 2]);
+        assert_eq!(reserved, vec![part_in_dl("f.bin.part"); 2]);
         mgr.tasks
             .write()
             .await
@@ -9897,11 +9901,7 @@ mod tests {
         let reserved = reserved_part_paths(&mgr.tasks, "me", Some(mine)).await;
         assert_eq!(
             reserved,
-            vec![
-                Value::String("/dl/x.iso.part".into()),
-                partial(gnutella),
-                partial(g2),
-            ]
+            vec![part_in_dl("x.iso.part"), partial(gnutella), partial(g2)]
         );
     }
 
@@ -10007,8 +10007,8 @@ mod tests {
         assert_eq!(
             reserved,
             vec![
-                Value::String("/dl/My File.iso.part".into()),
-                Value::String("/dl/My File.1.iso.part".into()),
+                part_in_dl("My File.iso.part"),
+                part_in_dl("My File.1.iso.part"),
             ]
         );
         assert!(
