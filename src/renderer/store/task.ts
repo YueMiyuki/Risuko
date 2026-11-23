@@ -488,6 +488,7 @@ export const useTaskStore = defineStore("task", {
 					const lightData = (await api.fetchTaskList({
 						type: fetchType,
 						keys: TASK_LIST_LIGHT_KEYS,
+						activeKeys: TASK_LIST_KEYS,
 					})) as DownloadTask[];
 					if (isStale()) {
 						return [];
@@ -856,6 +857,7 @@ export const useTaskStore = defineStore("task", {
 			return this.pauseTask({ gid, status: "active" }).then(() => {
 				const options = {
 					seedTime: 0,
+					seedRatio: 0,
 				};
 				return this.changeTaskOption({ gid, options });
 			});

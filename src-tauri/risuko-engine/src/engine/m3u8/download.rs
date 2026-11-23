@@ -34,9 +34,10 @@ pub async fn run_m3u8_download(
     let dir_path = Path::new(dir);
     std::fs::create_dir_all(dir_path).map_err(|e| format!("Failed to create dir: {e}"))?;
 
-    let mut client = build_client(options, Some(uri))?;
+    let headers = RequestHeaders::new(options, uri);
+    let client = build_client(options)?;
 
-    let playlist = parser::fetch_and_parse_playlist(uri, &client).await?;
+    let playlist = parser::fetch_and_parse_playlist(uri, &client, &headers).await?;
 
     let (media_playlist_url, media_playlist) = match playlist {
         ParsedPlaylist::Master { variants } => {
@@ -54,12 +55,7 @@ pub async fn run_m3u8_download(
                 variant.bandwidth,
                 crate::engine::util::redact_url(&variant.url)
             );
-            let media = if same_host(uri, &variant.url) {
-                parser::fetch_and_parse_playlist(&variant.url, &client).await?
-            } else {
-                let plain = build_client(options, None)?;
-                parser::fetch_and_parse_playlist(&variant.url, &plain).await?
-            };
+            let media = parser::fetch_and_parse_playlist(&variant.url, &client, &headers).await?;
             (variant.url.clone(), media)
         }
         media @ ParsedPlaylist::Media { .. } => (uri.to_string(), media),
@@ -83,10 +79,6 @@ pub async fn run_m3u8_download(
     }
 
     check_cancelled(&cancel_token)?;
-
-    if leaves_host(uri, &media_playlist_url, &segments) {
-        client = build_client(options, None)?;
-    }
 
     let total_segments = segments.len();
     tracing::info!(
@@ -132,6 +124,7 @@ pub async fn run_m3u8_download(
         media_sequence,
         &temp_dir,
         &client,
+        &headers,
         total.clone(),
         completed.clone(),
         connections.clone(),
@@ -244,32 +237,35 @@ fn select_variant<'a>(variants: &'a [Variant], options: &Map<String, Value>) -> 
         .unwrap_or(&variants[0])
 }
 
-fn client_headers(
-    options: &Map<String, Value>,
-    netrc_uri: Option<&str>,
-) -> risuko_http::header::HeaderMap {
-    let mut headers = http::build_headers(options);
-    if let Some(scope) = options
-        .get(http::COOKIE_HOST_OPTION)
-        .and_then(Value::as_str)
-    {
-        let in_scope = netrc_uri
-            .and_then(crate::engine::cookie_store::host_of)
-            .is_some_and(|host| crate::engine::cookie_store::host_matches(&host, scope));
-        if !in_scope {
-            headers.remove(risuko_http::header::COOKIE);
+#[derive(Clone)]
+pub(super) struct RequestHeaders {
+    base: risuko_http::header::HeaderMap,
+    primary: String,
+    options: Map<String, Value>,
+}
+
+impl RequestHeaders {
+    pub(super) fn new(options: &Map<String, Value>, primary: &str) -> Self {
+        Self {
+            base: http::build_headers(options),
+            primary: primary.to_string(),
+            options: options.clone(),
         }
     }
-    if let Some(uri) = netrc_uri {
-        http::apply_netrc_auth(&mut headers, uri, options);
+
+    pub(super) fn for_url(&self, url: &str) -> risuko_http::header::HeaderMap {
+        http::headers_for_uri(&self.base, url, &self.primary, &self.options)
     }
+}
+
+fn client_headers(options: &Map<String, Value>) -> risuko_http::header::HeaderMap {
+    let mut headers = http::build_headers(options);
+    headers.remove(risuko_http::header::AUTHORIZATION);
+    headers.remove(risuko_http::header::COOKIE);
     headers
 }
 
-fn build_client(
-    options: &Map<String, Value>,
-    netrc_uri: Option<&str>,
-) -> Result<risuko_http::Client, String> {
+fn build_client(options: &Map<String, Value>) -> Result<risuko_http::Client, String> {
     let connect_timeout = options
         .get("connect-timeout")
         .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
@@ -281,7 +277,7 @@ fn build_client(
         .tcp_nodelay(true)
         .tcp_keepalive(std::time::Duration::from_secs(60));
 
-    let headers = client_headers(options, netrc_uri);
+    let headers = client_headers(options);
     if !headers.contains_key(risuko_http::header::USER_AGENT) {
         builder = builder.user_agent("Mozilla/5.0");
     }
@@ -317,27 +313,6 @@ fn build_client(
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
-}
-
-fn host_of(url: &str) -> Option<String> {
-    risuko_http::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-}
-
-fn same_host(a: &str, b: &str) -> bool {
-    host_of(a) == host_of(b)
-}
-
-fn leaves_host(uri: &str, media_playlist_url: &str, segments: &[parser::Segment]) -> bool {
-    !same_host(uri, media_playlist_url)
-        || segments.iter().any(|segment| {
-            !same_host(uri, &segment.url)
-                || segment
-                    .encryption
-                    .as_ref()
-                    .is_some_and(|enc| !same_host(uri, &enc.key_uri))
-        })
 }
 
 fn infer_filename_from_uri(uri: &str) -> String {
@@ -593,6 +568,8 @@ async fn reserve_unique_output_path(dir: &Path, filename: &str) -> Result<PathBu
 mod tests {
     use super::*;
 
+    const PRIMARY: &str = "https://site.example/a.m3u8";
+
     #[test]
     fn headers_come_from_task_options() {
         let mut options = Map::new();
@@ -602,11 +579,15 @@ mod tests {
         );
         options.insert("referer".into(), "https://site.example/".into());
         options.insert("cookie".into(), "a=b".into());
-        let headers = http::build_headers(&options);
+        let headers = RequestHeaders::new(&options, PRIMARY).for_url(PRIMARY);
         assert_eq!(headers["authorization"], "Bearer t");
         assert_eq!(headers["referer"], "https://site.example/");
         assert_eq!(headers["cookie"], "a=b");
-        assert!(build_client(&options, Some("https://site.example/a.m3u8")).is_ok());
+        let defaults = client_headers(&options);
+        assert!(!defaults.contains_key(risuko_http::header::AUTHORIZATION));
+        assert!(!defaults.contains_key(risuko_http::header::COOKIE));
+        assert_eq!(defaults["referer"], "https://site.example/");
+        assert!(build_client(&options).is_ok());
     }
 
     fn cookie_options(scope: Option<&str>) -> Map<String, Value> {
@@ -618,36 +599,88 @@ mod tests {
         options
     }
 
+    fn cookie_for(options: &Map<String, Value>, url: &str) -> Option<String> {
+        RequestHeaders::new(options, PRIMARY)
+            .for_url(url)
+            .get(risuko_http::header::COOKIE)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
     #[test]
     fn unscoped_cookie_goes_to_every_host() {
         let options = cookie_options(None);
-        for uri in [Some("https://site.example/a.m3u8"), None] {
-            let headers = client_headers(&options, uri);
-            assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
+        for url in [PRIMARY, "https://cdn.other.example/1.ts"] {
+            assert_eq!(
+                cookie_for(&options, url).as_deref(),
+                Some("sid=abc"),
+                "{url}"
+            );
         }
     }
 
     #[test]
     fn scoped_cookie_goes_only_to_its_host() {
         let options = cookie_options(Some("site.example"));
-        let headers = client_headers(&options, Some("https://site.example/a.m3u8"));
-        assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
-        assert!(!client_headers(&options, None).contains_key(risuko_http::header::COOKIE));
-        assert!(
-            !client_headers(&options, Some("https://cdn.other.example/a.m3u8"))
-                .contains_key(risuko_http::header::COOKIE)
+        assert_eq!(cookie_for(&options, PRIMARY).as_deref(), Some("sid=abc"));
+        assert_eq!(
+            cookie_for(&options, "https://cdn.other.example/a.m3u8"),
+            None
         );
     }
 
     #[test]
     fn scoped_cookie_reaches_subdomains_of_its_host() {
         let options = cookie_options(Some("site.example"));
-        let headers = client_headers(&options, Some("https://video.site.example/a.m3u8"));
-        assert_eq!(headers[risuko_http::header::COOKIE], "sid=abc");
-        assert!(
-            !client_headers(&options, Some("https://notsite.example/a.m3u8"))
-                .contains_key(risuko_http::header::COOKIE)
+        assert_eq!(
+            cookie_for(&options, "https://video.site.example/a.m3u8").as_deref(),
+            Some("sid=abc")
         );
+        assert_eq!(cookie_for(&options, "https://notsite.example/a.m3u8"), None);
+    }
+
+    #[test]
+    fn credentials_follow_the_request_host() {
+        let same_host = "https://site.example/seg1.ts";
+        let other_host = "https://cdn.other.example/seg1.ts";
+        let plain_same_host = "http://site.example/seg1.ts";
+
+        let mut options = Map::new();
+        options.insert(
+            "header".into(),
+            serde_json::json!(["Authorization: Bearer t"]),
+        );
+        options.insert("no-netrc".into(), Value::Bool(true));
+        let headers = RequestHeaders::new(&options, PRIMARY);
+        let authorization = |url: &str| {
+            headers
+                .for_url(url)
+                .get(risuko_http::header::AUTHORIZATION)
+                .map(|value| value.to_str().unwrap().to_string())
+        };
+        assert_eq!(authorization(PRIMARY).as_deref(), Some("Bearer t"));
+        assert_eq!(authorization(same_host).as_deref(), Some("Bearer t"));
+        assert_eq!(authorization(other_host), None);
+
+        let mut options = cookie_options(Some("site.example"));
+        assert_eq!(cookie_for(&options, same_host).as_deref(), Some("sid=abc"));
+        assert_eq!(cookie_for(&options, "https://cdn.other.example/key"), None);
+        options.insert(http::COOKIE_HTTP_OPTION.into(), "plain=1".into());
+        assert_eq!(cookie_for(&options, same_host).as_deref(), Some("sid=abc"));
+        assert_eq!(
+            cookie_for(&options, plain_same_host).as_deref(),
+            Some("plain=1")
+        );
+        options.insert(http::COOKIE_HTTP_OPTION.into(), "".into());
+        assert_eq!(cookie_for(&options, plain_same_host), None);
+
+        let options = cookie_options(None);
+        for url in [same_host, other_host, plain_same_host] {
+            assert_eq!(
+                cookie_for(&options, url).as_deref(),
+                Some("sid=abc"),
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -657,26 +690,15 @@ mod tests {
         std::fs::write(&netrc, "machine site.example login u password p\n").unwrap();
         let mut options = Map::new();
         options.insert("netrc-path".into(), netrc.to_string_lossy().into());
-        let mut headers = http::build_headers(&options);
-        http::apply_netrc_auth(&mut headers, "https://site.example/a.m3u8", &options);
-        assert!(headers.contains_key(risuko_http::header::AUTHORIZATION));
-
-        let segment = |url: &str| parser::Segment {
-            url: url.to_string(),
-            byte_range: None,
-            encryption: None,
+        let headers = RequestHeaders::new(&options, PRIMARY);
+        let has_auth = |url: &str| {
+            headers
+                .for_url(url)
+                .contains_key(risuko_http::header::AUTHORIZATION)
         };
-        let uri = "https://site.example/a.m3u8";
-        assert!(!leaves_host(
-            uri,
-            uri,
-            &[segment("https://site.example/1.ts")]
-        ));
-        assert!(leaves_host(
-            uri,
-            uri,
-            &[segment("https://cdn.example/1.ts")]
-        ));
+        assert!(has_auth(PRIMARY));
+        assert!(has_auth("https://site.example/1.ts"));
+        assert!(!has_auth("https://cdn.example/1.ts"));
     }
 
     #[test]

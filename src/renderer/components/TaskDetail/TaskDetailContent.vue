@@ -219,7 +219,7 @@ export default {
 					this.startPeersPolling();
 					break;
 				case "files":
-					this.$nextTick(() => {
+					void this.$nextTick().then(() => {
 						this.updateFilesListSelection();
 					});
 					break;

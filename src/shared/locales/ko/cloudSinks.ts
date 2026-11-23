@@ -73,6 +73,8 @@ export default {
 	errSftpUsernameRequired: "SFTP 사용자 이름을 입력해야 합니다.",
 	errSftpAuthRequired: "SFTP 비밀번호 또는 개인 키가 필요합니다.",
 	errFtpHostRequired: "FTP 호스트를 입력해야 합니다.",
+	errSecretForNewServer:
+		"서버가 변경되어 저장된 비밀번호 또는 키를 다시 사용하지 않습니다. 다시 입력하세요.",
 	errMoveTargetRequired:
 		"업로드 후 동작이 이동일 때는 이동할 폴더를 입력해야 합니다.",
 	saving: "저장 중…",

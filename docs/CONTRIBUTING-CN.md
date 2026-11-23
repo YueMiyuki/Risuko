@@ -19,7 +19,6 @@ Risuko 使用 [i18next](https://www.i18next.com/overview/getting-started) 作为
 - index.ts
 - menu.ts
 - preferences.ts
-- rss.ts
 - share.ts
 - subnav.ts
 - sync.ts

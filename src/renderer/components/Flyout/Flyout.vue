@@ -289,7 +289,7 @@ export default {
 			}
 			event.preventDefault();
 			this.selectTab(keys[next]);
-			this.$nextTick(() => {
+			void this.$nextTick().then(() => {
 				const buttons = this.$refs.tabButtons as
 					| HTMLButtonElement[]
 					| undefined;
@@ -300,7 +300,7 @@ export default {
 			this.addOpen = !this.addOpen;
 			this.addError = "";
 			if (this.addOpen) {
-				this.$nextTick(() => {
+				void this.$nextTick().then(() => {
 					(this.$refs.addInput as HTMLInputElement | undefined)?.focus();
 				});
 			}

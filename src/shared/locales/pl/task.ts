@@ -330,6 +330,8 @@ export default {
 	"media-format-auto": "Najlepszy dostępny (auto)",
 	"media-format-hint": "Wczytaj formaty, aby wybrać konkretną jakość.",
 	"media-format-error": "Nie udało się wczytać formatów dla tego URL.",
+	"media-unsupported-android":
+		"Pobieranie z serwisów multimedialnych wymaga yt-dlp, który nie jest dostępny w systemie Android",
 	"download-complete-message": "Ukończono pobieranie {{taskName}}",
 	"download-complete-notify": "Pobieranie ukończone",
 	"bt-download-complete-message":
@@ -377,6 +379,16 @@ export default {
 	"mirror-placeholder": "URL serwera lustrzanego (ten sam plik, inny serwer)",
 	"mirror-hint":
 		"Dodaj adresy URL serwerów lustrzanych wskazujące ten sam plik, aby pobierać z wielu źródeł równolegle.",
+	"mirror-sources": "Źródła: {{count}}",
+	"mirror-failing": "Zawodzi",
+	"mirror-idle": "Nieużywany",
+	"add-tab-links": "Linki",
+	"add-tab-mirrors": "Lustra",
+	"mirror-list-placeholder":
+		"Adresy URL serwerów lustrzanych jednego pliku, po jednym w wierszu",
+	"mirror-list-hint":
+		"Każdy link musi wskazywać ten sam plik. Jego części są pobierane ze wszystkich serwerów lustrzanych naraz, a serwer, który zawodzi lub zwalnia, przekazuje swoje części pozostałym.",
+	"mirror-list-rejected": "To nie jest zwykły link http(s) do pliku:",
 	"detail-tab-general": "Ogólne",
 	"detail-tab-activity": "Aktywność",
 	"detail-tab-trackers": "Trackery",
@@ -407,6 +419,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 lub puste = bez limitu (np. 500K)",
 	"edit-primary-uri": "URL pobierania",
 	"edit-primary-uri-placeholder": "Główny URL pobierania",
+	"edit-tab-seeding": "Seedowanie",
+	"seeding-rule-global": "Użyj ustawienia globalnego",
+	"seeding-rule-forever": "Seeduj, aż go zatrzymam",
+	"seeding-rule-limits": "Zatrzymaj przy stosunku lub po czasie",
+	"seeding-rule-none": "Nie seeduj",
+	"seeding-global-off": "Obecnie: bez seedowania",
+	"seeding-global-forever": "Obecnie: seedowanie do zatrzymania",
+	"seeding-global-ratio": "Obecnie: zatrzymanie przy stosunku {{ratio}}",
+	"seeding-global-minutes": "Obecnie: zatrzymanie po {{minutes}} min",
+	"seeding-global-both":
+		"Obecnie: zatrzymanie przy stosunku {{ratio}} lub po {{minutes}} min",
+	"seeding-limits-hint":
+		"Seedowanie zatrzymuje się przy limicie osiągniętym jako pierwszy. 0 oznacza brak limitu tego rodzaju.",
+	"seeding-limits-required": "Wpisz stosunek lub liczbę minut większą niż 0",
+	"seeding-for": "Czas seedowania",
+	"seeding-applies-after-download":
+		"Zacznie to obowiązywać po zakończeniu pobierania.",
+	"seeding-stops-now": "To zadanie przestanie seedować po zapisaniu.",
+	"seeding-limit-reached":
+		"To zadanie osiągnęło już ten limit i przestanie seedować po zapisaniu.",
+	"seeding-in-place-note":
+		"Utworzone przez Ciebie torrenty są seedowane, dopóki ich nie zatrzymasz.",
+	"seeding-ed2k-sharing-off":
+		"Udostępnianie przez eD2K jest wyłączone w Ustawieniach, więc to zadanie nie będzie niczego wysyłać.",
+	"seeding-leftover-values":
+		"To zadanie ma wartości seedowania z wcześniejszej zmiany ustawień. Zapisanie je zastępuje.",
 	"create-torrent": "Utwórz torrent",
 	"create-torrent-menu": "Utwórz torrent...",
 	"create-torrent-source": "Plik lub folder do udostępnienia",

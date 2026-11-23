@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Gecomprimeerd",
 	"file-category-program": "Programma",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Door de sandbox permissie restricties van de App Store wordt aangeraden om ~/Downloads als standaard downloadmap in te stellen",
 	"transfer-settings": "Transmissie",
@@ -207,6 +206,9 @@ export default {
 	"uri-selector-inorder":
 		"In volgorde (spiegels van links naar rechts proberen)",
 	"uri-selector-adaptive": "Adaptief (snelste bij voorkeur)",
+	"send-auth-to-all-mirrors": "Inloggegevens naar alle HTTPS-spiegels sturen",
+	"send-auth-to-all-mirrors-tips":
+		"Stuurt de autorisatieheader van een taak naar elke HTTPS-spiegel. Indien uit, krijgen alleen spiegels met hetzelfde schema, dezelfde host en poort als de eerste link hem.",
 	"unit-seconds": "seconden",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Opslag",

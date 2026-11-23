@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Dokument",
 	"file-category-compressed": "Komprimiert",
 	"file-category-program": "Programm",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Aufgrund der Einschränkungen durch Sandbox-Berechtigungen im App Store wird der Download Ordner als Standard empfohlen",
 	"transfer-settings": "Übertragung",
@@ -209,6 +208,9 @@ export default {
 	"uri-selector-inorder":
 		"In Reihenfolge (Spiegel von links nach rechts versuchen)",
 	"uri-selector-adaptive": "Adaptiv (schnellsten bevorzugen)",
+	"send-auth-to-all-mirrors": "Anmeldedaten an alle HTTPS-Spiegel senden",
+	"send-auth-to-all-mirrors-tips":
+		"Sendet den Autorisierungs-Header einer Aufgabe an jeden HTTPS-Spiegel. Wenn aus, erhalten ihn nur Spiegel mit demselben Schema, Host und Port wie der erste Link.",
 	"unit-seconds": "Sekunden",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Speicher",

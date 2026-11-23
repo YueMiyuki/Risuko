@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Compactado",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Devido às restrições de permissões do sandbox da App Store, recomenda-se que o diretório de download padrão seja definido como o diretório de downloads",
 	"transfer-settings": "Transmissão",
@@ -205,6 +204,9 @@ export default {
 	"uri-selector-inorder":
 		"Em ordem (tenta os espelhos da esquerda para a direita)",
 	"uri-selector-adaptive": "Adaptativo (prefere o mais rápido)",
+	"send-auth-to-all-mirrors": "Enviar credenciais a todos os espelhos HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Envia o cabeçalho de autorização de uma tarefa a todos os espelhos HTTPS. Quando desativado, só os espelhos com o mesmo esquema, host e porta do primeiro link o recebem.",
 	"unit-seconds": "segundos",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Armazenamento",

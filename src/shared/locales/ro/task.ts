@@ -334,6 +334,8 @@ export default {
 	"media-format-auto": "Cea mai bună disponibilă (automat)",
 	"media-format-hint": "Preluați formatele pentru a alege o anumită calitate.",
 	"media-format-error": "Formatele pentru acest URL nu au putut fi încărcate.",
+	"media-unsupported-android":
+		"Descărcările de pe site-uri media necesită yt-dlp, care nu este disponibil pe Android",
 	"download-complete-message": "Descărcare finalizată {{taskName}}",
 	"download-complete-notify": "Descărcare finalizată",
 	"bt-download-complete-message":
@@ -381,6 +383,16 @@ export default {
 	"mirror-placeholder": "URL oglindă (același fișier, alt server)",
 	"mirror-hint":
 		"Adaugă URL-uri de oglindă care indică același fișier pentru a descărca din mai multe surse în paralel.",
+	"mirror-sources": "Surse: {{count}}",
+	"mirror-failing": "Eșuează",
+	"mirror-idle": "Nefolosită",
+	"add-tab-links": "Linkuri",
+	"add-tab-mirrors": "Oglinzi",
+	"mirror-list-placeholder":
+		"URL-uri oglindă ale unui fișier, câte unul pe linie",
+	"mirror-list-hint":
+		"Toate linkurile trebuie să indice același fișier. Bucățile lui se descarcă de pe toate oglinzile deodată, iar o oglindă care eșuează sau încetinește își predă bucățile celorlalte.",
+	"mirror-list-rejected": "Nu este un link simplu http(s) către un fișier:",
 	"detail-tab-general": "General",
 	"detail-tab-activity": "Activitate",
 	"detail-tab-trackers": "Trackere",
@@ -411,6 +423,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 sau gol = nelimitat (ex. 500K)",
 	"edit-primary-uri": "URL de descărcare",
 	"edit-primary-uri-placeholder": "URL principal de descărcare",
+	"edit-tab-seeding": "Seeding",
+	"seeding-rule-global": "Folosește setarea globală",
+	"seeding-rule-forever": "Fă seeding până îl opresc",
+	"seeding-rule-limits": "Oprește la un raport sau după un timp",
+	"seeding-rule-none": "Nu face seeding",
+	"seeding-global-off": "Momentan: fără seeding",
+	"seeding-global-forever": "Momentan: seeding până la oprire",
+	"seeding-global-ratio": "Momentan: oprire la raportul {{ratio}}",
+	"seeding-global-minutes": "Momentan: oprire după {{minutes}} min",
+	"seeding-global-both":
+		"Momentan: oprire la raportul {{ratio}} sau după {{minutes}} min",
+	"seeding-limits-hint":
+		"Seeding-ul se oprește la prima limită atinsă. 0 înseamnă fără limită de acel fel.",
+	"seeding-limits-required":
+		"Introduceți un raport sau un număr de minute peste 0",
+	"seeding-for": "Durata seeding-ului",
+	"seeding-applies-after-download": "Se aplică la finalizarea descărcării.",
+	"seeding-stops-now": "Această sarcină nu mai face seeding la salvare.",
+	"seeding-limit-reached":
+		"Această sarcină a atins deja această limită și nu mai face seeding la salvare.",
+	"seeding-in-place-note":
+		"Torrentele pe care le-ați creat rămân în seeding până când le opriți.",
+	"seeding-ed2k-sharing-off":
+		"Partajarea prin eD2K este dezactivată în Setări, așa că această sarcină nu va încărca nimic.",
+	"seeding-leftover-values":
+		"Această sarcină are valori de seeding dintr-o modificare anterioară a setărilor. Salvarea le înlocuiește.",
 	"create-torrent": "Creează torrent",
 	"create-torrent-menu": "Creează torrent...",
 	"create-torrent-source": "Fișier sau folder de partajat",

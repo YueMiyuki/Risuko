@@ -456,6 +456,38 @@ test("relaunches through the native command so the engine stops first", async ()
 	await updater.checkForUpdates("manual");
 	assert.ok(state.invokeCalls.some(([command]) => command === "relaunch_app"));
 	assert.equal(state.relaunchCalls, 0);
+	assert.ok(
+		state.toastEvents.some(
+			(event) => event.args[0] === "app.update-relaunching",
+		),
+	);
+});
+
+test("a declined restart never says the app is restarting", async () => {
+	useDesktop(state);
+	state.store.config = { autoCheckUpdate: true, lastCheckUpdateTime: 0 };
+	state.invokeResult = (command) =>
+		command === "is_signed_updater_available" ? true : null;
+	state.checkResult = {
+		version: "9.9.9",
+		download: async () => undefined,
+		install: async () => undefined,
+		close: async () => undefined,
+	};
+	state.confirmQueue = [
+		{ confirmed: true, checkboxChecked: false },
+		{ confirmed: true, checkboxChecked: false },
+		{ confirmed: false, checkboxChecked: false },
+	];
+
+	await updater.checkForUpdates("manual");
+	assert.equal(state.confirmCalls.length, 3);
+	assert.ok(!state.invokeCalls.some(([command]) => command === "relaunch_app"));
+	assert.ok(
+		!state.toastEvents.some(
+			(event) => event.args[0] === "app.update-relaunching",
+		),
+	);
 });
 
 test("restores the engine and logs a failed restart when the Windows install fails", async () => {

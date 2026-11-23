@@ -72,6 +72,8 @@ export default {
 	errSftpUsernameRequired: "请填写 SFTP 用户名。",
 	errSftpAuthRequired: "请填写 SFTP 密码或私钥。",
 	errFtpHostRequired: "请填写 FTP 主机。",
+	errSecretForNewServer:
+		"服务器已更改，已保存的密码或密钥不会再使用，请重新填写。",
 	errMoveTargetRequired: "选择「移动到目录」时必须填写目标路径。",
 	saving: "保存中…",
 	recentJobs: "最近上传",

@@ -1,4 +1,5 @@
 import type {
+	SinkConfig,
 	UploadJob,
 	UploadRule,
 	UploadSinkRecord,
@@ -20,6 +21,23 @@ interface UploadState {
 }
 
 const POLL_MS = 1000;
+
+function withoutSecrets(config: SinkConfig): SinkConfig {
+	switch (config.kind) {
+		case "s3": {
+			const { secretAccessKey: _, ...rest } = config;
+			return rest;
+		}
+		case "sftp": {
+			const { password: _, privateKey: __, ...rest } = config;
+			return rest;
+		}
+		default: {
+			const { password: _, ...rest } = config;
+			return rest;
+		}
+	}
+}
 
 export const useUploadSinkStore = defineStore("uploadSink", {
 	state: (): UploadState => ({
@@ -80,7 +98,7 @@ export const useUploadSinkStore = defineStore("uploadSink", {
 			await api.updateUploadSink(record);
 			const idx = this.sinks.findIndex((s) => s.id === record.id);
 			if (idx >= 0) {
-				this.sinks[idx] = record;
+				this.sinks[idx] = { ...record, config: withoutSecrets(record.config) };
 			}
 		},
 

@@ -133,16 +133,10 @@ fn is_unsupported(e: &io::Error) -> bool {
     let Some(code) = e.raw_os_error() else {
         return false;
     };
-    if code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if code == libc::EINVAL {
-            return true;
-        }
-    }
-    false
+    code == libc::ENOTSUP
+        || code == libc::EOPNOTSUPP
+        || code == libc::ENOSYS
+        || (cfg!(target_os = "linux") && code == libc::EINVAL)
 }
 
 #[cfg(not(unix))]

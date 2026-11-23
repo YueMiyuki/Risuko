@@ -4,9 +4,9 @@ pub struct DownloadArgs {
     #[arg(required = true, num_args = 1..)]
     pub urls: Vec<String>,
 
-    /// Number of connections per download (maps to split)
-    #[arg(short = 't', long, default_value_t = 16)]
-    pub threads: u32,
+    /// Number of connections per download (maps to split); the configured value is used when not given
+    #[arg(short = 't', long)]
+    pub threads: Option<u32>,
 
     /// Download directory
     #[arg(short, long)]

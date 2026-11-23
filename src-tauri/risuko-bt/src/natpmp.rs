@@ -55,8 +55,12 @@ fn spawn_with(
 }
 
 fn default_gateway() -> Option<SocketAddr> {
+    default_gateway_ipv4().map(|ip| SocketAddr::from((ip, SERVER_PORT)))
+}
+
+pub(crate) fn default_gateway_ipv4() -> Option<Ipv4Addr> {
     let usable = |ip: &Ipv4Addr| !ip.is_unspecified() && !ip.is_loopback();
-    let ip = netdev::get_default_gateway()
+    netdev::get_default_gateway()
         .ok()
         .and_then(|device| device.ipv4.into_iter().find(usable))
         .or_else(|| {
@@ -68,8 +72,7 @@ fn default_gateway() -> Option<SocketAddr> {
                     .filter(usable)
                     .find(|ip| iface.ipv4.iter().any(|net| net.contains(ip)))
             })
-        })?;
-    Some(SocketAddr::from((ip, SERVER_PORT)))
+        })
 }
 
 async fn run_forever(

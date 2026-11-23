@@ -1,7 +1,10 @@
 use serde_json::{Map, Value};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{watch, OnceCell};
@@ -9,8 +12,28 @@ use tokio_util::sync::CancellationToken;
 
 use super::speed_limiter::parse_speed_limit;
 
-static FFMPEG_PATH: OnceCell<Option<PathBuf>> = OnceCell::const_new();
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static FFMPEG_PATH: OnceCell<PathBuf> = OnceCell::const_new();
 static YT_DLP_READY: OnceCell<()> = OnceCell::const_new();
+
+async fn output_within(mut cmd: Command, limit: Duration) -> std::io::Result<Output> {
+    cmd.kill_on_drop(true);
+    tokio::time::timeout(limit, cmd.output())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out after {}s", limit.as_secs_f32()),
+            )
+        })?
+}
+
+pub async fn probe_output(program: impl AsRef<OsStr>, arg: &str) -> std::io::Result<Output> {
+    let mut cmd = Command::new(program);
+    cmd.arg(arg);
+    output_within(cmd, PROBE_TIMEOUT).await
+}
 
 pub fn is_youtube_uri(uri: &str) -> bool {
     let trimmed = uri.trim();
@@ -94,9 +117,7 @@ pub fn is_force_ytdlp(options: &Map<String, Value>) -> bool {
 }
 
 pub async fn check_yt_dlp_available() -> Result<(), String> {
-    let output = Command::new("yt-dlp")
-        .arg("--version")
-        .output()
+    let output = probe_output("yt-dlp", "--version")
         .await
         .map_err(|e| format!("yt-dlp is not available in PATH: {e}"))?;
 
@@ -125,22 +146,16 @@ async fn kill_tree(child: &mut tokio::process::Child) {
 
 pub async fn find_ffmpeg() -> Option<PathBuf> {
     FFMPEG_PATH
-        .get_or_init(|| async {
+        .get_or_try_init(|| async {
             let candidate = PathBuf::from("ffmpeg");
-            let ok = Command::new(&candidate)
-                .arg("-version")
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if ok {
-                Some(candidate)
-            } else {
-                None
+            match probe_output(&candidate, "-version").await {
+                Ok(o) if o.status.success() => Ok(candidate),
+                _ => Err(()),
             }
         })
         .await
-        .clone()
+        .ok()
+        .cloned()
 }
 
 fn yt_dlp_retries(max_tries: u64) -> String {
@@ -1005,6 +1020,33 @@ mod tests {
         let folder = folder_with_bad_config();
         let (cmd, _home) = media_info_command(UNREACHABLE_URL, &Map::new()).unwrap();
         assert_runs_without_the_config(cmd, folder.path()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_that_outlasts_its_limit_returns_nothing_and_stops_waiting() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let started = std::time::Instant::now();
+        let result = output_within(cmd, Duration::from_millis(100)).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_returns_the_output_of_a_command_that_finishes() {
+        let output = probe_output("echo", "hello").await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_probe_of_a_missing_command_returns_nothing() {
+        assert!(probe_output("risuko-no-such-command", "--version")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

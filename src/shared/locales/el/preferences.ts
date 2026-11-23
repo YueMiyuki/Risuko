@@ -157,7 +157,6 @@ export default {
 	"file-category-document": "Έγγραφο",
 	"file-category-compressed": "Συμπιεσμένα",
 	"file-category-program": "Πρόγραμμα",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Λόγω των περιορισμών δικαιωμάτων του App Store,ο προεπιλεγμένος φάκελος λήψεων συστήνεται να είναι το ~/Downloads",
 	"transfer-settings": "Μετάδοση",
@@ -211,6 +210,10 @@ export default {
 	"uri-selector-inorder":
 		"Με τη σειρά (δοκιμή καθρεφτών από αριστερά προς τα δεξιά)",
 	"uri-selector-adaptive": "Προσαρμοστική (προτίμηση του ταχύτερου)",
+	"send-auth-to-all-mirrors":
+		"Αποστολή στοιχείων σύνδεσης σε όλους τους καθρέφτες HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Στέλνει την κεφαλίδα εξουσιοδότησης μιας εργασίας σε κάθε καθρέφτη HTTPS. Όταν είναι ανενεργό, τη λαμβάνουν μόνο οι καθρέφτες με το ίδιο σχήμα, κεντρικό υπολογιστή και θύρα με τον πρώτο σύνδεσμο.",
 	"unit-seconds": "δευτερόλεπτα",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Αποθήκευση",

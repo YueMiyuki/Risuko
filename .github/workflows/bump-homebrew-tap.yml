@@ -44,7 +44,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check out homebrew-risuko tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: yuemiyuki/homebrew-risuko
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

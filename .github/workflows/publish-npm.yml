@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
-  id-token: write
 
 env:
   CARGO_INCREMENTAL: 0
@@ -27,8 +25,11 @@ env:
 jobs:
   meta:
     name: Resolve version
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'release'
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'release' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       dist_tag: ${{ steps.version.outputs.dist_tag }}
@@ -52,7 +53,7 @@ jobs:
 
       - name: Download release metadata
         if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-meta
           run-id: ${{ github.event.workflow_run.id }}
@@ -117,7 +118,7 @@ jobs:
             npm_dir: win32-arm64-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.meta.outputs.sha }}
 
@@ -133,7 +134,7 @@ jobs:
       - name: Build risuko-cli
         if: runner.os != 'Linux'
         working-directory: src-tauri
-        run: cargo build --release --target ${{ matrix.target }} -p risuko-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p risuko-cli
 
       - name: Build risuko-cli (glibc 2.17)
         if: runner.os == 'Linux'
@@ -142,7 +143,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cli-${{ matrix.npm_dir }}
           path: src-tauri/target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -181,7 +182,7 @@ jobs:
             npm_dir: win32-arm64-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.meta.outputs.sha }}
 
@@ -195,8 +196,17 @@ jobs:
           cache-key: napi-${{ matrix.target }}
 
       - name: Build risuko-napi
+        if: runner.os != 'Linux'
         working-directory: src-tauri
-        run: cargo build --release --target ${{ matrix.target }} -p risuko-napi
+        run: cargo build --release --locked --target ${{ matrix.target }} -p risuko-napi
+
+      - name: Build risuko-napi (glibc 2.17)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/build-cli-glibc
+        with:
+          target: ${{ matrix.target }}
+          package: risuko-napi
+          artifact: librisuko_napi.so
 
       - name: Rename .node artifact
         shell: bash
@@ -211,7 +221,7 @@ jobs:
           cp "$src" "${{ matrix.node_file }}"
 
       - name: Upload .node artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: napi-${{ matrix.npm_dir }}
           path: ${{ matrix.node_file }}
@@ -220,28 +230,31 @@ jobs:
     name: Publish to npm
     needs: [meta, build-cli, build-napi]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.meta.outputs.sha }}
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           run_install: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Download all CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: cli-*
           path: artifacts/cli
 
       - name: Download all NAPI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: napi-*
           path: artifacts/napi

@@ -6,7 +6,6 @@ import type {
 	LogLevel,
 	LogReadResult,
 } from "@shared/types/log";
-import type { RssRule } from "@shared/types/rss";
 import type {
 	DownloadStatsMinuteInput,
 	DownloadStatsQuery,
@@ -35,18 +34,11 @@ import {
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
 import { isEmpty } from "lodash";
+import { liveTaskOptions, liveUserOptions } from "@/utils/liveTaskOptions";
 import { fetchAllPages } from "@/utils/taskPages";
 
 const ENGINE_RESTART_USER_KEYS: string[] = ["engine-overrides", "rpc-host"];
 const P2P_RUNTIME_OPTION_KEYS = new Set([
-	"p2p-proxy",
-	"p2p-no-proxy",
-	"p2p-udp-proxy",
-	"p2p-udp-no-proxy",
-]);
-const PROXY_RUNTIME_OPTION_KEYS = new Set([
-	"all-proxy",
-	"no-proxy",
 	"p2p-proxy",
 	"p2p-no-proxy",
 	"p2p-udp-proxy",
@@ -144,17 +136,19 @@ export default class Api {
 		}
 
 		const result = await invoke("save_preference", { config });
-		if (!isEmpty(runtimeSystem)) {
+		const runtimeGlobal = {
+			...runtimeSystem,
+			...liveUserOptions(user as Record<string, unknown>),
+		};
+		if (!isEmpty(runtimeGlobal)) {
 			try {
-				await this.changeGlobalOption(runtimeSystem);
+				await this.changeGlobalOption(runtimeGlobal);
 			} catch (err) {
 				logger.warn("[Risuko] changeGlobalOption failed:", err?.message || err);
 			}
-			const activeTaskOptions = Object.fromEntries(
-				Object.entries(runtimeSystem).filter(
-					([key]) => !PROXY_RUNTIME_OPTION_KEYS.has(key),
-				),
-			);
+		}
+		if (!isEmpty(runtimeSystem)) {
+			const activeTaskOptions = liveTaskOptions(runtimeSystem);
 			if (!isEmpty(activeTaskOptions)) {
 				this.updateActiveTaskOption(activeTaskOptions);
 			}
@@ -492,6 +486,7 @@ export default class Api {
 			offset?: number;
 			num?: number;
 			keys?: string[];
+			activeKeys?: string[];
 		} = {},
 	) {
 		const { type } = params;
@@ -510,11 +505,16 @@ export default class Api {
 	}
 
 	async fetchAllTaskList(
-		params: { offset?: number; num?: number; keys?: string[] } = {},
+		params: {
+			offset?: number;
+			num?: number;
+			keys?: string[];
+			activeKeys?: string[];
+		} = {},
 	) {
-		const { keys } = params;
+		const { keys, activeKeys = keys } = params;
 		const [active, waiting, scheduled, stopped] = await Promise.all([
-			invoke<DownloadTask[]>("tell_active", { keys }),
+			invoke<DownloadTask[]>("tell_active", { keys: activeKeys }),
 			this.fetchWaitingTaskList(params),
 			this.fetchScheduledTaskList(params),
 			this.fetchStoppedTaskList(params),
@@ -630,82 +630,6 @@ export default class Api {
 
 	batchPauseTask(params: { gids?: string[] } = {}) {
 		return this.multicall("risuko.pause", params);
-	}
-
-	addRssFeed(url: string) {
-		return invoke("add_rss_feed", { url });
-	}
-
-	removeRssFeed(feedId: string) {
-		return invoke("remove_rss_feed", { feedId });
-	}
-
-	refreshRssFeed(feedId: string) {
-		return invoke("refresh_rss_feed", { feedId });
-	}
-
-	refreshAllRssFeeds() {
-		return invoke("refresh_all_rss_feeds");
-	}
-
-	getRssFeeds() {
-		return invoke("get_rss_feeds");
-	}
-
-	getRssItems(feedId: string) {
-		return invoke("get_rss_items", { feedId });
-	}
-
-	updateRssFeedSettings(feedId: string, interval?: number, isActive?: boolean) {
-		return invoke("update_rss_feed_settings", { feedId, interval, isActive });
-	}
-
-	addRssRule(rule: RssRule) {
-		return invoke("add_rss_rule", { rule });
-	}
-
-	updateRssRule(rule: RssRule) {
-		return invoke("update_rss_rule", { rule });
-	}
-
-	dryRunRssRule(rule: RssRule, sampleSize?: number) {
-		return invoke("dry_run_rss_rule", { rule, sampleSize });
-	}
-
-	removeRssRule(ruleId: string) {
-		return invoke("remove_rss_rule", { ruleId });
-	}
-
-	getRssRules() {
-		return invoke("get_rss_rules");
-	}
-
-	deleteRssItems(itemsByFeed: [string, string[]][]) {
-		return invoke("delete_rss_items", { itemsByFeed });
-	}
-
-	clearRssDownload(feedId: string, itemId: string) {
-		return invoke("clear_rss_download", { feedId, itemId });
-	}
-
-	readRssDownload(feedId: string, itemId: string) {
-		return invoke("read_rss_download", { feedId, itemId }) as Promise<string>;
-	}
-
-	downloadRssItemTracked(
-		feedId: string,
-		itemId: string,
-		options?: Record<string, unknown>,
-	) {
-		return invoke("download_rss_item_tracked", { feedId, itemId, options });
-	}
-
-	markRssItemRead(feedId: string, itemId: string) {
-		return invoke("mark_rss_item_read", { feedId, itemId });
-	}
-
-	markRssItemsRead(entries: [string, string][]) {
-		return invoke("mark_rss_items_read", { entries });
 	}
 
 	listUploadSinks() {

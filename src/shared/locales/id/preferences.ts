@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Dokumen",
 	"file-category-compressed": "Terkompresi",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Karena pembatasan dari App Store, direktori unduhan default direkomendasikan untuk disetel ke ~/Downloads",
 	"transfer-settings": "Transfer Setting",
@@ -205,6 +204,9 @@ export default {
 	"uri-selector-feedback": "Umpan balik (buang mirror yang lambat/gagal)",
 	"uri-selector-inorder": "Berurutan (coba mirror dari kiri ke kanan)",
 	"uri-selector-adaptive": "Adaptif (utamakan yang tercepat)",
+	"send-auth-to-all-mirrors": "Kirim kredensial ke semua mirror HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Kirim header otorisasi tugas ke setiap mirror HTTPS. Jika nonaktif, hanya mirror dengan skema, host, dan port yang sama dengan tautan pertama yang menerimanya.",
 	"unit-seconds": "detik",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Penyimpanan",

@@ -50,7 +50,7 @@ impl RateLimiter {
         if self.limit_bps.swap(bps, Ordering::AcqRel) != bps {
             let _ = self
                 .state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
                     Some(((s >> EPOCH_SHIFT) + 1) << EPOCH_SHIFT)
                 });
             self.retuned.notify_waiters();

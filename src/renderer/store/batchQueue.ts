@@ -52,6 +52,7 @@ export interface BatchQueueItem {
 	status: BatchItemStatus;
 	gid?: string;
 	error?: string;
+	refusal?: string;
 }
 
 const createFileBatchItem = (
@@ -112,11 +113,15 @@ export const batchItemForFilePath = (
 	return null;
 };
 
-export const createUriBatchItem = (uri: string): BatchQueueItem => {
+export const createUriBatchItem = (
+	uri: string,
+	mediaRefusal?: string,
+): BatchQueueItem => {
 	const trimmed = uri.trim();
 	const isMagnet = trimmed.toLowerCase().startsWith("magnet:");
 	const label = trimmed.length > 80 ? `${trimmed.slice(0, 77)}…` : trimmed;
 	const media = !isMagnet && isMediaUri(trimmed);
+	const refused = media && !!mediaRefusal;
 	return {
 		id: crypto.randomUUID(),
 		kind: isMagnet ? "magnet" : "uri",
@@ -124,8 +129,9 @@ export const createUriBatchItem = (uri: string): BatchQueueItem => {
 		uri: trimmed,
 		resolveState: isMagnet ? "idle" : "ready",
 		selectFile: SELECTED_ALL_FILES,
-		status: "queued",
-		isMedia: media,
+		status: refused ? "failed" : "queued",
+		...(refused ? { error: mediaRefusal, refusal: mediaRefusal } : {}),
+		isMedia: media && !refused,
 		mediaInfoState: "idle",
 	};
 };

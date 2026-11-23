@@ -153,7 +153,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Comprimit",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Degut a les restriccions de la botiga d'aplicacions, la ruta per defecte es recomana que sigui ~/Downloads",
 	"transfer-settings": "Transmission",
@@ -207,6 +206,10 @@ export default {
 		"Per retroacció (descarta les rèpliques lentes o fallides)",
 	"uri-selector-inorder": "En ordre (prova les rèpliques d'esquerra a dreta)",
 	"uri-selector-adaptive": "Adaptatiu (prefereix la més ràpida)",
+	"send-auth-to-all-mirrors":
+		"Envia les credencials a totes les rèpliques HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Envia la capçalera d'autorització d'una tasca a cada rèplica HTTPS. Si està desactivat, només la reben les rèpliques amb el mateix esquema, amfitrió i port que el primer enllaç.",
 	"unit-seconds": "segons",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Emmagatzematge",

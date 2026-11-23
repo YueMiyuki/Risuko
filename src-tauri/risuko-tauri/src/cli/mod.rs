@@ -149,7 +149,7 @@ mod parse_tests {
             panic!("not download");
         };
         assert_eq!(args.urls, ["http://a/f", "http://b/f"]);
-        assert_eq!(args.threads, 16);
+        assert_eq!(args.threads, None);
         assert_eq!(args.dir, None);
         assert_eq!(args.out, None);
         assert!(args.headers.is_empty());
@@ -211,7 +211,7 @@ mod parse_tests {
             panic!("not download");
         };
         assert_eq!(args.urls, ["magnet:?xt=urn:btih:abc"]);
-        assert_eq!(args.threads, 4);
+        assert_eq!(args.threads, Some(4));
         assert_eq!(args.dir.as_deref(), Some("/tmp/d"));
         assert_eq!(args.out.as_deref(), Some("f.bin"));
         assert_eq!(args.headers, ["A: 1", "B: 2"]);
@@ -251,7 +251,7 @@ mod parse_tests {
         ]) else {
             panic!("not download");
         };
-        assert_eq!(args.threads, 2);
+        assert_eq!(args.threads, Some(2));
         assert_eq!(args.dir.as_deref(), Some("d"));
         assert_eq!(args.out.as_deref(), Some("o"));
         assert_eq!(args.headers, ["X: y"]);

@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "Укажите имя пользователя SFTP.",
 	errSftpAuthRequired: "Укажите пароль или закрытый ключ SFTP.",
 	errFtpHostRequired: "Укажите хост FTP.",
+	errSecretForNewServer:
+		"Сервер изменён, поэтому сохранённые пароль или ключ не будут использованы повторно. Введите их ещё раз.",
 	errMoveTargetRequired:
 		"Укажите папку назначения, если действие после отправки — перемещение.",
 	saving: "Сохранение…",

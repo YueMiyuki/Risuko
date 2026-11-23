@@ -324,6 +324,8 @@ export default {
 	"media-format-auto": "Terbaik yang tersedia (otomatis)",
 	"media-format-hint": "Ambil format untuk memilih kualitas tertentu.",
 	"media-format-error": "Tidak dapat memuat format untuk URL ini.",
+	"media-unsupported-android":
+		"Unduhan dari situs media memerlukan yt-dlp, yang tidak tersedia di Android",
 	"download-complete-message": "Selesai mengunduh {{taskName}}",
 	"download-complete-notify": "Unduh Selesai",
 	"bt-download-complete-message": "Selesai mengunduh {{taskName}}, penyemaian",
@@ -370,6 +372,15 @@ export default {
 	"mirror-placeholder": "URL mirror (berkas sama, server lain)",
 	"mirror-hint":
 		"Tambahkan URL mirror yang menunjuk ke berkas yang sama untuk mengunduh dari beberapa sumber secara paralel.",
+	"mirror-sources": "{{count}} sumber",
+	"mirror-failing": "Gagal",
+	"mirror-idle": "Tidak dipakai",
+	"add-tab-links": "Tautan",
+	"add-tab-mirrors": "Mirror",
+	"mirror-list-placeholder": "URL mirror untuk satu berkas, satu per baris",
+	"mirror-list-hint":
+		"Semua tautan harus menunjuk ke berkas yang sama. Bagian-bagiannya diunduh dari semua mirror sekaligus, dan mirror yang gagal atau melambat menyerahkan bagiannya ke mirror lain.",
+	"mirror-list-rejected": "Bukan tautan berkas http(s) biasa:",
 	"detail-tab-general": "Umum",
 	"detail-tab-activity": "Aktivitas",
 	"detail-tab-trackers": "Tracker",
@@ -400,6 +411,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 atau kosong = tak terbatas (mis. 500K)",
 	"edit-primary-uri": "URL unduhan",
 	"edit-primary-uri-placeholder": "URL unduhan utama",
+	"edit-tab-seeding": "Penyemaian",
+	"seeding-rule-global": "Gunakan pengaturan global",
+	"seeding-rule-forever": "Semai sampai saya hentikan",
+	"seeding-rule-limits":
+		"Berhenti pada rasio tertentu atau setelah waktu tertentu",
+	"seeding-rule-none": "Jangan menyemai",
+	"seeding-global-off": "Saat ini: tidak menyemai",
+	"seeding-global-forever": "Saat ini: menyemai sampai dihentikan",
+	"seeding-global-ratio": "Saat ini: berhenti pada rasio {{ratio}}",
+	"seeding-global-minutes": "Saat ini: berhenti setelah {{minutes}} menit",
+	"seeding-global-both":
+		"Saat ini: berhenti pada rasio {{ratio}} atau setelah {{minutes}} menit",
+	"seeding-limits-hint":
+		"Penyemaian berhenti pada batas mana pun yang tercapai lebih dulu. 0 berarti tanpa batas jenis itu.",
+	"seeding-limits-required": "Masukkan rasio atau jumlah menit di atas 0",
+	"seeding-for": "Lama menyemai",
+	"seeding-applies-after-download": "Ini berlaku saat unduhan selesai.",
+	"seeding-stops-now": "Tugas ini berhenti menyemai saat Anda menyimpan.",
+	"seeding-limit-reached":
+		"Tugas ini sudah mencapai batas ini dan berhenti menyemai saat Anda menyimpan.",
+	"seeding-in-place-note":
+		"Torrent yang Anda buat disemai sampai Anda menghentikannya.",
+	"seeding-ed2k-sharing-off":
+		"Berbagi lewat eD2K dimatikan di Pengaturan, jadi tugas ini tidak akan mengunggah.",
+	"seeding-leftover-values":
+		"Tugas ini memiliki nilai penyemaian dari perubahan pengaturan sebelumnya. Menyimpan akan menggantikannya.",
 	"create-torrent": "Buat Torrent",
 	"create-torrent-menu": "Buat Torrent...",
 	"create-torrent-source": "Berkas atau folder untuk dibagikan",

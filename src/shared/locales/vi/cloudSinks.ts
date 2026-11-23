@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "Cần có tên người dùng SFTP.",
 	errSftpAuthRequired: "Cần có mật khẩu hoặc khóa riêng SFTP.",
 	errFtpHostRequired: "Cần có máy chủ FTP.",
+	errSecretForNewServer:
+		"Máy chủ đã thay đổi nên mật khẩu hoặc khóa đã lưu sẽ không được dùng lại. Hãy nhập lại.",
 	errMoveTargetRequired:
 		"Cần có thư mục chuyển đến khi hành động sau khi tải lên là chuyển.",
 	saving: "Đang lưu…",

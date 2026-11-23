@@ -21,7 +21,6 @@ Each locale directory contains TypeScript files split by feature area:
 - index.ts
 - menu.ts
 - preferences.ts
-- rss.ts
 - share.ts
 - subnav.ts
 - sync.ts

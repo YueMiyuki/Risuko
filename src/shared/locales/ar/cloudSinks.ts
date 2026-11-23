@@ -73,6 +73,8 @@ export default {
 	errSftpUsernameRequired: "اسم مستخدم SFTP مطلوب.",
 	errSftpAuthRequired: "كلمة مرور SFTP أو المفتاح الخاص مطلوب.",
 	errFtpHostRequired: "مضيف FTP مطلوب.",
+	errSecretForNewServer:
+		"تغيّر الخادم، لذا لا يُعاد استخدام كلمة المرور أو المفتاح المحفوظ. أدخله مرة أخرى.",
 	errMoveTargetRequired: "مجلد النقل مطلوب عندما يكون الإجراء اللاحق هو النقل.",
 	saving: "جارٍ الحفظ…",
 	recentJobs: "عمليات الرفع الأخيرة",

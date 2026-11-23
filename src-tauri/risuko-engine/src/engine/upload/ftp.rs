@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use suppaftp::tokio::{AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use super::sink::{
     write_or_stall, FtpConfig, UploadControl, UploadError, UploadFile, UploadSink,
@@ -25,6 +26,23 @@ fn ftp_error(context: &str, error: &suppaftp::FtpError) -> UploadError {
         FtpError::SecureError(_)
         | FtpError::InvalidAddress(_)
         | FtpError::DataConnectionAlreadyOpen => UploadError::fatal(message),
+    }
+}
+
+async fn control<T>(
+    what: &str,
+    limit: Duration,
+    cancel: &CancellationToken,
+    step: impl std::future::Future<Output = Result<T, suppaftp::FtpError>>,
+) -> Result<T, UploadError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(UploadError::fatal("cancelled")),
+        result = tokio::time::timeout(limit, step) => match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(ftp_error(what, &e)),
+            Err(_) => Err(UploadError::transient(format!("{what}: timed out"))),
+        },
     }
 }
 
@@ -122,7 +140,7 @@ macro_rules! ensure_dirs {
                     accum.push('/');
                 }
                 accum.push_str(seg);
-                let _ = $ftp.mkdir(&accum).await;
+                let _ = tokio::time::timeout(CONNECT_TIMEOUT, $ftp.mkdir(&accum)).await;
             }
         }
     }};
@@ -135,10 +153,13 @@ macro_rules! copy_to {
             .map_err(|e| UploadError::fatal(format!("open {}: {e}", $local.display())))?;
 
         let part_remote = format!("{}.part", $remote);
-        let mut writer = $ftp
-            .put_with_stream(&part_remote)
-            .await
-            .map_err(|e| ftp_error(&format!("FTP STOR {}", part_remote), &e))?;
+        let mut writer = control(
+            &format!("FTP STOR {}", part_remote),
+            CONNECT_TIMEOUT,
+            &$ctl.cancel,
+            $ftp.put_with_stream(&part_remote),
+        )
+        .await?;
 
         let mut buf = vec![0u8; COPY_BUF];
         let mut sent: u64 = 0;
@@ -174,22 +195,37 @@ macro_rules! copy_to {
             .await;
             return Err(e);
         }
-        writer
-            .finish()
-            .await
-            .map_err(|e| ftp_error("FTP finalize", &e))?;
+        control(
+            "FTP finalize",
+            UPLOAD_STALL_TIMEOUT,
+            &$ctl.cancel,
+            writer.finish(),
+        )
+        .await?;
 
-        if $ftp
-            .rename(part_remote.as_str(), $remote.as_str())
-            .await
-            .is_err()
+        if control(
+            "FTP rename",
+            UPLOAD_CLEANUP_TIMEOUT,
+            &$ctl.cancel,
+            $ftp.rename(part_remote.as_str(), $remote.as_str()),
+        )
+        .await
+        .is_err()
         {
-            let _ = $ftp.rm($remote.as_str()).await;
-            $ftp.rename(part_remote.as_str(), $remote.as_str())
-                .await
-                .map_err(|e| {
-                    ftp_error(&format!("FTP rename {} -> {}", part_remote, $remote), &e)
-                })?;
+            let _ = control(
+                "FTP delete",
+                UPLOAD_CLEANUP_TIMEOUT,
+                &$ctl.cancel,
+                $ftp.rm($remote.as_str()),
+            )
+            .await;
+            control(
+                &format!("FTP rename {} -> {}", part_remote, $remote),
+                UPLOAD_CLEANUP_TIMEOUT,
+                &$ctl.cancel,
+                $ftp.rename(part_remote.as_str(), $remote.as_str()),
+            )
+            .await?;
         }
     }};
 }
@@ -212,30 +248,46 @@ impl UploadSink for FtpSink {
             let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, self.connect_secure())
                 .await
                 .map_err(|_| UploadError::transient("FTPS connect timed out"))??;
-            ftp.login(&user, &pass)
-                .await
-                .map_err(|e| ftp_error("FTP login failed", &e))?;
-            ftp.transfer_type(suppaftp::types::FileType::Binary)
-                .await
-                .map_err(|e| ftp_error("FTP binary mode", &e))?;
+            control(
+                "FTP login failed",
+                CONNECT_TIMEOUT,
+                &ctl.cancel,
+                ftp.login(&user, &pass),
+            )
+            .await?;
+            control(
+                "FTP binary mode",
+                CONNECT_TIMEOUT,
+                &ctl.cancel,
+                ftp.transfer_type(suppaftp::types::FileType::Binary),
+            )
+            .await?;
             ensure_dirs!(ftp, remote);
             copy_to!(ftp, local, remote, size, ctl);
-            let _ = ftp.quit().await;
+            let _ = tokio::time::timeout(UPLOAD_CLEANUP_TIMEOUT, ftp.quit()).await;
         } else {
             let mut ftp = tokio::time::timeout(CONNECT_TIMEOUT, AsyncFtpStream::connect(&addr))
                 .await
                 .map_err(|_| UploadError::transient("FTP connect timed out"))?
                 .map_err(|e| ftp_error("FTP connect failed", &e))?;
             ftp.set_passive_nat_workaround(true);
-            ftp.login(&user, &pass)
-                .await
-                .map_err(|e| ftp_error("FTP login failed", &e))?;
-            ftp.transfer_type(suppaftp::types::FileType::Binary)
-                .await
-                .map_err(|e| ftp_error("FTP binary mode", &e))?;
+            control(
+                "FTP login failed",
+                CONNECT_TIMEOUT,
+                &ctl.cancel,
+                ftp.login(&user, &pass),
+            )
+            .await?;
+            control(
+                "FTP binary mode",
+                CONNECT_TIMEOUT,
+                &ctl.cancel,
+                ftp.transfer_type(suppaftp::types::FileType::Binary),
+            )
+            .await?;
             ensure_dirs!(ftp, remote);
             copy_to!(ftp, local, remote, size, ctl);
-            let _ = ftp.quit().await;
+            let _ = tokio::time::timeout(UPLOAD_CLEANUP_TIMEOUT, ftp.quit()).await;
         }
 
         ctl.report(size, size);
@@ -328,6 +380,36 @@ mod tests {
         assert!(is_implicit_ftps_port(990));
         assert!(!is_implicit_ftps_port(21));
         assert!(!is_implicit_ftps_port(2121));
+    }
+
+    #[tokio::test]
+    async fn a_control_wait_times_out_as_transient() {
+        let cancel = CancellationToken::new();
+        let error = control(
+            "FTP login failed",
+            Duration::from_millis(20),
+            &cancel,
+            std::future::pending::<Result<(), suppaftp::FtpError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.retryable);
+        assert_eq!(error.message, "FTP login failed: timed out");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_control_wait_is_reported_as_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = control(
+            "FTP login failed",
+            Duration::from_secs(60),
+            &cancel,
+            std::future::pending::<Result<(), suppaftp::FtpError>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, UploadError::fatal("cancelled"));
     }
 
     #[test]

@@ -328,6 +328,8 @@ export default {
 	"media-format-auto": "Best tilgjengelig (auto)",
 	"media-format-hint": "Hent formater for å velge en bestemt kvalitet.",
 	"media-format-error": "Kunne ikke laste formater for denne URL-en.",
+	"media-unsupported-android":
+		"Nedlastinger fra mediesider krever yt-dlp, som ikke er tilgjengelig på Android",
 	"download-complete-message": "Nedlastingen er fullført {{taskName}}",
 	"download-complete-notify": "Nedlasting fullført",
 	"bt-download-complete-message":
@@ -375,6 +377,15 @@ export default {
 	"mirror-placeholder": "Speil-URL (samme fil, annen tjener)",
 	"mirror-hint":
 		"Legg til speil-URL-er som peker til samme fil for å laste ned fra flere kilder samtidig.",
+	"mirror-sources": "{{count}} kilder",
+	"mirror-failing": "Feiler",
+	"mirror-idle": "Ikke i bruk",
+	"add-tab-links": "Lenker",
+	"add-tab-mirrors": "Speil",
+	"mirror-list-placeholder": "Speil-URL-er for én fil, én per linje",
+	"mirror-list-hint":
+		"Alle lenker må peke til samme fil. Delene lastes ned fra alle speil samtidig, og et speil som feiler eller går tregt, gir delene sine videre til de andre.",
+	"mirror-list-rejected": "Ikke en vanlig http(s)-fillenke:",
 	"detail-tab-general": "Generelt",
 	"detail-tab-activity": "Aktivitet",
 	"detail-tab-trackers": "Trackere",
@@ -405,6 +416,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 eller tom = ubegrenset (f.eks. 500K)",
 	"edit-primary-uri": "Nedlastings-URL",
 	"edit-primary-uri-placeholder": "Primær nedlastings-URL",
+	"edit-tab-seeding": "Seeding",
+	"seeding-rule-global": "Bruk den globale innstillingen",
+	"seeding-rule-forever": "Seed til jeg stopper det",
+	"seeding-rule-limits": "Stopp ved et forhold eller etter en tid",
+	"seeding-rule-none": "Ikke seed",
+	"seeding-global-off": "For øyeblikket: ikke seed",
+	"seeding-global-forever": "For øyeblikket: seed til det stoppes",
+	"seeding-global-ratio": "For øyeblikket: stopp ved forholdet {{ratio}}",
+	"seeding-global-minutes": "For øyeblikket: stopp etter {{minutes}} minutter",
+	"seeding-global-both":
+		"For øyeblikket: stopp ved forholdet {{ratio}} eller etter {{minutes}} minutter",
+	"seeding-limits-hint":
+		"Seedingen stopper ved den grensen som nås først. 0 betyr ingen grense av den typen.",
+	"seeding-limits-required":
+		"Skriv inn et forhold eller et antall minutter over 0",
+	"seeding-for": "Har seedet i",
+	"seeding-applies-after-download": "Dette gjelder når nedlastingen er ferdig.",
+	"seeding-stops-now": "Denne oppgaven slutter å seede når du lagrer.",
+	"seeding-limit-reached":
+		"Denne oppgaven har allerede nådd denne grensen og slutter å seede når du lagrer.",
+	"seeding-in-place-note":
+		"Torrenter du har opprettet seedes til du stopper dem.",
+	"seeding-ed2k-sharing-off":
+		"Deling via eD2K er slått av i Innstillinger, så denne oppgaven laster ikke opp.",
+	"seeding-leftover-values":
+		"Denne oppgaven har seeding-verdier fra en tidligere endring av innstillinger. Lagring erstatter dem.",
 	"create-torrent": "Opprett torrent",
 	"create-torrent-menu": "Opprett torrent...",
 	"create-torrent-source": "Fil eller mappe som skal deles",

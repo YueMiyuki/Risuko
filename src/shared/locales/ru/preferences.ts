@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Документы",
 	"file-category-compressed": "Архивы",
 	"file-category-program": "Программы",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Из-за ограничения в App Store, рекомендуется устанавливать путь по умолчанию как ~/Downloads",
 	"transfer-settings": "Передача данных",
@@ -204,6 +203,9 @@ export default {
 		"По обратной связи (отбрасывать медленные и неисправные зеркала)",
 	"uri-selector-inorder": "По порядку (пробовать зеркала слева направо)",
 	"uri-selector-adaptive": "Адаптивно (предпочитать самое быстрое)",
+	"send-auth-to-all-mirrors": "Отправлять данные входа на все HTTPS-зеркала",
+	"send-auth-to-all-mirrors-tips":
+		"Отправляет заголовок авторизации задания на каждое HTTPS-зеркало. Если выключено, его получают только зеркала с той же схемой, хостом и портом, что и у первой ссылки.",
 	"unit-seconds": "секунд",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Хранение",

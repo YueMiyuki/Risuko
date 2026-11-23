@@ -12,6 +12,7 @@ import {
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "vue-sonner";
+import { torrentTrashTargets } from "@/utils/trashTargets";
 
 export function safUriToFilesystemPath(uri: string): string {
 	if (typeof uri !== "string" || !uri.startsWith("content://")) {
@@ -284,39 +285,42 @@ export const moveTaskFilesToTrash = async (
 
 	const isBtMultiFile = !!bittorrent?.info?.name && files.length > 1;
 	if (isBtMultiFile) {
-		const torrentFolder = joinPath(dir, btFolderName(bittorrent));
-		logger.info(`[Risuko] trashing torrent folder: "${torrentFolder}"`);
-		try {
-			const found: boolean = await invoke("trash_item", {
-				path: torrentFolder,
-			});
-			if (found) {
-				logger.info(`[Risuko] trashed torrent folder: "${torrentFolder}"`);
-			}
-		} catch (err) {
-			logger.warn(`[Risuko] trash torrent folder failed: ${err}`);
-			let trashedAny = false;
-			for (const file of files) {
-				const filePath = `${file?.path || ""}`.trim();
-				if (!filePath || filePath === dir) {
-					continue;
+		const targets = torrentTrashTargets(
+			dir,
+			btFolderName(bittorrent),
+			files.map((file) => file?.path || ""),
+		);
+		let fileFailures = 0;
+		let folderTrashed = false;
+		if (targets.folder) {
+			logger.info(`[Risuko] trashing torrent folder: "${targets.folder}"`);
+			try {
+				const found: boolean = await invoke("trash_item", {
+					path: targets.folder,
+				});
+				if (found) {
+					logger.info(`[Risuko] trashed torrent folder: "${targets.folder}"`);
+					folderTrashed = true;
 				}
+			} catch (err) {
+				logger.warn(`[Risuko] trash torrent folder failed: ${err}`);
+			}
+		}
+		if (!folderTrashed) {
+			for (const filePath of targets.files) {
 				try {
 					const found: boolean = await invoke("trash_item", { path: filePath });
 					if (found) {
-						trashedAny = true;
+						logger.info(`[Risuko] trashed: "${filePath}"`);
 					}
 				} catch (fileErr) {
 					logger.warn(`[Risuko] trash file "${filePath}" failed: ${fileErr}`);
+					fileFailures++;
 				}
-			}
-			if (!trashedAny) {
-				await cleanupGeneratedTorrentSidecars(task);
-				return false;
 			}
 		}
 		await cleanupGeneratedTorrentSidecars(task);
-		return true;
+		return fileFailures === 0;
 	}
 
 	const path = getTaskFullPath(task);

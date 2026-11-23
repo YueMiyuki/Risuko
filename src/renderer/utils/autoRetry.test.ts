@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { test } from "node:test";
 import {
 	AUTO_RETRY_DEFAULT_MAX_ATTEMPTS,
@@ -8,28 +10,55 @@ import {
 	normalizeMaxAttempts,
 } from "./autoRetry.ts";
 
+const PERMANENT_CODES = [
+	"300",
+	"301",
+	"302",
+	"400",
+	"401",
+	"502",
+	"530",
+	"531",
+	"533",
+	"534",
+	"540",
+	"541",
+	"542",
+	"550",
+	"551",
+	"552",
+	"553",
+	"554",
+];
+
 test("errors that cannot succeed are permanent", () => {
-	for (const code of [
-		"300",
-		"301",
-		"302",
-		"400",
-		"401",
-		"502",
-		"530",
-		"531",
-		"533",
-		"534",
-		"540",
-		"541",
-		"542",
-		"550",
-		"551",
-		"552",
-		"553",
-		"554",
-	]) {
+	for (const code of PERMANENT_CODES) {
 		assert.equal(isPermanentErrorCode(code), true, code);
+	}
+});
+
+test("the engine and the window agree on which errors are permanent", () => {
+	const source = readFileSync(
+		resolve(
+			import.meta.dirname,
+			"../../../src-tauri/risuko-engine/src/engine/headless_policy.rs",
+		),
+		"utf8",
+	);
+	const list = source.match(
+		/const PERMANENT_ERROR_CODES: &\[&str\] = &\[([^\]]*)\];/,
+	);
+	assert.ok(list, "the engine list was not found");
+	const engineCodes = [...list[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+	assert.ok(engineCodes.length >= 10, "the engine list looks truncated");
+
+	for (const code of engineCodes.filter((code) => code !== "315")) {
+		assert.equal(isPermanentErrorCode(code), true, code);
+	}
+	assert.ok(engineCodes.includes("315"));
+	assert.equal(isPermanentErrorCode("315"), false);
+	for (const code of PERMANENT_CODES) {
+		assert.ok(engineCodes.includes(code), code);
 	}
 });
 

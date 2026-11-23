@@ -423,14 +423,17 @@ impl FilesystemStorage {
         };
         let file = &self.layout.files()[idx];
         let ranges = boundary_ranges(file.offset, file.length, self.piece_length);
+        let copy_from = shadow_path.clone();
+        let shadow = task::spawn_blocking(move || open_part_file(&copy_from))
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))??;
         let real = self.handle(idx, true).await?;
         let target = [(idx, Arc::clone(&real))];
-        let copy_from = shadow_path.clone();
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         self.pause_at_write_hold().await;
         let copied = task::spawn_blocking(move || -> io::Result<()> {
-            let Ok(shadow) = std::fs::File::open(&copy_from) else {
+            let Some(shadow) = shadow else {
                 return Ok(());
             };
             let shadow_len = shadow.metadata()?.len();
@@ -1043,6 +1046,14 @@ fn pread_exact(file: &std::fs::File, mut offset: u64, mut buf: &mut [u8]) -> io:
     Ok(())
 }
 
+fn open_part_file(path: &Path) -> io::Result<Option<std::fs::File>> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,6 +1622,99 @@ mod tests {
         storage.sync_written().await.unwrap();
         assert!(storage.unsynced.lock().is_empty());
         assert!(!storage.dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_missing_part_file_is_nothing_to_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("0");
+        assert!(open_part_file(&path).unwrap().is_none());
+        std::fs::write(&path, b"part").unwrap();
+        assert!(open_part_file(&path).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    fn mode_bits_are_enforced(unreadable: &Path) -> bool {
+        let enforced = std::fs::File::open(unreadable).is_err();
+        if !enforced {
+            eprintln!(
+                "SKIPPED: this process opens files whatever their mode (running as root?), so nothing was checked"
+            );
+        }
+        enforced
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_part_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = file_with_mode(tmp.path(), "0", 0o000);
+        let enforced = mode_bits_are_enforced(&path);
+        let result = open_part_file(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !enforced {
+            return;
+        }
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_promotion_that_cannot_open_its_part_file_fails_and_keeps_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = |len: i64, name: &[u8]| {
+            Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(len)),
+                (
+                    b"path".to_vec(),
+                    Value::List(vec![Value::Bytes(name.to_vec())]),
+                ),
+            ])
+        };
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![file(10, b"a.bin"), file(22, b"b.bin")]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0; 40])),
+        ]);
+        let meta =
+            parse_torrent(&encode_to_vec(&Value::Dict(vec![(b"info".to_vec(), info)]))).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let parts = parts_dir_for(&root, "abcd");
+        let storage = FilesystemStorage::new(&meta.info, &root).with_parts_dir(parts.clone());
+        let only_b: HashSet<usize> = [1].into_iter().collect();
+        storage.set_selection(Some(&only_b)).await;
+        let piece0: Vec<u8> = (1u8..=16).collect();
+        storage.write_at(0, &piece0).await.unwrap();
+        storage.sync_written().await.unwrap();
+        storage.close_handles().await.unwrap();
+        let part = parts.join("0");
+        assert!(part.exists());
+
+        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if !mode_bits_are_enforced(&part) {
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        assert_eq!(storage.set_selection(None).await, vec![0]);
+        let failed = storage.promote_file(0).await;
+        let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600));
+        assert!(failed.is_err());
+        assert!(storage.is_shadowed(0));
+        assert!(part.exists());
+        assert!(!root.join("a.bin").exists());
+
+        storage.promote_file(0).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(root.join("a.bin")).await.unwrap(),
+            piece0[..10]
+        );
+        assert!(!part.exists());
     }
 
     #[tokio::test]

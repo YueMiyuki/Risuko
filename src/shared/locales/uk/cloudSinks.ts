@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "Потрібно вказати ім'я користувача SFTP.",
 	errSftpAuthRequired: "Потрібно вказати пароль або закритий ключ SFTP.",
 	errFtpHostRequired: "Потрібно вказати хост FTP.",
+	errSecretForNewServer:
+		"Сервер змінено, тому збережений пароль або ключ не використовуватиметься повторно. Введіть їх ще раз.",
 	errMoveTargetRequired:
 		"Для дії переміщення потрібно вказати теку призначення.",
 	saving: "Збереження…",

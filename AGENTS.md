@@ -24,7 +24,8 @@ From the repository root:
 | Run the app | `pnpm dev` |
 | Typecheck | `pnpm typecheck` |
 | JavaScript tests | `pnpm test` |
-| Lint and format | `pnpm fmt` (writes) or `pnpx @biomejs/biome check` (reports) |
+| Lint and format | `pnpm fmt` (writes) or `pnpm exec biome check` (reports) |
+| Everything CI checks | `pnpm verify` |
 
 From `src-tauri/`:
 

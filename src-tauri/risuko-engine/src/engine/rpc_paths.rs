@@ -49,6 +49,7 @@ pub(crate) fn check_out_name(out: &str) -> Result<(), String> {
         || [out, out.trim()].into_iter().any(|name| {
             let path = Path::new(name);
             name.starts_with(['/', '\\'])
+                || starts_at_home(name)
                 || path.has_root()
                 || matches!(path.components().next(), Some(Component::Prefix(_)))
         });
@@ -144,6 +145,11 @@ fn absolute_paths(dirs: impl Iterator<Item = String>) -> Vec<PathBuf> {
         .collect()
 }
 
+fn starts_at_home(name: &str) -> bool {
+    name.strip_prefix('~')
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+}
+
 fn has_parent_step(path: &str) -> bool {
     path.split(['/', '\\']).any(|part| {
         let part = part.trim();
@@ -151,9 +157,17 @@ fn has_parent_step(path: &str) -> bool {
     })
 }
 
+// Win32 trims trailing dots and spaces from the last name only, and resolve() probes every ancestor as a last name
+fn has_trimmed_name(path: &Path) -> bool {
+    path.components().any(|part| match part {
+        Component::Normal(name) => name.to_string_lossy().ends_with(['.', ' ']),
+        _ => false,
+    })
+}
+
 fn dir_is_inside(dir: &str, roots: &[PathBuf]) -> bool {
     let path = Path::new(dir);
-    if !path.is_absolute() || has_parent_step(dir) {
+    if !path.is_absolute() || has_parent_step(dir) || (cfg!(windows) && has_trimmed_name(path)) {
         return false;
     }
     let Some((existing, resolved)) = resolve(path) else {
@@ -292,11 +306,21 @@ mod tests {
     }
 
     #[test]
+    fn names_ending_in_a_dot_or_space_are_spotted() {
+        for path in ["/dl /x", "/dl.", "/dl/sub ", "/dl../x", "/dl/new./x"] {
+            assert!(has_trimmed_name(Path::new(path)), "{path:?}");
+        }
+        for path in ["/dl/x", "/dl/.hidden", "/dl/a. b/x", "/dl/./x", "/"] {
+            assert!(!has_trimmed_name(Path::new(path)), "{path:?}");
+        }
+    }
+
+    #[test]
     fn roots_and_folders_compare_after_resolving() {
         let (_tmp, root) = download_root();
         let canonical = std::fs::canonicalize(&root).unwrap();
-        assert!(check_save_dir(&text(&root.join("sub")), &[canonical.clone()]).is_ok());
-        assert!(check_save_dir(&text(&canonical.join("sub")), &[root.clone()]).is_ok());
+        assert!(check_save_dir(&text(&root.join("sub")), std::slice::from_ref(&canonical)).is_ok());
+        assert!(check_save_dir(&text(&canonical.join("sub")), std::slice::from_ref(&root)).is_ok());
     }
 
     #[cfg(unix)]
@@ -319,7 +343,7 @@ mod tests {
     fn a_symlink_inside_a_root_that_stays_inside_passes() {
         let (_tmp, root) = download_root();
         std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).unwrap();
-        assert!(check_save_dir(&text(&root.join("alias")), &[root.clone()]).is_ok());
+        assert!(check_save_dir(&text(&root.join("alias")), std::slice::from_ref(&root)).is_ok());
     }
 
     fn ignores_case(tmp: &Path) -> bool {
@@ -419,7 +443,16 @@ mod tests {
 
     #[test]
     fn out_names_stay_inside_the_save_folder() {
-        for out in ["file.bin", "sub/name.bin", "a..b.bin", ".hidden", ""] {
+        for out in [
+            "file.bin",
+            "sub/name.bin",
+            "a..b.bin",
+            ".hidden",
+            "",
+            "~x.bin",
+            "sub/~/x.bin",
+            "~user/x.bin",
+        ] {
             assert!(check_out_name(out).is_ok(), "{out:?}");
         }
         for out in [
@@ -431,6 +464,11 @@ mod tests {
             "sub/.. ",
             "..\\x.bin",
             "\\x.bin",
+            "~",
+            "~/x.mp4",
+            " ~/x.mp4",
+            "~\\x.mp4",
+            "~/.config/autostart/x.desktop",
         ] {
             let error = check_out_name(out).unwrap_err();
             assert!(error.contains("not allowed for RPC clients"), "{error}");
@@ -447,35 +485,29 @@ mod tests {
 
     #[test]
     fn category_and_routing_folders_count_as_roots() {
+        let data = if cfg!(windows) { "C:\\data" } else { "/data" };
+        let dir = |name: &str| text(&Path::new(data).join(name));
         let options = options(json!({
-            "dir": "/data/dl",
+            "dir": dir("dl"),
             "file-category-dirs": {
-                "video": " /data/video ",
+                "video": format!(" {} ", dir("video")),
                 "music": "",
                 "image": "relative/images"
             },
             "task-routing-rules": [
-                {"id": "a", "label": "ISO", "pattern": "*.iso", "dir": "/data/iso"},
-                {"id": "b", "label": "Off", "pattern": "*.x", "dir": "/data/off", "enabled": false},
+                {"id": "a", "label": "ISO", "pattern": "*.iso", "dir": dir("iso")},
+                {"id": "b", "label": "Off", "pattern": "*.x", "dir": dir("off"), "enabled": false},
                 {"id": "c", "label": "Empty", "pattern": "*.y", "dir": ""}
             ]
         }));
         let mut base = download_roots(&options);
         base.sort();
-        assert_eq!(
-            base,
-            vec![PathBuf::from("/data/dl"), PathBuf::from("/data/video")]
-        );
+        assert_eq!(base, ["dl", "video"].map(|name| PathBuf::from(dir(name))));
         let mut all = allowed_roots(&options);
         all.sort();
         assert_eq!(
             all,
-            vec![
-                PathBuf::from("/data/dl"),
-                PathBuf::from("/data/iso"),
-                PathBuf::from("/data/off"),
-                PathBuf::from("/data/video"),
-            ]
+            ["dl", "iso", "off", "video"].map(|name| PathBuf::from(dir(name)))
         );
     }
 

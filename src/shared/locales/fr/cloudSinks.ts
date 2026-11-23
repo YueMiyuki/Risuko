@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "Le nom d’utilisateur SFTP est obligatoire.",
 	errSftpAuthRequired: "Le mot de passe ou la clé privée SFTP est obligatoire.",
 	errFtpHostRequired: "L’hôte FTP est obligatoire.",
+	errSecretForNewServer:
+		"Le serveur a changé, le mot de passe ou la clé enregistrés ne sont donc pas réutilisés. Saisissez-les à nouveau.",
 	errMoveTargetRequired:
 		"Le dossier de destination du déplacement est obligatoire lorsque l’action suivante est un déplacement.",
 	saving: "Enregistrement…",

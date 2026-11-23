@@ -18,8 +18,6 @@ use tauri::Manager;
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
-use risuko_engine::engine::rss::RssManager;
-
 #[cfg(not(target_os = "android"))]
 fn with_desktop_plugins<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
@@ -403,11 +401,6 @@ pub fn run(context: tauri::Context) {
             }
         }
 
-        let rss = app.state::<state::AppState>().rss.clone();
-        tauri::async_runtime::spawn(async move {
-            drop(RssManager::start_polling(rss));
-        });
-
         Ok(())
     })
     .on_window_event(|window, event| {
@@ -555,24 +548,6 @@ pub fn run(context: tauri::Context) {
         commands::event_cmds::update_tray,
         commands::event_cmds::update_tray_menu_labels,
         commands::event_cmds::update_app_menu_labels,
-        commands::rss_cmds::add_rss_feed,
-        commands::rss_cmds::remove_rss_feed,
-        commands::rss_cmds::refresh_rss_feed,
-        commands::rss_cmds::refresh_all_rss_feeds,
-        commands::rss_cmds::get_rss_feeds,
-        commands::rss_cmds::get_rss_items,
-        commands::rss_cmds::update_rss_feed_settings,
-        commands::rss_cmds::add_rss_rule,
-        commands::rss_cmds::update_rss_rule,
-        commands::rss_cmds::dry_run_rss_rule,
-        commands::rss_cmds::remove_rss_rule,
-        commands::rss_cmds::get_rss_rules,
-        commands::rss_cmds::delete_rss_items,
-        commands::rss_cmds::clear_rss_download,
-        commands::rss_cmds::read_rss_download,
-        commands::rss_cmds::download_rss_item_tracked,
-        commands::rss_cmds::mark_rss_item_read,
-        commands::rss_cmds::mark_rss_items_read,
         commands::upload_cmds::list_upload_sinks,
         commands::upload_cmds::add_upload_sink,
         commands::upload_cmds::update_upload_sink,

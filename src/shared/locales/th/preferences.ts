@@ -140,7 +140,6 @@ export default {
 	"file-category-document": "เอกสาร",
 	"file-category-compressed": "ไฟล์บีบอัด",
 	"file-category-program": "โปรแกรม",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"เนื่องจากข้อจำกัดการอนุญาตแซนด์บ็อกซ์ของ App Store แนะนำให้ตั้งค่าไดเร็กทอรีดาวน์โหลดเริ่มต้นเป็น ~/Downloads",
 	"transfer-settings": "การส่งผ่าน",
@@ -191,6 +190,9 @@ export default {
 	"uri-selector-feedback": "ตามผลตอบรับ (ทิ้งมิเรอร์ที่ช้าหรือล้มเหลว)",
 	"uri-selector-inorder": "ตามลำดับ (ลองมิเรอร์จากซ้ายไปขวา)",
 	"uri-selector-adaptive": "ปรับตัว (เลือกตัวที่เร็วที่สุด)",
+	"send-auth-to-all-mirrors": "ส่งข้อมูลเข้าสู่ระบบไปยังมิเรอร์ HTTPS ทั้งหมด",
+	"send-auth-to-all-mirrors-tips":
+		"ส่งเฮดเดอร์การอนุญาตของงานไปยังมิเรอร์ HTTPS ทุกตัว เมื่อปิด จะส่งให้เฉพาะมิเรอร์ที่มีสคีม โฮสต์ และพอร์ตเดียวกับลิงก์แรกเท่านั้น",
 	"unit-seconds": "วินาที",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "พื้นที่จัดเก็บ",

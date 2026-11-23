@@ -333,6 +333,8 @@ export default {
 	"media-format-hint":
 		"Haal formaten op om een specifieke kwaliteit te kiezen.",
 	"media-format-error": "Formaten voor deze URL konden niet worden geladen.",
+	"media-unsupported-android":
+		"Downloads van mediasites vereisen yt-dlp, dat niet beschikbaar is op Android",
 	"download-complete-message": "Download van {{taskName}} voltooid",
 	"download-complete-notify": "Download voltooid",
 	"bt-download-complete-message":
@@ -380,6 +382,15 @@ export default {
 	"mirror-placeholder": "Spiegel-URL (zelfde bestand, andere server)",
 	"mirror-hint":
 		"Voeg spiegel-URL's toe die naar hetzelfde bestand verwijzen om van meerdere bronnen tegelijk te downloaden.",
+	"mirror-sources": "{{count}} bronnen",
+	"mirror-failing": "Mislukt",
+	"mirror-idle": "Niet in gebruik",
+	"add-tab-links": "Links",
+	"add-tab-mirrors": "Spiegels",
+	"mirror-list-placeholder": "Spiegel-URL's van één bestand, één per regel",
+	"mirror-list-hint":
+		"Elke link moet naar hetzelfde bestand verwijzen. De delen worden van alle spiegels tegelijk gedownload, en een spiegel die faalt of trager wordt, geeft zijn delen door aan de andere.",
+	"mirror-list-rejected": "Geen gewone http(s)-bestandslink:",
 	"detail-tab-general": "Algemeen",
 	"detail-tab-activity": "Activiteit",
 	"detail-tab-trackers": "Trackers",
@@ -410,6 +421,31 @@ export default {
 	"edit-speed-limit-placeholder": "0 of leeg = onbeperkt (bijv. 500K)",
 	"edit-primary-uri": "Download-URL",
 	"edit-primary-uri-placeholder": "Primaire download-URL",
+	"edit-tab-seeding": "Seeden",
+	"seeding-rule-global": "De globale instelling gebruiken",
+	"seeding-rule-forever": "Seeden tot ik stop",
+	"seeding-rule-limits": "Stoppen bij een ratio of na een tijd",
+	"seeding-rule-none": "Niet seeden",
+	"seeding-global-off": "Momenteel: niet seeden",
+	"seeding-global-forever": "Momenteel: seeden tot het wordt gestopt",
+	"seeding-global-ratio": "Momenteel: stoppen bij ratio {{ratio}}",
+	"seeding-global-minutes": "Momenteel: stoppen na {{minutes}} minuten",
+	"seeding-global-both":
+		"Momenteel: stoppen bij ratio {{ratio}} of na {{minutes}} minuten",
+	"seeding-limits-hint":
+		"Seeden stopt bij de limiet die het eerst wordt bereikt. 0 betekent geen limiet van dat soort.",
+	"seeding-limits-required": "Voer een ratio of een aantal minuten boven 0 in",
+	"seeding-for": "Seedduur",
+	"seeding-applies-after-download": "Dit geldt zodra de download klaar is.",
+	"seeding-stops-now": "Deze taak stopt met seeden zodra u opslaat.",
+	"seeding-limit-reached":
+		"Deze taak heeft deze limiet al bereikt en stopt met seeden zodra u opslaat.",
+	"seeding-in-place-note":
+		"Torrents die u hebt gemaakt blijven seeden tot u ze stopt.",
+	"seeding-ed2k-sharing-off":
+		"Delen via eD2K staat uit in Voorkeuren, dus deze taak uploadt niet.",
+	"seeding-leftover-values":
+		"Deze taak heeft seedwaarden van een eerdere wijziging van de instellingen. Opslaan vervangt ze.",
 	"create-torrent": "Torrent maken",
 	"create-torrent-menu": "Torrent maken...",
 	"create-torrent-source": "Te delen bestand of map",

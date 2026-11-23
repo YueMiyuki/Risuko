@@ -478,7 +478,7 @@ fn parse_announce_response(buf: &[u8], is_ipv6: bool) -> AnnounceResponse {
     let seeders = be::read_u32(&buf[16..20]);
     let mut peers = Vec::new();
     if is_ipv6 {
-        for chunk in buf[20..].chunks_exact(18) {
+        for chunk in buf[20..].as_chunks::<18>().0 {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&chunk[0..16]);
             let ip = std::net::Ipv6Addr::from(octets);
@@ -489,7 +489,7 @@ fn parse_announce_response(buf: &[u8], is_ipv6: bool) -> AnnounceResponse {
             }
         }
     } else {
-        for chunk in buf[20..].chunks_exact(6) {
+        for chunk in buf[20..].as_chunks::<6>().0 {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             let endpoint = SocketAddr::new(IpAddr::V4(ip), port);

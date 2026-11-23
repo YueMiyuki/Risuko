@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "Nazwa użytkownika SFTP jest wymagana.",
 	errSftpAuthRequired: "Wymagane jest hasło SFTP lub klucz prywatny.",
 	errFtpHostRequired: "Host FTP jest wymagany.",
+	errSecretForNewServer:
+		"Serwer został zmieniony, więc zapisane hasło lub klucz nie zostaną użyte ponownie. Wprowadź je ponownie.",
 	errMoveTargetRequired:
 		"Folder docelowy przeniesienia jest wymagany, gdy akcją po wysłaniu jest przeniesienie.",
 	saving: "Zapisywanie…",

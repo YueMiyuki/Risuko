@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 const ATOMIC_TEMP_PREFIX: &str = ".risuko-atomic-";
 const ATOMIC_TEMP_SUFFIX: &str = ".tmp";
 const STALE_ATOMIC_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const PERSIST_RETRY_LIMIT: u32 = 5;
 
 pub(crate) fn process_may_be_running(pid: u32) -> bool {
     #[cfg(unix)]
@@ -106,6 +107,30 @@ pub(crate) fn cleanup_stale_atomic_write_files(directory: &Path) {
     }
 }
 
+fn persist_error_is_transient(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+        };
+
+        error.raw_os_error().is_some_and(|code| {
+            [
+                ERROR_ACCESS_DENIED,
+                ERROR_SHARING_VIOLATION,
+                ERROR_LOCK_VIOLATION,
+            ]
+            .contains(&(code as u32))
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 pub fn write_file_atomically(path: &Path, data: &[u8]) -> Result<(), String> {
     write_file_atomically_with(path, data, |_| Ok(()))
 }
@@ -140,8 +165,26 @@ pub fn write_file_atomically_with(
         .sync_all()
         .map_err(|e| format!("Failed to sync temporary file for {}: {e}", path.display()))?;
     prepare(temp.path())?;
-    temp.persist(path)
-        .map_err(|e| format!("Failed to persist {}: {}", path.display(), e.error))?;
+    let mut attempt = 0;
+    loop {
+        match temp.persist(path) {
+            Ok(_) => break,
+            Err(error)
+                if attempt < PERSIST_RETRY_LIMIT && persist_error_is_transient(&error.error) =>
+            {
+                temp = error.file;
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(u64::from(attempt) * 10));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to persist {}: {}",
+                    path.display(),
+                    error.error
+                ))
+            }
+        }
+    }
 
     if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();

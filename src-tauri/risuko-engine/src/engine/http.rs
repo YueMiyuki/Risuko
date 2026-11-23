@@ -69,7 +69,25 @@ struct ChunkMeta {
     etag: Option<String>,
     #[serde(default)]
     last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     pieces: Vec<PieceProgress>,
+}
+
+impl ChunkMeta {
+    fn validated_elsewhere(&self, origin: &Option<String>) -> bool {
+        has_resume_validator(&self.etag, &self.last_modified)
+            && matches!((&self.origin, origin), (Some(saved), Some(current)) if saved != current)
+    }
+}
+
+fn url_origin(uri: &str) -> Option<String> {
+    let url = url::Url::parse(uri).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port_or_known_default() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
 }
 
 fn etags_strongly_equal(a: &str, b: &str) -> bool {
@@ -286,13 +304,20 @@ fn save_piece_meta(
     content_length: u64,
     etag: &Option<String>,
     last_modified: &Option<String>,
+    origin: &Option<String>,
 ) {
-    let path = chunk_meta_path(part_path);
-    let resumable = has_resume_validator(etag, last_modified);
-    if !resumable && path.exists() {
-        return;
-    }
-    let pieces: Vec<PieceProgress> = if resumable {
+    let meta = snapshot_piece_meta(queue, content_length, etag, last_modified, origin);
+    write_piece_meta(part_path, &meta);
+}
+
+fn snapshot_piece_meta(
+    queue: &PieceQueue,
+    content_length: u64,
+    etag: &Option<String>,
+    last_modified: &Option<String>,
+    origin: &Option<String>,
+) -> ChunkMeta {
+    let pieces: Vec<PieceProgress> = if has_resume_validator(etag, last_modified) {
         queue
             .pieces
             .iter()
@@ -309,15 +334,23 @@ fn save_piece_meta(
     } else {
         Vec::new()
     };
-    let meta = ChunkMeta {
+    ChunkMeta {
         version: META_VERSION,
         content_length,
         piece_size: queue.piece_size as u32,
         etag: etag.clone(),
         last_modified: last_modified.clone(),
+        origin: origin.clone(),
         pieces,
-    };
-    if let Ok(json) = serde_json::to_string(&meta) {
+    }
+}
+
+fn write_piece_meta(part_path: &Path, meta: &ChunkMeta) {
+    let path = chunk_meta_path(part_path);
+    if !has_resume_validator(&meta.etag, &meta.last_modified) && path.exists() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(meta) {
         let _ = crate::traits::write_file_atomically(&path, json.as_bytes());
     }
 }
@@ -327,6 +360,7 @@ fn load_piece_meta(
     content_length: u64,
     etag: &Option<String>,
     last_modified: &Option<String>,
+    origin: &Option<String>,
 ) -> Option<ChunkMeta> {
     let path = chunk_meta_path(part_path);
     let data = fs::read_to_string(&path).ok()?;
@@ -359,7 +393,7 @@ fn load_piece_meta(
         }
         _ => false,
     };
-    if !validators_match {
+    if !validators_match && !meta.validated_elsewhere(origin) {
         let _ = fs::remove_file(&path);
         return None;
     }
@@ -978,7 +1012,7 @@ fn is_https_uri(uri: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
 }
 
-fn headers_for_uri(
+pub(super) fn headers_for_uri(
     base_headers: &HeaderMap,
     uri: &str,
     primary: &str,
@@ -1429,6 +1463,7 @@ async fn run_single_uri_download(
                     throttle.clone(),
                     probe.etag.clone(),
                     probe.last_modified.clone(),
+                    url_origin(uri),
                     &chunk_completed,
                     stall.clone(),
                     falloc_mode,
@@ -1769,6 +1804,24 @@ fn cloudflare_error(uri: &str, status: u16) -> String {
         .and_then(|u| u.host_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "unknown".to_string());
     format!("{CLOUDFLARE_MARKER} host={host} status={status}")
+}
+
+fn loggable_headers(headers: &HeaderMap) -> String {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_str = name.as_str();
+            if matches!(
+                name_str.to_lowercase().as_str(),
+                "authorization" | "set-cookie" | "cookie" | "proxy-authorization"
+            ) {
+                None
+            } else {
+                Some(format!("{}: {:?}", name_str, value))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn read_body_prefix(
@@ -2482,6 +2535,7 @@ async fn run_multi_chunk(
     throttle: Throttle,
     expected_etag: Option<String>,
     expected_last_modified: Option<String>,
+    validator_origin: Option<String>,
     chunk_completed: &[Arc<AtomicU64>],
     stall: StallWatchdog,
     falloc_mode: super::falloc::Mode,
@@ -2502,7 +2556,20 @@ async fn run_multi_chunk(
         content_length,
         &expected_etag,
         &expected_last_modified,
+        &validator_origin,
     );
+    let (meta_etag, meta_last_modified, meta_origin) = match &resumed_meta {
+        Some(meta) if meta.validated_elsewhere(&validator_origin) => (
+            meta.etag.clone(),
+            meta.last_modified.clone(),
+            meta.origin.clone(),
+        ),
+        _ => (
+            expected_etag.clone(),
+            expected_last_modified.clone(),
+            validator_origin,
+        ),
+    };
     let piece_size = resumed_meta
         .as_ref()
         .map(|m| u64::from(m.piece_size))
@@ -2552,8 +2619,9 @@ async fn run_multi_chunk(
         part_path,
         &queue,
         content_length,
-        &expected_etag,
-        &expected_last_modified,
+        &meta_etag,
+        &meta_last_modified,
+        &meta_origin,
     );
 
     let speed_cancel = cancel_token.clone();
@@ -2573,9 +2641,11 @@ async fn run_multi_chunk(
     });
 
     let save_part = part_path.to_path_buf();
+    let save_file = Arc::clone(&file);
     let save_queue = Arc::clone(&queue);
-    let save_etag = expected_etag.clone();
-    let save_lm = expected_last_modified.clone();
+    let save_etag = meta_etag.clone();
+    let save_lm = meta_last_modified.clone();
+    let save_origin = meta_origin.clone();
     let save_cancel = cancel_token.clone();
     let save_stop = CancellationToken::new();
     let save_stop_rx = save_stop.clone();
@@ -2600,14 +2670,21 @@ async fn run_multi_chunk(
                         continue;
                     }
                     last_saved = now;
-                    let (part, queue, etag, lm) = (
+                    let (part, file, queue, etag, lm, origin) = (
                         save_part.clone(),
+                        Arc::clone(&save_file),
                         Arc::clone(&save_queue),
                         save_etag.clone(),
                         save_lm.clone(),
+                        save_origin.clone(),
                     );
                     let _ = tokio::task::spawn_blocking(move || {
-                        save_piece_meta(&part, &queue, content_length, &etag, &lm);
+                        let meta =
+                            snapshot_piece_meta(&queue, content_length, &etag, &lm, &origin);
+                        if file.sync_data().is_err() {
+                            return;
+                        }
+                        write_piece_meta(&part, &meta);
                     })
                     .await;
                 }
@@ -2719,13 +2796,16 @@ async fn run_multi_chunk(
     }
 
     if stall.flag.load(Ordering::Acquire) {
-        save_piece_meta(
-            part_path,
+        let meta = snapshot_piece_meta(
             &queue,
             content_length,
-            &expected_etag,
-            &expected_last_modified,
+            &meta_etag,
+            &meta_last_modified,
+            &meta_origin,
         );
+        if sync_file(&file).await.is_ok() {
+            write_piece_meta(part_path, &meta);
+        }
         return Err(format!(
             "Download stalled: speed below {} B/s for {}s",
             stall.lowest_speed,
@@ -2734,13 +2814,16 @@ async fn run_multi_chunk(
     }
 
     if !errors.is_empty() {
-        save_piece_meta(
-            part_path,
+        let meta = snapshot_piece_meta(
             &queue,
             content_length,
-            &expected_etag,
-            &expected_last_modified,
+            &meta_etag,
+            &meta_last_modified,
+            &meta_origin,
         );
+        if sync_file(&file).await.is_ok() {
+            write_piece_meta(part_path, &meta);
+        }
 
         if errors.iter().all(|e| e.contains("cancelled")) {
             return Err("Download cancelled".to_string());
@@ -3118,22 +3201,7 @@ async fn download_piece_stream(
     }
 
     if status >= 400 {
-        let safe_headers: String = resp
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                let name_str = name.as_str();
-                if matches!(
-                    name_str.to_lowercase().as_str(),
-                    "authorization" | "set-cookie" | "cookie" | "proxy-authorization"
-                ) {
-                    None
-                } else {
-                    Some(format!("{}: {:?}", name_str, value))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        let safe_headers = loggable_headers(resp.headers());
 
         let body_len = resp.content_length().unwrap_or(0);
         const MAX_SNIPPET_BYTES: usize = 256;
@@ -3598,13 +3666,16 @@ async fn run_single_download(
     }
 
     if status >= 400 {
-        let header_dump = format!("{:?}", resp.headers());
+        let safe_headers = loggable_headers(resp.headers());
         let body = read_body_prefix(resp, 512, idle_timeout, &cancel_token).await;
         let snippet = String::from_utf8_lossy(&body);
         tracing::warn!(
-            "Single download got HTTP {status} for {}; force_range={force_range}; \
-             headers={header_dump}; body[..512]={snippet:?}",
+            "Single download got HTTP {status} for {}; force_range={force_range}",
             super::util::redact_url(uri)
+        );
+        tracing::debug!(
+            "Single download HTTP {status} details: safe_headers=[{safe_headers}]; \
+             body[..512]={snippet:?}"
         );
         if status == 412 && sent_if_range {
             tracing::warn!(
@@ -4159,6 +4230,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loggable_headers_leave_out_credentials() {
+        let mut map = HeaderMap::new();
+        map.insert(
+            "set-cookie",
+            HeaderValue::from_static("sid=cookie-secret-1"),
+        );
+        map.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer token-secret-2"),
+        );
+        map.insert("cookie", HeaderValue::from_static("jar=cookie-secret-3"));
+        map.insert(
+            "proxy-authorization",
+            HeaderValue::from_static("Basic proxy-secret-4"),
+        );
+        map.insert("content-type", HeaderValue::from_static("text/html"));
+        let text = loggable_headers(&map);
+        assert!(text.contains("content-type"), "{text}");
+        for secret in [
+            "cookie-secret-1",
+            "token-secret-2",
+            "cookie-secret-3",
+            "proxy-secret-4",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    #[test]
     fn temporary_http_statuses_are_retried_on_a_single_connection() {
         for status in [
             "412 Precondition Failed",
@@ -4321,7 +4421,11 @@ mod tests {
         assert!(name.ends_with(".mkv"));
         assert!(name.starts_with('\u{6f22}'));
         let no_ext = sanitize_filename(&"a".repeat(400));
-        assert_eq!(no_ext.len(), MAX_FILENAME_BYTES);
+        if cfg!(windows) {
+            assert!(no_ext.len() <= MAX_FILENAME_BYTES);
+        } else {
+            assert_eq!(no_ext.len(), MAX_FILENAME_BYTES);
+        }
     }
 
     #[test]
@@ -4879,9 +4983,9 @@ mod tests {
             .store(PIECE_SIZE as u32 / 2, Ordering::Relaxed);
 
         let etag = Some("\"abc\"".to_string());
-        save_piece_meta(&part, &q, PIECE_SIZE * 3, &etag, &None);
+        save_piece_meta(&part, &q, PIECE_SIZE * 3, &etag, &None, &None);
 
-        let loaded = load_piece_meta(&part, PIECE_SIZE * 3, &etag, &None).expect("meta");
+        let loaded = load_piece_meta(&part, PIECE_SIZE * 3, &etag, &None, &None).expect("meta");
         assert_eq!(loaded.version, META_VERSION);
         assert_eq!(loaded.content_length, PIECE_SIZE * 3);
         assert_eq!(loaded.pieces.len(), 2);
@@ -4891,15 +4995,15 @@ mod tests {
         assert_eq!(p1.c, PIECE_SIZE as u32 / 2);
 
         let other = Some("\"xyz\"".to_string());
-        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &other, &None).is_none());
+        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &other, &None, &None).is_none());
 
-        save_piece_meta(&part, &q, PIECE_SIZE * 3, &etag, &None);
+        save_piece_meta(&part, &q, PIECE_SIZE * 3, &etag, &None, &None);
         let weak = Some("W/\"abc\"".to_string());
-        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &weak, &None).is_none());
+        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &weak, &None, &None).is_none());
 
         let lm = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
-        save_piece_meta(&part, &q, PIECE_SIZE * 3, &None, &lm);
-        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &etag, &lm).is_none());
+        save_piece_meta(&part, &q, PIECE_SIZE * 3, &None, &lm, &None);
+        assert!(load_piece_meta(&part, PIECE_SIZE * 3, &etag, &lm, &None).is_none());
 
         delete_chunk_meta(&part);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4929,9 +5033,9 @@ mod tests {
             .store(PIECE_SIZE as u32, Ordering::Relaxed);
         q.pieces[3].completed.store(10, Ordering::Relaxed);
         let etag = Some("\"abc\"".to_string());
-        save_piece_meta(&part, &q, PIECE_SIZE * 4, &etag, &None);
+        save_piece_meta(&part, &q, PIECE_SIZE * 4, &etag, &None, &None);
 
-        let meta = load_piece_meta(&part, PIECE_SIZE * 4, &etag, &None).expect("meta");
+        let meta = load_piece_meta(&part, PIECE_SIZE * 4, &etag, &None, &None).expect("meta");
         let c_of = |i: u32| meta.pieces.iter().find(|p| p.i == i).map(|p| p.c);
         assert_eq!(c_of(0), Some(PIECE_SIZE as u32));
         assert_eq!(c_of(1), Some(PIECE_SIZE as u32 / 2));
@@ -4939,12 +5043,29 @@ mod tests {
     }
 
     #[test]
+    fn a_progress_snapshot_is_not_affected_by_later_writes() {
+        let (_dir, part, q) = meta_fixture("snapshot", PIECE_SIZE * 2, PIECE_SIZE * 2);
+        q.pieces[0].completed.store(5, Ordering::Relaxed);
+        let etag = Some("\"abc\"".to_string());
+        let meta = snapshot_piece_meta(&q, PIECE_SIZE * 2, &etag, &None, &None);
+        q.pieces[0]
+            .completed
+            .store(PIECE_SIZE as u32, Ordering::Relaxed);
+        write_piece_meta(&part, &meta);
+
+        let loaded = load_piece_meta(&part, PIECE_SIZE * 2, &etag, &None, &None).expect("meta");
+        assert_eq!(loaded.pieces.len(), 1);
+        assert_eq!(loaded.pieces[0].i, 0);
+        assert_eq!(loaded.pieces[0].c, 5);
+    }
+
+    #[test]
     fn oversized_part_file_discards_sidecar() {
         let (_dir, part, q) = meta_fixture("big", PIECE_SIZE * 2 + 1, PIECE_SIZE * 2);
         let etag = Some("\"abc\"".to_string());
         q.pieces[0].completed.store(1, Ordering::Relaxed);
-        save_piece_meta(&part, &q, PIECE_SIZE * 2, &etag, &None);
-        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &etag, &None).is_none());
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &etag, &None, &None);
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &etag, &None, &None).is_none());
     }
 
     #[test]
@@ -4967,19 +5088,47 @@ mod tests {
         q.pieces[0].completed.store(5, Ordering::Relaxed);
         let lm = Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string());
         let weak = Some("W/\"x\"".to_string());
-        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &lm);
-        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &None, &lm).is_some());
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &lm, &None);
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &None, &lm, &None).is_some());
 
         let other = Some("Thu, 22 Oct 2015 07:28:00 GMT".to_string());
-        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &lm);
-        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &weak, &other).is_none());
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &lm, &None);
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &weak, &other, &None).is_none());
 
         delete_chunk_meta(&part);
-        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &None);
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &weak, &None, &None);
         assert!(chunk_meta_path(&part).exists());
         assert!(probe_from_sidecar(&part).is_none());
-        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &weak, &None).is_none());
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &weak, &None, &None).is_none());
         assert!(!chunk_meta_path(&part).exists());
+    }
+
+    #[test]
+    fn validators_from_another_mirror_do_not_discard_progress() {
+        let (_dir, part, q) = meta_fixture("origin", PIECE_SIZE * 2, PIECE_SIZE * 2);
+        q.pieces[0].completed.store(5, Ordering::Relaxed);
+        let etag_a = Some("\"a\"".to_string());
+        let etag_b = Some("\"b\"".to_string());
+        let origin_a = url_origin("https://a.example/file.bin");
+        let origin_b = url_origin("https://b.example/file.bin");
+        assert_eq!(url_origin("HTTPS://A.Example:443/other"), origin_a);
+        assert_ne!(origin_a, origin_b);
+
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &etag_a, &None, &origin_a);
+        let meta = load_piece_meta(&part, PIECE_SIZE * 2, &etag_b, &None, &origin_b).expect("meta");
+        assert_eq!(meta.pieces.len(), 1);
+        assert_eq!(meta.etag, etag_a);
+        assert_eq!(meta.origin, origin_a);
+
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &etag_b, &None, &origin_a).is_none());
+
+        save_piece_meta(&part, &q, PIECE_SIZE * 2, &etag_a, &None, &None);
+        assert!(load_piece_meta(&part, PIECE_SIZE * 2, &etag_b, &None, &origin_b).is_none());
+
+        for current in [&origin_a, &origin_b] {
+            save_piece_meta(&part, &q, PIECE_SIZE * 2, &etag_a, &None, &origin_a);
+            assert!(load_piece_meta(&part, PIECE_SIZE * 3, &etag_a, &None, current).is_none());
+        }
     }
 
     #[test]
@@ -4992,8 +5141,8 @@ mod tests {
         assert_eq!(q.pieces.len(), 2);
         q.pieces[0].completed.store(7, Ordering::Relaxed);
         let etag = Some("\"abc\"".to_string());
-        save_piece_meta(&part, &q, 8 * PIECE_SIZE, &etag, &None);
-        let meta = load_piece_meta(&part, 8 * PIECE_SIZE, &etag, &None).expect("meta");
+        save_piece_meta(&part, &q, 8 * PIECE_SIZE, &etag, &None, &None);
+        let meta = load_piece_meta(&part, 8 * PIECE_SIZE, &etag, &None, &None).expect("meta");
         assert_eq!(u64::from(meta.piece_size), 4 * PIECE_SIZE);
     }
 
@@ -5359,7 +5508,7 @@ mod tests {
         let queue = PieceQueue::new(PIECE_SIZE * 2);
         queue.pieces[0].completed.store(5, Ordering::Relaxed);
         let etag = Some("\"abc\"".to_string());
-        save_piece_meta(&part, &queue, PIECE_SIZE * 2, &etag, &None);
+        save_piece_meta(&part, &queue, PIECE_SIZE * 2, &etag, &None, &None);
         assert!(!dir.path().join("f.bin.part.chunks.tmp").exists());
         let probe = probe_from_sidecar(&part).expect("sidecar usable");
         assert_eq!(probe.content_length, PIECE_SIZE * 2);

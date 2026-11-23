@@ -300,7 +300,6 @@ export const FILE_CATEGORIES = {
 	DOCUMENT: "document",
 	COMPRESSED: "compressed",
 	PROGRAM: "program",
-	RSS: "rss",
 } as const;
 
 export const DEFAULT_CLIPBOARD_WATCH_EXTENSIONS = [

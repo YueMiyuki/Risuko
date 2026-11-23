@@ -154,7 +154,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Comprimido",
 	"file-category-program": "Programa",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Debido a las restricciones de la tienda de aplicaciones, la ruta por defecto se recomienda que sea ~/Downloads",
 	"transfer-settings": "Transferencia",
@@ -209,6 +208,9 @@ export default {
 	"uri-selector-inorder":
 		"En orden (prueba las réplicas de izquierda a derecha)",
 	"uri-selector-adaptive": "Adaptativa (prefiere la más rápida)",
+	"send-auth-to-all-mirrors": "Enviar credenciales a todas las réplicas HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Envía el encabezado de autorización de una tarea a todas las réplicas HTTPS. Si está desactivado, solo lo reciben las réplicas con el mismo esquema, host y puerto que el primer enlace.",
 	"unit-seconds": "segundos",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Almacenamiento",

@@ -56,7 +56,7 @@ pub(crate) fn has_internal_suffix(name: &str) -> bool {
     })
 }
 
-pub(crate) fn is_allowed_webseed_url(url: &Url) -> bool {
+pub fn is_allowed_webseed_url(url: &Url) -> bool {
     url.host().is_some_and(|host| is_allowed_host(&host))
 }
 

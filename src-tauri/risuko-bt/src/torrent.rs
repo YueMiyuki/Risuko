@@ -887,6 +887,7 @@ struct Peer {
     canceled_requests: CanceledRequests,
     last_piece: Option<u32>,
     io_abort: Option<AbortHandle>,
+    dht_port_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -996,6 +997,7 @@ impl Peer {
             canceled_requests: CanceledRequests::default(),
             last_piece: None,
             io_abort: None,
+            dht_port_seen: false,
         }
     }
 }
@@ -1889,14 +1891,7 @@ async fn torrent_loop(
                         || matches!(duplicate, DuplicateAction::RejectNew);
                     let admitted = (!rejected
                         && !paused
-                        && !inbound_addr_taken(
-                            addr,
-                            &known_addrs,
-                            &peers,
-                            &pending_dials,
-                            &holepunch,
-                            Instant::now(),
-                        )
+                        && !inbound_addr_taken(addr, &peers)
                         && super::magnet::is_dialable_peer_addr(addr))
                     .then(|| {
                         inbound_room(
@@ -1964,7 +1959,13 @@ async fn torrent_loop(
                         let _ = cmd_tx.try_send(PeerCommand::Disconnect);
                     }
                 }
-                TorrentCommand::PauseIfHalted(ack) if paused || write_tasks.halted.is_none() => {
+                TorrentCommand::PauseIfHalted(ack)
+                    if !halt_pause_is_due(
+                        paused,
+                        write_tasks.halted.is_some(),
+                        upload_read_failures.load(Ordering::Relaxed),
+                    ) =>
+                {
                     let _ = ack.send(());
                 }
                 TorrentCommand::Pause(ack) | TorrentCommand::PauseIfHalted(ack) => {
@@ -3402,8 +3403,8 @@ fn allowed_fast_set(info_hash: &Id20, addr: SocketAddr, total_pieces: u32) -> Ve
         let mut h = Sha1::new();
         h.update(&seed);
         seed = h.finalize().to_vec();
-        for chunk in seed.chunks_exact(4) {
-            let index = u32::from_be_bytes(chunk.try_into().expect("sha1 chunk")) % total_pieces;
+        for chunk in seed.as_chunks::<4>().0 {
+            let index = u32::from_be_bytes(*chunk) % total_pieces;
             if !out.contains(&index) {
                 out.push(index);
                 if out.len() == MAX_FAST_PIECES.min(total_pieces as usize) {
@@ -3635,6 +3636,10 @@ fn record_upload_read(
             s.set_error(format!("Disk read failed: {error}"), true);
         }
     }
+}
+
+fn halt_pause_is_due(paused: bool, write_halted: bool, read_failures: u32) -> bool {
+    !paused && (write_halted || read_failures >= MAX_READ_FAILURES)
 }
 
 async fn serve_upload(job: UploadJob) {
@@ -4584,7 +4589,25 @@ async fn process_peer_event(
                                 proof_layers,
                             )
                         };
-                        let _ = peer.cmd_tx.try_send(PeerCommand::Send(response));
+                        if let Message::Hashes { hashes, .. } = &response {
+                            let cost = hashes.len();
+                            send_bulk_reply(
+                                &peer.leaf_slots,
+                                upload_limiter,
+                                &peer.cmd_tx,
+                                response,
+                                cost,
+                                Message::HashReject {
+                                    pieces_root,
+                                    base_layer,
+                                    index,
+                                    length,
+                                    proof_layers,
+                                },
+                            );
+                        } else {
+                            let _ = peer.cmd_tx.try_send(PeerCommand::Send(response));
+                        }
                     }
                 }
                 Message::Hashes { .. } | Message::HashReject { .. } => {}
@@ -4629,7 +4652,7 @@ async fn process_peer_event(
                             }
                         }
                     } else if ext_id == OUR_UT_METADATA_ID {
-                        serve_ut_metadata(peer, &payload, info_bytes);
+                        serve_ut_metadata(peer, &payload, info_bytes, upload_limiter);
                     } else if ext_id == OUR_UT_PEX_ID && !private_torrent {
                         let candidates = ingest_pex(
                             pid,
@@ -4675,8 +4698,10 @@ async fn process_peer_event(
                     cancel_upload_request(peer, (index, begin, length));
                 }
                 Message::Port(port) if !private_torrent => {
-                    if let (Some(dht), true) = (dht, port != 0) {
-                        dht.add_node(SocketAddr::new(peer.addr.ip(), port));
+                    if let Some(dht) = dht {
+                        if accept_dht_port(&mut peer.dht_port_seen, port) {
+                            dht.add_node(SocketAddr::new(peer.addr.ip(), port));
+                        }
                     }
                 }
                 _ => {}
@@ -5443,21 +5468,8 @@ fn holepunch_endpoint(peer: &Peer) -> SocketAddr {
     }
 }
 
-fn inbound_addr_taken(
-    addr: SocketAddr,
-    known_addrs: &HashSet<SocketAddr>,
-    peers: &HashMap<u32, Peer>,
-    pending_dials: &HashMap<u32, SocketAddr>,
-    holepunch: &HolepunchState,
-    now: Instant,
-) -> bool {
-    if !known_addrs.contains(&addr) {
-        return false;
-    }
-    if peers.values().any(|p| p.has_addr(addr)) {
-        return true;
-    }
-    !(holepunch.is_target(&addr, now) || pending_dials.values().any(|dialing| *dialing == addr))
+fn inbound_addr_taken(addr: SocketAddr, peers: &HashMap<u32, Peer>) -> bool {
+    peers.values().any(|p| p.has_addr(addr))
 }
 
 fn admit_pex_contacts(
@@ -8496,7 +8508,36 @@ fn reply_queue_backed_up(cmd_tx: &mpsc::Sender<PeerCommand>) -> bool {
     cmd_tx.max_capacity() - cmd_tx.capacity() > MAX_QUEUED_BULK_REPLIES
 }
 
-fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>) {
+fn send_bulk_reply(
+    slots: &Arc<Semaphore>,
+    limiter: &Throttle,
+    cmd_tx: &mpsc::Sender<PeerCommand>,
+    reply: Message,
+    cost: usize,
+    reject: Message,
+) {
+    let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+        let _ = cmd_tx.try_send(PeerCommand::Send(reject));
+        return;
+    };
+    let limiter = limiter.clone();
+    let cmd_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        limiter.acquire(cost).await;
+        let _ = cmd_tx.send(PeerCommand::Send(reply)).await;
+        drop(permit);
+    });
+}
+
+fn accept_dht_port(seen: &mut bool, port: u16) -> bool {
+    if *seen || port == 0 {
+        return false;
+    }
+    *seen = true;
+    true
+}
+
+fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>, limiter: &Throttle) {
     let Some(msg) = super::wire::extended::parse_ut_metadata(payload.clone()) else {
         return;
     };
@@ -8523,10 +8564,21 @@ fn serve_ut_metadata(peer: &Peer, payload: &Bytes, info_bytes: &Arc<Vec<u8>>) {
     let end = (start + META_PIECE_SIZE).min(total);
     let block = &info_bytes[start..end];
     let data = ut_metadata_data(piece, total as i64, block);
-    let _ = peer.cmd_tx.try_send(PeerCommand::Send(Message::Extended {
-        ext_id: their_id,
-        payload: data,
-    }));
+    let cost = data.len();
+    send_bulk_reply(
+        &peer.leaf_slots,
+        limiter,
+        &peer.cmd_tx,
+        Message::Extended {
+            ext_id: their_id,
+            payload: data,
+        },
+        cost,
+        Message::Extended {
+            ext_id: their_id,
+            payload: super::wire::extended::ut_metadata_reject(piece),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -10337,14 +10389,7 @@ mod tests {
         );
         assert_eq!(fx.queues.priority, VecDeque::from([target]));
         assert!(fx.holepunch.is_target(&target, fx.now));
-        assert!(!inbound_addr_taken(
-            target,
-            &fx.known_addrs,
-            &fx.peers,
-            &fx.pending_dials,
-            &fx.holepunch,
-            fx.now
-        ));
+        assert!(!inbound_addr_taken(target, &fx.peers));
 
         let (peer_tx, _peer_rx) = mpsc::channel(4);
         fx.peers.insert(
@@ -10359,14 +10404,7 @@ mod tests {
 
         assert_eq!(fx.queued(), 0);
         assert!(fx.known_addrs.contains(&target));
-        assert!(inbound_addr_taken(
-            target,
-            &fx.known_addrs,
-            &fx.peers,
-            &fx.pending_dials,
-            &fx.holepunch,
-            fx.now
-        ));
+        assert!(inbound_addr_taken(target, &fx.peers));
     }
 
     #[test]
@@ -10622,56 +10660,57 @@ mod tests {
     }
 
     #[test]
-    fn inbound_connections_from_a_dialed_or_punched_endpoint_are_adopted() {
-        let now = Instant::now();
+    fn an_inbound_peer_whose_address_is_only_queued_is_adopted() {
         let addr = SocketAddr::from(([198, 51, 100, 60], 6881));
-        let mut known = HashSet::from([addr]);
-        let mut peers = HashMap::new();
-        let mut pending = HashMap::new();
-        let mut holepunch = HolepunchState::new(true, 6881, None);
-
-        assert!(!inbound_addr_taken(
-            SocketAddr::from(([198, 51, 100, 61], 6881)),
-            &known,
-            &peers,
-            &pending,
-            &holepunch,
-            now
-        ));
-        assert!(inbound_addr_taken(
-            addr, &known, &peers, &pending, &holepunch, now
-        ));
-
-        pending.insert(4u32, addr);
-        assert!(!inbound_addr_taken(
-            addr, &known, &peers, &pending, &holepunch, now
-        ));
-
-        pending.clear();
-        holepunch.note_target(addr, now);
-        assert!(!inbound_addr_taken(
-            addr, &known, &peers, &pending, &holepunch, now
-        ));
-        assert!(inbound_addr_taken(
+        let mut queues = PeerQueues::default();
+        let mut known_addrs = HashSet::new();
+        let blocklist = RwLock::new(BlockList::default());
+        assert!(enqueue_peer_candidate(
             addr,
-            &known,
-            &peers,
-            &pending,
-            &holepunch,
-            now + HOLEPUNCH_TTL
+            false,
+            &mut queues,
+            &mut known_addrs,
+            &blocklist
         ));
+        assert!(known_addrs.contains(&addr));
 
         let (tx, _rx) = mpsc::channel(1);
-        peers.insert(1u32, Peer::connected(addr, tx, 1, 1, 1, false, false, None));
-        pending.insert(4u32, addr);
-        assert!(inbound_addr_taken(
-            addr, &known, &peers, &pending, &holepunch, now
-        ));
+        let mut peers = HashMap::new();
+        peers.insert(
+            1u32,
+            Peer::connected(
+                SocketAddr::from(([198, 51, 100, 61], 6881)),
+                tx.clone(),
+                1,
+                1,
+                1,
+                false,
+                false,
+                None,
+            ),
+        );
+        assert!(!inbound_addr_taken(addr, &peers));
 
-        known.clear();
-        assert!(!inbound_addr_taken(
-            addr, &known, &peers, &pending, &holepunch, now
-        ));
+        peers.insert(
+            2u32,
+            Peer::connected(addr, tx.clone(), 1, 1, 1, false, false, None),
+        );
+        assert!(inbound_addr_taken(addr, &peers));
+
+        peers.remove(&2);
+        let mut listening = Peer::connected(
+            SocketAddr::from(([198, 51, 100, 60], 50_000)),
+            tx,
+            1,
+            1,
+            1,
+            false,
+            false,
+            None,
+        );
+        listening.listen_addr = Some(addr);
+        peers.insert(3u32, listening);
+        assert!(inbound_addr_taken(addr, &peers));
     }
 
     #[test]
@@ -12030,6 +12069,55 @@ mod tests {
             next_leaf_reply(&mut rx).await,
             Message::Hashes { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn bulk_replies_wait_for_the_upload_limiter() {
+        let global = Arc::new(RateLimiter::new(1));
+        let limiter = Throttle::new(Arc::clone(&global), Arc::new(RateLimiter::unlimited()));
+        let slots = Arc::new(Semaphore::new(1));
+        let (tx, mut rx) = mpsc::channel(8);
+        let reply = Message::Extended {
+            ext_id: 3,
+            payload: Bytes::from(vec![0u8; 1_000]),
+        };
+        send_bulk_reply(&slots, &limiter, &tx, reply, 1_000, Message::KeepAlive);
+        assert_no_leaf_reply(&mut rx).await;
+        global.set_limit(0);
+        assert!(matches!(
+            next_leaf_reply(&mut rx).await,
+            Message::Extended { ext_id: 3, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_no_free_slot_gets_the_reject() {
+        let slots = Arc::new(Semaphore::new(0));
+        let (tx, mut rx) = mpsc::channel(8);
+        let reply = Message::Extended {
+            ext_id: 3,
+            payload: Bytes::from(vec![0u8; 1_000]),
+        };
+        let reject = Message::Extended {
+            ext_id: 3,
+            payload: crate::wire::extended::ut_metadata_reject(0),
+        };
+        send_bulk_reply(&slots, &Throttle::unlimited(), &tx, reply, 1_000, reject);
+        let Ok(PeerCommand::Send(Message::Extended { payload, .. })) = rx.try_recv() else {
+            panic!("expected the reject at once");
+        };
+        assert_eq!(payload, crate::wire::extended::ut_metadata_reject(0));
+        assert_no_leaf_reply(&mut rx).await;
+    }
+
+    #[test]
+    fn only_the_first_port_message_of_a_peer_counts() {
+        let mut seen = false;
+        assert!(!accept_dht_port(&mut seen, 0));
+        assert!(!seen);
+        assert!(accept_dht_port(&mut seen, 6881));
+        assert!(!accept_dht_port(&mut seen, 6882));
+        assert!(!accept_dht_port(&mut seen, 6881));
     }
 
     #[tokio::test]
@@ -16611,6 +16699,15 @@ mod tracker_list_tests {
         let error = stats.error.unwrap();
         assert!(error.starts_with("Disk read failed:"), "{error}");
         assert!(error.contains("gone"), "{error}");
+    }
+
+    #[test]
+    fn a_halt_pause_is_due_after_a_write_halt_or_three_failed_reads() {
+        assert!(!halt_pause_is_due(false, false, 0));
+        assert!(!halt_pause_is_due(false, false, MAX_READ_FAILURES - 1));
+        assert!(halt_pause_is_due(false, false, MAX_READ_FAILURES));
+        assert!(halt_pause_is_due(false, true, 0));
+        assert!(!halt_pause_is_due(true, true, MAX_READ_FAILURES));
     }
 
     #[test]

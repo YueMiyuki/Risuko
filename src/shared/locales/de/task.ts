@@ -335,6 +335,8 @@ export default {
 	"media-format-auto": "Beste verfügbare (automatisch)",
 	"media-format-hint": "Formate abrufen, um eine bestimmte Qualität zu wählen.",
 	"media-format-error": "Formate für diese URL konnten nicht geladen werden.",
+	"media-unsupported-android":
+		"Für Downloads von Medienseiten wird yt-dlp benötigt, das unter Android nicht verfügbar ist",
 	"download-complete-message": "Download von {{taskName}} abgeschlossen",
 	"download-complete-notify": "Download abgeschlossen",
 	"bt-download-complete-message":
@@ -383,6 +385,15 @@ export default {
 	"mirror-placeholder": "Spiegel-URL (gleiche Datei, anderer Server)",
 	"mirror-hint":
 		"Fügen Sie Spiegel-URLs hinzu, die auf dieselbe Datei verweisen, um von mehreren Quellen gleichzeitig herunterzuladen.",
+	"mirror-sources": "{{count}} Quellen",
+	"mirror-failing": "Fehlerhaft",
+	"mirror-idle": "Nicht genutzt",
+	"add-tab-links": "Links",
+	"add-tab-mirrors": "Spiegel",
+	"mirror-list-placeholder": "Spiegel-URLs einer Datei, eine pro Zeile",
+	"mirror-list-hint":
+		"Alle Links müssen auf dieselbe Datei verweisen. Die Teile werden von allen Spiegeln gleichzeitig geladen, und ein Spiegel, der ausfällt oder langsamer wird, gibt seine Teile an die anderen ab.",
+	"mirror-list-rejected": "Kein einfacher http(s)-Dateilink:",
 	"detail-tab-general": "Allgemein",
 	"detail-tab-activity": "Aktivität",
 	"detail-tab-trackers": "Tracker",
@@ -413,6 +424,34 @@ export default {
 	"edit-speed-limit-placeholder": "0 oder leer = unbegrenzt (z. B. 500K)",
 	"edit-primary-uri": "Download-URL",
 	"edit-primary-uri-placeholder": "Primäre Download-URL",
+	"edit-tab-seeding": "Aussaat",
+	"seeding-rule-global": "Globale Einstellung verwenden",
+	"seeding-rule-forever": "Aussäen, bis ich es beende",
+	"seeding-rule-limits": "Bei einem Verhältnis oder nach einer Zeit beenden",
+	"seeding-rule-none": "Nicht aussäen",
+	"seeding-global-off": "Aktuell: nicht aussäen",
+	"seeding-global-forever": "Aktuell: aussäen, bis es beendet wird",
+	"seeding-global-ratio": "Aktuell: bei Verhältnis {{ratio}} beenden",
+	"seeding-global-minutes": "Aktuell: nach {{minutes}} Minuten beenden",
+	"seeding-global-both":
+		"Aktuell: bei Verhältnis {{ratio}} oder nach {{minutes}} Minuten beenden",
+	"seeding-limits-hint":
+		"Die Aussaat endet bei der Grenze, die zuerst erreicht wird. 0 bedeutet keine Grenze dieser Art.",
+	"seeding-limits-required":
+		"Geben Sie ein Verhältnis oder eine Minutenzahl über 0 ein",
+	"seeding-for": "Aussaatdauer",
+	"seeding-applies-after-download":
+		"Das gilt, sobald der Download abgeschlossen ist.",
+	"seeding-stops-now":
+		"Diese Aufgabe beendet die Aussaat, sobald Sie speichern.",
+	"seeding-limit-reached":
+		"Diese Aufgabe hat diese Grenze bereits erreicht und beendet die Aussaat, sobald Sie speichern.",
+	"seeding-in-place-note":
+		"Von Ihnen erstellte Torrents werden ausgesät, bis Sie sie beenden.",
+	"seeding-ed2k-sharing-off":
+		"Das Teilen über eD2K ist in den Einstellungen ausgeschaltet, daher lädt diese Aufgabe nichts hoch.",
+	"seeding-leftover-values":
+		"Diese Aufgabe hat Aussaat-Werte aus einer früheren Änderung der Einstellungen. Beim Speichern werden sie ersetzt.",
 	"create-torrent": "Torrent erstellen",
 	"create-torrent-menu": "Torrent erstellen...",
 	"create-torrent-source": "Datei oder Ordner zum Teilen",

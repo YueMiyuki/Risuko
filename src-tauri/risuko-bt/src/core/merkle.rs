@@ -15,7 +15,9 @@ pub fn hash_pair(left: &Id32, right: &Id32) -> Id32 {
 
 fn reduce_layer(layer: &[Id32]) -> Vec<Id32> {
     layer
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| hash_pair(&pair[0], &pair[1]))
         .collect()
 }
@@ -210,7 +212,9 @@ impl MerkleProofTable {
             });
         }
         let piece_root_hashes: std::sync::Arc<[Id32]> = layer_bytes
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|c| Id32::from_slice(c).expect("32-byte chunk"))
             .collect();
 
@@ -464,7 +468,7 @@ impl MerkleProofTable {
         }
         let pad = pad_hash(piece_length / BLOCK_SIZE);
         let mut fold = LayerFold::default();
-        let hashes = chunks.iter().flat_map(|chunk| chunk.chunks_exact(32));
+        let hashes = chunks.iter().flat_map(|chunk| chunk.as_chunks::<32>().0);
         for (index, hash) in hashes.enumerate() {
             let leaf = Id32::from_slice(hash).expect("32-byte chunk");
             if index >= piece_count && leaf != pad {
@@ -885,8 +889,10 @@ mod tests {
         let pad = pad_hash(4);
         assert_ne!(pad.0, [0u8; 32]);
         assert!(served[(5 * 32)..(8 * 32)]
-            .chunks_exact(32)
-            .all(|entry| entry == pad.0));
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .all(|entry| *entry == pad.0));
         let canonical = verify_piece_layer_response(table.file_root, file_len, piece_len, &served)
             .expect("verifies");
         assert_eq!(canonical.len(), 5 * 32);
@@ -942,7 +948,9 @@ mod tests {
         let ranged = table.hashes_for_request(base, 4, 2, 2).unwrap();
         assert_eq!(ranged.len(), 4 * 32);
         let hashes: Vec<Id32> = ranged
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|c| Id32::from_slice(c).unwrap())
             .collect();
         let pair = hash_pair(&hashes[0], &hashes[1]);
@@ -988,7 +996,9 @@ mod tests {
 
     fn climb(response: &[u8], index: u32, length: u32) -> Id32 {
         let hashes: Vec<Id32> = response
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|c| Id32::from_slice(c).unwrap())
             .collect();
         let mut node = compute_root(&hashes[..length as usize]);

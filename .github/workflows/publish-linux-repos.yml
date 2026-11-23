@@ -59,7 +59,7 @@ jobs:
       BASE_URL: https://dl.risuko.app
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
 

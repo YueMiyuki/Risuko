@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Comprimate",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Datorită restricțiilor privind permisiunea sandbox-ului din App Store, se recomandă ca directorul de descărcare implicit să fie setat la ~/Downloads",
 	"transfer-settings": "Transmitere",
@@ -209,6 +208,10 @@ export default {
 	"uri-selector-inorder":
 		"În ordine (încearcă oglinzile de la stânga la dreapta)",
 	"uri-selector-adaptive": "Adaptiv (preferă cea mai rapidă)",
+	"send-auth-to-all-mirrors":
+		"Trimite datele de autentificare tuturor oglinzilor HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Trimite antetul de autorizare al unei sarcini fiecărei oglinzi HTTPS. Când este dezactivat, îl primesc doar oglinzile cu aceeași schemă, gazdă și port ca primul link.",
 	"unit-seconds": "secunde",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Stocare",

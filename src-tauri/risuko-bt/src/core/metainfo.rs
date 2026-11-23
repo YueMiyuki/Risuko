@@ -499,7 +499,7 @@ fn check_meta_version(info: &Value) -> Result<(), MetaError> {
     }
 }
 
-const MAX_PIECES: u64 = 1 << 22;
+pub(crate) const MAX_PIECES: u64 = 1 << 22;
 const MAX_PIECE_LENGTH: u32 = 256 * 1024 * 1024;
 
 fn check_piece_count(total_len: u64, piece_length: u32) -> Result<(), MetaError> {
@@ -537,10 +537,17 @@ pub(crate) fn is_safe_component(s: &str) -> bool {
 }
 
 pub fn sanitize_windows_component(s: &str) -> String {
+    sanitize_windows(s, true)
+}
+
+fn sanitize_windows(s: &str, replace_invisible: bool) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            if c.is_control()
+                || (replace_invisible && risuko_util::is_invisible_format_char(c))
+                || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 c
@@ -574,9 +581,33 @@ pub fn sanitize_windows_component(s: &str) -> String {
 pub fn fs_component(s: &str) -> std::borrow::Cow<'_, str> {
     if cfg!(windows) {
         std::borrow::Cow::Owned(sanitize_windows_component(s))
+    } else if s.chars().any(risuko_util::is_invisible_format_char) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| {
+                    if risuko_util::is_invisible_format_char(c) {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+        )
     } else {
         std::borrow::Cow::Borrowed(s)
     }
+}
+
+pub fn legacy_fs_component(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(sanitize_windows(s, false))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+fn storage_ignores_case() -> bool {
+    cfg!(any(windows, target_os = "macos", target_os = "android"))
 }
 
 fn disk_path_key(path: &[String]) -> String {
@@ -585,7 +616,7 @@ fn disk_path_key(path: &[String]) -> String {
         .map(|c| fs_component(c).into_owned())
         .collect::<Vec<_>>()
         .join("/");
-    if cfg!(any(windows, target_os = "macos")) {
+    if storage_ignores_case() {
         joined.to_lowercase()
     } else {
         joined
@@ -608,6 +639,11 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
         .filter(|&i| !skipped(i))
         .map(|i| disk_path_key(&paths[i]))
         .collect();
+    let folders: HashSet<String> = (0..paths.len())
+        .filter(|&i| !skipped(i))
+        .flat_map(|i| (1..paths[i].len()).map(move |depth| (i, depth)))
+        .map(|(i, depth)| disk_path_key(&paths[i][..depth]))
+        .collect();
     let mut seen: HashSet<String> = HashSet::with_capacity(taken.len());
     let mut next_suffix: HashMap<String, usize> = HashMap::new();
     for (i, &is_skipped) in skipped_at.iter().enumerate() {
@@ -615,7 +651,7 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
             continue;
         }
         let key = disk_path_key(&paths[i]);
-        if !seen.contains(&key) {
+        if !seen.contains(&key) && !folders.contains(&key) {
             seen.insert(key);
             continue;
         }
@@ -630,7 +666,7 @@ pub fn dedupe_paths(paths: &mut [Vec<String>], skip: &[bool]) {
             }
             *next += 1;
             let ck = disk_path_key(&candidate);
-            if taken.insert(ck.clone()) {
+            if !folders.contains(&ck) && taken.insert(ck.clone()) {
                 seen.insert(ck);
                 paths[i] = candidate;
                 break;
@@ -1631,11 +1667,64 @@ mod tests {
     fn dedupe_folds_case_only_where_the_filesystem_does() {
         let mut paths = vec![vec!["A.txt".to_string()], vec!["a.txt".to_string()]];
         dedupe_paths(&mut paths, &[false, false]);
-        if cfg!(any(windows, target_os = "macos")) {
+        if storage_ignores_case() {
             assert_eq!(paths[1], vec!["a (1).txt".to_string()]);
         } else {
             assert_eq!(paths[1], vec!["a.txt".to_string()]);
         }
+    }
+
+    #[test]
+    fn invisible_format_characters_are_replaced_in_disk_names() {
+        assert_eq!(fs_component("report\u{202E}gpj.exe"), "report_gpj.exe");
+        assert_eq!(fs_component("a\u{200B}b\u{FEFF}c"), "a_b_c");
+        #[cfg(not(windows))]
+        {
+            let plain = fs_component("plain name.txt");
+            assert!(matches!(plain, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(plain, "plain name.txt");
+        }
+    }
+
+    #[test]
+    fn a_file_named_like_the_folder_of_another_file_is_renamed() {
+        let path = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let mut paths = vec![path(&["docs", "a.txt"]), path(&["docs"])];
+        dedupe_paths(&mut paths, &[false, false]);
+        assert_eq!(paths, [path(&["docs", "a.txt"]), path(&["docs (1)"])]);
+
+        let mut paths = vec![
+            path(&["a\u{200B}"]),
+            path(&["a_", "x.txt"]),
+            path(&["a_ (1)", "y.txt"]),
+        ];
+        dedupe_paths(&mut paths, &[false, false, false]);
+        assert_eq!(paths[0], path(&["a\u{200B} (2)"]));
+        assert_eq!(paths[1], path(&["a_", "x.txt"]));
+        assert_eq!(paths[2], path(&["a_ (1)", "y.txt"]));
+    }
+
+    #[test]
+    fn the_earlier_disk_name_keeps_invisible_format_characters() {
+        let name = "report\u{202E}gpj.exe";
+        if cfg!(windows) {
+            assert_eq!(legacy_fs_component("a:b\u{200B}"), "a_b\u{200B}");
+        } else {
+            assert_eq!(legacy_fs_component(name), name);
+        }
+        assert_eq!(legacy_fs_component("plain"), fs_component("plain"));
+        assert_ne!(legacy_fs_component(name), fs_component(name));
+    }
+
+    #[test]
+    fn names_that_differ_only_by_an_invisible_character_do_not_collide() {
+        let mut paths = vec![
+            vec!["a\u{202E}.txt".to_string()],
+            vec!["a_.txt".to_string()],
+        ];
+        dedupe_paths(&mut paths, &[false, false]);
+        assert_ne!(disk_path_key(&paths[0]), disk_path_key(&paths[1]));
+        assert_eq!(paths[1], vec!["a_ (1).txt".to_string()]);
     }
 
     #[test]

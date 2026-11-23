@@ -73,6 +73,8 @@ export default {
 	errSftpUsernameRequired: "ต้องระบุชื่อผู้ใช้ SFTP",
 	errSftpAuthRequired: "ต้องระบุรหัสผ่านหรือคีย์ส่วนตัวของ SFTP",
 	errFtpHostRequired: "ต้องระบุโฮสต์ FTP",
+	errSecretForNewServer:
+		"เซิร์ฟเวอร์มีการเปลี่ยนแปลง จึงไม่ใช้รหัสผ่านหรือคีย์ที่บันทึกไว้อีก โปรดป้อนอีกครั้ง",
 	errMoveTargetRequired: "ต้องระบุโฟลเดอร์ที่จะย้ายไปเมื่อการดำเนินการหลังอัปโหลดคือย้าย",
 	saving: "กำลังบันทึก…",
 	recentJobs: "การอัปโหลดล่าสุด",

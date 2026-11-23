@@ -40,6 +40,7 @@ export const LIGHT_REFRESH_FULL_EVERY = 20;
 export const LIGHT_REFRESH_MAX_MISSING = 20;
 
 const LIGHT_REFRESH_LISTS = new Set([
+	"all",
 	"waiting",
 	"scheduled",
 	"stopped",
@@ -76,6 +77,9 @@ export function mergeRowFiles<
 	}
 	const missing: string[] = [];
 	const rows = light.map((row) => {
+		if (Array.isArray(row.files)) {
+			return row;
+		}
 		const old = held.get(row.gid);
 		if (old && old.status === row.status) {
 			return { ...row, files: old.files };

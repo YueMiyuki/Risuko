@@ -125,7 +125,7 @@
 
         <div
           class="settings-section"
-          data-preference-search-target="preferences.file-category-dirs preferences.file-category-music preferences.file-category-video preferences.file-category-image preferences.file-category-document preferences.file-category-compressed preferences.file-category-program preferences.file-category-rss"
+          data-preference-search-target="preferences.file-category-dirs preferences.file-category-music preferences.file-category-video preferences.file-category-image preferences.file-category-document preferences.file-category-compressed preferences.file-category-program"
         >
           <div class="settings-section-header">
             <div class="section-icon"><FolderDown :size="16" /></div>
@@ -929,7 +929,6 @@ const initForm = (config) => {
 			document: "",
 			compressed: "",
 			program: "",
-			rss: "",
 			...(fileCategoryDirs || {}),
 		},
 		taskRoutingRules: (config.taskRoutingRules || []).map((rule) => ({

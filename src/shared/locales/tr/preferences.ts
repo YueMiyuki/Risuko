@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Belge",
 	"file-category-compressed": "Sıkıştırılmış",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store'un sanal alan izinleri kısıtlamaları nedeniyle, varsayılan indirme dizininin İndirilenler dizinine ayarlanması önerilir.",
 	"transfer-settings": "İletim",
@@ -204,6 +203,9 @@ export default {
 	"uri-selector-feedback": "Geri bildirim (yavaş/başarısız yansıları bırak)",
 	"uri-selector-inorder": "Sırayla (yansıları soldan sağa dene)",
 	"uri-selector-adaptive": "Uyarlanabilir (en hızlıyı tercih et)",
+	"send-auth-to-all-mirrors": "Giriş bilgilerini tüm HTTPS yansılarına gönder",
+	"send-auth-to-all-mirrors-tips":
+		"Bir görevin yetkilendirme başlığını her HTTPS yansısına gönderir. Kapalıyken yalnızca ilk bağlantıyla aynı şemaya, ana makineye ve bağlantı noktasına sahip yansılar alır.",
 	"unit-seconds": "saniye",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Depolama",

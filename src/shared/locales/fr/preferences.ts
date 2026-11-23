@@ -154,7 +154,6 @@ export default {
 	"file-category-document": "Document",
 	"file-category-compressed": "Archive",
 	"file-category-program": "Programme",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"En raison des restrictions d'autorisations du bac à sable de l'App Store, il est recommandé de définir le répertoire de téléchargement par défaut sur le répertoire Téléchargements.",
 	"transfer-settings": "Transmission",
@@ -210,6 +209,10 @@ export default {
 	"uri-selector-inorder":
 		"Dans l’ordre (essayer les miroirs de gauche à droite)",
 	"uri-selector-adaptive": "Adaptatif (préférer le plus rapide)",
+	"send-auth-to-all-mirrors":
+		"Envoyer les identifiants à tous les miroirs HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Envoie l’en-tête d’autorisation d’une tâche à chaque miroir HTTPS. Désactivé, seuls les miroirs ayant le même schéma, hôte et port que le premier lien le reçoivent.",
 	"unit-seconds": "secondes",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Stockage",

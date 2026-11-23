@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "Az SFTP-felhasználónév kötelező.",
 	errSftpAuthRequired: "Az SFTP-jelszó vagy a privát kulcs kötelező.",
 	errFtpHostRequired: "Az FTP-gazdagép kötelező.",
+	errSecretForNewServer:
+		"A szerver megváltozott, ezért a mentett jelszót vagy kulcsot a rendszer nem használja újra. Adja meg újra.",
 	errMoveTargetRequired:
 		"Az áthelyezési mappa kötelező, ha a feltöltés utáni művelet az áthelyezés.",
 	saving: "Mentés…",

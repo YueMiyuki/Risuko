@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "نام کاربری SFTP الزامی است.",
 	errSftpAuthRequired: "گذرواژه یا کلید خصوصی SFTP الزامی است.",
 	errFtpHostRequired: "میزبان FTP الزامی است.",
+	errSecretForNewServer:
+		"سرور تغییر کرده است، بنابراین گذرواژه یا کلید ذخیره‌شده دوباره استفاده نمی‌شود. آن را دوباره وارد کنید.",
 	errMoveTargetRequired:
 		"وقتی عمل پس از بارگذاری «انتقال به پوشه» است، پوشهٔ مقصد انتقال الزامی است.",
 	saving: "در حال ذخیره…",

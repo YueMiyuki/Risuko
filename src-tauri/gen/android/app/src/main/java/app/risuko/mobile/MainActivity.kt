@@ -302,14 +302,11 @@ class MainActivity : TauriActivity() {
       }
       val uri = buildOpenFileUri(activity, path)
       val normalizedMime = mime.ifBlank { "*/*" }
-      val grantRead = uri.scheme != "http" && uri.scheme != "https"
       val newViewIntent: (String) -> Intent = { targetMime ->
         Intent(Intent.ACTION_VIEW).apply {
           setDataAndType(uri, targetMime)
           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-          if (grantRead) {
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-          }
+          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
       }
       data class Attempt(
@@ -325,9 +322,7 @@ class MainActivity : TauriActivity() {
           launchFactory = {
             Intent.createChooser(newViewIntent(targetMime), "Open file with").apply {
               addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-              if (grantRead) {
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-              }
+              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
           },
         )
@@ -369,7 +364,7 @@ class MainActivity : TauriActivity() {
     }
 
     private fun buildOpenFileUri(activity: MainActivity, path: String): Uri {
-      if (path.startsWith("content://") || path.startsWith("http://") || path.startsWith("https://")) {
+      if (path.startsWith("content://")) {
         return Uri.parse(path)
       }
 	      val filePath = if (path.startsWith("file://")) {

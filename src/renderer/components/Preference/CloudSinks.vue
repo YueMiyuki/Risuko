@@ -951,6 +951,57 @@ function emptyForm(): FormState {
 	};
 }
 
+function sameEndpoint(a: string, b: string): boolean {
+	try {
+		return (
+			new URL(a.trim().replace(/\/+$/, "")).href ===
+			new URL(b.trim().replace(/\/+$/, "")).href
+		);
+	} catch {
+		return false;
+	}
+}
+
+function sameHost(a: string, b: string): boolean {
+	return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function sameSinkServer(a: SinkConfig, b: SinkConfig): boolean {
+	if (a.kind === "webdav" && b.kind === "webdav") {
+		return sameEndpoint(a.endpoint, b.endpoint);
+	}
+	if (a.kind === "s3" && b.kind === "s3") {
+		return (
+			sameEndpoint(a.endpoint, b.endpoint) &&
+			a.bucket.trim() === b.bucket.trim()
+		);
+	}
+	if (a.kind === "sftp" && b.kind === "sftp") {
+		return sameHost(a.host, b.host) && a.port === b.port;
+	}
+	if (a.kind === "ftp" && b.kind === "ftp") {
+		return (
+			sameHost(a.host, b.host) && a.port === b.port && !!a.secure === !!b.secure
+		);
+	}
+	return false;
+}
+
+const blank = (value?: string): boolean => !value?.trim();
+
+function secretMissing(config: SinkConfig): boolean {
+	switch (config.kind) {
+		case "webdav":
+			return !blank(config.username) && blank(config.password);
+		case "s3":
+			return blank(config.secretAccessKey);
+		case "sftp":
+			return blank(config.password) && blank(config.privateKey);
+		case "ftp":
+			return !blank(config.username) && blank(config.password);
+	}
+}
+
 export default defineComponent({
 	name: "preference-cloud-sinks",
 	components: {
@@ -1116,28 +1167,23 @@ export default defineComponent({
 				f.webdav.endpoint = c.endpoint;
 				f.webdav.basePath = c.basePath ?? "";
 				f.webdav.username = c.username ?? "";
-				f.webdav.password = c.password ?? "";
 				f.webdav.insecure = !!c.insecure;
 			} else if (c.kind === "s3") {
 				f.s3.endpoint = c.endpoint;
 				f.s3.region = c.region;
 				f.s3.bucket = c.bucket;
 				f.s3.accessKeyId = c.accessKeyId;
-				f.s3.secretAccessKey = c.secretAccessKey ?? "";
 				f.s3.prefix = c.prefix ?? "";
 				f.s3.forcePathStyle = !!c.forcePathStyle;
 			} else if (c.kind === "sftp") {
 				f.sftp.host = c.host;
 				f.sftp.port = c.port || 22;
 				f.sftp.username = c.username;
-				f.sftp.password = c.password ?? "";
-				f.sftp.privateKey = c.privateKey ?? "";
 				f.sftp.basePath = c.basePath ?? "";
 			} else if (c.kind === "ftp") {
 				f.ftp.host = c.host;
 				f.ftp.port = c.port || 21;
 				f.ftp.username = c.username ?? "";
-				f.ftp.password = c.password ?? "";
 				f.ftp.basePath = c.basePath ?? "";
 				f.ftp.secure = !!c.secure;
 				f.ftp.insecure = !!c.insecure;
@@ -1194,6 +1240,16 @@ export default defineComponent({
 					};
 			}
 		},
+		secretNeededForNewServer(): boolean {
+			const saved = this.editingId
+				? this.store.sinks.find((s) => s.id === this.editingId)
+				: undefined;
+			if (!saved) {
+				return false;
+			}
+			const config = this.buildConfig();
+			return !sameSinkServer(saved.config, config) && secretMissing(config);
+		},
 		validate(): string | null {
 			if (!this.form.label.trim()) {
 				return this.$t("cloudSinks.errLabelRequired") as string;
@@ -1238,6 +1294,9 @@ export default defineComponent({
 						return this.$t("cloudSinks.errFtpHostRequired") as string;
 					}
 					break;
+			}
+			if (this.secretNeededForNewServer()) {
+				return this.$t("cloudSinks.errSecretForNewServer") as string;
 			}
 			if (this.form.postAction === "move" && !this.form.moveTarget.trim()) {
 				return this.$t("cloudSinks.errMoveTargetRequired") as string;
@@ -1374,9 +1433,22 @@ export default defineComponent({
 				.getSavedCredentials()
 				.find((c: SavedCredential) => c.id === record.id);
 			if (existing) {
+				const sameServer =
+					existing.host === mapped.host &&
+					existing.protocol === mapped.protocol;
 				const credential: SavedCredential = {
 					...existing,
 					...mapped,
+					...(sameServer
+						? {
+								ftpPasswd: mapped.ftpPasswd || existing.ftpPasswd,
+								sftpPrivateKey:
+									mapped.sftpPrivateKey || existing.sftpPrivateKey,
+								sftpPrivateKeyContent:
+									mapped.sftpPrivateKeyContent ||
+									existing.sftpPrivateKeyContent,
+							}
+						: {}),
 					createdAt: existing.createdAt,
 					lastUsedAt: existing.lastUsedAt,
 				};

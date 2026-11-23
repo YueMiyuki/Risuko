@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::State;
 
+use risuko_engine::engine::upload::manager::same_sink_destination;
 use risuko_engine::engine::upload::{SinkConfig, UploadRule, UploadSinkManager, UploadSinkRecord};
 
 use crate::managers::vault::VaultManager;
@@ -113,6 +114,21 @@ async fn fill_from_vault(
     }
 }
 
+async fn fill_saved_secrets(
+    vault: &VaultManager,
+    mgr: &UploadSinkManager,
+    record: &mut UploadSinkRecord,
+) {
+    let saved = mgr
+        .list_sinks()
+        .await
+        .into_iter()
+        .find(|sink| sink.id == record.id);
+    if saved.is_some_and(|saved| same_sink_destination(&saved.config, &record.config)) {
+        fill_from_vault(vault, mgr, &record.id, &mut record.config).await;
+    }
+}
+
 async fn clear_stale_sink_fallback(mgr: &UploadSinkManager, id: &str) -> Result<(), String> {
     if mgr.remove_sink_secret_fallback(id).await.is_ok() {
         return Ok(());
@@ -217,7 +233,7 @@ pub async fn update_upload_sink(
 ) -> Result<(), String> {
     let mgr = state.upload_sinks.clone();
     let vault = state.vault.clone();
-    fill_from_vault(&vault, &mgr, &record.id, &mut record.config).await;
+    fill_saved_secrets(&vault, &mgr, &mut record).await;
     let id = record.id.clone();
     let config_for_vault = record.config.clone();
     mgr.update_sink(record).await?;
@@ -431,6 +447,102 @@ mod tests {
             }
             _ => panic!("expected sftp"),
         }
+    }
+
+    async fn manager_with_saved_ftp_sink(
+        dir: &tempfile::TempDir,
+    ) -> (UploadSinkManager, UploadSinkRecord) {
+        use risuko_engine::traits::{FileStorage, NoopEventSink};
+
+        let storage: Arc<dyn risuko_engine::traits::StorageBackend> =
+            Arc::new(FileStorage::new(dir.path().to_path_buf()));
+        let event_sink: Arc<dyn risuko_engine::traits::EventSink> = Arc::new(NoopEventSink);
+        let mgr = UploadSinkManager::new(storage, event_sink);
+        let record = mgr
+            .add_sink(UploadSinkRecord {
+                id: "sink".into(),
+                label: "A".into(),
+                config: SinkConfig::Ftp(FtpConfig {
+                    host: "ftp.example.com".into(),
+                    port: 21,
+                    username: "u".into(),
+                    password: "saved".into(),
+                    base_path: "/uploads".into(),
+                    secure: true,
+                    insecure: false,
+                }),
+                post_action: risuko_engine::engine::upload::PostUploadAction::Keep,
+                move_target: None,
+                created_at: 0,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+        mgr.put_sink_secret_fallback("sink", &json!({"password": "saved"}))
+            .await
+            .unwrap();
+        (mgr, record)
+    }
+
+    fn edited_ftp(
+        record: &UploadSinkRecord,
+        change: impl FnOnce(&mut FtpConfig),
+    ) -> UploadSinkRecord {
+        let mut record = record.clone();
+        if let SinkConfig::Ftp(ref mut c) = record.config {
+            c.password.clear();
+            change(c);
+        }
+        record
+    }
+
+    fn ftp_password(record: &UploadSinkRecord) -> &str {
+        match &record.config {
+            SinkConfig::Ftp(c) => &c.password,
+            _ => panic!("expected ftp"),
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_secrets_are_filled_in_for_the_saved_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, saved) = manager_with_saved_ftp_sink(&dir).await;
+        let vault = crate::managers::vault::VaultManager::for_test(false);
+
+        let mut record = edited_ftp(&saved, |c| c.base_path = "/elsewhere".into());
+        fill_saved_secrets(&vault, &mgr, &mut record).await;
+
+        assert_eq!(ftp_password(&record), "saved");
+    }
+
+    #[tokio::test]
+    async fn saved_secrets_are_not_filled_in_for_another_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, saved) = manager_with_saved_ftp_sink(&dir).await;
+        let vault = crate::managers::vault::VaultManager::for_test(false);
+
+        for change in [
+            (|c: &mut FtpConfig| c.host = "ftp.attacker.example".into()) as fn(&mut FtpConfig),
+            |c| c.port = 2121,
+            |c| c.secure = false,
+        ] {
+            let mut record = edited_ftp(&saved, change);
+            fill_saved_secrets(&vault, &mgr, &mut record).await;
+            assert_eq!(ftp_password(&record), "");
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_secrets_are_not_filled_in_for_an_unknown_sink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mgr, saved) = manager_with_saved_ftp_sink(&dir).await;
+        let vault = crate::managers::vault::VaultManager::for_test(false);
+
+        let mut record = edited_ftp(&saved, |_| {});
+        record.id = "other".into();
+        fill_saved_secrets(&vault, &mgr, &mut record).await;
+
+        assert_eq!(ftp_password(&record), "");
     }
 
     struct FlakyStorage {

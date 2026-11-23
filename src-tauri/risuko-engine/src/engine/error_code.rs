@@ -61,6 +61,29 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+const COUNTER_WORDS: [&str; 11] = [
+    "piece", "pieces", "segment", "segments", "block", "blocks", "chunk", "chunks", "part",
+    "worker", "retries",
+];
+
+fn is_counter(haystack: &str, start: usize, end: usize) -> bool {
+    let before = &haystack[..start];
+    let word = before
+        .trim_end()
+        .rsplit(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    if COUNTER_WORDS.contains(&word) {
+        return true;
+    }
+    let list_item = |c: char| c.is_ascii_digit() || c == ',' || c == ' ';
+    before.contains("unavailable segments:")
+        && before.trim_end_matches(list_item).ends_with(":[")
+        && haystack[end..]
+            .trim_start_matches(list_item)
+            .starts_with(']')
+}
+
 fn contains_status(haystack: &str, code: &str) -> bool {
     let bytes = haystack.as_bytes();
     let mut start = 0;
@@ -69,7 +92,7 @@ fn contains_status(haystack: &str, code: &str) -> bool {
         let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
         let after = i + code.len();
         let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
-        if before_ok && after_ok {
+        if before_ok && after_ok && !is_counter(haystack, i, after) {
             return true;
         }
         start = i + 1;
@@ -458,5 +481,82 @@ mod tests {
             classify_error("unsafe PAR2 filename: ../escape.bin", "usenet"),
             ErrorCode::USENET_ARCHIVE_UNSAFE
         );
+    }
+
+    #[test]
+    fn counters_in_a_message_are_not_http_status_codes() {
+        let cases = [
+            (
+                "Worker 2 failed after 5 retries on piece 403: HTTP error: 503",
+                "Worker 2 failed after 5 retries on piece 405: HTTP error: 503",
+                "http",
+            ),
+            (
+                "Worker 0 failed after 5 retries on piece 404: server closed stream early",
+                "Worker 0 failed after 5 retries on piece 405: server closed stream early",
+                "http",
+            ),
+            (
+                "Worker 1: all mirrors failed on piece 401",
+                "Worker 1: all mirrors failed on piece 405",
+                "http",
+            ),
+            (
+                "Worker 2 local storage failure on piece 404: Write failed: No space left on device (os error 28)",
+                "Worker 2 local storage failure on piece 12: Write failed: No space left on device (os error 28)",
+                "http",
+            ),
+            (
+                "Piece 401 matches its v1 hash but not its v2 hash; the torrent's hashes disagree",
+                "Piece 405 matches its v1 hash but not its v2 hash; the torrent's hashes disagree",
+                "torrent",
+            ),
+            (
+                "PAR2 recovery is insufficient: need 4 blocks, have 1; unavailable segments: archive.part1.rar:[503]",
+                "PAR2 recovery is insufficient: need 4 blocks, have 1; unavailable segments: archive.part1.rar:[7]",
+                "usenet",
+            ),
+        ];
+        for (msg, control, protocol) in cases {
+            assert_eq!(
+                classify_error(msg, protocol),
+                classify_error(control, protocol),
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            classify_error(cases[0].0, "http"),
+            ErrorCode::HTTP_SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn real_http_statuses_are_still_recognised() {
+        let cases = [
+            ("HTTP error: 403", ErrorCode::HTTP_FORBIDDEN),
+            ("HTTP error: 404", ErrorCode::HTTP_NOT_FOUND),
+            (
+                "Single download got HTTP 401 for https://example.com/f",
+                ErrorCode::HTTP_UNAUTHORIZED,
+            ),
+            ("server returned 503", ErrorCode::HTTP_SERVICE_UNAVAILABLE),
+            ("status 429", ErrorCode::HTTP_TOO_MANY_REQUESTS),
+            (
+                "Worker 1 failed after 5 retries on piece 7: HTTP error: 404",
+                ErrorCode::HTTP_NOT_FOUND,
+            ),
+            (
+                "Range probe HTTP error: 416",
+                ErrorCode::HTTP_RANGE_NOT_SATISFIABLE,
+            ),
+            ("HTTP error: 502 Bad Gateway", ErrorCode::HTTP_SERVER_ERROR),
+            (
+                "mirrors answered with status:[503]",
+                ErrorCode::HTTP_SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(classify_error(msg, "http"), expected, "{msg}");
+        }
     }
 }

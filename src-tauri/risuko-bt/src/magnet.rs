@@ -468,7 +468,7 @@ pub fn is_dialable_peer_addr(addr: SocketAddr) -> bool {
     if addr.port() == 0 {
         return false;
     }
-    match addr.ip() {
+    match addr.ip().to_canonical() {
         std::net::IpAddr::V4(ip) => {
             if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_link_local() {
                 return false;
@@ -2389,6 +2389,19 @@ mod tests {
         assert!(!is_dialable_peer_addr(cf2));
         assert!(is_dialable_peer_addr(ok));
         assert!(is_dialable_peer_addr(loopback));
+    }
+
+    #[test]
+    fn dialable_filter_sees_through_ipv4_mapped_addresses() {
+        let dialable = |s: &str| is_dialable_peer_addr(s.parse::<SocketAddr>().unwrap());
+        assert!(!dialable("[::ffff:0.0.0.0]:6881"));
+        assert!(!dialable("[::ffff:255.255.255.255]:6881"));
+        assert!(!dialable("[::ffff:224.0.0.1]:6881"));
+        assert!(!dialable("[::ffff:169.254.1.1]:6881"));
+        assert!(!dialable("[::ffff:162.158.179.174]:6881"));
+        assert!(dialable("[::ffff:111.193.237.96]:34000"));
+        assert!(dialable("[::ffff:127.0.0.1]:6881"));
+        assert!(dialable("[2001:db8::1]:6881"));
     }
 
     #[test]

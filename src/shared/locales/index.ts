@@ -109,71 +109,64 @@ export const availableLanguages = [
 	},
 ];
 
-const checkLngIsAvailable = (locale) => {
-	return availableLanguages.some((lng) => lng.value === locale);
+const checkLngIsAvailable = (locale: string) => {
+	return availableLanguages.some(
+		(lng) => lng.value !== "auto" && lng.value === locale,
+	);
 };
 
-export const getLanguage = (locale = "en-US") => {
-	if (locale === "auto") {
-		const system = getSystemLocale();
-		return getLanguage(system === "auto" ? "en-US" : system);
-	}
+const REGIONLESS_DEFAULTS: Record<string, string> = {
+	en: "en-US",
+	pt: "pt-BR",
+	no: "nb",
+};
 
+const TRADITIONAL_CHINESE = /^zh-(hant|tw|hk|mo)\b/;
+
+const matchLanguage = (locale: unknown): string | null => {
 	if (typeof locale !== "string" || !locale) {
-		return "en-US";
+		return null;
 	}
-
-	if (checkLngIsAvailable(locale)) {
-		return locale;
+	const tag = locale.trim().replace(/_/g, "-");
+	const lower = tag.toLowerCase();
+	const exact = availableLanguages.find(
+		(lng) => lng.value !== "auto" && lng.value.toLowerCase() === lower,
+	);
+	if (exact) {
+		return exact.value;
 	}
-
-	if (locale.startsWith("ar")) {
-		return "ar";
+	if (lower === "zh" || lower.startsWith("zh-")) {
+		return TRADITIONAL_CHINESE.test(lower) ? "zh-TW" : "zh-CN";
 	}
-
-	if (locale.startsWith("de")) {
-		return "de";
+	const base = lower.split("-")[0];
+	if (Object.hasOwn(REGIONLESS_DEFAULTS, base)) {
+		return REGIONLESS_DEFAULTS[base];
 	}
+	return checkLngIsAvailable(base) ? base : null;
+};
 
-	if (locale.startsWith("en")) {
-		return "en-US";
+export const pickLanguage = (candidates: readonly unknown[]): string => {
+	for (const candidate of candidates) {
+		const match = matchLanguage(candidate);
+		if (match) {
+			return match;
+		}
 	}
-
-	if (locale.startsWith("es")) {
-		return "es";
-	}
-
-	if (locale.startsWith("fr")) {
-		return "fr";
-	}
-
-	if (locale.startsWith("it")) {
-		return "it";
-	}
-
-	if (locale.startsWith("pt")) {
-		return "pt-BR";
-	}
-
-	if (locale === "zh-HK") {
-		return "zh-TW";
-	}
-
-	if (locale.startsWith("zh")) {
-		return "zh-CN";
-	}
-
 	return "en-US";
 };
 
-const getSystemLocale = () => {
+const getSystemLocales = (): readonly unknown[] => {
 	if (typeof navigator === "undefined") {
-		return "en-US";
+		return [];
 	}
-	const locales = Array.isArray(navigator.languages)
+	return Array.isArray(navigator.languages)
 		? navigator.languages
 		: [navigator.language];
-	return (
-		locales.find((locale) => typeof locale === "string" && locale) || "en-US"
-	);
+};
+
+export const getLanguage = (locale: unknown = "en-US"): string => {
+	if (locale === "auto") {
+		return pickLanguage(getSystemLocales());
+	}
+	return matchLanguage(locale) ?? "en-US";
 };

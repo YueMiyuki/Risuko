@@ -147,7 +147,6 @@ export default {
 	"file-category-document": "문서",
 	"file-category-compressed": "압축 파일",
 	"file-category-program": "프로그램",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"App Store의 샌드박스 권한 제한으로 인해 기본 다운로드 폴더는 ~/Downloads로 설정하는 것이 좋습니다.",
 	"transfer-settings": "전송",
@@ -198,6 +197,9 @@ export default {
 	"uri-selector-feedback": "피드백 (느리거나 실패하는 미러 제외)",
 	"uri-selector-inorder": "순서대로 (미러를 왼쪽에서 오른쪽으로 시도)",
 	"uri-selector-adaptive": "적응형 (가장 빠른 미러 우선)",
+	"send-auth-to-all-mirrors": "모든 HTTPS 미러에 로그인 정보 보내기",
+	"send-auth-to-all-mirrors-tips":
+		"작업의 권한 부여 헤더를 모든 HTTPS 미러에 보냅니다. 끄면 첫 번째 링크와 스킴, 호스트, 포트가 같은 미러만 받습니다.",
 	"unit-seconds": "초",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "저장소",

@@ -81,12 +81,7 @@ impl SessionManager {
                 t.download_speed = 0;
                 t.upload_speed = 0;
                 t.connections = 0;
-                if t.seeder && t.seeding_since > 0 {
-                    t.seeding_since = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                }
+                t.seeding_since = 0;
                 t
             })
             .collect()
@@ -199,15 +194,33 @@ mod tests {
     }
 
     #[test]
-    fn load_restarts_seed_clock_and_save_leaves_no_temp_files() {
+    fn load_stops_the_seed_clock_and_keeps_the_time_already_seeded() {
         let dir = TempDir::new().unwrap();
         let mgr = SessionManager::new(dir.path());
         let mut task = make_http_task("gid1", TaskStatus::Active);
         task.seeder = true;
         task.seeding_since = 1;
-        mgr.save(&[task]).unwrap();
+        task.seeded_ms = 5000;
+        mgr.save(&[task.clone()]).unwrap();
         let loaded = mgr.load();
-        assert!(loaded[0].seeding_since > 1);
+        assert_eq!(loaded[0].status, TaskStatus::Paused);
+        assert_eq!((loaded[0].seeded_ms, loaded[0].seeding_since), (5000, 0));
+
+        let mut old = serde_json::to_value(&task).unwrap();
+        old.as_object_mut().unwrap().remove("seeded_ms");
+        let file = serde_json::json!({ "version": 1, "tasks": [old] });
+        fs::write(dir.path().join(SESSION_FILENAME), file.to_string()).unwrap();
+        let loaded = mgr.load();
+        assert_eq!((loaded[0].seeded_ms, loaded[0].seeding_since), (0, 0));
+        assert!(loaded[0].seeder);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_files() {
+        let dir = TempDir::new().unwrap();
+        let mgr = SessionManager::new(dir.path());
+        mgr.save(&[make_http_task("gid1", TaskStatus::Active)])
+            .unwrap();
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .flatten()

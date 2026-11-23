@@ -3,7 +3,6 @@ export default {
 	"add-task": "Añadir tareas",
 	"primary-navigation": "Navegación principal",
 	"nav-tasks": "Tareas",
-	"nav-rss": "RSS",
 	"nav-health": "Estado",
 	"nav-settings": "Preferencias",
 	"nav-share": "Compartir",
@@ -31,6 +30,7 @@ export default {
 	"update-cancelled": "Actualización cancelada",
 	"update-install": "Instalar actualización",
 	"update-relaunch": "Reinicia para completar la actualización",
+	"update-relaunching": "Reiniciando Risuko…",
 	"update-progress": "Progreso de la actualización: {{progress}}%",
 	"update-error": "Error de actualización: {{error}}",
 	"update-unsigned":

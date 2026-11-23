@@ -322,6 +322,8 @@ export default {
 	"media-format-auto": "Tốt nhất hiện có (tự động)",
 	"media-format-hint": "Hãy lấy định dạng để chọn một chất lượng cụ thể.",
 	"media-format-error": "Không thể tải các định dạng cho URL này.",
+	"media-unsupported-android":
+		"Tải xuống từ các trang web phương tiện cần có yt-dlp, nhưng yt-dlp không khả dụng trên Android",
 	"download-complete-message": "Đã hoàn tất tải xuống {{taskName}}",
 	"download-complete-notify": "Tải xuống hoàn tất",
 	"bt-download-complete-message":
@@ -369,6 +371,15 @@ export default {
 	"mirror-placeholder": "URL máy chủ gương (cùng tệp, máy chủ khác)",
 	"mirror-hint":
 		"Thêm các URL máy chủ gương trỏ đến cùng một tệp để tải xuống từ nhiều nguồn song song.",
+	"mirror-sources": "{{count}} nguồn",
+	"mirror-failing": "Đang lỗi",
+	"mirror-idle": "Không dùng",
+	"add-tab-links": "Liên kết",
+	"add-tab-mirrors": "Máy chủ gương",
+	"mirror-list-placeholder": "URL máy chủ gương của một tệp, mỗi dòng một URL",
+	"mirror-list-hint":
+		"Mọi liên kết phải trỏ đến cùng một tệp. Các phần của tệp được tải xuống từ tất cả máy chủ gương cùng lúc, và máy chủ gương nào lỗi hoặc chậm lại sẽ chuyển phần của nó cho các máy chủ khác.",
+	"mirror-list-rejected": "Không phải liên kết tệp http(s) thông thường:",
 	"detail-tab-general": "Chung",
 	"detail-tab-activity": "Hoạt động",
 	"detail-tab-trackers": "Tracker",
@@ -399,6 +410,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 hoặc trống = không giới hạn (ví dụ 500K)",
 	"edit-primary-uri": "URL tải xuống",
 	"edit-primary-uri-placeholder": "URL tải xuống chính",
+	"edit-tab-seeding": "Seed",
+	"seeding-rule-global": "Dùng cài đặt chung",
+	"seeding-rule-forever": "Seed cho đến khi tôi dừng",
+	"seeding-rule-limits": "Dừng ở một tỷ lệ hoặc sau một khoảng thời gian",
+	"seeding-rule-none": "Không seed",
+	"seeding-global-off": "Hiện tại: không seed",
+	"seeding-global-forever": "Hiện tại: seed cho đến khi dừng",
+	"seeding-global-ratio": "Hiện tại: dừng ở tỷ lệ {{ratio}}",
+	"seeding-global-minutes": "Hiện tại: dừng sau {{minutes}} phút",
+	"seeding-global-both":
+		"Hiện tại: dừng ở tỷ lệ {{ratio}} hoặc sau {{minutes}} phút",
+	"seeding-limits-hint":
+		"Việc seed dừng ở giới hạn nào đến trước. 0 nghĩa là không có giới hạn loại đó.",
+	"seeding-limits-required": "Nhập một tỷ lệ hoặc số phút lớn hơn 0",
+	"seeding-for": "Đã seed được",
+	"seeding-applies-after-download":
+		"Điều này áp dụng khi quá trình tải xuống hoàn tất.",
+	"seeding-stops-now": "Tác vụ này sẽ dừng seed khi bạn lưu.",
+	"seeding-limit-reached":
+		"Tác vụ này đã đạt giới hạn này và sẽ dừng seed khi bạn lưu.",
+	"seeding-in-place-note":
+		"Các torrent bạn đã tạo sẽ seed cho đến khi bạn dừng chúng.",
+	"seeding-ed2k-sharing-off":
+		"Chia sẻ qua eD2K đang tắt trong Cài đặt, nên tác vụ này sẽ không tải lên.",
+	"seeding-leftover-values":
+		"Tác vụ này có các giá trị seed từ một lần đổi cài đặt trước đó. Lưu sẽ thay thế chúng.",
 	"create-torrent": "Tạo Torrent",
 	"create-torrent-menu": "Tạo Torrent...",
 	"create-torrent-source": "Tệp hoặc thư mục để chia sẻ",

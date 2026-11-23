@@ -51,9 +51,6 @@ pub enum Command {
     /// Manage configuration
     Config(ConfigCommand),
 
-    /// Manage RSS feeds
-    Rss(RssCommand),
-
     /// Start headless engine (RPC server only, no GUI)
     Serve(ServeArgs),
 
@@ -191,59 +188,6 @@ pub enum ConfigAction {
     },
 }
 
-#[derive(clap::Args)]
-pub struct RssCommand {
-    #[command(subcommand)]
-    pub action: RssAction,
-}
-
-#[derive(Subcommand)]
-pub enum RssAction {
-    /// Add an RSS feed
-    Add {
-        /// Feed URL
-        url: String,
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-    /// List all RSS feeds
-    List {
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh all RSS feeds
-    Refresh {
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-    /// Remove an RSS feed
-    Remove {
-        /// Feed ID
-        id: String,
-        /// RPC port
-        #[arg(long, default_value_t = 16800)]
-        rpc_port: u16,
-        /// RPC secret for authentication
-        #[arg(long)]
-        rpc_secret: Option<String>,
-    },
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -292,7 +236,6 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Peers(args) => commands::peers(args).await,
         Command::Purge(args) => commands::purge(args).await,
         Command::Config(cmd) => commands::config(cmd).await,
-        Command::Rss(cmd) => commands::rss(cmd).await,
         Command::Serve(args) => shared::serve(&commands::HOST, args).await,
         Command::Shutdown(args) => commands::shutdown(args).await,
         Command::CreateTorrent(args) => commands::create_torrent(args).await,
@@ -326,7 +269,7 @@ mod tests {
             panic!("not download");
         };
         assert_eq!(args.urls, ["http://a/f", "http://b/f"]);
-        assert_eq!(args.threads, 16);
+        assert_eq!(args.threads, None);
         assert_eq!(args.dir, None);
         assert_eq!(args.out, None);
         assert!(args.headers.is_empty());
@@ -382,7 +325,7 @@ mod tests {
             panic!("not download");
         };
         assert_eq!(args.urls, ["magnet:?xt=urn:btih:abc"]);
-        assert_eq!(args.threads, 4);
+        assert_eq!(args.threads, Some(4));
         assert_eq!(args.dir.as_deref(), Some("/tmp/d"));
         assert_eq!(args.out.as_deref(), Some("f.bin"));
         assert_eq!(args.headers, ["A: 1", "B: 2"]);
@@ -417,7 +360,7 @@ mod tests {
         ]) else {
             panic!("not download");
         };
-        assert_eq!(args.threads, 2);
+        assert_eq!(args.threads, Some(2));
         assert_eq!(args.dir.as_deref(), Some("d"));
         assert_eq!(args.out.as_deref(), Some("o"));
         assert_eq!(args.headers, ["X: y"]);

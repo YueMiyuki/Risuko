@@ -100,7 +100,4 @@
 	.app-content:has(.window-controls) .panel-header {
 		padding-right: 128px;
 	}
-	.app-content:has(.rss-feed-column) .content-topbar-dragger {
-		margin-inline-start: 220px;
-	}
 }

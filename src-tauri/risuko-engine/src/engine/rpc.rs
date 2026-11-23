@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::events::EventBroadcaster;
-use super::manager::TaskManager;
+use super::manager::{uri_kind, TaskManager, UriKind};
 use super::options::EngineOptions;
 use super::rpc_paths;
 
@@ -21,6 +21,16 @@ const ARIA2NEXT_VERSION: &str = "1.37.0";
 
 const RPC_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const RPC_BLOCKED_OPTION_STEM: &str = "risukocompletionscript";
+const RPC_BLOCKED_OPTION_NAMES: [&str; 1] = ["usenetprofiles"];
+const RPC_SECRET_MASK: &str = "********";
+const RPC_SECRET_OPTIONS: [&str; 6] = [
+    "ftp-passwd",
+    "sftp-passwd",
+    "sftp-private-key",
+    "sftp-private-key-passphrase",
+    "pbh-rpc-secret",
+    "rpc-secret",
+];
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -690,6 +700,7 @@ fn task_options(params: &[Value], index: usize) -> Map<String, Value> {
         .cloned()
         .unwrap_or_default();
     strip_blocked_options(&mut options);
+    drop_masked_secrets(&mut options);
     options
 }
 
@@ -703,10 +714,38 @@ fn is_blocked_option(key: &str) -> bool {
         .map(|c| c.to_ascii_lowercase())
         .collect();
     folded.starts_with(RPC_BLOCKED_OPTION_STEM)
+        || RPC_BLOCKED_OPTION_NAMES.contains(&folded.as_str())
 }
 
 fn strip_blocked_options(options: &mut Map<String, Value>) {
     options.retain(|key, _| !is_blocked_option(key));
+}
+
+fn mask_secret_options(mut options: Value) -> Value {
+    if let Value::Object(map) = &mut options {
+        for key in RPC_SECRET_OPTIONS {
+            let Some(value) = map.get_mut(key) else {
+                continue;
+            };
+            let secret = match value {
+                Value::String(text) if key == "sftp-private-key" => {
+                    super::ftp::is_pasted_private_key(text)
+                }
+                Value::String(text) => !text.is_empty(),
+                _ => true,
+            };
+            if secret {
+                *value = Value::String(RPC_SECRET_MASK.into());
+            }
+        }
+    }
+    options
+}
+
+fn drop_masked_secrets(options: &mut Map<String, Value>) {
+    options.retain(|key, value| {
+        !(RPC_SECRET_OPTIONS.contains(&key.as_str()) && value.as_str() == Some(RPC_SECRET_MASK))
+    });
 }
 
 fn invalid_params(message: String) -> RpcError {
@@ -833,7 +872,30 @@ fn dispatch_method<'a>(
                 let options = task_options(&params, 1);
                 check_save_options(state, &options).await?;
 
-                let gid = state.manager.add_http_task(uris, options).await?;
+                let manager = &state.manager;
+                let gid = if uris.len() == 1 {
+                    match uri_kind(&uris[0], &options) {
+                        UriKind::Http | UriKind::Magnet => {
+                            manager.add_http_task(uris, options).await?
+                        }
+                        UriKind::M3u8 => manager.add_m3u8_task(&uris[0], options).await?,
+                        UriKind::Ed2k => manager.add_ed2k_task(&uris[0], options).await?,
+                        UriKind::Ftp => manager.add_ftp_task(&uris[0], options).await?,
+                        UriKind::Media => manager.add_media_task(&uris[0], options).await?,
+                        UriKind::LegacyP2p(_) => {
+                            return Err("This kind of link cannot be added over RPC"
+                                .to_string()
+                                .into());
+                        }
+                    }
+                } else if uris
+                    .iter()
+                    .all(|uri| uri_kind(uri, &options) == UriKind::Http)
+                {
+                    manager.add_http_task(uris, options).await?
+                } else {
+                    return Err("Several addresses in one addUri call are mirrors of one file and must all be http or https".to_string().into());
+                };
                 Ok(Value::String(gid))
             }
 
@@ -1002,6 +1064,7 @@ fn dispatch_method<'a>(
                     .map_err(|e| RpcError::from(format!("Invalid task patch: {e}")))?;
                 if let Some(options) = patch.options.as_mut() {
                     strip_blocked_options(options);
+                    drop_masked_secrets(options);
                 }
                 check_task_patch(state, &patch).await?;
                 let outcome = state.manager.update_task(&gid, patch).await?;
@@ -1029,13 +1092,18 @@ fn dispatch_method<'a>(
 
             "risuko.getOption" => {
                 let gid = resolve_gid(&params, &state.manager).await?;
-                state.manager.get_option(&gid).await.map_err(RpcError::from)
+                state
+                    .manager
+                    .get_option(&gid)
+                    .await
+                    .map(mask_secret_options)
+                    .map_err(RpcError::from)
             }
 
             "risuko.getGlobalOption" => {
                 let options = state.manager.get_global_option().await;
                 Ok(match (state.compat, options) {
-                    (RpcCompatMode::Standard, options) => options,
+                    (RpcCompatMode::Standard, options) => mask_secret_options(options),
                     (RpcCompatMode::Aria2Next, Value::Object(mut map)) => {
                         map.retain(|key, _| PBH_READABLE_OPTIONS.contains(&key.as_str()));
                         Value::Object(map)
@@ -1514,6 +1582,38 @@ mod tests {
         let mut keys: Vec<&str> = options.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["dir", "out", "risuko-cookie-host"]);
+    }
+
+    #[test]
+    fn rpc_options_drop_usenet_provider_lists() {
+        let providers = json!([{"id": "a", "host": "news.example", "port": 563}]);
+        for spelling in [
+            "usenet-profiles",
+            "usenetProfiles",
+            "usenet_profiles",
+            "USENET-PROFILES",
+        ] {
+            let mut sent = Map::new();
+            sent.insert("dir".into(), json!("/tmp"));
+            sent.insert(spelling.into(), providers.clone());
+            let params = vec![json!(["http://example.com/a"]), Value::Object(sent)];
+            let options = task_options(&params, 1);
+            assert_eq!(options.len(), 1, "{spelling}");
+            assert_eq!(options.get("dir"), Some(&json!("/tmp")));
+        }
+
+        let params = vec![
+            json!(["http://example.com/a"]),
+            json!({
+                "usenet-profiles": providers,
+                "usenet-archive-limits": "{}",
+                "usenet-cleanup-mode": "all",
+            }),
+        ];
+        let options = task_options(&params, 1);
+        let mut keys: Vec<&str> = options.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["usenet-archive-limits", "usenet-cleanup-mode"]);
     }
 
     #[test]
@@ -2409,10 +2509,25 @@ mod tests {
         );
         assert_eq!(task_count(&state).await, 0);
 
-        for out in ["../escape.bin", "/tmp/escape.bin"] {
+        for out in ["../escape.bin", "/tmp/escape.bin", "~/escape.bin"] {
             let response = add_paused(&state, json!({"out": out})).await;
             assert!(refused(&response), "{out}: {response}");
         }
+
+        let response = call(
+            &state,
+            "risuko.addMedia",
+            vec![
+                json!("https://www.youtube.com/watch?v=x"),
+                json!({"out": "~/escape.mp4", "pause": "true"}),
+            ],
+        )
+        .await;
+        assert!(refused(&response), "{response}");
+        assert!(
+            error_message(&response).contains("leads outside the save folder"),
+            "{response}"
+        );
 
         let options = json!({"dir": outside, "pause": "true"});
         let calls = [
@@ -2974,5 +3089,178 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(methods.contains(&"aria2.addUri"));
+    }
+
+    #[tokio::test]
+    async fn stored_secrets_are_masked_in_get_global_option() {
+        let (state, config_dir) = make_rpc_state("secret").await;
+        let mut opts = Map::new();
+        opts.insert("ftp-passwd".into(), json!("hunter2"));
+        opts.insert("sftp-passwd".into(), json!("hunter3"));
+        opts.insert("sftp-private-key-passphrase".into(), json!("pp"));
+        opts.insert("pbh-rpc-secret".into(), json!("pbh"));
+        opts.insert(
+            "sftp-private-key".into(),
+            json!("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----"),
+        );
+        opts.insert("rpc-secret".into(), json!(""));
+        state.manager.change_global_option(opts).await;
+
+        let response = call(&state, "aria2.getGlobalOption", vec![]).await;
+        let result = response["result"].as_object().unwrap();
+        for key in [
+            "ftp-passwd",
+            "sftp-passwd",
+            "sftp-private-key-passphrase",
+            "pbh-rpc-secret",
+            "sftp-private-key",
+        ] {
+            assert_eq!(result[key], json!("********"), "{key}: {response}");
+        }
+        assert_eq!(result["rpc-secret"], json!(""), "{response}");
+        let serialized = response.to_string();
+        assert!(!serialized.contains("hunter2"), "{serialized}");
+        assert!(!serialized.contains("BEGIN OPENSSH"), "{serialized}");
+        assert_eq!(
+            result["dir"],
+            json!(text(&config_dir.path().join("downloads")))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_file_path_is_not_masked() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let mut opts = Map::new();
+        opts.insert("sftp-private-key".into(), json!("/home/u/.ssh/id_ed25519"));
+        state.manager.change_global_option(opts).await;
+
+        let response = call(&state, "aria2.getGlobalOption", vec![]).await;
+        assert_eq!(
+            response["result"]["sftp-private-key"],
+            json!("/home/u/.ssh/id_ed25519"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_the_mask_back_keeps_the_stored_secret() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let mut opts = Map::new();
+        opts.insert("ftp-passwd".into(), json!("hunter2"));
+        state.manager.change_global_option(opts).await;
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"ftp-passwd": "********", "max-overall-download-limit": "1K"})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+        let stored = state.manager.get_global_option().await;
+        assert_eq!(stored["ftp-passwd"], json!("hunter2"));
+        assert_eq!(stored["max-overall-download-limit"], json!("1K"));
+
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({"ftp-passwd": "new"})],
+        )
+        .await;
+        assert_eq!(response["result"], "OK", "{response}");
+        let stored = state.manager.get_global_option().await;
+        assert_eq!(stored["ftp-passwd"], json!("new"));
+    }
+
+    #[tokio::test]
+    async fn a_global_change_over_rpc_leaves_the_provider_list_alone() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let response = call(
+            &state,
+            "aria2.changeGlobalOption",
+            vec![json!({
+                "usenet-profiles": [{"id": "a", "host": "news.example", "port": 563}],
+                "max-overall-download-limit": "1K",
+            })],
+        )
+        .await;
+        assert_eq!(response["result"], json!("OK"), "{response}");
+
+        let global = state.manager.get_global_option().await;
+        let global = global.as_object().unwrap();
+        assert!(!global
+            .get("usenet-profiles")
+            .is_some_and(|value| value.to_string().contains("news.example")));
+        assert_eq!(global.get("max-overall-download-limit"), Some(&json!("1K")));
+    }
+
+    #[tokio::test]
+    async fn add_uri_starts_the_right_kind_of_task() {
+        let (state, _config_dir) = make_rpc_state("secret").await;
+        let paused = || json!({"pause": "true"});
+        let mut gids = Vec::new();
+        for (uri, kind) in [
+            ("ftp://127.0.0.1:1/f.bin", "ftp"),
+            ("sftp://127.0.0.1:1/f.bin", "ftp"),
+            ("http://127.0.0.1:1/live/index.m3u8", "m3u8"),
+            (
+                "ed2k://|file|a.bin|1|0123456789ABCDEF0123456789ABCDEF|/",
+                "ed2k",
+            ),
+        ] {
+            let response = call(&state, "aria2.addUri", vec![json!([uri]), paused()]).await;
+            let gid = response["result"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{uri}: {response}"))
+                .to_string();
+            let status = call(
+                &state,
+                "aria2.tellStatus",
+                vec![json!(gid), json!(["kind", "status"])],
+            )
+            .await;
+            assert_eq!(status["result"]["kind"], json!(kind), "{uri}: {status}");
+            assert_eq!(
+                status["result"]["status"],
+                json!("paused"),
+                "{uri}: {status}"
+            );
+            gids.push(gid);
+        }
+
+        let response = call(
+            &state,
+            "aria2.addUri",
+            vec![
+                json!(["http://127.0.0.1:1/a.bin", "ftp://127.0.0.1:1/a.bin"]),
+                paused(),
+            ],
+        )
+        .await;
+        let message = error_message(&response);
+        assert!(
+            message.contains("mirrors") && message.contains("http or https"),
+            "{response}"
+        );
+
+        let response = call(
+            &state,
+            "aria2.addUri",
+            vec![
+                json!(["dchub://hub.example.com:411/?TTH=ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFG&xl=42&dn=a.bin"]),
+                paused(),
+            ],
+        )
+        .await;
+        assert!(response["error"].is_object(), "{response}");
+        assert!(
+            error_message(&response).contains("cannot be added over RPC"),
+            "{response}"
+        );
+        assert_eq!(task_count(&state).await, gids.len());
+
+        for gid in gids {
+            let response = call(&state, "aria2.remove", vec![json!(gid)]).await;
+            assert_eq!(response["result"], json!(gid), "{response}");
+        }
     }
 }

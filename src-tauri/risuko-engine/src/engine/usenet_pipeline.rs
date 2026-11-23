@@ -554,8 +554,8 @@ static CRC32_TABLES: [[u32; 256]; 8] = build_crc32_tables();
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let tables = &CRC32_TABLES;
     let mut crc = 0xffff_ffffu32;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
         let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
         let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         crc = tables[7][(low & 0xff) as usize]
@@ -567,7 +567,7 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
             ^ tables[1][((high >> 16) & 0xff) as usize]
             ^ tables[0][(high >> 24) as usize];
     }
-    for byte in chunks.remainder() {
+    for byte in remainder {
         crc = (crc >> 8) ^ tables[0][((crc ^ *byte as u32) & 0xff) as usize];
     }
     !crc

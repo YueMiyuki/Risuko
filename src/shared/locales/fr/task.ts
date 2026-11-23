@@ -335,6 +335,8 @@ export default {
 	"media-format-hint":
 		"Récupérez les formats pour choisir une qualité précise.",
 	"media-format-error": "Impossible de charger les formats pour cette URL.",
+	"media-unsupported-android":
+		"Les téléchargements depuis les sites de médias nécessitent yt-dlp, qui n’est pas disponible sur Android",
 	"download-complete-message": "{{taskName}} téléchargement terminé",
 	"download-complete-notify": "Téléchargement Terminé",
 	"bt-download-complete-message":
@@ -384,6 +386,15 @@ export default {
 	"mirror-placeholder": "URL du miroir (même fichier, autre serveur)",
 	"mirror-hint":
 		"Ajoutez des URL de miroirs pointant vers le même fichier pour télécharger depuis plusieurs sources en parallèle.",
+	"mirror-sources": "{{count}} sources",
+	"mirror-failing": "En échec",
+	"mirror-idle": "Inutilisé",
+	"add-tab-links": "Liens",
+	"add-tab-mirrors": "Miroirs",
+	"mirror-list-placeholder": "URL miroirs d’un même fichier, une par ligne",
+	"mirror-list-hint":
+		"Chaque lien doit pointer vers le même fichier. Ses morceaux sont téléchargés depuis tous les miroirs à la fois, et un miroir qui échoue ou ralentit cède ses morceaux aux autres.",
+	"mirror-list-rejected": "Pas un simple lien de fichier http(s) :",
 	"detail-tab-general": "Général",
 	"detail-tab-activity": "Activité",
 	"detail-tab-trackers": "Trackers",
@@ -414,6 +425,33 @@ export default {
 	"edit-speed-limit-placeholder": "0 ou vide = illimité (ex. 500K)",
 	"edit-primary-uri": "URL de téléchargement",
 	"edit-primary-uri-placeholder": "URL de téléchargement principale",
+	"edit-tab-seeding": "Ensemencement",
+	"seeding-rule-global": "Utiliser le paramètre global",
+	"seeding-rule-forever": "Semer jusqu’à ce que je l’arrête",
+	"seeding-rule-limits": "Arrêter à un ratio ou après un délai",
+	"seeding-rule-none": "Ne pas semer",
+	"seeding-global-off": "Actuellement : ne pas semer",
+	"seeding-global-forever": "Actuellement : semer jusqu’à l’arrêt",
+	"seeding-global-ratio": "Actuellement : arrêter au ratio {{ratio}}",
+	"seeding-global-minutes": "Actuellement : arrêter après {{minutes}} minutes",
+	"seeding-global-both":
+		"Actuellement : arrêter au ratio {{ratio}} ou après {{minutes}} minutes",
+	"seeding-limits-hint":
+		"L’ensemencement s’arrête dès que la première limite est atteinte. 0 signifie aucune limite de ce type.",
+	"seeding-limits-required":
+		"Saisissez un ratio ou un nombre de minutes supérieur à 0",
+	"seeding-for": "Durée d’ensemencement",
+	"seeding-applies-after-download":
+		"Cela s’applique à la fin du téléchargement.",
+	"seeding-stops-now": "Cette tâche arrête l’ensemencement à l’enregistrement.",
+	"seeding-limit-reached":
+		"Cette tâche a déjà atteint cette limite et arrête l’ensemencement à l’enregistrement.",
+	"seeding-in-place-note":
+		"Les torrents que vous avez créés restent ensemencés jusqu’à ce que vous les arrêtiez.",
+	"seeding-ed2k-sharing-off":
+		"Le partage via eD2K est désactivé dans les Préférences, donc cette tâche n’enverra rien.",
+	"seeding-leftover-values":
+		"Cette tâche contient des valeurs d’ensemencement issues d’une modification antérieure des paramètres. L’enregistrement les remplace.",
 	"create-torrent": "Créer un torrent",
 	"create-torrent-menu": "Créer un torrent...",
 	"create-torrent-source": "Fichier ou dossier à partager",

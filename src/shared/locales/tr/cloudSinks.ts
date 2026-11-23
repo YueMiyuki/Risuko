@@ -73,6 +73,8 @@ export default {
 	errSftpUsernameRequired: "SFTP kullanıcı adı gerekli.",
 	errSftpAuthRequired: "SFTP parolası veya özel anahtarı gerekli.",
 	errFtpHostRequired: "FTP sunucusu gerekli.",
+	errSecretForNewServer:
+		"Sunucu değişti, bu nedenle kayıtlı parola veya anahtar yeniden kullanılmaz. Lütfen yeniden girin.",
 	errMoveTargetRequired:
 		"Yükleme sonrası eylem taşıma olduğunda taşınacak klasör gerekli.",
 	saving: "Kaydediliyor…",

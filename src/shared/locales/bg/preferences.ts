@@ -156,7 +156,6 @@ export default {
 	"file-category-document": "Документ",
 	"file-category-compressed": "Компресирани",
 	"file-category-program": "Програма",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"поради ограничения в App Store, препоръчително е да зададете пътя по подразбиране като ~/Downloads",
 	"transfer-settings": "Трансфер",
@@ -211,6 +210,10 @@ export default {
 		"Според резултата (отхвърля бавни/неработещи огледала)",
 	"uri-selector-inorder": "По ред (огледалата се опитват отляво надясно)",
 	"uri-selector-adaptive": "Адаптивно (предпочита най-бързото)",
+	"send-auth-to-all-mirrors":
+		"Изпращане на данните за вход до всички HTTPS огледала",
+	"send-auth-to-all-mirrors-tips":
+		"Изпраща заглавката за упълномощаване на задачата до всяко HTTPS огледало. Когато е изключено, я получават само огледалата със същата схема, хост и порт като първата връзка.",
 	"unit-seconds": "секунди",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Съхранение",

@@ -339,6 +339,8 @@ export default {
 	"media-format-auto": "El millor disponible (automàtic)",
 	"media-format-hint": "Obté els formats per triar una qualitat concreta.",
 	"media-format-error": "No s'han pogut carregar els formats d'aquesta URL.",
+	"media-unsupported-android":
+		"Les descàrregues de llocs multimèdia necessiten yt-dlp, que no està disponible a Android",
 	"download-complete-message": "S'ha terminat de descarregar {{taskName}}",
 	"download-complete-notify": "Descàrrega completada",
 	"bt-download-complete-message":
@@ -386,6 +388,15 @@ export default {
 	"mirror-placeholder": "URL de la rèplica (mateix fitxer, un altre servidor)",
 	"mirror-hint":
 		"Afegeix URL de rèpliques que apuntin al mateix fitxer per descarregar des de múltiples fonts en paral·lel.",
+	"mirror-sources": "{{count}} fonts",
+	"mirror-failing": "Amb errors",
+	"mirror-idle": "No s'utilitza",
+	"add-tab-links": "Enllaços",
+	"add-tab-mirrors": "Rèpliques",
+	"mirror-list-placeholder": "URL de rèpliques d'un fitxer, una per línia",
+	"mirror-list-hint":
+		"Tots els enllaços han d'apuntar al mateix fitxer. Les seves parts es descarreguen de totes les rèpliques alhora, i una rèplica que falla o s'alenteix passa les seves parts a les altres.",
+	"mirror-list-rejected": "No és un enllaç http(s) simple a un fitxer:",
 	"detail-tab-general": "General",
 	"detail-tab-activity": "Activitat",
 	"detail-tab-trackers": "Trackers",
@@ -416,6 +427,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 o buit = il·limitat (p. ex. 500K)",
 	"edit-primary-uri": "URL de descàrrega",
 	"edit-primary-uri-placeholder": "URL de descàrrega principal",
+	"edit-tab-seeding": "Sembra",
+	"seeding-rule-global": "Fes servir la configuració global",
+	"seeding-rule-forever": "Sembra fins que ho aturi",
+	"seeding-rule-limits": "Atura a una relació o passat un temps",
+	"seeding-rule-none": "No sembris",
+	"seeding-global-off": "Actualment: no se sembra",
+	"seeding-global-forever": "Actualment: se sembra fins que s'aturi",
+	"seeding-global-ratio": "Actualment: s'atura a la relació {{ratio}}",
+	"seeding-global-minutes": "Actualment: s'atura passats {{minutes}} minuts",
+	"seeding-global-both":
+		"Actualment: s'atura a la relació {{ratio}} o passats {{minutes}} minuts",
+	"seeding-limits-hint":
+		"La sembra s'atura amb el primer límit que s'assoleixi. 0 vol dir que no hi ha límit d'aquest tipus.",
+	"seeding-limits-required":
+		"Introdueix una relació o un nombre de minuts superior a 0",
+	"seeding-for": "Temps sembrant",
+	"seeding-applies-after-download": "Això s'aplica quan acabi la descàrrega.",
+	"seeding-stops-now": "Aquesta tasca deixa de sembrar quan desis.",
+	"seeding-limit-reached":
+		"Aquesta tasca ja ha assolit aquest límit i deixa de sembrar quan desis.",
+	"seeding-in-place-note":
+		"Els torrents que has creat se sembren fins que els aturis.",
+	"seeding-ed2k-sharing-off":
+		"La compartició per eD2K està desactivada a Preferències, així que aquesta tasca no pujarà res.",
+	"seeding-leftover-values":
+		"Aquesta tasca té valors de sembra d'un canvi de configuració anterior. En desar, se substitueixen.",
 	"create-torrent": "Crea un torrent",
 	"create-torrent-menu": "Crea un torrent...",
 	"create-torrent-source": "Fitxer o carpeta per compartir",

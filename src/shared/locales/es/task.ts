@@ -333,6 +333,8 @@ export default {
 	"media-format-auto": "Mejor disponible (automático)",
 	"media-format-hint": "Obtén los formatos para elegir una calidad concreta.",
 	"media-format-error": "No se pudieron cargar los formatos de esta URL.",
+	"media-unsupported-android":
+		"Las descargas de sitios multimedia requieren yt-dlp, que no está disponible en Android",
 	"download-complete-message": "Se terminó de descargar {{taskName}}",
 	"download-complete-notify": "Descarga completada",
 	"bt-download-complete-message":
@@ -381,6 +383,15 @@ export default {
 	"mirror-placeholder": "URL de la réplica (mismo archivo, otro servidor)",
 	"mirror-hint":
 		"Añade URL de réplicas que apunten al mismo archivo para descargar desde múltiples fuentes en paralelo.",
+	"mirror-sources": "{{count}} fuentes",
+	"mirror-failing": "Con fallos",
+	"mirror-idle": "Sin usar",
+	"add-tab-links": "Enlaces",
+	"add-tab-mirrors": "Réplicas",
+	"mirror-list-placeholder": "URL de réplicas de un archivo, una por línea",
+	"mirror-list-hint":
+		"Todos los enlaces deben apuntar al mismo archivo. Sus partes se descargan de todas las réplicas a la vez, y una réplica que falla o se ralentiza cede sus partes a las demás.",
+	"mirror-list-rejected": "No es un enlace http(s) simple a un archivo:",
 	"detail-tab-general": "General",
 	"detail-tab-activity": "Actividad",
 	"detail-tab-trackers": "Trackers",
@@ -411,6 +422,33 @@ export default {
 	"edit-speed-limit-placeholder": "0 o vacío = ilimitado (p. ej. 500K)",
 	"edit-primary-uri": "URL de descarga",
 	"edit-primary-uri-placeholder": "URL de descarga principal",
+	"edit-tab-seeding": "Siembra",
+	"seeding-rule-global": "Usar la configuración global",
+	"seeding-rule-forever": "Sembrar hasta que yo lo detenga",
+	"seeding-rule-limits": "Detener a una proporción o pasado un tiempo",
+	"seeding-rule-none": "No sembrar",
+	"seeding-global-off": "Actualmente: no sembrar",
+	"seeding-global-forever": "Actualmente: sembrar hasta detenerlo",
+	"seeding-global-ratio": "Actualmente: detener con proporción {{ratio}}",
+	"seeding-global-minutes": "Actualmente: detener tras {{minutes}} minutos",
+	"seeding-global-both":
+		"Actualmente: detener con proporción {{ratio}} o tras {{minutes}} minutos",
+	"seeding-limits-hint":
+		"La siembra se detiene con el primer límite que se alcance. 0 significa sin límite de ese tipo.",
+	"seeding-limits-required":
+		"Introduce una proporción o un número de minutos superior a 0",
+	"seeding-for": "Tiempo sembrando",
+	"seeding-applies-after-download":
+		"Esto se aplica cuando termine la descarga.",
+	"seeding-stops-now": "Esta tarea deja de sembrar al guardar.",
+	"seeding-limit-reached":
+		"Esta tarea ya alcanzó este límite y deja de sembrar al guardar.",
+	"seeding-in-place-note":
+		"Los torrents que creaste se siembran hasta que los detengas.",
+	"seeding-ed2k-sharing-off":
+		"Compartir por eD2K está desactivado en Preferencias, así que esta tarea no subirá nada.",
+	"seeding-leftover-values":
+		"Esta tarea tiene valores de siembra de un cambio de configuración anterior. Al guardar se reemplazan.",
 	"create-torrent": "Crear torrent",
 	"create-torrent-menu": "Crear torrent...",
 	"create-torrent-source": "Archivo o carpeta para compartir",

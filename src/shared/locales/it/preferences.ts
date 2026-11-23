@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Documento",
 	"file-category-compressed": "Compressi",
 	"file-category-program": "Programma",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"A causa delle restrizioni imposte dall'App Store, è raccomandato impostare la directory di default su ~/Downloads",
 	"transfer-settings": "Trasmissione dati",
@@ -209,6 +208,9 @@ export default {
 	"uri-selector-feedback": "Feedback (scarta i mirror lenti o difettosi)",
 	"uri-selector-inorder": "In ordine (prova i mirror da sinistra a destra)",
 	"uri-selector-adaptive": "Adattiva (preferisce il più veloce)",
+	"send-auth-to-all-mirrors": "Invia le credenziali a tutti i mirror HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Invia l’intestazione di autorizzazione di un’attività a ogni mirror HTTPS. Se disattivato, la ricevono solo i mirror con lo stesso schema, host e porta del primo link.",
 	"unit-seconds": "secondi",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Archiviazione",

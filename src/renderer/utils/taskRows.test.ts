@@ -106,6 +106,37 @@ test("merged rows keep the order of the light rows", () => {
 	assert.deepEqual(missing, ["n"]);
 });
 
+test("a light row that brings its own files keeps them and is not missing", () => {
+	const stale = [{ path: "old" }];
+	const fresh = [{ path: "new" }];
+	const filesB = [{ path: "b" }];
+	const { rows, missing } = mergeRowFiles<Row>(
+		[
+			{ gid: "a", status: "active", files: stale },
+			{ gid: "b", status: "complete", files: filesB },
+		],
+		[
+			{ gid: "a", status: "active", files: fresh },
+			{ gid: "n", status: "active", files: [] },
+			{ gid: "b", status: "complete" },
+		],
+	);
+	assert.deepEqual(missing, []);
+	assert.equal(rows[0].files, fresh);
+	assert.deepEqual(rows[1].files, []);
+	assert.equal(rows[2].files, filesB);
+});
+
+test("an active row with an unchanged status and no files of its own keeps the held ones", () => {
+	const filesA = [{ path: "a" }];
+	const { rows, missing } = mergeRowFiles<Row>(
+		[{ gid: "a", status: "active", files: filesA }],
+		[{ gid: "a", status: "active" }],
+	);
+	assert.deepEqual(missing, []);
+	assert.equal(rows[0].files, filesA);
+});
+
 test("filled rows take the fetched files array", () => {
 	const known = [{ path: "a" }];
 	const fetched = [{ path: "n" }];
@@ -134,21 +165,18 @@ test("a row left without a files array fails the fill", () => {
 	assert.equal(fillRowFiles(rows, [null, undefined]), null);
 });
 
-test("a light refresh is only for the waiting, scheduled, stopped and completed lists", () => {
-	for (const type of ["waiting", "scheduled", "stopped", "completed"]) {
+test("a light refresh is only for the all, waiting, scheduled, stopped and completed lists", () => {
+	for (const type of ["all", "waiting", "scheduled", "stopped", "completed"]) {
 		assert.equal(
 			canRefreshLight({ type, lastType: type, lightRefreshes: 0 }),
 			true,
 			type,
 		);
 	}
-	for (const type of ["active", "all"]) {
-		assert.equal(
-			canRefreshLight({ type, lastType: type, lightRefreshes: 0 }),
-			false,
-			type,
-		);
-	}
+	assert.equal(
+		canRefreshLight({ type: "active", lastType: "active", lightRefreshes: 0 }),
+		false,
+	);
 });
 
 test("a light refresh needs the last applied fetch to be for the same list", () => {

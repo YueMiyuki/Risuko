@@ -155,7 +155,6 @@ export default {
 	"file-category-document": "Dokumentum",
 	"file-category-compressed": "Tömörített",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Az App Store korlátozása miatt ajánlott a ~/Downloads mappába tenni a letöltéseket",
 	"transfer-settings": "Transmission",
@@ -207,6 +206,10 @@ export default {
 	"uri-selector-feedback": "Visszajelzés (a lassú/hibás tükrök elvetése)",
 	"uri-selector-inorder": "Sorrendben (a tükrök balról jobbra)",
 	"uri-selector-adaptive": "Adaptív (a leggyorsabb előnyben)",
+	"send-auth-to-all-mirrors":
+		"Bejelentkezési adatok küldése minden HTTPS-tükörnek",
+	"send-auth-to-all-mirrors-tips":
+		"A feladat felhatalmazási fejlécét minden HTTPS-tükörnek elküldi. Kikapcsolva csak az első linkkel azonos sémájú, gazdagépű és portú tükrök kapják meg.",
 	"unit-seconds": "másodperc",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Tárhely",

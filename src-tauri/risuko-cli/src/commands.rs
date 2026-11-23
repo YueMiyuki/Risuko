@@ -6,13 +6,11 @@ use risuko_engine::config::defaults;
 use risuko_engine::config::keys::{self, KeyScope};
 use risuko_engine::standalone::{load_config, standalone_config_dir, StandaloneEngine};
 
-use crate::{
-    ConfigAction, ConfigCommand, CreateTorrentArgs, GidArgs, RpcArgs, RssAction, RssCommand,
-    TorrentFormat,
-};
+use crate::{ConfigAction, ConfigCommand, CreateTorrentArgs, GidArgs, RpcArgs, TorrentFormat};
 use risuko_cli::progress::{format_size, format_size_speed, parse_num};
 use risuko_cli::rpc_client::RpcClient;
 use risuko_cli::shared::{self, add_torrent, connect_or_start_engine, EngineHost};
+use risuko_cli::signal::exit_on_next_signal;
 
 pub const HOST: EngineHost = EngineHost {
     config_dir: get_config_dir,
@@ -175,63 +173,6 @@ pub async fn config(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>
                     println!("{}: {}", k, merged[k]);
                 }
             }
-            Ok(())
-        }
-    }
-}
-
-pub async fn rss(cmd: RssCommand) -> Result<(), Box<dyn std::error::Error>> {
-    match cmd.action {
-        RssAction::Add {
-            url,
-            rpc_port,
-            rpc_secret,
-        } => {
-            let client = connect(rpc_port, rpc_secret).await?;
-            let result = client.call("risuko.addRssFeed", vec![json!(url)]).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            Ok(())
-        }
-        RssAction::List {
-            rpc_port,
-            rpc_secret,
-            json,
-        } => {
-            let client = connect(rpc_port, rpc_secret).await?;
-            let result = client.call("risuko.getRssFeeds", vec![]).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else if let Some(feeds) = result.as_array() {
-                if feeds.is_empty() {
-                    println!("No RSS feeds.");
-                } else {
-                    for feed in feeds {
-                        let id = feed.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-                        let url = feed.get("url").and_then(|v| v.as_str()).unwrap_or("-");
-                        let title = feed.get("title").and_then(|v| v.as_str()).unwrap_or("-");
-                        println!("[{}] {} ({})", id, title, url);
-                    }
-                }
-            }
-            Ok(())
-        }
-        RssAction::Refresh {
-            rpc_port,
-            rpc_secret,
-        } => {
-            let client = connect(rpc_port, rpc_secret).await?;
-            client.call("risuko.refreshAllRssFeeds", vec![]).await?;
-            println!("RSS feeds refreshed.");
-            Ok(())
-        }
-        RssAction::Remove {
-            id,
-            rpc_port,
-            rpc_secret,
-        } => {
-            let client = connect(rpc_port, rpc_secret).await?;
-            client.call("risuko.removeRssFeed", vec![json!(id)]).await?;
-            println!("Removed RSS feed: {}", id);
             Ok(())
         }
     }
@@ -402,6 +343,7 @@ pub async fn create_torrent(args: CreateTorrentArgs) -> Result<(), Box<dyn std::
             _ = &mut interrupted => {}
             _ = signal.notified() => {}
         }
+        exit_on_next_signal();
         engine.stop().await;
     }
     Ok(())
@@ -413,9 +355,10 @@ async fn seed_created_torrent(
     torrent: &[u8],
     dir: &std::path::Path,
 ) -> Result<(String, Option<StandaloneEngine>), Box<dyn std::error::Error>> {
-    let (client, headless_engine) = connect_or_start_engine(&HOST, rpc_port, rpc_secret).await?;
-    let options =
-        risuko_engine::engine::manager::TaskManager::seed_in_place_options(&dir.to_string_lossy());
+    let dir = dir.to_string_lossy();
+    let (client, headless_engine) =
+        connect_or_start_engine(&HOST, rpc_port, rpc_secret, Some(&dir)).await?;
+    let options = risuko_engine::engine::manager::TaskManager::seed_in_place_options(&dir);
     let added = match add_torrent(&client, torrent, &options).await {
         Ok(gid) if gid.is_empty() => Err("Failed to get task GID from engine".into()),
         Ok(gid) => ensure_task_ok(&client, &gid).await.map(|()| gid),
@@ -425,6 +368,7 @@ async fn seed_created_torrent(
         Ok(gid) => Ok((gid, headless_engine)),
         Err(e) => {
             if let Some(engine) = headless_engine {
+                exit_on_next_signal();
                 engine.stop().await;
             }
             Err(e)

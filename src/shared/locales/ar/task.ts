@@ -319,6 +319,8 @@ export default {
 	"media-format-auto": "أفضل جودة متاحة (تلقائي)",
 	"media-format-hint": "اجلب الصيغ لاختيار جودة محددة.",
 	"media-format-error": "تعذّر تحميل الصيغ لهذا الرابط.",
+	"media-unsupported-android":
+		"التنزيل من مواقع الوسائط يتطلب yt-dlp، وهو غير متوفر على Android",
 	"download-complete-message": "اكتمل تحميل {{taskName}}",
 	"download-complete-notify": "اكتمل التحميل",
 	"bt-download-complete-message": "اكتمل تحميل {{taskName}}، وعملية البَذر",
@@ -363,6 +365,15 @@ export default {
 	"mirror-placeholder": "رابط المرآة (نفس الملف، خادم آخر)",
 	"mirror-hint":
 		"أضف روابط مرآة تشير إلى نفس الملف للتنزيل من عدة مصادر في وقت واحد.",
+	"mirror-sources": "المصادر: {{count}}",
+	"mirror-failing": "فاشلة",
+	"mirror-idle": "غير مستخدمة",
+	"add-tab-links": "الروابط",
+	"add-tab-mirrors": "المرايا",
+	"mirror-list-placeholder": "روابط مرايا لملف واحد، رابط في كل سطر",
+	"mirror-list-hint":
+		"يجب أن تشير كل الروابط إلى الملف نفسه. تُنزَّل أجزاؤه من كل المرايا في وقت واحد، والمرآة التي تفشل أو تبطؤ تسلّم أجزاءها إلى المرايا الأخرى.",
+	"mirror-list-rejected": "ليس رابط ملف http(s) عاديًا:",
 	"detail-tab-general": "عام",
 	"detail-tab-activity": "النشاط",
 	"detail-tab-trackers": "المتتبعات",
@@ -393,6 +404,30 @@ export default {
 	"edit-speed-limit-placeholder": "0 أو فارغ = بلا حد (مثل 500K)",
 	"edit-primary-uri": "رابط التنزيل",
 	"edit-primary-uri-placeholder": "رابط التنزيل الرئيسي",
+	"edit-tab-seeding": "البذر",
+	"seeding-rule-global": "استخدام الإعداد العام",
+	"seeding-rule-forever": "البذر حتى أوقفه",
+	"seeding-rule-limits": "الإيقاف عند نسبة معينة أو بعد مدة معينة",
+	"seeding-rule-none": "عدم البذر",
+	"seeding-global-off": "حاليًا: عدم البذر",
+	"seeding-global-forever": "حاليًا: البذر حتى الإيقاف",
+	"seeding-global-ratio": "حاليًا: الإيقاف عند النسبة {{ratio}}",
+	"seeding-global-minutes": "حاليًا: الإيقاف بعد {{minutes}} د",
+	"seeding-global-both":
+		"حاليًا: الإيقاف عند النسبة {{ratio}} أو بعد {{minutes}} د",
+	"seeding-limits-hint":
+		"يتوقف البذر عند أول حد يتم بلوغه. القيمة 0 تعني عدم وجود حد من هذا النوع.",
+	"seeding-limits-required": "أدخل نسبة أو عدد دقائق أكبر من 0",
+	"seeding-for": "مدة البذر",
+	"seeding-applies-after-download": "يسري هذا عند اكتمال التحميل.",
+	"seeding-stops-now": "ستتوقف هذه المهمة عن البذر عند الحفظ.",
+	"seeding-limit-reached":
+		"بلغت هذه المهمة هذا الحد بالفعل، وستتوقف عن البذر عند الحفظ.",
+	"seeding-in-place-note": "ملفات التورنت التي أنشأتها تُبذر حتى توقفها.",
+	"seeding-ed2k-sharing-off":
+		"المشاركة عبر eD2K متوقفة في التفضيلات، لذا لن ترفع هذه المهمة أي ملفات.",
+	"seeding-leftover-values":
+		"تحتوي هذه المهمة على قيم بذر من تغيير سابق في الإعدادات. سيؤدي الحفظ إلى استبدالها.",
 	"create-torrent": "إنشاء تورنت",
 	"create-torrent-menu": "إنشاء تورنت...",
 	"create-torrent-source": "ملف أو مجلد للمشاركة",

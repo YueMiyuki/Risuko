@@ -1169,6 +1169,7 @@ fn spawn_peer_task_with_permit(
                 added
             }
             Ok(PeerOutcome::Recheck) => queued.add(candidate, u16::MAX, VERIFY_RECHECK_DELAY),
+            Ok(PeerOutcome::NothingNeeded) => queued.add(candidate, u16::MAX, reask_delay()),
             _ => false,
         };
         sources
@@ -1195,6 +1196,7 @@ fn session_end(result: &Result<PeerOutcome, String>, requeued: bool) -> SessionE
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOutcome {
     Finished,
+    NothingNeeded,
     Queued(u16),
     Recheck,
 }
@@ -1355,7 +1357,7 @@ pub(crate) async fn peer_session(
                     } else if verifying {
                         return Ok(PeerOutcome::Recheck);
                     } else {
-                        return Ok(PeerOutcome::Finished);
+                        return Ok(PeerOutcome::NothingNeeded);
                     }
                 }
             }
@@ -2141,6 +2143,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_source_with_nothing_needed_is_dialled_again_after_the_reask_delay() {
+        let cancel = CancellationToken::new();
+        let (dispatcher, mut started) = recording_dispatcher();
+        let scheduler = SourceScheduler::with_dispatcher(cancel.clone(), 4, 4, dispatcher);
+        let candidate = queued_candidate(1);
+        assert!(scheduler.submit(candidate));
+        started.recv().await.expect("first dial");
+
+        let delay = reask_delay();
+        let requeued = scheduler.queued.add(candidate, u16::MAX, delay);
+        let end = session_end(&Ok(PeerOutcome::NothingNeeded), requeued);
+        assert_eq!(end, SessionEnd::Requeued);
+        end_session(&scheduler, candidate.addr, end, Instant::now());
+        assert!(!scheduler.submit(candidate));
+
+        tokio::time::sleep(delay - Duration::from_secs(1)).await;
+        assert!(started.try_recv().is_err());
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let again = started.recv().await.expect("re-ask dial");
+        assert_eq!(again.addr, candidate.addr);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn queued_sources_are_capped_by_the_source_limit() {
         let cancel = CancellationToken::new();
         let (dispatcher, _started) = recording_dispatcher();
@@ -2312,6 +2339,10 @@ mod tests {
         assert_eq!(
             session_end(&Ok(PeerOutcome::Finished), false),
             SessionEnd::Done
+        );
+        assert_eq!(
+            session_end(&Ok(PeerOutcome::NothingNeeded), true),
+            SessionEnd::Requeued
         );
     }
 
@@ -2549,6 +2580,43 @@ mod tests {
         addr
     }
 
+    async fn fake_peer_offering(file_hash: [u8; 16], parts: u8) -> SocketAddrV4 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = match listener.local_addr().expect("addr") {
+            std::net::SocketAddr::V4(a) => a,
+            _ => unreachable!("bound to an IPv4 address"),
+        };
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 256];
+            let _ = stream.read(&mut scratch).await;
+            let mut status = file_hash.to_vec();
+            status.extend_from_slice(&2u16.to_le_bytes());
+            status.push(parts);
+            let packets = [
+                Ed2kPacket::new(PROTO_EDONKEY, OP_HELLO_ANSWER, vec![0; 26]),
+                Ed2kPacket::new(PROTO_EDONKEY, OP_FILE_STATUS, status),
+            ];
+            for packet in packets {
+                if stream.write_all(&packet.encode()).await.is_err() {
+                    return;
+                }
+            }
+            while stream
+                .read(&mut scratch)
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false)
+            {}
+        });
+        addr
+    }
+
     async fn fixture_chunks(
         fixture_dir: &Path,
         size: u64,
@@ -2650,6 +2718,28 @@ mod tests {
         };
         let outcome = session_against(addr, dir.path(), timeouts).await;
         assert_eq!(outcome, Ok(PeerOutcome::Queued(3)));
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_no_needed_part_is_asked_again_later() {
+        let (data, _hashes, file_hash) = two_part_fixture();
+        let addr = fake_peer_offering(file_hash, 0b01).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunks = fixture_chunks(dir.path(), data.len() as u64, file_hash).await;
+        chunks.lock().await.restore_verified(0);
+        let outcome = timeout(
+            Duration::from_secs(5),
+            session_with(
+                addr,
+                &chunks,
+                file_hash,
+                PeerTimeouts::default(),
+                &Throttle::unlimited(),
+            ),
+        )
+        .await
+        .expect("the session ends once the peer's parts are known");
+        assert_eq!(outcome, Ok(PeerOutcome::NothingNeeded));
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ pub const TAG_ENCRYPTION: u8 = 0xf3;
 
 fn id_to_wire(id: &KadId) -> KadId {
     let mut wire = *id;
-    for chunk in wire.chunks_exact_mut(4) {
+    for chunk in wire.as_chunks_mut::<4>().0 {
         chunk.reverse();
     }
     wire

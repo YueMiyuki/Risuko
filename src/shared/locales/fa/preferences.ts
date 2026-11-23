@@ -151,7 +151,6 @@ export default {
 	"file-category-document": "سند",
 	"file-category-compressed": "فشرده",
 	"file-category-program": "برنامه",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"بخاطر محدودیت‌های دسترسی سندباکس از اپ استور، پیشنهاد می‌شود شاخه پیش‌فرض دانلود بر روی ~/Downloads تنظیم شده باشد.",
 	"transfer-settings": "انتقال",
@@ -203,6 +202,9 @@ export default {
 		"بازخوردی (آینه‌های کند یا ناموفق کنار گذاشته می‌شوند)",
 	"uri-selector-inorder": "به ترتیب (آینه‌ها یکی‌یکی امتحان می‌شوند)",
 	"uri-selector-adaptive": "تطبیقی (سریع‌ترین ترجیح داده می‌شود)",
+	"send-auth-to-all-mirrors": "ارسال اطلاعات ورود به همه آینه‌های HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"سرآیند مجوز یک وظیفه را به هر آینه HTTPS می‌فرستد. اگر خاموش باشد، فقط آینه‌هایی که طرح، میزبان و درگاهشان با پیوند اول یکی است آن را دریافت می‌کنند.",
 	"unit-seconds": "ثانیه",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "ذخیره‌سازی",

@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "SFTP ユーザー名は必須です。",
 	errSftpAuthRequired: "SFTP のパスワードまたは秘密鍵が必要です。",
 	errFtpHostRequired: "FTP ホストは必須です。",
+	errSecretForNewServer:
+		"サーバーが変更されたため、保存済みのパスワードまたは鍵は再利用されません。もう一度入力してください。",
 	errMoveTargetRequired:
 		"アップロード後の動作で移動を選択した場合、移動先フォルダーは必須です。",
 	saving: "保存中…",

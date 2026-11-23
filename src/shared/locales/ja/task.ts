@@ -328,6 +328,8 @@ export default {
 	"media-format-auto": "利用可能な最高画質（自動）",
 	"media-format-hint": "特定の画質を選ぶには、形式を取得してください。",
 	"media-format-error": "この URL の形式を読み込めませんでした。",
+	"media-unsupported-android":
+		"メディアサイトのダウンロードには yt-dlp が必要ですが、Android では利用できません",
 	"download-complete-message": "{{taskName}} のダウンロードに成功",
 	"download-complete-notify": "ダウンロード成功",
 	"bt-download-complete-message":
@@ -376,6 +378,15 @@ export default {
 	"mirror-placeholder": "ミラーURL(同じファイル、別のサーバー)",
 	"mirror-hint":
 		"同じファイルを指すミラーURLを追加すると、複数のソースから並列でダウンロードできます。",
+	"mirror-sources": "{{count}} 件のソース",
+	"mirror-failing": "失敗中",
+	"mirror-idle": "未使用",
+	"add-tab-links": "リンク",
+	"add-tab-mirrors": "ミラー",
+	"mirror-list-placeholder": "同じファイルのミラー URL（1 行に 1 つ）",
+	"mirror-list-hint":
+		"すべてのリンクが同じファイルを指している必要があります。ファイルのピースはすべてのミラーから同時にダウンロードされ、失敗したり遅くなったりしたミラーのピースは他のミラーに引き継がれます。",
+	"mirror-list-rejected": "通常の http(s) ファイルリンクではありません:",
 	"detail-tab-general": "一般",
 	"detail-tab-activity": "アクティビティ",
 	"detail-tab-trackers": "トラッカー",
@@ -406,6 +417,30 @@ export default {
 	"edit-speed-limit-placeholder": "0 または空欄 = 無制限（例: 500K）",
 	"edit-primary-uri": "ダウンロード URL",
 	"edit-primary-uri-placeholder": "メインのダウンロード URL",
+	"edit-tab-seeding": "シード",
+	"seeding-rule-global": "グローバル設定を使う",
+	"seeding-rule-forever": "停止するまでシードする",
+	"seeding-rule-limits": "比率または時間で停止する",
+	"seeding-rule-none": "シードしない",
+	"seeding-global-off": "現在：シードしない",
+	"seeding-global-forever": "現在：停止するまでシードする",
+	"seeding-global-ratio": "現在：比率 {{ratio}} で停止する",
+	"seeding-global-minutes": "現在：{{minutes}} 分後に停止する",
+	"seeding-global-both":
+		"現在：比率 {{ratio}} または {{minutes}} 分後に停止する",
+	"seeding-limits-hint":
+		"先に達した方の上限でシードを停止します。0 はその種類の上限なしを意味します。",
+	"seeding-limits-required": "0 より大きい比率または分数を入力してください",
+	"seeding-for": "シード時間",
+	"seeding-applies-after-download": "ダウンロードの完了時に適用されます。",
+	"seeding-stops-now": "保存すると、このタスクはシードを停止します。",
+	"seeding-limit-reached":
+		"このタスクはすでにこの上限に達しており、保存するとシードを停止します。",
+	"seeding-in-place-note": "作成した torrent は、停止するまでシードされます。",
+	"seeding-ed2k-sharing-off":
+		"環境設定で eD2K 経由の共有がオフになっているため、このタスクはアップロードしません。",
+	"seeding-leftover-values":
+		"このタスクには、以前の設定変更によるシード値が残っています。保存すると置き換えられます。",
 	"create-torrent": "torrent を作成",
 	"create-torrent-menu": "torrent を作成...",
 	"create-torrent-source": "共有するファイルまたはフォルダー",

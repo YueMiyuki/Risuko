@@ -3,6 +3,7 @@ import logger from "@shared/utils/logger";
 import axios from "axios";
 import { defineStore } from "pinia";
 import api from "@/api";
+import { normalizeSyncServer } from "@/utils/syncServer";
 import { usePreferenceStore } from "./preference";
 
 const syncAxios = axios.create({ timeout: 10_000 });
@@ -89,8 +90,8 @@ export const useAuthStore = defineStore("auth", {
 	}),
 	getters: {
 		serverUrl(): string {
-			return (
-				(api.config?.cloudSyncServerUrl as string) || "https://api.risuko.app"
+			return normalizeSyncServer(
+				usePreferenceStore().config.cloudSyncServerUrl as string | undefined,
 			);
 		},
 	},
@@ -261,6 +262,7 @@ export const useAuthStore = defineStore("auth", {
 				}
 			}
 			this.clearAuth();
+			clearPendingLogin();
 			await this.persistAuth();
 			try {
 				const { useSyncStore } = await import("./sync");

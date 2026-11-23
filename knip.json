@@ -1,3 +1,4 @@
 {
+	"entry": ["packages/*/bin.js", "packages/risuko-js/index.{js,d.ts}"],
 	"ignore": ["src/renderer/components/ui/**", "scripts/**"]
 }

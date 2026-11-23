@@ -15,3 +15,15 @@ export function sortedIndexList(selected: ReadonlySet<number>): string {
 		.sort((a, b) => a - b)
 		.join(",");
 }
+
+export function splitBySelection<T extends { selectFile?: string }>(
+	items: readonly T[],
+	noneValue: string,
+): { selectable: T[]; empty: T[] } {
+	const selectable: T[] = [];
+	const empty: T[] = [];
+	for (const item of items) {
+		(item.selectFile === noneValue ? empty : selectable).push(item);
+	}
+	return { selectable, empty };
+}

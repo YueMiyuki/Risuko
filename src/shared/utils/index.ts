@@ -166,7 +166,7 @@ export const localeDateTimeFormat = (timestamp, locale) => {
 };
 
 const ellipsis = (str = "", maxLen = 64) => {
-	if (str.length < maxLen) {
+	if (str.length <= maxLen) {
 		return str;
 	}
 	return maxLen > 0 ? `${str.substring(0, maxLen)}...` : str;
@@ -323,7 +323,8 @@ export const isMediaUri = (uri: string): boolean => {
 	if (!uri || typeof uri !== "string") {
 		return false;
 	}
-	if (!uri.startsWith("http://") && !uri.startsWith("https://")) {
+	const lower = uri.trim().toLowerCase();
+	if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
 		return false;
 	}
 	const hostname = hostnameOf(uri);
@@ -401,7 +402,7 @@ export const detectUriProtocol = (uri: string): string | null => {
 };
 
 export const checkTaskIsSeeder = (task) =>
-	task.seeder === "true" && task.status === TASK_STATUS.ACTIVE;
+	task?.seeder === "true" && task?.status === TASK_STATUS.ACTIVE;
 
 export const getDisplayTaskStatus = (task) => {
 	return checkTaskIsSeeder(task) ? TASK_STATUS.SEEDING : task.status;
@@ -625,6 +626,9 @@ export function formatOptionsForEngine(
 	const result: Record<string, string | null> = {};
 
 	for (const [key, value] of Object.entries(options)) {
+		if (value === undefined) {
+			continue;
+		}
 		const kebabCaseKey = toKebabCasePreserveNumbers(key);
 		if (preserveNull && value === null) {
 			result[kebabCaseKey] = null;

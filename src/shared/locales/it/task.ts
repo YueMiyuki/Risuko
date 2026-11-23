@@ -336,6 +336,8 @@ export default {
 	"media-format-hint":
 		"Recupera i formati per scegliere una qualità specifica.",
 	"media-format-error": "Impossibile caricare i formati per questo URL.",
+	"media-unsupported-android":
+		"I download dai siti multimediali richiedono yt-dlp, che non è disponibile su Android",
 	"download-complete-message": "Download di {{taskName}} completato",
 	"download-complete-notify": "Download completato",
 	"bt-download-complete-message":
@@ -384,6 +386,15 @@ export default {
 	"mirror-placeholder": "URL del mirror (stesso file, altro server)",
 	"mirror-hint":
 		"Aggiungi URL di mirror che puntano allo stesso file per scaricare da più fonti in parallelo.",
+	"mirror-sources": "{{count}} fonti",
+	"mirror-failing": "In errore",
+	"mirror-idle": "Non in uso",
+	"add-tab-links": "Link",
+	"add-tab-mirrors": "Mirror",
+	"mirror-list-placeholder": "URL mirror di un unico file, uno per riga",
+	"mirror-list-hint":
+		"Ogni link deve puntare allo stesso file. Le sue parti vengono scaricate da tutti i mirror insieme, e un mirror che fallisce o rallenta cede le sue parti agli altri.",
+	"mirror-list-rejected": "Non è un semplice link http(s) a un file:",
 	"detail-tab-general": "Generale",
 	"detail-tab-activity": "Attività",
 	"detail-tab-trackers": "Tracker",
@@ -414,6 +425,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 o vuoto = illimitato (es. 500K)",
 	"edit-primary-uri": "URL di download",
 	"edit-primary-uri-placeholder": "URL di download principale",
+	"edit-tab-seeding": "Seeding",
+	"seeding-rule-global": "Usa l'impostazione globale",
+	"seeding-rule-forever": "Fai seeding finché non lo fermo",
+	"seeding-rule-limits": "Ferma a un rapporto o dopo un certo tempo",
+	"seeding-rule-none": "Non fare seeding",
+	"seeding-global-off": "Attualmente: nessun seeding",
+	"seeding-global-forever": "Attualmente: seeding finché non viene fermato",
+	"seeding-global-ratio": "Attualmente: arresto al rapporto {{ratio}}",
+	"seeding-global-minutes": "Attualmente: arresto dopo {{minutes}} minuti",
+	"seeding-global-both":
+		"Attualmente: arresto al rapporto {{ratio}} o dopo {{minutes}} minuti",
+	"seeding-limits-hint":
+		"Il seeding si ferma al primo limite raggiunto. 0 significa nessun limite di quel tipo.",
+	"seeding-limits-required":
+		"Inserisci un rapporto o un numero di minuti superiore a 0",
+	"seeding-for": "Durata del seeding",
+	"seeding-applies-after-download": "Si applica al termine del download.",
+	"seeding-stops-now": "Questa attività smette di fare seeding quando salvi.",
+	"seeding-limit-reached":
+		"Questa attività ha già raggiunto questo limite e smette di fare seeding quando salvi.",
+	"seeding-in-place-note":
+		"I torrent che hai creato restano in seeding finché non li fermi.",
+	"seeding-ed2k-sharing-off":
+		"La condivisione tramite eD2K è disattivata nelle Preferenze, quindi questa attività non farà upload.",
+	"seeding-leftover-values":
+		"Questa attività ha valori di seeding da una precedente modifica delle impostazioni. Il salvataggio li sostituisce.",
 	"create-torrent": "Crea torrent",
 	"create-torrent-menu": "Crea torrent...",
 	"create-torrent-source": "File o cartella da condividere",

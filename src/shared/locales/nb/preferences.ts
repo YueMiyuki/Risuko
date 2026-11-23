@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Dokument",
 	"file-category-compressed": "Komprimert",
 	"file-category-program": "Program",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"På grunn av begrensninger for tillatelse av sandkasse i App Store, anbefales standard nedlastningskatalog å settes til ~ / Nedlastinger",
 	"transfer-settings": "Overføring",
@@ -203,6 +202,9 @@ export default {
 	"uri-selector-feedback": "Tilbakemelding (dropp trege/feilende speil)",
 	"uri-selector-inorder": "I rekkefølge (prøv speil fra venstre til høyre)",
 	"uri-selector-adaptive": "Adaptiv (foretrekk raskeste)",
+	"send-auth-to-all-mirrors": "Send innlogging til alle HTTPS-speil",
+	"send-auth-to-all-mirrors-tips":
+		"Sender autorisasjonshodet til en oppgave til hvert HTTPS-speil. Når av, sendes det bare til speil med samme skjema, vert og port som oppgavens første lenke.",
 	"unit-seconds": "sekunder",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Lagring",

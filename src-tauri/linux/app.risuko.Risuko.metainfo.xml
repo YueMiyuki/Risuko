@@ -19,7 +19,7 @@
       <li>Usenet NZB files, with PAR2 repair</li>
       <li>HLS video streams</li>
     </ul>
-    <p>Risuko can also follow RSS feeds and download new items automatically, upload finished files to WebDAV, S3, SFTP or FTP servers, and be controlled remotely through an aria2-compatible RPC interface.</p>
+    <p>Risuko can also upload finished files to WebDAV, S3, SFTP or FTP servers, and be controlled remotely through an aria2-compatible RPC interface.</p>
   </description>
   <launchable type="desktop-id">app.risuko.Risuko.desktop</launchable>
   <provides>

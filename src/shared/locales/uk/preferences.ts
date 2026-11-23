@@ -152,7 +152,6 @@ export default {
 	"file-category-document": "Документ",
 	"file-category-compressed": "Архіви",
 	"file-category-program": "Програма",
-	"file-category-rss": "RSS",
 	"mas-default-dir-tips":
 		"Через обмеження в App Store, рекомендовано встановити шлях за замовчуванням ~/Downloads",
 	"transfer-settings": "Передача",
@@ -205,6 +204,9 @@ export default {
 		"Зворотний зв'язок (відкидати повільні/збійні дзеркала)",
 	"uri-selector-inorder": "За порядком (дзеркала зліва направо)",
 	"uri-selector-adaptive": "Адаптивно (надавати перевагу найшвидшому)",
+	"send-auth-to-all-mirrors": "Надсилати дані входу на всі HTTPS-дзеркала",
+	"send-auth-to-all-mirrors-tips":
+		"Надсилає заголовок авторизації завдання на кожне HTTPS-дзеркало. Якщо вимкнено, його отримують лише дзеркала з тією самою схемою, хостом і портом, що й перше посилання.",
 	"unit-seconds": "секунд",
 	"unit-kib-per-sec": "КіБ/с",
 	storage: "Сховище",

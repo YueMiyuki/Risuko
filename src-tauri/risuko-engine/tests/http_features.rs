@@ -2260,3 +2260,122 @@ async fn each_mirror_reports_the_bytes_it_served() {
         .iter()
         .all(|m| m.speed == 0 && m.connections == 0 && m.state == MirrorState::Idle));
 }
+
+async fn spawn_tagged_server(
+    payload: Arc<Vec<u8>>,
+    etag: &'static str,
+) -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let served = Arc::new(AtomicU64::new(0));
+    let counter = served.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (payload, counter) = (payload.clone(), counter.clone());
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let resp = validated_response(&payload, &req, etag, true);
+                    let len = hyper::body::Body::size_hint(resp.body())
+                        .exact()
+                        .unwrap_or(0);
+                    counter.fetch_add(len, Ordering::SeqCst);
+                    async move { Ok::<_, Infallible>(resp) }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, served, accept)
+}
+
+#[tokio::test]
+async fn a_resume_on_the_second_mirror_keeps_the_pieces_already_downloaded() {
+    let payload = Arc::new(small_payload(PIECE_SIZE as usize * 8));
+    let (addr_a, _, server_a) = spawn_tagged_server(payload.clone(), "\"mirror-a\"").await;
+    let (addr_b, served_b, _) = spawn_tagged_server(payload.clone(), "\"mirror-b\"").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let uris = vec![
+        format!("http://{addr_a}/file.bin"),
+        format!("http://{addr_b}/file.bin"),
+    ];
+    let options = options_with(vec![("max-worker-retries", json!("2"))]);
+    let sidecar = tmp.path().join(format!("file.bin.part{CHUNK_META_SUFFIX}"));
+
+    let (total, completed, speed, conns, ct, gl, _, cc) = dummy_state();
+    let stopper = {
+        let (completed, ct) = (completed.clone(), ct.clone());
+        tokio::spawn(async move {
+            while completed.load(Ordering::Relaxed) < PIECE_SIZE * 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            ct.cancel();
+        })
+    };
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_http_download_multi(
+            &uris,
+            &dir,
+            "file.bin",
+            &options,
+            total,
+            completed,
+            speed,
+            conns,
+            ct,
+            gl,
+            Arc::new(SpeedLimiter::new(2 * PIECE_SIZE)),
+            cc,
+            Arc::new(parking_lot::Mutex::new(None)),
+        ),
+    )
+    .await
+    .expect("the first run must stop once it is cancelled");
+    stopper.abort();
+    first.expect_err("the first run is cancelled midway");
+    let meta: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    assert_eq!(meta["etag"], "\"mirror-a\"");
+    assert!(
+        !meta["pieces"].as_array().unwrap().is_empty(),
+        "the first run must record its progress"
+    );
+
+    server_a.abort();
+    let _ = server_a.await;
+    let served_before = served_b.load(Ordering::SeqCst);
+
+    let (total, completed, speed, conns, ct, gl, tl, cc) = dummy_state();
+    let path = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_http_download_multi(
+            &uris,
+            &dir,
+            "file.bin",
+            &options,
+            total,
+            completed,
+            speed,
+            conns,
+            ct,
+            gl,
+            tl,
+            cc,
+            Arc::new(parking_lot::Mutex::new(None)),
+        ),
+    )
+    .await
+    .expect("the resume must not hang on the dead mirror")
+    .expect("the second mirror must finish the download");
+
+    assert_eq!(std::fs::read(&path).unwrap(), *payload);
+    let resent = served_b.load(Ordering::SeqCst) - served_before;
+    assert!(
+        resent < payload.len() as u64 * 9 / 10,
+        "the second mirror served {resent} of {} bytes again, so the earlier pieces were thrown away",
+        payload.len()
+    );
+}

@@ -183,9 +183,54 @@ fn clear_stale_fallback(path: &Path, profile_id: &str) -> Result<(), String> {
     remove_fallback(path, profile_id).map_err(|error| {
         tracing::warn!("Failed to clear stale Usenet credential fallback for {profile_id}: {error}");
         format!(
-            "Credentials were saved to the vault, but the older fallback copy could not be cleared: {error}"
+            "The older fallback copy of these credentials could not be cleared, so nothing was changed: {error}"
         )
     })
+}
+
+fn save_in_order(
+    vault_enabled: bool,
+    clear_fallback: impl FnOnce() -> Result<(), String>,
+    put_vault: impl FnOnce() -> Result<(), String>,
+    save_fallback: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if vault_enabled {
+        clear_fallback()?;
+        match put_vault() {
+            Ok(()) => return Ok(()),
+            Err(error) => tracing::warn!(
+                "Failed to store Usenet credentials in vault: {error}; using fallback"
+            ),
+        }
+    }
+    save_fallback()
+}
+
+fn saved_server_matches(
+    saved: &[UsenetProviderProfile],
+    requested: &UsenetProviderProfile,
+) -> bool {
+    saved.iter().any(|profile| {
+        profile.id == requested.id
+            && profile.deleted_at.is_none()
+            && profile
+                .host
+                .trim()
+                .eq_ignore_ascii_case(requested.host.trim())
+            && profile.port == requested.port
+            && profile.security_mode == requested.security_mode
+    })
+}
+
+fn saved_profiles(state: &AppState) -> Result<Vec<UsenetProviderProfile>, String> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())?;
+    Ok(
+        risuko_engine::engine::usenet_worker::profiles_from_options(config.get_user_config())
+            .unwrap_or_default(),
+    )
 }
 
 fn resolver_for_state(state: &AppState) -> Result<VaultCredentialResolver, String> {
@@ -222,15 +267,17 @@ pub fn usenet_save_credentials(
         .config_dir()
         .to_path_buf();
     let fallback_path = risuko_engine::engine::usenet_credential_fallback_path(&config_dir);
-    if state.vault.enabled() {
-        match state.vault.put(&credential_key(&profile_id), &credentials) {
-            Ok(()) => return clear_stale_fallback(&fallback_path, &profile_id),
-            Err(error) => tracing::warn!(
-                "Failed to store Usenet credentials in vault for {profile_id}: {error}; using fallback"
-            ),
-        }
-    }
-    save_fallback(&fallback_path, &profile_id, &credentials)
+    save_in_order(
+        state.vault.enabled(),
+        || clear_stale_fallback(&fallback_path, &profile_id),
+        || {
+            state
+                .vault
+                .put(&credential_key(&profile_id), &credentials)
+                .map_err(|error| format!("{profile_id}: {error}"))
+        },
+        || save_fallback(&fallback_path, &profile_id, &credentials),
+    )
 }
 
 #[tauri::command(async)]
@@ -286,7 +333,11 @@ pub async fn usenet_test_profile(
     state: State<'_, AppState>,
     profile: UsenetProviderProfile,
 ) -> Result<String, String> {
-    let credentials = resolver_for_state(&state)?.resolve(&profile.id).await?;
+    let credentials = if saved_server_matches(&saved_profiles(&state)?, &profile) {
+        resolver_for_state(&state)?.resolve(&profile.id).await?
+    } else {
+        None
+    };
     let _capacity_lease = match risuko_engine::engine::get_manager().await {
         Some(manager) => Some(
             manager
@@ -331,6 +382,7 @@ pub async fn usenet_test_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use tempfile::TempDir;
 
     #[test]
@@ -388,6 +440,186 @@ mod tests {
 
         result.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_failed_cleanup_stops_before_the_vault_is_written() {
+        let calls = RefCell::new(Vec::new());
+        let result = save_in_order(
+            true,
+            || {
+                calls.borrow_mut().push("clear");
+                Err("clear failed".to_string())
+            },
+            || {
+                calls.borrow_mut().push("vault");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("clear failed".to_string()));
+        assert_eq!(*calls.borrow(), ["clear"]);
+    }
+
+    #[test]
+    fn a_vault_failure_falls_back_to_the_file() {
+        let calls = RefCell::new(Vec::new());
+        let result = save_in_order(
+            true,
+            || {
+                calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("vault");
+                Err("vault failed".to_string())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Err("fallback failed".to_string())
+            },
+        );
+
+        assert_eq!(result, Err("fallback failed".to_string()));
+        assert_eq!(*calls.borrow(), ["clear", "vault", "fallback"]);
+    }
+
+    #[test]
+    fn a_working_vault_leaves_no_fallback() {
+        let calls = RefCell::new(Vec::new());
+        let result = save_in_order(
+            true,
+            || {
+                calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("vault");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), ["clear", "vault"]);
+    }
+
+    #[test]
+    fn without_a_vault_only_the_file_is_written() {
+        let calls = RefCell::new(Vec::new());
+        let result = save_in_order(
+            false,
+            || {
+                calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("vault");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*calls.borrow(), ["fallback"]);
+    }
+
+    fn saved_profile(
+        id: &str,
+        host: &str,
+        port: u16,
+        security_mode: &str,
+    ) -> UsenetProviderProfile {
+        UsenetProviderProfile {
+            id: id.into(),
+            name: id.into(),
+            host: host.into(),
+            port,
+            security_mode: security_mode.into(),
+            enabled: true,
+            priority: 0,
+            max_connections: 4,
+            allow_plain: security_mode == "plain",
+            deleted_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn saved() -> [UsenetProviderProfile; 1] {
+        [saved_profile(
+            "primary",
+            "news.example",
+            563,
+            "implicit-tls",
+        )]
+    }
+
+    #[test]
+    fn the_saved_server_may_use_the_stored_login() {
+        let requested = saved_profile("primary", "news.example", 563, "implicit-tls");
+
+        assert!(saved_server_matches(&saved(), &requested));
+    }
+
+    #[test]
+    fn the_host_is_compared_without_letter_case() {
+        let saved = [saved_profile(
+            "primary",
+            "News.Example",
+            563,
+            "implicit-tls",
+        )];
+        let requested = saved_profile("primary", "news.EXAMPLE", 563, "implicit-tls");
+
+        assert!(saved_server_matches(&saved, &requested));
+    }
+
+    #[test]
+    fn another_host_does_not_get_the_stored_login() {
+        let requested = saved_profile("primary", "evil.example", 563, "implicit-tls");
+
+        assert!(!saved_server_matches(&saved(), &requested));
+    }
+
+    #[test]
+    fn another_port_does_not_get_the_stored_login() {
+        let requested = saved_profile("primary", "news.example", 443, "implicit-tls");
+
+        assert!(!saved_server_matches(&saved(), &requested));
+    }
+
+    #[test]
+    fn another_tls_setting_does_not_get_the_stored_login() {
+        let requested = saved_profile("primary", "news.example", 563, "plain");
+
+        assert!(!saved_server_matches(&saved(), &requested));
+    }
+
+    #[test]
+    fn an_id_that_is_not_saved_does_not_get_a_stored_login() {
+        let requested = saved_profile("backup", "news.example", 563, "implicit-tls");
+
+        assert!(!saved_server_matches(&saved(), &requested));
+        assert!(!saved_server_matches(&[], &requested));
+    }
+
+    #[test]
+    fn a_removed_profile_does_not_get_a_stored_login() {
+        let mut removed = saved_profile("primary", "news.example", 563, "implicit-tls");
+        removed.deleted_at = Some(1);
+        let requested = saved_profile("primary", "news.example", 563, "implicit-tls");
+
+        assert!(!saved_server_matches(&[removed], &requested));
     }
 
     #[test]

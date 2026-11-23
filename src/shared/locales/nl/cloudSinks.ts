@@ -76,6 +76,8 @@ export default {
 	errSftpUsernameRequired: "Een SFTP-gebruikersnaam is vereist.",
 	errSftpAuthRequired: "Een SFTP-wachtwoord of privésleutel is vereist.",
 	errFtpHostRequired: "Een FTP-host is vereist.",
+	errSecretForNewServer:
+		"De server is gewijzigd, dus het opgeslagen wachtwoord of de opgeslagen sleutel wordt niet opnieuw gebruikt. Voer deze opnieuw in.",
 	errMoveTargetRequired:
 		"Een doelmap voor verplaatsen is vereist wanneer de actie na het uploaden verplaatsen is.",
 	saving: "Opslaan…",

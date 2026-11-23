@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "Numele de utilizator SFTP este obligatoriu.",
 	errSftpAuthRequired: "Parola sau cheia privată SFTP este obligatorie.",
 	errFtpHostRequired: "Gazda FTP este obligatorie.",
+	errSecretForNewServer:
+		"Serverul s-a schimbat, deci parola sau cheia salvată nu este reutilizată. Introduceți-o din nou.",
 	errMoveTargetRequired:
 		"Folderul de destinație este obligatoriu când acțiunea de după încărcare este mutarea.",
 	saving: "Se salvează…",
