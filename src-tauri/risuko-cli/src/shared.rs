@@ -59,6 +59,7 @@ pub async fn connect_or_start_engine(
     host: &EngineHost,
     rpc_port: u16,
     rpc_secret: Option<String>,
+    own_dir: Option<&str>,
 ) -> CliResult<(RpcClient, Option<StandaloneEngine>)> {
     let secret = resolve_rpc_secret(host, rpc_secret);
     let client = rpc_client(host, rpc_port, secret.clone());
@@ -71,10 +72,10 @@ pub async fn connect_or_start_engine(
     }
     eprintln!("No running Risuko instance found. Starting headless engine...");
     let engine = start_headless_engine(host, rpc_port).await?;
-    engine
-        .manager
-        .change_global_option(own_engine_options())
-        .await;
+    let own_options = own_engine_options(own_dir);
+    if !own_options.is_empty() {
+        engine.manager.change_global_option(own_options).await;
+    }
     let client = match secret {
         Some(_) => client,
         None => rpc_client(host, rpc_port, engine.rpc_secret.clone()),
@@ -98,8 +99,13 @@ pub async fn add_torrent(
 }
 
 pub async fn download(host: &EngineHost, args: DownloadArgs) -> CliResult<()> {
-    let (client, headless_engine) =
-        connect_or_start_engine(host, args.rpc_port, args.rpc_secret.clone()).await?;
+    let (client, headless_engine) = connect_or_start_engine(
+        host,
+        args.rpc_port,
+        args.rpc_secret.clone(),
+        args.dir.as_deref(),
+    )
+    .await?;
 
     let mut previous_doh = None;
     // Ctrl+C must still reach the shutdown below so an embedded engine saves its session
@@ -111,6 +117,7 @@ pub async fn download(host: &EngineHost, args: DownloadArgs) -> CliResult<()> {
         }
     };
 
+    crate::signal::exit_on_next_signal();
     if let Some(saved) = previous_doh {
         let _ = client
             .call("risuko.changeGlobalOption", vec![json!(saved)])
@@ -123,14 +130,12 @@ pub async fn download(host: &EngineHost, args: DownloadArgs) -> CliResult<()> {
     result
 }
 
-async fn do_download(
-    client: &RpcClient,
-    args: &DownloadArgs,
-    previous_doh: &mut Option<Map<String, Value>>,
-) -> CliResult<()> {
-    let mut options = serde_json::Map::new();
+fn download_options(args: &DownloadArgs) -> Map<String, Value> {
+    let mut options = Map::new();
 
-    options.insert("split".into(), json!(args.threads.to_string()));
+    if let Some(threads) = args.threads {
+        options.insert("split".into(), json!(threads.to_string()));
+    }
 
     if let Some(ref dir) = args.dir {
         options.insert("dir".into(), json!(absolute_dir(dir)));
@@ -186,6 +191,16 @@ async fn do_download(
         }
         options.insert("header".into(), json!(all_headers));
     }
+
+    options
+}
+
+async fn do_download(
+    client: &RpcClient,
+    args: &DownloadArgs,
+    previous_doh: &mut Option<Map<String, Value>>,
+) -> CliResult<()> {
+    let options = download_options(args);
 
     let primary = args.urls.first().map(String::as_str).unwrap_or_default();
     let is_torrent = primary.ends_with(".torrent") && std::path::Path::new(primary).exists();
@@ -253,12 +268,14 @@ fn absolute_dir(dir: &str) -> String {
         .unwrap_or_else(|| dir.to_string())
 }
 
-fn own_engine_options() -> Map<String, Value> {
+fn own_engine_options(dir: Option<&str>) -> Map<String, Value> {
     let mut options = Map::new();
-    options.insert(
-        risuko_engine::engine::rpc_paths::ALLOW_ANY_DIR_KEY.into(),
-        json!(true),
-    );
+    if let Some(dir) = dir {
+        options.insert("dir".into(), json!(absolute_dir(dir)));
+        // a folder named on the command line must beat routing rules and category folders
+        options.insert("file-category-dirs".into(), json!({}));
+        options.insert("task-routing-rules".into(), json!([]));
+    }
     options
 }
 
@@ -394,6 +411,7 @@ pub async fn serve(host: &EngineHost, args: ServeArgs) -> CliResult<()> {
             tracing::info!("Shutdown requested via RPC, shutting down...");
         }
     }
+    crate::signal::exit_on_next_signal();
     engine.stop().await;
     Ok(())
 }
@@ -401,13 +419,88 @@ pub async fn serve(host: &EngineHost, args: ServeArgs) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::start_server;
 
     #[test]
     fn an_own_engine_lets_the_command_choose_its_folder() {
+        assert!(own_engine_options(None).is_empty());
+
+        let absolute = std::env::temp_dir().join("x");
+        let absolute = absolute.to_str().unwrap();
         assert_eq!(
-            Value::Object(own_engine_options()),
-            json!({"rpc-allow-any-dir": true})
+            Value::Object(own_engine_options(Some(absolute))),
+            json!({"dir": absolute, "file-category-dirs": {}, "task-routing-rules": []})
         );
+        assert_eq!(
+            Value::Object(own_engine_options(Some("saved"))),
+            json!({
+                "dir": absolute_dir("saved"),
+                "file-category-dirs": {},
+                "task-routing-rules": []
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chosen_folder_switches_routing_off_for_the_own_engine() {
+        use risuko_engine::config::defaults;
+        use risuko_engine::engine::events::EventBroadcaster;
+        use risuko_engine::engine::manager::TaskManager;
+        use risuko_engine::engine::options::EngineOptions;
+        use risuko_engine::engine::routing::RoutingDecision;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = |name: &str| temp.path().join(name).to_string_lossy().into_owned();
+        let (default_dir, chosen) = (folder("dl"), folder("chosen"));
+        let (category_dir, rule_dir) = (folder("videos"), folder("isos"));
+
+        let mut system = defaults::system_defaults();
+        system.insert("dir".into(), json!(default_dir));
+        system.insert("bt-enable-upnp".into(), json!(false));
+        system.insert("bt-enable-lsd".into(), json!(false));
+        let mut user = Map::new();
+        user.insert("file-category-dirs".into(), json!({"video": category_dir}));
+        user.insert(
+            "task-routing-rules".into(),
+            json!([{"id": "iso", "label": "ISO", "pattern": "*.iso", "dir": rule_dir}]),
+        );
+        let options = EngineOptions::from_config(&system, &user);
+        let manager = TaskManager::new(temp.path(), options, EventBroadcaster::default())
+            .await
+            .unwrap();
+        assert_eq!(manager.preview_routing("disk.iso").await.dir, rule_dir);
+        assert_eq!(manager.preview_routing("film.mkv").await.dir, category_dir);
+
+        manager
+            .change_global_option(own_engine_options(Some(&chosen)))
+            .await;
+
+        let global = manager.get_global_option().await;
+        assert_eq!(global["dir"], json!(chosen));
+        assert_eq!(global["file-category-dirs"], json!({}));
+        assert_eq!(global["task-routing-rules"], json!([]));
+        assert!(manager.list_routing_rules().await.is_empty());
+        for name in ["disk.iso", "film.mkv"] {
+            assert_eq!(
+                manager.preview_routing(name).await,
+                RoutingDecision {
+                    tag: None,
+                    dir: chosen.clone()
+                }
+            );
+            let mut task_options = Map::new();
+            task_options.insert("dir".into(), json!(chosen));
+            task_options.insert("pause".into(), json!("true"));
+            let gid = manager
+                .add_http_task(vec![format!("http://127.0.0.1:1/{name}")], task_options)
+                .await
+                .unwrap();
+            let status = manager
+                .tell_status(&gid, &["dir".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(status["dir"], json!(chosen));
+        }
     }
 
     #[test]
@@ -477,5 +570,130 @@ mod tests {
             Value::Object(doh_restore(current.as_object().unwrap())),
             json!({"doh-enable": false, "doh-url": "https://dns.example/q"})
         );
+    }
+
+    fn download_args(argv: &[&str]) -> DownloadArgs {
+        #[derive(clap::Parser)]
+        struct Parsed {
+            #[command(flatten)]
+            args: DownloadArgs,
+        }
+        let argv = ["risuko"].into_iter().chain(argv.iter().copied());
+        <Parsed as clap::Parser>::parse_from(argv).args
+    }
+
+    #[test]
+    fn a_download_without_threads_leaves_split_to_the_engine() {
+        let options = download_options(&download_args(&["http://a/f"]));
+        assert!(!options.contains_key("split"));
+    }
+
+    #[test]
+    fn threads_given_on_the_command_line_become_split() {
+        let options = download_options(&download_args(&["-t", "4", "http://a/f"]));
+        assert_eq!(options["split"], json!("4"));
+    }
+
+    async fn serve_file(body: Vec<u8>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    if !request.starts_with(b"HEAD ") {
+                        let _ = stream.write_all(&body).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_download_through_a_running_engine_saves_the_file() {
+        let (mut server, port, temp) = start_server("secret").await;
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let url = format!(
+            "http://127.0.0.1:{}/file.bin",
+            serve_file(body.clone()).await
+        );
+        let rpc_port = port.to_string();
+        let args = download_args(&[
+            &url,
+            "--rpc-port",
+            &rpc_port,
+            "--rpc-secret",
+            "secret",
+            "--json",
+        ]);
+        assert!(args.dir.is_none());
+        let client = RpcClient::new_with_host("127.0.0.1", port, args.rpc_secret.clone());
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            do_download(&client, &args, &mut None),
+        )
+        .await
+        .expect("the download did not finish within 30 seconds");
+
+        assert!(result.is_ok(), "{result:?}");
+        let saved = std::fs::read(temp.path().join("dl").join("file.bin")).unwrap();
+        assert!(
+            saved == body,
+            "saved {} bytes that differ from the served ones",
+            saved.len()
+        );
+        server.stop();
+    }
+
+    #[tokio::test]
+    async fn an_ftp_link_is_accepted_by_the_engine() {
+        let (mut server, port, _temp) = start_server("secret").await;
+        let client = RpcClient::new_with_host("127.0.0.1", port, Some("secret".into()));
+
+        let gid = client
+            .call(
+                "risuko.addUri",
+                vec![json!(["ftp://127.0.0.1:1/f.bin"]), json!({"pause": "true"})],
+            )
+            .await
+            .unwrap();
+
+        assert!(gid.as_str().is_some_and(|gid| !gid.is_empty()), "{gid}");
+        server.stop();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_method_is_reported() {
+        let (mut server, port, _temp) = start_server("secret").await;
+        let client = RpcClient::new_with_host("127.0.0.1", port, Some("secret".into()));
+
+        let error = client
+            .call("risuko.noSuchMethod", vec![])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Method not found"), "{error}");
+        server.stop();
     }
 }

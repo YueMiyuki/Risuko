@@ -327,6 +327,8 @@ export default {
 	"media-format-auto": "Mevcut en iyi (otomatik)",
 	"media-format-hint": "Belirli bir kaliteyi seçmek için biçimleri getirin.",
 	"media-format-error": "Bu URL için biçimler yüklenemedi.",
+	"media-unsupported-android":
+		"Medya sitesi indirmeleri için yt-dlp gerekir, ancak Android'de kullanılamıyor",
 	"download-complete-message": "{{taskName}} görevi tamamlandı",
 	"download-complete-notify": "İndirme bitti",
 	"bt-download-complete-message":
@@ -374,6 +376,16 @@ export default {
 	"mirror-placeholder": "Yansı URL'si (aynı dosya, başka sunucu)",
 	"mirror-hint":
 		"Birden fazla kaynaktan paralel indirmek için aynı dosyaya işaret eden yansı URL'leri ekleyin.",
+	"mirror-sources": "{{count}} kaynak",
+	"mirror-failing": "Başarısız",
+	"mirror-idle": "Kullanılmıyor",
+	"add-tab-links": "Bağlantılar",
+	"add-tab-mirrors": "Yansılar",
+	"mirror-list-placeholder":
+		"Tek bir dosyanın yansı URL'leri, satır başına bir tane",
+	"mirror-list-hint":
+		"Tüm bağlantılar aynı dosyaya işaret etmelidir. Dosyanın parçaları tüm yansılardan aynı anda indirilir; başarısız olan veya yavaşlayan bir yansı parçalarını diğerlerine devreder.",
+	"mirror-list-rejected": "Düz bir http(s) dosya bağlantısı değil:",
 	"detail-tab-general": "Genel",
 	"detail-tab-activity": "Etkinlik",
 	"detail-tab-trackers": "İzleyiciler",
@@ -404,6 +416,31 @@ export default {
 	"edit-speed-limit-placeholder": "0 veya boş = sınırsız (ör. 500K)",
 	"edit-primary-uri": "İndirme URL'si",
 	"edit-primary-uri-placeholder": "Birincil indirme URL'si",
+	"edit-tab-seeding": "Tohumlama",
+	"seeding-rule-global": "Genel ayarı kullan",
+	"seeding-rule-forever": "Ben durdurana kadar tohumla",
+	"seeding-rule-limits": "Bir orana ulaşınca veya süre dolunca durdur",
+	"seeding-rule-none": "Tohumlama yapma",
+	"seeding-global-off": "Şu anda: tohumlama yapma",
+	"seeding-global-forever": "Şu anda: durdurulana kadar tohumla",
+	"seeding-global-ratio": "Şu anda: {{ratio}} oranında durdur",
+	"seeding-global-minutes": "Şu anda: {{minutes}} dakika sonra durdur",
+	"seeding-global-both":
+		"Şu anda: {{ratio}} oranında veya {{minutes}} dakika sonra durdur",
+	"seeding-limits-hint":
+		"Tohumlama, önce hangi sınıra ulaşılırsa orada durur. 0, o türden sınır olmadığı anlamına gelir.",
+	"seeding-limits-required": "0'dan büyük bir oran veya dakika sayısı girin",
+	"seeding-for": "Tohumlama süresi",
+	"seeding-applies-after-download": "Bu, indirme bittiğinde uygulanır.",
+	"seeding-stops-now": "Bu görev, kaydettiğinizde tohumlamayı durdurur.",
+	"seeding-limit-reached":
+		"Bu görev bu sınıra zaten ulaştı ve kaydettiğinizde tohumlamayı durdurur.",
+	"seeding-in-place-note":
+		"Oluşturduğunuz torrentler siz durdurana kadar tohumlanır.",
+	"seeding-ed2k-sharing-off":
+		"eD2K üzerinden paylaşım Ayarlar'da kapalı, bu yüzden bu görev yükleme yapmayacak.",
+	"seeding-leftover-values":
+		"Bu görev, önceki bir ayar değişikliğinden kalan tohumlama değerlerine sahip. Kaydetmek bunların yerine yenilerini yazar.",
 	"create-torrent": "Torrent oluştur",
 	"create-torrent-menu": "Torrent oluştur...",
 	"create-torrent-source": "Paylaşılacak dosya veya klasör",

@@ -276,10 +276,10 @@ impl S3Sink {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-            return Err(UploadError::http(
-                status.as_u16(),
-                format!("S3 initiate multipart returned {status}: {body}"),
-            ));
+            return Err(UploadError {
+                message: format!("S3 initiate multipart returned {status}: {body}"),
+                retryable: is_retryable_response(status.as_u16(), &body),
+            });
         }
         let body = resp
             .text_limited(RESPONSE_BODY_LIMIT)
@@ -416,7 +416,7 @@ impl S3Sink {
             let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
             return Err((
                 format!("S3 UploadPart {part_number} returned {status}: {body}"),
-                is_retryable_status(status.as_u16()),
+                is_retryable_response(status.as_u16(), &body),
             ));
         }
         etag.ok_or_else(|| {
@@ -464,10 +464,10 @@ impl S3Sink {
             .await
             .unwrap_or_default();
         if !status.is_success() {
-            return Err(UploadError::http(
-                status.as_u16(),
-                format!("S3 CompleteMultipart returned {status}: {resp_body}"),
-            ));
+            return Err(UploadError {
+                message: format!("S3 CompleteMultipart returned {status}: {resp_body}"),
+                retryable: is_retryable_response(status.as_u16(), &resp_body),
+            });
         }
         if resp_body.contains("<Error>") {
             return Err(UploadError::transient(format!(
@@ -557,10 +557,10 @@ impl UploadSink for S3Sink {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.snippet(ERROR_SNIPPET_BYTES).await;
-            return Err(UploadError::http(
-                status.as_u16(),
-                format!("S3 PUT {url} returned {status}: {body}"),
-            ));
+            return Err(UploadError {
+                message: format!("S3 PUT {url} returned {status}: {body}"),
+                retryable: is_retryable_response(status.as_u16(), &body),
+            });
         }
 
         ctl.report(file.size, file.size);
@@ -699,6 +699,10 @@ fn epoch_to_ymdhms(secs: u64) -> (i64, u8, u8, u8, u8, u8) {
 
 fn is_retryable_status(code: u16) -> bool {
     code >= 500 || code == 408 || code == 429
+}
+
+fn is_retryable_response(code: u16, body: &str) -> bool {
+    is_retryable_status(code) || (code == 400 && body.contains("<Code>RequestTimeout</Code>"))
 }
 
 fn s3_error_is_credential_failure(body: &str) -> bool {
@@ -988,6 +992,21 @@ mod tests {
         assert!(is_retryable_status(408));
         assert!(!is_retryable_status(403));
         assert!(!is_retryable_status(400));
+    }
+
+    #[test]
+    fn a_request_timeout_answer_is_retried() {
+        assert!(is_retryable_response(
+            400,
+            "<Error><Code>RequestTimeout</Code><Message>Your socket connection to the server was not read from or written to within the timeout period.</Message></Error>"
+        ));
+        assert!(!is_retryable_response(
+            400,
+            "<Error><Code>InvalidArgument</Code></Error>"
+        ));
+        assert!(!is_retryable_response(400, ""));
+        assert!(!is_retryable_response(403, "<Code>RequestTimeout</Code>"));
+        assert!(is_retryable_response(503, ""));
     }
 
     const _: () = assert!(

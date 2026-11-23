@@ -263,6 +263,7 @@ import { Input } from "@/components/ui/input";
 import { useAuthStore } from "@/store/auth";
 import { usePreferenceStore } from "@/store/preference";
 import { useSyncStore } from "@/store/sync";
+import { sameSyncServer } from "@/utils/syncServer";
 
 export default defineComponent({
 	name: "preference-sync",
@@ -345,6 +346,12 @@ export default defineComponent({
 			usePreferenceStore().save({ cloudSyncCategories: [] });
 		},
 		async saveServerUrl() {
+			if (
+				!sameSyncServer(this.serverUrl, this.authStore.serverUrl) &&
+				this.authStore.isLoggedIn
+			) {
+				await this.authStore.logout();
+			}
 			await usePreferenceStore().save({ cloudSyncServerUrl: this.serverUrl });
 			this.serverConfigChecked = false;
 			if (this.serverUrl) {

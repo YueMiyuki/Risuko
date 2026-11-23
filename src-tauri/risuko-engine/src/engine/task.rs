@@ -316,6 +316,8 @@ pub struct DownloadTask {
     #[serde(default)]
     pub seeding_since: u64,
     #[serde(default)]
+    pub seeded_ms: u64,
+    #[serde(default)]
     pub start_at: Option<u64>,
     #[serde(default)]
     pub schedule_missed: bool,
@@ -355,6 +357,32 @@ pub struct UpdateTaskOutcome {
 impl DownloadTask {
     pub(crate) fn holds_download_slot(&self) -> bool {
         self.kind != TaskKind::Torrent && !self.seeder
+    }
+
+    pub(crate) fn seeding_total_ms(&self, now: u64) -> u64 {
+        let running = if self.seeding_since > 0 {
+            now.saturating_sub(self.seeding_since)
+        } else {
+            0
+        };
+        self.seeded_ms.saturating_add(running)
+    }
+
+    pub(crate) fn can_be_started(&self) -> bool {
+        match self.kind {
+            TaskKind::Http
+            | TaskKind::Media
+            | TaskKind::M3u8
+            | TaskKind::Ed2k
+            | TaskKind::Ftp
+            | TaskKind::Adc
+            | TaskKind::Gnutella
+            | TaskKind::G2
+            | TaskKind::Gift => !self.uris.is_empty(),
+            TaskKind::Metalink => !self.files.is_empty(),
+            TaskKind::Usenet => self.usenet.is_some(),
+            TaskKind::Torrent => true,
+        }
     }
 
     pub fn verified_files(&self) -> Vec<risuko_bt::create::FileStamp> {
@@ -833,6 +861,10 @@ impl DownloadTask {
                 "seeder".into(),
                 Value::String(if self.seeder { "true" } else { "false" }.into()),
             );
+            m.insert(
+                "seedingTime".into(),
+                Value::String(self.seeding_total_ms(now_ms()).to_string()),
+            );
         }
         if self.kind == TaskKind::Torrent {
             let mut bt = Map::new();
@@ -1013,6 +1045,60 @@ use crate::engine::util::now_ms;
 mod tests {
     use super::*;
     use serde_json::{json, Map};
+
+    #[test]
+    fn a_task_can_be_started_only_once_it_has_what_its_kind_downloads_from() {
+        for kind in [
+            TaskKind::Http,
+            TaskKind::Media,
+            TaskKind::M3u8,
+            TaskKind::Ed2k,
+            TaskKind::Ftp,
+            TaskKind::Adc,
+            TaskKind::Gnutella,
+            TaskKind::G2,
+            TaskKind::Gift,
+        ] {
+            let mut task = DownloadTask {
+                kind,
+                ..Default::default()
+            };
+            assert!(!task.can_be_started(), "{kind:?} without uris");
+            task.uris = vec!["http://example.com/f".into()];
+            assert!(task.can_be_started(), "{kind:?} with uris");
+        }
+
+        let mut metalink = DownloadTask {
+            kind: TaskKind::Metalink,
+            uris: vec!["http://example.com/f".into()],
+            ..Default::default()
+        };
+        assert!(!metalink.can_be_started());
+        metalink.files = vec![DownloadFile {
+            index: "1".into(),
+            path: "/dl/f".into(),
+            length: "0".into(),
+            completed_length: "0".into(),
+            selected: "true".into(),
+            uris: Vec::new(),
+        }];
+        assert!(metalink.can_be_started());
+
+        let mut usenet = DownloadTask {
+            kind: TaskKind::Usenet,
+            files: metalink.files.clone(),
+            ..Default::default()
+        };
+        assert!(!usenet.can_be_started());
+        usenet.usenet = Some(UsenetTaskData::default());
+        assert!(usenet.can_be_started());
+
+        let torrent = DownloadTask {
+            kind: TaskKind::Torrent,
+            ..Default::default()
+        };
+        assert!(torrent.can_be_started());
+    }
 
     #[test]
     fn rpc_status_lists_mirrors_only_when_known() {
@@ -1707,6 +1793,42 @@ mod tests {
         assert!(obj.contains_key("ed2kLink"));
         assert_eq!(obj["seeder"], "false");
         assert!(!obj.contains_key("bittorrent"));
+    }
+
+    #[test]
+    fn a_seeding_task_reports_how_long_it_has_seeded() {
+        let ed2k = DownloadTask::new_ed2k(
+            "egid".into(),
+            "ed2k://|file|test|100|hash|/".into(),
+            "test".into(),
+            100,
+            "/dl".into(),
+            None,
+            Map::new(),
+        );
+        assert_eq!(ed2k.to_rpc_status(&[])["seedingTime"], "0");
+
+        let mut torrent = DownloadTask::new_torrent("tgid".into(), "/dl".into(), None, Map::new());
+        torrent.seeder = true;
+        torrent.seeded_ms = 5000;
+        assert_eq!(torrent.to_rpc_status(&[])["seedingTime"], "5000");
+
+        torrent.seeding_since = now_ms() - 60_000;
+        let reported: u64 = torrent.to_rpc_status(&[])["seedingTime"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((65_000..70_000).contains(&reported), "{reported}");
+
+        let http = DownloadTask::new_http(
+            "hgid".into(),
+            vec!["http://example.com/f.bin".into()],
+            "/dl".into(),
+            None,
+            Map::new(),
+        );
+        assert!(http.to_rpc_status(&[]).get("seedingTime").is_none());
     }
 
     #[test]

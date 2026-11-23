@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Oppdatering avbrutt",
 	"update-install": "Installer oppdatering",
 	"update-relaunch": "Start på nytt for å fullføre oppdateringen",
+	"update-relaunching": "Starter Risuko på nytt…",
 	"update-progress": "Fremdrift for oppdatering: {{progress}}%",
 	"update-error": "Oppdateringsfeil: {{error}}",
 	"update-unsigned": "Oppdateringer er ikke tilgjengelige i denne versjonen",

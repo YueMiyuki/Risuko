@@ -1,10 +1,18 @@
-name: Build risuko-cli for glibc 2.17
-description: Build risuko-cli with cargo-zigbuild against glibc 2.17 and check the floor
+name: Build a package for glibc 2.17
+description: Build a cargo package with cargo-zigbuild against glibc 2.17 and check the floor
 
 inputs:
   target:
     description: Rust target triple
     required: true
+  package:
+    description: Cargo package to build
+    required: false
+    default: risuko-cli
+  artifact:
+    description: File under target/<triple>/release whose glibc requirement is checked
+    required: false
+    default: risuko
 
 runs:
   using: composite
@@ -15,11 +23,13 @@ runs:
         version: 0.16.0
         use-cache: false
 
-    - name: Build risuko-cli (glibc 2.17)
+    - name: Build ${{ inputs.package }} (glibc 2.17)
       working-directory: src-tauri
       shell: bash
       env:
         MATRIX_TARGET: ${{ inputs.target }}
+        PACKAGE: ${{ inputs.package }}
+        ARTIFACT: ${{ inputs.artifact }}
       run: |
         set -euo pipefail
         case "$MATRIX_TARGET" in
@@ -33,9 +43,9 @@ runs:
         echo "$zigbuild_sha256  $RUNNER_TEMP/zigbuild.tar.xz" | sha256sum -c -
         tar -xJf "$RUNNER_TEMP/zigbuild.tar.xz" -C "$RUNNER_TEMP"
         export PATH="$RUNNER_TEMP/$zigbuild_dir:$PATH"
-        cargo zigbuild --release --target "$MATRIX_TARGET.2.17" -p risuko-cli
-        glibc=$(objdump -T "target/$MATRIX_TARGET/release/risuko" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n1)
+        cargo zigbuild --release --locked --target "$MATRIX_TARGET.2.17" -p "$PACKAGE"
+        glibc=$(objdump -T "target/$MATRIX_TARGET/release/$ARTIFACT" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n1)
         if [[ "$(printf '%s\n' GLIBC_2.17 "$glibc" | sort -V | tail -n1)" != GLIBC_2.17 ]]; then
-          echo "::error::risuko-cli requires $glibc, above the glibc 2.17 floor"
+          echo "::error::$PACKAGE requires $glibc, above the glibc 2.17 floor"
           exit 1
         fi

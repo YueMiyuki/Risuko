@@ -326,6 +326,8 @@ export default {
 	"media-format-hint":
 		"Kérje le a formátumokat egy adott minőség kiválasztásához.",
 	"media-format-error": "Az URL formátumai nem tölthetők be.",
+	"media-unsupported-android":
+		"A médiaoldalakról való letöltéshez yt-dlp szükséges, amely Androidon nem érhető el",
 	"download-complete-message": "Letöltés befejezve {{taskName}}",
 	"download-complete-notify": "Letöltés befejezve",
 	"bt-download-complete-message": "Letöltés befejezve {{taskName}}, továbbadás",
@@ -371,6 +373,15 @@ export default {
 	"mirror-placeholder": "Tükör URL (ugyanaz a fájl, másik kiszolgáló)",
 	"mirror-hint":
 		"Adjon hozzá ugyanarra a fájlra mutató tükör URL-eket, hogy egyszerre több forrásból tölthessen le.",
+	"mirror-sources": "{{count}} forrás",
+	"mirror-failing": "Hibás",
+	"mirror-idle": "Nincs használatban",
+	"add-tab-links": "Linkek",
+	"add-tab-mirrors": "Tükrök",
+	"mirror-list-placeholder": "Egy fájl tükör URL-jei, soronként egy",
+	"mirror-list-hint":
+		"Minden linknek ugyanarra a fájlra kell mutatnia. A fájl darabjai egyszerre töltődnek le az összes tükörről, és a hibázó vagy lelassuló tükör átadja a darabjait a többinek.",
+	"mirror-list-rejected": "Nem egyszerű http(s) fájllink:",
 	"detail-tab-general": "Általános",
 	"detail-tab-activity": "Tevékenység",
 	"detail-tab-trackers": "Trackerek",
@@ -401,6 +412,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 vagy üres = korlátlan (pl. 500K)",
 	"edit-primary-uri": "Letöltési URL",
 	"edit-primary-uri-placeholder": "Elsődleges letöltési URL",
+	"edit-tab-seeding": "Vetés",
+	"seeding-rule-global": "Globális beállítás használata",
+	"seeding-rule-forever": "Vetés, amíg le nem állítom",
+	"seeding-rule-limits": "Leállítás aránynál vagy idő után",
+	"seeding-rule-none": "Nincs vetés",
+	"seeding-global-off": "Jelenleg: nincs vetés",
+	"seeding-global-forever": "Jelenleg: vetés a leállításig",
+	"seeding-global-ratio": "Jelenleg: leállítás {{ratio}} aránynál",
+	"seeding-global-minutes": "Jelenleg: leállítás {{minutes}} perc után",
+	"seeding-global-both":
+		"Jelenleg: leállítás {{ratio}} aránynál vagy {{minutes}} perc után",
+	"seeding-limits-hint":
+		"A vetés az elsőként elért korlátnál áll le. A 0 azt jelenti, hogy nincs ilyen korlát.",
+	"seeding-limits-required":
+		"Adjon meg egy arányt vagy 0-nál nagyobb percszámot",
+	"seeding-for": "Vetés ideje",
+	"seeding-applies-after-download": "Ez a letöltés befejezésekor lép érvénybe.",
+	"seeding-stops-now": "A feladat a mentéskor leállítja a vetést.",
+	"seeding-limit-reached":
+		"A feladat már elérte ezt a korlátot, és a mentéskor leállítja a vetést.",
+	"seeding-in-place-note":
+		"A létrehozott torrentek addig vetésben maradnak, amíg le nem állítja őket.",
+	"seeding-ed2k-sharing-off":
+		"Az eD2K-n keresztüli megosztás ki van kapcsolva a Beállításokban, ezért ez a feladat nem tölt fel.",
+	"seeding-leftover-values":
+		"Ez a feladat egy korábbi beállításmódosításból származó vetési értékeket tartalmaz. A mentés lecseréli őket.",
 	"create-torrent": "Torrent létrehozása",
 	"create-torrent-menu": "Torrent létrehozása...",
 	"create-torrent-source": "Megosztandó fájl vagy mappa",

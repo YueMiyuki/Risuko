@@ -28,6 +28,7 @@
             <TabsTrigger v-if="!isBT" value="sources">{{ $t('task.edit-tab-sources') }}</TabsTrigger>
             <TabsTrigger v-if="isBT" value="trackers">{{ $t('task.edit-tab-trackers') }}</TabsTrigger>
             <TabsTrigger value="network">{{ $t('task.edit-tab-network') }}</TabsTrigger>
+            <TabsTrigger v-if="showSeedingTab" value="seeding">{{ $t('task.edit-tab-seeding') }}</TabsTrigger>
           </TabsList>
 
           <TabsContent v-if="!isBT" value="general" class="mt-0 flex flex-col gap-3">
@@ -172,6 +173,84 @@
               <Textarea id="edit-task-authorization" v-model="form.authorization" rows="2" class="resize-none text-xs" />
             </div>
           </TabsContent>
+
+          <TabsContent v-if="showSeedingTab" value="seeding" class="mt-0 flex flex-col gap-3">
+            <p v-if="seedingInPlace" class="text-[11px] leading-relaxed text-muted-foreground">
+              {{ $t('task.seeding-in-place-note') }}
+            </p>
+            <template v-else>
+              <RadioGroupRoot
+                :model-value="form.seedingChoice"
+                class="flex flex-col gap-2.5"
+                :aria-label="$t('task.edit-tab-seeding')"
+                @update:model-value="onSeedingChoice"
+              >
+                <div v-for="option in seedingOptions" :key="option.value">
+                  <div class="flex items-center gap-2">
+                    <RadioGroupItem
+                      :id="`edit-task-seeding-${option.value}`"
+                      :value="option.value"
+                      class="flex size-4 shrink-0 items-center justify-center rounded-full border border-input shadow-xs outline-none transition-shadow focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[state=checked]:border-primary"
+                      @select="seedingTouched = true"
+                    >
+                      <RadioGroupIndicator class="size-2 rounded-full bg-primary" />
+                    </RadioGroupItem>
+                    <label :for="`edit-task-seeding-${option.value}`" class="text-xs">{{ option.label }}</label>
+                  </div>
+                  <p v-if="option.value === 'global'" class="mt-1 ml-6 text-[11px] text-muted-foreground">
+                    {{ globalSeedingText }}
+                  </p>
+                  <div
+                    v-if="option.value === 'limits' && form.seedingChoice === 'limits'"
+                    class="mt-2 ml-6 flex flex-col gap-2"
+                  >
+                    <div class="grid grid-cols-2 gap-3">
+                      <div>
+                        <label for="edit-task-seed-ratio" class="mb-1 block text-[11px] text-muted-foreground">{{ $t('preferences.seed-ratio') }}</label>
+                        <NumberInput id="edit-task-seed-ratio" v-model="form.seedRatio" :min="0" :max="100" :step="0.1" />
+                      </div>
+                      <div>
+                        <label for="edit-task-seed-time" class="mb-1 block text-[11px] text-muted-foreground">{{ $t('preferences.seed-time') }} ({{ $t('preferences.seed-time-unit') }})</label>
+                        <NumberInput id="edit-task-seed-time" v-model="form.seedTime" :min="0" :max="525600" :step="1" />
+                      </div>
+                    </div>
+                    <p class="text-[11px] leading-relaxed text-muted-foreground">{{ $t('task.seeding-limits-hint') }}</p>
+                    <p v-if="seedingLimitsInvalid" class="text-[11px] text-destructive">{{ $t('task.seeding-limits-required') }}</p>
+                  </div>
+                </div>
+              </RadioGroupRoot>
+
+              <div
+                v-if="showSeedingStatus"
+                class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px]"
+              >
+                <span class="text-muted-foreground">{{ $t('task.task-upload-length') }}</span>
+                <span class="tabular-nums">{{ uploadedText }}</span>
+                <span class="text-muted-foreground">{{ $t('task.task-ratio') }}</span>
+                <span class="tabular-nums">{{ currentRatio }}</span>
+                <template v-if="seedingForText">
+                  <span class="text-muted-foreground">{{ $t('task.seeding-for') }}</span>
+                  <span class="tabular-nums">{{ seedingForText }}</span>
+                </template>
+              </div>
+
+              <p v-if="seedingNotStarted" class="text-[11px] leading-relaxed text-muted-foreground">
+                {{ $t('task.seeding-applies-after-download') }}
+              </p>
+              <p v-if="ed2kSharingOff" class="text-[11px] leading-relaxed text-muted-foreground">
+                {{ $t('task.seeding-ed2k-sharing-off') }}
+              </p>
+              <p v-if="seedingLeftover" class="text-[11px] leading-relaxed text-muted-foreground">
+                {{ $t('task.seeding-leftover-values') }}
+              </p>
+              <div
+                v-if="seedingWarning"
+                class="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300"
+              >
+                {{ seedingWarning }}
+              </div>
+            </template>
+          </TabsContent>
         </Tabs>
 
         <div v-if="!loading && showRestartWarning" class="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
@@ -198,9 +277,21 @@
 import { Pencil, X } from "@lucide/vue";
 import { TASK_STATUS } from "@shared/constants";
 import type { DownloadTask } from "@shared/types/task";
-import { checkTaskIsBT, getFileName, getTaskName } from "@shared/utils";
+import {
+	bytesToSize,
+	calcRatio,
+	checkTaskIsBT,
+	checkTaskIsSeeder,
+	checkTaskUploads,
+	getFileName,
+	getTaskName,
+	parseBooleanConfig,
+	timeFormat,
+} from "@shared/utils";
 import { convertTrackerDataToLine } from "@shared/utils/tracker";
+import { RadioGroupIndicator, RadioGroupItem, RadioGroupRoot } from "reka-ui";
 import type { PropType } from "vue";
+import api from "@/api";
 import SelectDirectory from "@/components/Native/SelectDirectory.vue";
 import HistoryDirectory from "@/components/Preference/HistoryDirectory.vue";
 import { Button } from "@/components/ui/button";
@@ -218,6 +309,15 @@ import { Textarea } from "@/components/ui/textarea";
 import is from "@/shims/platform";
 import { usePreferenceStore } from "@/store/preference";
 import { useTaskStore } from "@/store/task";
+import {
+	type GlobalSeedingKind,
+	type GlobalSeedingSummary,
+	globalSeedingSummary,
+	type SeedingChoice,
+	type SeedingRuleOptions,
+	seedingChoiceOf,
+	seedingRuleOptions,
+} from "@/utils/seedingRule";
 
 type EditForm = {
 	out: string;
@@ -232,9 +332,32 @@ type EditForm = {
 	referer: string;
 	cookie: string;
 	authorization: string;
+	seedingChoice: SeedingChoice;
+	seedRatio: number;
+	seedTime: number;
 };
 
 type Snapshot = EditForm;
+
+type SeedingStatus = Partial<DownloadTask> & { uploadLength?: string };
+
+const SEEDING_STATUS_KEYS = [
+	"gid",
+	"status",
+	"seeder",
+	"totalLength",
+	"completedLength",
+	"uploadLength",
+	"seedingTime",
+];
+
+const GLOBAL_SEEDING_KEYS: Record<GlobalSeedingKind, string> = {
+	off: "task.seeding-global-off",
+	forever: "task.seeding-global-forever",
+	ratio: "task.seeding-global-ratio",
+	minutes: "task.seeding-global-minutes",
+	both: "task.seeding-global-both",
+};
 
 function emptyForm(): EditForm {
 	return {
@@ -250,6 +373,9 @@ function emptyForm(): EditForm {
 		referer: "",
 		cookie: "",
 		authorization: "",
+		seedingChoice: "global",
+		seedRatio: 0,
+		seedTime: 0,
 	};
 }
 
@@ -330,6 +456,9 @@ export default {
 		DialogTitle,
 		Input,
 		NumberInput,
+		RadioGroupIndicator,
+		RadioGroupItem,
+		RadioGroupRoot,
 		Textarea,
 		Tabs,
 		TabsList,
@@ -354,6 +483,10 @@ export default {
 			existingTrackers: [] as string[],
 			otherHeaders: [] as string[],
 			reloadGeneration: 0,
+			seedingInPlace: false,
+			seedingLeftover: false,
+			seedingTouched: false,
+			seedingStatus: null as SeedingStatus | null,
 		};
 	},
 	computed: {
@@ -431,9 +564,155 @@ export default {
 		trackersChanged(): boolean {
 			return this.newTrackers.length > 0;
 		},
+		showSeedingTab(): boolean {
+			return checkTaskUploads(this.task);
+		},
+		seedingEditable(): boolean {
+			return this.showSeedingTab && !this.seedingInPlace;
+		},
+		seedingOptions(): { value: SeedingChoice; label: string }[] {
+			return [
+				{ value: "global", label: this.$t("task.seeding-rule-global") },
+				{ value: "forever", label: this.$t("task.seeding-rule-forever") },
+				{ value: "limits", label: this.$t("task.seeding-rule-limits") },
+				{ value: "none", label: this.$t("task.seeding-rule-none") },
+			];
+		},
+		globalSeeding(): GlobalSeedingSummary {
+			const { keepSeeding, seedTime, seedRatio } = usePreferenceStore().config;
+			return globalSeedingSummary({ keepSeeding, seedTime, seedRatio });
+		},
+		globalSeedingText(): string {
+			const { kind, ratio, minutes } = this.globalSeeding;
+			return this.$t(GLOBAL_SEEDING_KEYS[kind], { ratio, minutes });
+		},
+		seedingRule(): SeedingRuleOptions | null {
+			return seedingRuleOptions(this.form.seedingChoice, {
+				ratio: Number(this.form.seedRatio),
+				minutes: Number(this.form.seedTime),
+			});
+		},
+		seedingLimitsInvalid(): boolean {
+			return (
+				this.seedingEditable &&
+				this.form.seedingChoice === "limits" &&
+				!this.seedingRule
+			);
+		},
+		seedingChanged(): boolean {
+			if (!this.seedingEditable) {
+				return false;
+			}
+			if (this.form.seedingChoice !== this.snapshot.seedingChoice) {
+				return true;
+			}
+			if (this.seedingLeftover && this.seedingTouched) {
+				return true;
+			}
+			if (this.form.seedingChoice !== "limits") {
+				return false;
+			}
+			return (
+				Number(this.form.seedRatio) !== Number(this.snapshot.seedRatio) ||
+				Number(this.form.seedTime) !== Number(this.snapshot.seedTime)
+			);
+		},
+		seedingTask(): SeedingStatus | null {
+			return this.seedingStatus ?? this.task;
+		},
+		isSeeder(): boolean {
+			return checkTaskIsSeeder(this.seedingTask);
+		},
+		uploadedLength(): string {
+			return this.seedingTask?.uploadLength ?? "0";
+		},
+		showSeedingStatus(): boolean {
+			return Number(this.uploadedLength) > 0 || this.isSeeder;
+		},
+		uploadedText(): string {
+			return bytesToSize(this.uploadedLength);
+		},
+		currentRatio(): number {
+			return calcRatio(this.seedingTask?.totalLength, this.uploadedLength);
+		},
+		seedingTimeMs(): number | null {
+			const raw = this.seedingTask?.seedingTime;
+			if (raw === undefined || raw === null || `${raw}`.trim() === "") {
+				return null;
+			}
+			const ms = Number(raw);
+			return Number.isFinite(ms) && ms >= 0 ? ms : null;
+		},
+		seedingForText(): string {
+			if (this.seedingTimeMs === null) {
+				return "";
+			}
+			return timeFormat(Math.floor(this.seedingTimeMs / 1000), {
+				i18n: {
+					gt1d: this.$t("app.gt1d"),
+					hour: this.$t("app.hour"),
+					minute: this.$t("app.minute"),
+					second: this.$t("app.second"),
+				},
+			}).trim();
+		},
+		seedingNotStarted(): boolean {
+			if (this.seedingTask?.seeder === "true") {
+				return false;
+			}
+			const total = Number(this.seedingTask?.totalLength) || 0;
+			const completed = Number(this.seedingTask?.completedLength) || 0;
+			return !(total > 0 && completed >= total);
+		},
+		ed2kSharingOff(): boolean {
+			if (!this.task?.ed2kLink) {
+				return false;
+			}
+			const { ed2kEnableUpload, ed2KEnableUpload } =
+				usePreferenceStore().config;
+			return !parseBooleanConfig(ed2kEnableUpload ?? ed2KEnableUpload, true);
+		},
+		seedingGoal(): { keep: boolean; ratio: number; minutes: number } {
+			switch (this.form.seedingChoice) {
+				case "global": {
+					const { kind, ratio, minutes } = this.globalSeeding;
+					return { keep: kind !== "off", ratio, minutes };
+				}
+				case "limits":
+					return {
+						keep: true,
+						ratio: Number(this.seedingRule?.seedRatio) || 0,
+						minutes: Number(this.seedingRule?.seedTime) || 0,
+					};
+				case "none":
+					return { keep: false, ratio: 0, minutes: 0 };
+				default:
+					return { keep: true, ratio: 0, minutes: 0 };
+			}
+		},
+		seedingWarning(): string {
+			if (!this.isSeeder || !this.seedingChanged || this.seedingLimitsInvalid) {
+				return "";
+			}
+			const { keep, ratio, minutes } = this.seedingGoal;
+			if (!keep) {
+				return this.$t("task.seeding-stops-now");
+			}
+			const ratioReached = ratio > 0 && this.currentRatio >= ratio;
+			const timeReached =
+				minutes > 0 &&
+				this.seedingTimeMs !== null &&
+				this.seedingTimeMs >= minutes * 60_000;
+			return ratioReached || timeReached
+				? this.$t("task.seeding-limit-reached")
+				: "";
+		},
 		hasChanges(): boolean {
 			return (
-				this.urisChanged || this.pathOrOptionsChanged || this.trackersChanged
+				this.urisChanged ||
+				this.pathOrOptionsChanged ||
+				this.trackersChanged ||
+				this.seedingChanged
 			);
 		},
 		canConfirm(): boolean {
@@ -447,6 +726,9 @@ export default {
 				return false;
 			}
 			if (!this.isBT && !this.form.dir.trim()) {
+				return false;
+			}
+			if (this.seedingLimitsInvalid) {
 				return false;
 			}
 			return true;
@@ -500,6 +782,26 @@ export default {
 		removeMirror(idx: number) {
 			this.form.mirrors = this.form.mirrors.filter((_, i) => i !== idx);
 		},
+		onSeedingChoice(value: unknown) {
+			const choice = this.seedingOptions.find(
+				(option) => option.value === value,
+			)?.value;
+			if (!choice) {
+				return;
+			}
+			this.seedingTouched = true;
+			if (
+				choice === "limits" &&
+				!(Number(this.form.seedRatio) > 0) &&
+				!(Number(this.form.seedTime) > 0)
+			) {
+				const { ratio, minutes } = this.globalSeeding;
+				const fromGlobal = ratio > 0 || minutes > 0;
+				this.form.seedRatio = fromGlobal ? ratio : 1;
+				this.form.seedTime = fromGlobal ? minutes : 0;
+			}
+			this.form.seedingChoice = choice;
+		},
 		taskUris(): string[] {
 			const files = this.task?.files;
 			if (files?.[0]?.uris?.length) {
@@ -516,10 +818,18 @@ export default {
 			this.loading = true;
 			this.activeTab = this.isBT ? "trackers" : "general";
 			this.mirrorDraft = "";
+			this.seedingTouched = false;
+			this.seedingStatus = null;
 			try {
+				const statusRequest = checkTaskUploads(task)
+					? api
+							.fetchTaskItem({ gid: task.gid, keys: SEEDING_STATUS_KEYS })
+							.catch(() => null)
+					: Promise.resolve(null);
 				const options = (await useTaskStore().getTaskOption(
 					task.gid,
 				)) as Record<string, unknown>;
+				const status = await statusRequest;
 				if (
 					generation !== this.reloadGeneration ||
 					this.task?.gid !== task.gid
@@ -544,14 +854,15 @@ export default {
 				);
 				const optionTracker =
 					typeof options.btTracker === "string" ? options.btTracker : "";
+				const seeding = seedingChoiceOf(options);
 				const form: EditForm = {
 					out:
 						(typeof options.out === "string" && options.out) ||
 						getFileName(this.task.files?.[0]?.path ?? "") ||
 						"",
 					dir:
-						(typeof options.dir === "string" && options.dir) ||
 						this.task.dir ||
+						(typeof options.dir === "string" && options.dir) ||
 						"",
 					split: Math.max(1, Math.min(128, Number(options.split) || 16)),
 					maxDownloadLimit: normalizeLimit(options.maxDownloadLimit),
@@ -568,11 +879,17 @@ export default {
 						(typeof options.referer === "string" && options.referer) || "",
 					cookie: cookie || "",
 					authorization: authorization || "",
+					seedingChoice: seeding.choice,
+					seedRatio: seeding.ratio,
+					seedTime: seeding.minutes,
 				};
 				this.existingTrackers = parseTrackerLines(
 					[trackerLine, optionTracker].filter(Boolean).join("\n"),
 				);
 				this.otherHeaders = otherHeaders;
+				this.seedingInPlace = seeding.inPlace;
+				this.seedingLeftover = seeding.leftover;
+				this.seedingStatus = status;
 				this.form = form;
 				this.snapshot = {
 					...form,
@@ -672,6 +989,10 @@ export default {
 				} else {
 					options.cookie = null;
 				}
+			}
+
+			if (this.seedingChanged && this.seedingRule) {
+				Object.assign(options, this.seedingRule);
 			}
 
 			if (this.newTrackers.length) {

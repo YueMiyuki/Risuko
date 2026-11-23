@@ -19,6 +19,7 @@ jobs:
   web:
     name: Web (typecheck, lint, tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out Git repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -26,7 +27,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           run_install: false
 
@@ -38,12 +39,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          HUSKY: 0
 
       - name: Typecheck
         run: pnpm typecheck
 
       - name: Lint
-        run: pnpx @biomejs/biome@2.5.15 ci --max-diagnostics none
+        run: pnpm exec biome ci --max-diagnostics none
 
       - name: Locale coverage
         run: pnpm check:locales
@@ -57,6 +60,7 @@ jobs:
   rust:
     name: Rust (fmt, clippy, tests)
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - name: Check out Git repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -91,8 +95,42 @@ jobs:
 
       - name: Clippy
         working-directory: src-tauri
-        run: cargo clippy --workspace --exclude risuko --locked
+        run: cargo clippy --workspace --exclude risuko --locked --all-targets -- -D warnings
 
       - name: Tests
         working-directory: src-tauri
         run: cargo test --workspace --exclude risuko --locked
+
+  rust-desktop:
+    name: Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            experimental: false
+          - os: windows-latest
+            experimental: true
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: "src-tauri -> target"
+          key: ci-${{ matrix.os }}
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test -p risuko-util -p risuko-http -p risuko-bt -p risuko-ed2k -p risuko-engine --locked

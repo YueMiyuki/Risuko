@@ -106,6 +106,35 @@ test("merged rows keep the order of the light rows", () => {
 	assert.deepEqual(missing, ["n"]);
 });
 
+test("a row the predicate matches is missing even when its status is unchanged", () => {
+	const filesA = [{ path: "a" }];
+	const filesB = [{ path: "b" }];
+	const { rows, missing } = mergeRowFiles<Row>(
+		[
+			{ gid: "a", status: "active", files: filesA },
+			{ gid: "b", status: "complete", files: filesB },
+		],
+		[
+			{ gid: "a", status: "active" },
+			{ gid: "b", status: "complete" },
+		],
+		(row) => row.status === "active",
+	);
+	assert.deepEqual(missing, ["a"]);
+	assert.equal(rows[0].files, undefined);
+	assert.equal(rows[1].files, filesB);
+});
+
+test("without a predicate an active row with an unchanged status keeps its files", () => {
+	const filesA = [{ path: "a" }];
+	const { rows, missing } = mergeRowFiles<Row>(
+		[{ gid: "a", status: "active", files: filesA }],
+		[{ gid: "a", status: "active" }],
+	);
+	assert.deepEqual(missing, []);
+	assert.equal(rows[0].files, filesA);
+});
+
 test("filled rows take the fetched files array", () => {
 	const known = [{ path: "a" }];
 	const fetched = [{ path: "n" }];
@@ -134,21 +163,18 @@ test("a row left without a files array fails the fill", () => {
 	assert.equal(fillRowFiles(rows, [null, undefined]), null);
 });
 
-test("a light refresh is only for the waiting, scheduled, stopped and completed lists", () => {
-	for (const type of ["waiting", "scheduled", "stopped", "completed"]) {
+test("a light refresh is only for the all, waiting, scheduled, stopped and completed lists", () => {
+	for (const type of ["all", "waiting", "scheduled", "stopped", "completed"]) {
 		assert.equal(
 			canRefreshLight({ type, lastType: type, lightRefreshes: 0 }),
 			true,
 			type,
 		);
 	}
-	for (const type of ["active", "all"]) {
-		assert.equal(
-			canRefreshLight({ type, lastType: type, lightRefreshes: 0 }),
-			false,
-			type,
-		);
-	}
+	assert.equal(
+		canRefreshLight({ type: "active", lastType: "active", lightRefreshes: 0 }),
+		false,
+	);
 });
 
 test("a light refresh needs the last applied fetch to be for the same list", () => {

@@ -58,6 +58,10 @@ fn client_builder(destination: Destination) -> risuko_http::ClientBuilder {
     }
 }
 
+pub fn probe_client_builder(url: &str) -> risuko_http::ClientBuilder {
+    client_builder(Destination::of(url))
+}
+
 fn client(destination: Destination) -> &'static risuko_http::Client {
     static ANNOUNCE: OnceLock<risuko_http::Client> = OnceLock::new();
     static PUBLIC_ONLY: OnceLock<risuko_http::Client> = OnceLock::new();
@@ -304,7 +308,7 @@ fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceRespons
         .and_then(|v| v.as_bytes())
         .and_then(|raw| reveal_peers(raw, 6, req, &value))
     {
-        for chunk in raw.chunks_exact(6) {
+        for chunk in raw.as_chunks::<6>().0 {
             if peers.len() >= MAX_RESPONSE_PEERS {
                 break;
             }
@@ -346,7 +350,7 @@ fn parse_response(bytes: &[u8], req: &AnnounceRequest) -> Result<AnnounceRespons
         .and_then(|v| v.as_bytes())
         .and_then(|raw| reveal_peers(raw, 18, req, &value))
     {
-        for chunk in raw.chunks_exact(18) {
+        for chunk in raw.as_chunks::<18>().0 {
             if peers.len() >= MAX_RESPONSE_PEERS {
                 break;
             }

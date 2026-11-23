@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Актуализацията е отменена",
 	"update-install": "Инсталирай актуализацията",
 	"update-relaunch": "Рестартирайте, за да завършите актуализацията",
+	"update-relaunching": "Рестартиране на Risuko…",
 	"update-progress": "Напредък на актуализацията: {{progress}}%",
 	"update-error": "Грешка при актуализация: {{error}}",
 	"update-unsigned": "Актуализациите не са налични в тази компилация",

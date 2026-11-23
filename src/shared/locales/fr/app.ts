@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Mise à jour annulée",
 	"update-install": "Installer la mise à jour",
 	"update-relaunch": "Redémarrer pour terminer la mise à jour",
+	"update-relaunching": "Redémarrage de Risuko…",
 	"update-progress": "Progression de la mise à jour: {{progress}}%",
 	"update-error": "Erreur de mise à jour: {{error}}",
 	"update-unsigned":

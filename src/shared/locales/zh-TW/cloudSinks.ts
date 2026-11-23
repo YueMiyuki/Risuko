@@ -71,6 +71,8 @@ export default {
 	errSftpUsernameRequired: "請填寫 SFTP 使用者名稱。",
 	errSftpAuthRequired: "請填寫 SFTP 密碼或私鑰。",
 	errFtpHostRequired: "請填寫 FTP 主機。",
+	errSecretForNewServer:
+		"伺服器已變更，已儲存的密碼或金鑰不會再使用，請重新填寫。",
 	errMoveTargetRequired: "選擇「移動到資料夾」時必須填寫目標路徑。",
 	saving: "儲存中…",
 	recentJobs: "最近上傳",

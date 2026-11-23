@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Оновлення скасовано",
 	"update-install": "Встановити оновлення",
 	"update-relaunch": "Перезапустіть, щоб завершити оновлення",
+	"update-relaunching": "Перезапуск Risuko…",
 	"update-progress": "Перебіг оновлення: {{progress}}%",
 	"update-error": "Помилка оновлення: {{error}}",
 	"update-unsigned": "Оновлення недоступні в цій збірці",

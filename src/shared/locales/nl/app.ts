@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Update geannuleerd",
 	"update-install": "Update installeren",
 	"update-relaunch": "Herstart om de update te voltooien",
+	"update-relaunching": "Risuko wordt herstart…",
 	"update-progress": "Voortgang van update: {{progress}}%",
 	"update-error": "Updatefout: {{error}}",
 	"update-unsigned": "Updates zijn niet beschikbaar in deze build",

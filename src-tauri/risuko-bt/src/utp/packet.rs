@@ -101,7 +101,7 @@ impl UtpHeader {
                     "truncated utp extension data",
                 ));
             }
-            if ext == EXT_SELECTIVE_ACK && len >= 4 && len % 4 == 0 {
+            if ext == EXT_SELECTIVE_ACK && len >= 4 && len.is_multiple_of(4) {
                 selective_ack = Some(buf[off..off + len].to_vec());
             }
             off += len;

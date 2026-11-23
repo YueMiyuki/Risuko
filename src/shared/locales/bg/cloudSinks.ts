@@ -75,6 +75,8 @@ export default {
 	errSftpUsernameRequired: "SFTP потребителското име е задължително.",
 	errSftpAuthRequired: "Необходими са SFTP парола или частен ключ.",
 	errFtpHostRequired: "FTP хостът е задължителен.",
+	errSecretForNewServer:
+		"Сървърът е променен, затова запазената парола или ключ не се използват повторно. Въведете ги отново.",
 	errMoveTargetRequired:
 		"Папката за преместване е задължителна, когато действието след качване е преместване.",
 	saving: "Запазване…",

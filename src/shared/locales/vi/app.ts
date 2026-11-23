@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "Đã hủy cập nhật",
 	"update-install": "Cài đặt bản cập nhật",
 	"update-relaunch": "Khởi động lại để hoàn tất cập nhật",
+	"update-relaunching": "Đang khởi động lại Risuko…",
 	"update-progress": "Tiến trình cập nhật: {{progress}}%",
 	"update-error": "Lỗi cập nhật: {{error}}",
 	"update-unsigned": "Không có cập nhật trong bản dựng này",

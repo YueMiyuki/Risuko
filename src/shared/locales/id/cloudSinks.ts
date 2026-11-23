@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "Nama pengguna SFTP wajib diisi.",
 	errSftpAuthRequired: "Kata sandi atau kunci privat SFTP wajib diisi.",
 	errFtpHostRequired: "Host FTP wajib diisi.",
+	errSecretForNewServer:
+		"Server telah berubah, sehingga kata sandi atau kunci yang tersimpan tidak digunakan lagi. Masukkan kembali.",
 	errMoveTargetRequired:
 		"Folder pemindahan wajib diisi jika tindakan setelah unggah adalah pindah.",
 	saving: "Menyimpan…",

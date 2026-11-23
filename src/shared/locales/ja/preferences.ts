@@ -204,6 +204,9 @@ export default {
 	"uri-selector-feedback": "フィードバック（遅い/失敗するミラーを除外）",
 	"uri-selector-inorder": "順番どおり（ミラーを左から順に試行）",
 	"uri-selector-adaptive": "適応型（最速を優先）",
+	"send-auth-to-all-mirrors": "すべての HTTPS ミラーにログイン情報を送信",
+	"send-auth-to-all-mirrors-tips":
+		"タスクの認可ヘッダーをすべての HTTPS ミラーに送信します。オフの場合は、最初のリンクとスキーム、ホスト、ポートが同じミラーにのみ送信します。",
 	"unit-seconds": "秒",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "ストレージ",

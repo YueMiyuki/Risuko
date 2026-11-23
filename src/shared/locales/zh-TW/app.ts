@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "更新已取消",
 	"update-install": "安裝更新",
 	"update-relaunch": "重新啟動以完成更新",
+	"update-relaunching": "正在重新啟動 Risuko…",
 	"update-progress": "更新進度: {{progress}}%",
 	"update-error": "更新錯誤: {{error}}",
 	"update-unsigned": "此版本無法使用更新",

@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Frissítés megszakítva",
 	"update-install": "Frissítés telepítése",
 	"update-relaunch": "Indítsa újra a frissítés befejezéséhez",
+	"update-relaunching": "A Risuko újraindul…",
 	"update-progress": "Frissítés állapota: {{progress}}%",
 	"update-error": "Frissítési hiba: {{error}}",
 	"update-unsigned": "A frissítések nem érhetők el ebben a buildben",

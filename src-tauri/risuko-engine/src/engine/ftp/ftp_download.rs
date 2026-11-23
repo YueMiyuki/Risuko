@@ -36,18 +36,22 @@ macro_rules! ftp_transfer {
     ($ftp:expr, $parsed:expr, $part_path:expr, $file_size:expr,
      $total:expr, $completed:expr, $speed:expr,
      $connections:expr, $cancel_token:expr, $throttle:expr, $read_timeout:expr) => {{
-        $ftp.transfer_type(suppaftp::types::FileType::Binary)
-            .await
-            .map_err(|e| format!("Failed to set binary mode: {e}"))?;
+        control_step(
+            $read_timeout,
+            $ftp.transfer_type(suppaftp::types::FileType::Binary),
+        )
+        .await?
+        .map_err(|e| format!("Failed to set binary mode: {e}"))?;
 
         let remote_path = &$parsed.path;
-        let remote_size = $ftp.size(remote_path).await.unwrap_or(0) as u64;
+        let remote_size = control_step($read_timeout, $ftp.size(remote_path))
+            .await?
+            .unwrap_or(0) as u64;
         if remote_size > 0 {
             $total.store(remote_size, Ordering::Relaxed);
         }
-        let remote_mtime = $ftp
-            .mdtm(remote_path)
-            .await
+        let remote_mtime = control_step($read_timeout, $ftp.mdtm(remote_path))
+            .await?
             .ok()
             .map(|t| t.and_utc().timestamp());
         let current = ResumeMeta {
@@ -82,12 +86,14 @@ macro_rules! ftp_transfer {
         if existing_size > 0 && effective_size > 0 && existing_size == effective_size {
             $completed.store(existing_size, Ordering::Relaxed);
             tracing::info!("FTP .part already complete ({existing_size} bytes), skipping transfer");
-            let _ = $ftp.quit().await;
+            let _ = control_step($read_timeout, $ftp.quit()).await;
         } else {
             let mut resume_offset =
                 if existing_size > 0 && (effective_size == 0 || existing_size < effective_size) {
                     match usize::try_from(existing_size) {
-                        Ok(off) => match $ftp.resume_transfer(off).await {
+                        Ok(off) => match control_step($read_timeout, $ftp.resume_transfer(off))
+                            .await?
+                        {
                             Ok(()) => existing_size,
                             Err(e) => {
                                 tracing::warn!("FTP resume not supported: {e}");
@@ -106,15 +112,16 @@ macro_rules! ftp_transfer {
                     0
                 };
 
-            let mut data_stream = match $ftp.retr_as_stream(remote_path).await {
+            let first_retr = control_step($read_timeout, $ftp.retr_as_stream(remote_path)).await?;
+            let mut data_stream = match first_retr {
                 Ok(stream) => stream,
                 Err(e) if resume_offset > 0 && non_transient_refusal(&e) => {
                     tracing::warn!(
                         "FTP server refused resuming at byte {resume_offset}, restarting from 0: {e}"
                     );
                     resume_offset = 0;
-                    $ftp.retr_as_stream(remote_path)
-                        .await
+                    control_step($read_timeout, $ftp.retr_as_stream(remote_path))
+                        .await?
                         .map_err(|e| format!("FTP RETR failed: {e}"))?
                 }
                 Err(e) => return Err(format!("FTP RETR failed: {e}")),
@@ -191,7 +198,10 @@ macro_rules! ftp_transfer {
             drop(file);
 
             // Idle control connection can fail the closing 226 although every byte arrived
-            if let Err(e) = data_stream.finish().await {
+            let finished = control_step($read_timeout, data_stream.finish())
+                .await
+                .and_then(|done| done.map_err(|e| e.to_string()));
+            if let Err(e) = finished {
                 if remote_size > 0 && bytes_downloaded == remote_size {
                     tracing::warn!("FTP finalize failed after a complete transfer: {e}");
                 } else {
@@ -204,7 +214,7 @@ macro_rules! ftp_transfer {
                 ));
             }
 
-            let _ = $ftp.quit().await;
+            let _ = control_step($read_timeout, $ftp.quit()).await;
         }
         Ok::<(), String>(())
     }};
@@ -368,24 +378,29 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
             None
         };
         let mut ftp = if parsed.port == 990 {
-            AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &parsed.host)
-                .await
-                .map_err(|e| format!("FTPS implicit connect failed: {e}"))?
+            control_step(
+                read_timeout,
+                AsyncRustlsFtpStream::connect_secure_implicit(&addr, connector, &parsed.host),
+            )
+            .await?
+            .map_err(|e| format!("FTPS implicit connect failed: {e}"))?
         } else {
             let control = match proxy_control {
-                Some(bridge) => bridge
-                    .connect()
-                    .await
+                Some(bridge) => control_step(read_timeout, bridge.connect())
+                    .await?
                     .map_err(|e| format!("FTPS proxy connect failed: {e}"))?,
-                None => TcpStream::connect(&addr)
-                    .await
+                None => control_step(read_timeout, TcpStream::connect(&addr))
+                    .await?
                     .map_err(|e| format!("FTPS explicit connect failed: {e}"))?,
             };
-            AsyncRustlsFtpStream::connect_with_stream(control)
-                .await
-                .map_err(|e| format!("FTPS explicit connect failed: {e}"))?
-                .into_secure(connector, &parsed.host)
-                .await
+            let plain = control_step(
+                read_timeout,
+                AsyncRustlsFtpStream::connect_with_stream(control),
+            )
+            .await?
+            .map_err(|e| format!("FTPS explicit connect failed: {e}"))?;
+            control_step(read_timeout, plain.into_secure(connector, &parsed.host))
+                .await?
                 .map_err(|e| format!("FTPS AUTH TLS failed: {e}"))?
         };
 
@@ -397,8 +412,8 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
             ftp = ftp.passive_stream_builder(passive_proxy_builder(proxy, parsed.host.clone()));
         }
 
-        ftp.login(user, password)
-            .await
+        control_step(read_timeout, ftp.login(user, password))
+            .await?
             .map_err(|e| format!("FTP login failed: {e}"))?;
 
         ftp_transfer!(
@@ -416,18 +431,18 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
         )
     } else {
         let mut ftp = if let Some(proxy) = control_proxy.clone() {
-            let control = proxy_bridge(proxy, parsed.host.clone(), parsed.port)
+            let bridge = proxy_bridge(proxy, parsed.host.clone(), parsed.port)
                 .await
-                .map_err(|e| format!("FTP proxy bridge failed: {e}"))?
-                .connect()
-                .await
+                .map_err(|e| format!("FTP proxy bridge failed: {e}"))?;
+            let control = control_step(read_timeout, bridge.connect())
+                .await?
                 .map_err(|e| format!("FTP connect failed: {e}"))?;
-            AsyncFtpStream::connect_with_stream(control)
-                .await
+            control_step(read_timeout, AsyncFtpStream::connect_with_stream(control))
+                .await?
                 .map_err(|e| format!("FTP connect failed: {e}"))?
         } else {
-            AsyncFtpStream::connect(&addr)
-                .await
+            control_step(read_timeout, AsyncFtpStream::connect(&addr))
+                .await?
                 .map_err(|e| format!("FTP connect failed: {e}"))?
         };
 
@@ -439,8 +454,8 @@ async fn ftp_attempt(job: &FtpJob<'_>) -> Result<(), String> {
             ftp = ftp.passive_stream_builder(passive_proxy_builder(proxy, parsed.host.clone()));
         }
 
-        ftp.login(user, password)
-            .await
+        control_step(read_timeout, ftp.login(user, password))
+            .await?
             .map_err(|e| format!("FTP login failed: {e}"))?;
 
         ftp_transfer!(
@@ -553,6 +568,15 @@ pub(super) fn read_timeout_from_options(options: &Map<String, Value>) -> Option<
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
+async fn control_step<F: Future>(limit: Option<Duration>, step: F) -> Result<F::Output, String> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, step)
+            .await
+            .map_err(|_| "FTP control timed out".to_string()),
+        None => Ok(step.await),
+    }
+}
+
 async fn read_with_timeout<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
@@ -580,6 +604,7 @@ pub(super) fn is_transient_error(error: &str) -> bool {
         "FTP connect failed",
         "FTP proxy",
         "FTP incomplete",
+        "FTP control timed out",
         "FTPS explicit connect failed",
         "FTPS implicit connect failed",
         "FTPS proxy",
@@ -605,7 +630,12 @@ where
     let wait = Duration::from_secs(option_u64(options, "retry-wait").unwrap_or(0).max(1));
     let mut tries: u64 = 0;
     loop {
-        let error = match attempt().await {
+        let outcome = tokio::select! {
+            biased;
+            outcome = attempt() => outcome,
+            _ = cancel_token.cancelled() => return Err("Download cancelled".to_string()),
+        };
+        let error = match outcome {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -938,6 +968,41 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_interrupts_an_attempt_that_never_answers() {
+        let options = Map::new();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            retry_transient(&options, &token, std::future::pending::<Result<(), String>>),
+        )
+        .await
+        .expect("a cancelled attempt kept running");
+        assert_eq!(result, Err("Download cancelled".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_control_step_times_out() {
+        let error = control_step(
+            Some(Duration::from_millis(20)),
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "FTP control timed out");
+        assert!(is_transient_error(&error));
+    }
+
+    #[tokio::test]
+    async fn a_control_step_without_a_limit_passes_through() {
+        assert_eq!(control_step(None, async { 7 }).await, Ok(7));
     }
 
     #[test]

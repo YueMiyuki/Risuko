@@ -197,6 +197,9 @@ export default {
 	"uri-selector-feedback": "بحسب الأداء (استبعاد المرايا البطيئة أو الفاشلة)",
 	"uri-selector-inorder": "بالترتيب (جرّب المرايا بحسب ترتيبها)",
 	"uri-selector-adaptive": "تكيّفي (تفضيل الأسرع)",
+	"send-auth-to-all-mirrors": "إرسال بيانات الدخول إلى كل مرايا HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"إرسال ترويسة التفويض الخاصة بالتحميل إلى كل مرآة HTTPS. عند إيقافه، لا تتلقاها إلا المرايا التي لها نفس البروتوكول والمضيف والمنفذ مثل الرابط الأول.",
 	"unit-seconds": "ثوانٍ",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "التخزين",

@@ -151,9 +151,10 @@ pub(crate) fn tracker_may_supply(tracker_url: &str, peer: SocketAddr) -> bool {
 }
 
 pub(crate) fn is_valid_endpoint(endpoint: SocketAddr) -> bool {
-    !endpoint.ip().is_unspecified()
-        && !endpoint.ip().is_multicast()
-        && !matches!(endpoint, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+    let ip = endpoint.ip().to_canonical();
+    !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
         && endpoint.port() != 0
 }
 
@@ -747,7 +748,20 @@ mod tests {
     #[test]
     fn rejects_broadcast_peer_endpoints() {
         assert!(!is_valid_endpoint("255.255.255.255:6881".parse().unwrap()));
+        assert!(!is_valid_endpoint("0.0.0.0:6881".parse().unwrap()));
+        assert!(!is_valid_endpoint("[::]:6881".parse().unwrap()));
+        assert!(!is_valid_endpoint("[::ffff:0.0.0.0]:6881".parse().unwrap()));
+        assert!(!is_valid_endpoint(
+            "[::ffff:255.255.255.255]:6881".parse().unwrap()
+        ));
+        assert!(!is_valid_endpoint(
+            "[::ffff:224.0.0.1]:6881".parse().unwrap()
+        ));
         assert!(is_valid_endpoint("192.0.2.1:6881".parse().unwrap()));
+        assert!(is_valid_endpoint(
+            "[::ffff:192.0.2.1]:6881".parse().unwrap()
+        ));
+        assert!(is_valid_endpoint("[2001:db8::1]:6881".parse().unwrap()));
     }
 
     #[test]

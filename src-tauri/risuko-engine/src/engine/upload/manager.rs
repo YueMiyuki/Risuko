@@ -348,6 +348,7 @@ impl UploadSinkManager {
         category: Option<String>,
         task_kind: &str,
         override_sink_id: Option<String>,
+        keep_local: bool,
     ) {
         let size = match tokio::fs::metadata(&local_path).await {
             Ok(meta) if meta.is_file() => meta.len(),
@@ -384,8 +385,10 @@ impl UploadSinkManager {
                 }
             }
         };
-        if task_kind == "torrent" && sink_record.post_action != PostUploadAction::Keep {
-            tracing::info!("upload: keeping local files of torrent {gid} despite post-action");
+        if (task_kind == "torrent" || keep_local)
+            && sink_record.post_action != PostUploadAction::Keep
+        {
+            tracing::info!("upload: keeping local files of {gid} despite post-action");
             sink_record.post_action = PostUploadAction::Keep;
         }
 
@@ -800,7 +803,38 @@ async fn run_post_action(
     }
 }
 
+fn same_host(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    let parse = |value: &str| url::Url::parse(value.trim().trim_end_matches('/'));
+    match (parse(a), parse(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+pub fn same_sink_destination(a: &SinkConfig, b: &SinkConfig) -> bool {
+    match (a, b) {
+        (SinkConfig::Webdav(a), SinkConfig::Webdav(b)) => same_endpoint(&a.endpoint, &b.endpoint),
+        (SinkConfig::S3(a), SinkConfig::S3(b)) => {
+            same_endpoint(&a.endpoint, &b.endpoint) && a.bucket.trim() == b.bucket.trim()
+        }
+        (SinkConfig::Sftp(a), SinkConfig::Sftp(b)) => {
+            same_host(&a.host, &b.host) && a.port == b.port
+        }
+        (SinkConfig::Ftp(a), SinkConfig::Ftp(b)) => {
+            same_host(&a.host, &b.host) && a.port == b.port && a.secure == b.secure
+        }
+        _ => false,
+    }
+}
+
 fn merge_secrets(new: &mut SinkConfig, old: &SinkConfig) {
+    if !same_sink_destination(new, old) {
+        return;
+    }
     match (new, old) {
         (SinkConfig::Webdav(n), SinkConfig::Webdav(o)) if n.password.is_empty() => {
             n.password = o.password.clone();
@@ -826,8 +860,13 @@ fn merge_secrets(new: &mut SinkConfig, old: &SinkConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::upload::sink::{FtpConfig, S3Config, SftpConfig, SinkConfig, WebdavConfig};
+    use crate::engine::upload::sink::{
+        FtpConfig, S3Config, SftpConfig, SinkConfig, UploadError, UploadSink, WebdavConfig,
+    };
     use crate::traits::{FileStorage, NoopEventSink};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct UploadTestCtx {
@@ -1004,6 +1043,262 @@ mod tests {
             assert_eq!(c.password, "p");
         } else {
             panic!("expected sftp");
+        }
+    }
+
+    fn webdav_config(endpoint: &str) -> SinkConfig {
+        SinkConfig::Webdav(WebdavConfig {
+            endpoint: endpoint.into(),
+            base_path: "/risuko".into(),
+            username: "u".into(),
+            password: "p".into(),
+            insecure: false,
+        })
+    }
+
+    fn s3_config(endpoint: &str, bucket: &str) -> SinkConfig {
+        SinkConfig::S3(S3Config {
+            endpoint: endpoint.into(),
+            region: "us-east-1".into(),
+            bucket: bucket.into(),
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            prefix: "uploads/".into(),
+            force_path_style: true,
+        })
+    }
+
+    fn edited(config: &SinkConfig, change: impl FnOnce(&mut SinkConfig)) -> SinkConfig {
+        let mut config = config.clone();
+        change(&mut config);
+        config
+    }
+
+    fn add_record(
+        rt: &tokio::runtime::Runtime,
+        mgr: &UploadSinkManager,
+        config: SinkConfig,
+    ) -> UploadSinkRecord {
+        rt.block_on(mgr.add_sink(UploadSinkRecord {
+            id: String::new(),
+            label: "A".into(),
+            config,
+            post_action: PostUploadAction::Keep,
+            move_target: None,
+            created_at: 0,
+            last_used_at: None,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_changed_folder_or_label_keeps_the_destination() {
+        let webdav = webdav_config("https://dav.example.com/remote");
+        let s3 = s3_config("https://s3.example.com", "bucket");
+        let sftp = sftp_config();
+        let ftp = ftp_config();
+
+        let cases = [
+            (
+                webdav.clone(),
+                edited(&webdav, |c| {
+                    if let SinkConfig::Webdav(c) = c {
+                        c.base_path = "/elsewhere".into();
+                        c.username = "other".into();
+                        c.insecure = true;
+                    }
+                }),
+            ),
+            (
+                s3.clone(),
+                edited(&s3, |c| {
+                    if let SinkConfig::S3(c) = c {
+                        c.prefix = "other/".into();
+                        c.region = "eu-west-1".into();
+                        c.force_path_style = false;
+                    }
+                }),
+            ),
+            (
+                sftp.clone(),
+                edited(&sftp, |c| {
+                    if let SinkConfig::Sftp(c) = c {
+                        c.base_path = "/elsewhere".into();
+                        c.host = "SFTP.Example.com".into();
+                    }
+                }),
+            ),
+            (
+                ftp.clone(),
+                edited(&ftp, |c| {
+                    if let SinkConfig::Ftp(c) = c {
+                        c.base_path = "/elsewhere".into();
+                        c.host = " FTP.example.COM ".into();
+                    }
+                }),
+            ),
+        ];
+        for (old, new) in cases {
+            assert!(same_sink_destination(&old, &new), "{new:?}");
+        }
+    }
+
+    #[test]
+    fn a_changed_server_is_another_destination() {
+        let webdav = webdav_config("https://dav.example.com/remote");
+        let s3 = s3_config("https://s3.example.com", "bucket");
+        let sftp = sftp_config();
+        let ftp = ftp_config();
+
+        let cases = [
+            (
+                webdav.clone(),
+                webdav_config("https://dav.attacker.example/remote"),
+            ),
+            (
+                webdav.clone(),
+                webdav_config("http://dav.example.com/remote"),
+            ),
+            (
+                webdav.clone(),
+                webdav_config("https://dav.example.com:8443/remote"),
+            ),
+            (
+                webdav.clone(),
+                webdav_config("https://dav.example.com/other"),
+            ),
+            (
+                s3.clone(),
+                s3_config("https://s3.attacker.example", "bucket"),
+            ),
+            (s3.clone(), s3_config("https://s3.example.com", "other")),
+            (
+                sftp.clone(),
+                edited(&sftp, |c| {
+                    if let SinkConfig::Sftp(c) = c {
+                        c.host = "sftp.attacker.example".into();
+                    }
+                }),
+            ),
+            (
+                sftp.clone(),
+                edited(&sftp, |c| {
+                    if let SinkConfig::Sftp(c) = c {
+                        c.port = 2222;
+                    }
+                }),
+            ),
+            (
+                ftp.clone(),
+                edited(&ftp, |c| {
+                    if let SinkConfig::Ftp(c) = c {
+                        c.host = "ftp.attacker.example".into();
+                    }
+                }),
+            ),
+            (
+                ftp.clone(),
+                edited(&ftp, |c| {
+                    if let SinkConfig::Ftp(c) = c {
+                        c.port = 2121;
+                    }
+                }),
+            ),
+            (
+                edited(&ftp, |c| {
+                    if let SinkConfig::Ftp(c) = c {
+                        c.secure = true;
+                    }
+                }),
+                ftp.clone(),
+            ),
+            (sftp.clone(), ftp.clone()),
+        ];
+        for (old, new) in cases {
+            assert!(!same_sink_destination(&old, &new), "{new:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_urls_are_compared_as_urls() {
+        assert!(same_sink_destination(
+            &webdav_config("https://dav.example.com/remote"),
+            &webdav_config("https://DAV.example.com:443/remote/"),
+        ));
+        assert!(same_sink_destination(
+            &s3_config("https://s3.example.com/", "bucket"),
+            &s3_config(" https://s3.example.com ", " bucket "),
+        ));
+        assert!(!same_sink_destination(
+            &webdav_config("not a url"),
+            &webdav_config("not a url"),
+        ));
+    }
+
+    #[test]
+    fn update_sink_drops_the_stored_secret_when_the_server_changes() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut updated = add_record(&rt, mgr, ftp_config());
+        if let SinkConfig::Ftp(ref mut c) = updated.config {
+            c.host = "ftp.attacker.example".into();
+            c.password.clear();
+        }
+        rt.block_on(mgr.update_sink(updated)).unwrap();
+        let sinks = rt.block_on(mgr.list_sinks());
+        match &sinks[0].config {
+            SinkConfig::Ftp(c) => {
+                assert_eq!(c.host, "ftp.attacker.example");
+                assert_eq!(c.password, "");
+            }
+            _ => panic!("expected ftp"),
+        }
+    }
+
+    #[test]
+    fn update_sink_keeps_the_stored_secret_when_only_the_folder_and_label_change() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut updated = add_record(&rt, mgr, ftp_config());
+        updated.label = "B".into();
+        if let SinkConfig::Ftp(ref mut c) = updated.config {
+            c.base_path = "/elsewhere".into();
+            c.password.clear();
+        }
+        rt.block_on(mgr.update_sink(updated)).unwrap();
+        let sinks = rt.block_on(mgr.list_sinks());
+        assert_eq!(sinks[0].label, "B");
+        match &sinks[0].config {
+            SinkConfig::Ftp(c) => {
+                assert_eq!(c.base_path, "/elsewhere");
+                assert_eq!(c.password, "p");
+            }
+            _ => panic!("expected ftp"),
+        }
+    }
+
+    #[test]
+    fn update_sink_refuses_a_new_server_without_credentials() {
+        let ctx = test_manager();
+        let mgr = &ctx.mgr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut updated = add_record(&rt, mgr, sftp_config());
+        if let SinkConfig::Sftp(ref mut c) = updated.config {
+            c.port = 2222;
+            c.password.clear();
+            c.private_key.clear();
+        }
+        let error = rt.block_on(mgr.update_sink(updated)).unwrap_err();
+        assert!(error.contains("password or a private key"), "{error}");
+        let sinks = rt.block_on(mgr.list_sinks());
+        match &sinks[0].config {
+            SinkConfig::Sftp(c) => {
+                assert_eq!(c.port, 22);
+                assert_eq!(c.password, "p");
+            }
+            _ => panic!("expected sftp"),
         }
     }
 
@@ -1310,5 +1605,275 @@ mod tests {
         .unwrap();
         mgr.set_max_concurrency(4).await.unwrap();
         assert_eq!(sem.available_permits(), 4);
+    }
+
+    enum Reply {
+        Done,
+        Transient,
+        Fatal,
+        Hang,
+    }
+
+    struct ScriptedSink {
+        script: StdMutex<VecDeque<Reply>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedSink {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for ScriptedSink {
+        async fn upload(
+            &self,
+            file: &UploadFile,
+            ctl: &UploadControl,
+        ) -> Result<String, UploadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reply = self.script.lock().unwrap().pop_front();
+            match reply {
+                Some(Reply::Done) => Ok(format!("scripted://{}", file.remote_relative)),
+                Some(Reply::Transient) => Err(UploadError::transient("connection reset")),
+                Some(Reply::Fatal) => Err(UploadError::fatal("permission denied")),
+                Some(Reply::Hang) => {
+                    ctl.cancel.cancelled().await;
+                    Err(UploadError::fatal("cancelled"))
+                }
+                None => Err(UploadError::fatal("unscripted upload")),
+            }
+        }
+
+        async fn test(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct JobHarness {
+        dir: TempDir,
+        mgr: Arc<UploadSinkManager>,
+        sink: Arc<ScriptedSink>,
+        sink_id: String,
+    }
+
+    impl JobHarness {
+        async fn new(post_action: PostUploadAction, script: Vec<Reply>) -> Self {
+            let UploadTestCtx { _dir: dir, mgr } = test_manager();
+            let mgr = Arc::new(mgr);
+            let record = mgr
+                .add_sink(UploadSinkRecord {
+                    id: String::new(),
+                    label: "Scripted".into(),
+                    config: ftp_config(),
+                    post_action,
+                    move_target: Some(dir.path().join("moved")),
+                    created_at: 0,
+                    last_used_at: None,
+                })
+                .await
+                .unwrap();
+            let sink = Arc::new(ScriptedSink {
+                script: StdMutex::new(script.into()),
+                calls: AtomicUsize::new(0),
+            });
+            let runtime: BoxedSink = sink.clone();
+            mgr.sink_runtimes
+                .lock()
+                .unwrap()
+                .insert(record.id.clone(), runtime);
+            Self {
+                dir,
+                mgr,
+                sink,
+                sink_id: record.id,
+            }
+        }
+
+        async fn limit_to_one(&self) {
+            self.mgr.set_max_concurrency(1).await.unwrap();
+            let sem = self.mgr.semaphore.read().await.clone();
+            while sem.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn local(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        async fn enqueue(&self, name: &str) -> String {
+            let path = self.local(name);
+            std::fs::write(&path, b"payload").unwrap();
+            self.mgr
+                .enqueue_for_file(
+                    name,
+                    path,
+                    format!("show/{name}"),
+                    None,
+                    "http",
+                    Some(self.sink_id.clone()),
+                    false,
+                )
+                .await;
+            self.mgr
+                .list_jobs()
+                .await
+                .into_iter()
+                .find(|j| j.gid == name)
+                .expect("job was not queued")
+                .id
+        }
+
+        async fn job(&self, id: &str) -> UploadJob {
+            self.mgr
+                .list_jobs()
+                .await
+                .into_iter()
+                .find(|j| j.id == id)
+                .expect("job disappeared")
+        }
+
+        async fn finished(&self, id: &str) -> UploadJob {
+            tokio::time::timeout(Duration::from_secs(600), async {
+                loop {
+                    let job = self.job(id).await;
+                    if !matches!(job.status, JobStatus::Queued | JobStatus::Active) {
+                        return job;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("job never finished")
+        }
+
+        async fn wait_for_calls(&self, n: usize) {
+            tokio::time::timeout(Duration::from_secs(600), async {
+                while self.sink.calls() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("sink was never called");
+        }
+
+        async fn free_permits(&self) -> usize {
+            self.mgr.semaphore.read().await.available_permits()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_error_is_retried_until_the_upload_succeeds() {
+        let h = JobHarness::new(PostUploadAction::Keep, vec![Reply::Transient, Reply::Done]).await;
+        let id = h.enqueue("ep01.mkv").await;
+
+        let job = h.finished(&id).await;
+        assert_eq!(job.status, JobStatus::Complete);
+        assert_eq!(job.error, None);
+        assert_eq!(job.uploaded, job.size);
+        assert_eq!(h.sink.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_errors_fail_the_job_after_the_last_attempt() {
+        let h = JobHarness::new(
+            PostUploadAction::Trash,
+            (0..MAX_UPLOAD_ATTEMPTS).map(|_| Reply::Transient).collect(),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let id = h.enqueue("ep01.mkv").await;
+
+        let job = h.finished(&id).await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.error.as_deref(), Some("connection reset"));
+        assert_eq!(h.sink.calls(), MAX_UPLOAD_ATTEMPTS as usize);
+        let waited: Duration = (1..MAX_UPLOAD_ATTEMPTS).map(upload_retry_delay).sum();
+        assert!(started.elapsed() >= waited);
+        assert!(h.local("ep01.mkv").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_error_fails_the_job_without_a_retry() {
+        let h = JobHarness::new(PostUploadAction::Trash, vec![Reply::Fatal, Reply::Done]).await;
+        let id = h.enqueue("ep01.mkv").await;
+
+        let job = h.finished(&id).await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.error.as_deref(), Some("permission denied"));
+        assert_eq!(h.sink.calls(), 1);
+        assert!(h.local("ep01.mkv").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_running_upload_frees_its_permit() {
+        let h = JobHarness::new(PostUploadAction::Trash, vec![Reply::Hang, Reply::Done]).await;
+        h.limit_to_one().await;
+        let first = h.enqueue("ep01.mkv").await;
+        h.wait_for_calls(1).await;
+        assert_eq!(h.job(&first).await.status, JobStatus::Active);
+        assert_eq!(h.free_permits().await, 0);
+
+        h.mgr.cancel_job(&first).await.unwrap();
+        assert_eq!(h.finished(&first).await.status, JobStatus::Cancelled);
+        assert_eq!(h.free_permits().await, 1);
+        assert!(h.local("ep01.mkv").exists());
+
+        let second = h.enqueue("ep02.mkv").await;
+        assert_eq!(h.finished(&second).await.status, JobStatus::Complete);
+        assert_eq!(h.sink.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_job_that_waits_for_a_permit_never_calls_the_sink() {
+        let h = JobHarness::new(PostUploadAction::Trash, vec![Reply::Hang]).await;
+        h.limit_to_one().await;
+        let first = h.enqueue("ep01.mkv").await;
+        h.wait_for_calls(1).await;
+
+        let second = h.enqueue("ep02.mkv").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(h.job(&second).await.status, JobStatus::Queued);
+
+        h.mgr.cancel_job(&second).await.unwrap();
+        assert_eq!(h.finished(&second).await.status, JobStatus::Cancelled);
+        assert_eq!(h.sink.calls(), 1);
+        assert!(h.local("ep02.mkv").exists());
+        assert_eq!(h.job(&first).await.status, JobStatus::Active);
+
+        h.mgr.cancel_job(&first).await.unwrap();
+        assert_eq!(h.finished(&first).await.status, JobStatus::Cancelled);
+        assert_eq!(h.free_permits().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trash_post_action_deletes_the_file_only_after_a_successful_upload() {
+        let h = JobHarness::new(PostUploadAction::Trash, vec![Reply::Fatal, Reply::Done]).await;
+        let failed = h.enqueue("ep01.mkv").await;
+        assert_eq!(h.finished(&failed).await.status, JobStatus::Failed);
+        assert!(h.local("ep01.mkv").exists());
+
+        let done = h.enqueue("ep02.mkv").await;
+        assert_eq!(h.finished(&done).await.status, JobStatus::Complete);
+        assert!(!h.local("ep02.mkv").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn move_post_action_moves_the_file_only_after_a_successful_upload() {
+        let h = JobHarness::new(PostUploadAction::Move, vec![Reply::Fatal, Reply::Done]).await;
+        let failed = h.enqueue("ep01.mkv").await;
+        assert_eq!(h.finished(&failed).await.status, JobStatus::Failed);
+        assert!(h.local("ep01.mkv").exists());
+        assert!(!h.local("moved/show/ep01.mkv").exists());
+
+        let done = h.enqueue("ep02.mkv").await;
+        assert_eq!(h.finished(&done).await.status, JobStatus::Complete);
+        assert!(!h.local("ep02.mkv").exists());
+        assert_eq!(
+            std::fs::read(h.local("moved/show/ep02.mkv")).unwrap(),
+            b"payload"
+        );
     }
 }

@@ -451,13 +451,21 @@ impl TorrentEngine {
             .ok_or_else(|| format!("torrent {torrent_id} not found"))?;
         let only_files = match raw.and_then(parse_select_file) {
             None => None,
-            Some(display) => Some(
-                handle
+            Some(display) => {
+                let indices = handle
                     .with_metadata(|meta| {
                         display_to_torrent_indices(&display, &meta.info.selectable_file_indices())
                     })
-                    .map_err(str::to_string)?,
-            ),
+                    .map_err(str::to_string)?;
+                if indices.is_empty() {
+                    tracing::warn!(
+                        "select-file matches none of the torrent's files; selecting everything"
+                    );
+                    None
+                } else {
+                    Some(indices)
+                }
+            }
         };
         handle.set_only_files(only_files).await
     }
@@ -1253,6 +1261,15 @@ pub(crate) fn display_to_torrent_indices(display: &[usize], selectable: &[usize]
         .collect()
 }
 
+pub(crate) fn selection_within(
+    indices: Vec<usize>,
+    file_count: usize,
+) -> Option<std::collections::HashSet<usize>> {
+    let kept: std::collections::HashSet<usize> =
+        indices.into_iter().filter(|&i| i < file_count).collect();
+    (!kept.is_empty()).then_some(kept)
+}
+
 pub(crate) fn torrent_to_display_indices(torrent: &[usize], selectable: &[usize]) -> Vec<usize> {
     torrent
         .iter()
@@ -1922,6 +1939,18 @@ mod tests {
         assert_eq!(
             initial_file_selection(&opts, None, Some(&selectable)),
             (Some(vec![1]), None)
+        );
+    }
+
+    #[test]
+    fn a_selection_outside_the_file_list_is_no_selection() {
+        use std::collections::HashSet;
+        assert_eq!(selection_within(vec![99], 3), None);
+        assert_eq!(selection_within(vec![], 3), None);
+        assert_eq!(selection_within(vec![1, 99], 3), Some(HashSet::from([1])));
+        assert_eq!(
+            selection_within(vec![0, 1, 2], 3),
+            Some(HashSet::from([0, 1, 2]))
         );
     }
 

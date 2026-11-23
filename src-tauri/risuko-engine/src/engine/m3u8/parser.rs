@@ -1,5 +1,7 @@
 use url::Url;
 
+use super::download::RequestHeaders;
+
 #[derive(Clone)]
 pub enum ParsedPlaylist {
     Master {
@@ -68,14 +70,15 @@ const PLAYLIST_FETCH_ATTEMPTS: u32 = 3;
 const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 const PLAYLIST_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub async fn fetch_and_parse_playlist(
+pub(super) async fn fetch_and_parse_playlist(
     url: &str,
     client: &risuko_http::Client,
+    headers: &RequestHeaders,
 ) -> Result<ParsedPlaylist, String> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match fetch_playlist_bytes(url, client).await {
+        match fetch_playlist_bytes(url, client, headers).await {
             Ok(bytes) => return parse_playlist_bytes(&bytes, url),
             Err(e) if attempt >= PLAYLIST_FETCH_ATTEMPTS => return Err(e),
             Err(_) => {
@@ -86,10 +89,15 @@ pub async fn fetch_and_parse_playlist(
     }
 }
 
-async fn fetch_playlist_bytes(url: &str, client: &risuko_http::Client) -> Result<Vec<u8>, String> {
+async fn fetch_playlist_bytes(
+    url: &str,
+    client: &risuko_http::Client,
+    headers: &RequestHeaders,
+) -> Result<Vec<u8>, String> {
     let fetch = async {
         let resp = client
             .get(url)
+            .headers(headers.for_url(url))
             .send()
             .await
             .map_err(|e| format!("Failed to fetch playlist: {e}"))?;
@@ -282,7 +290,10 @@ mod tests {
     async fn oversized_playlists_are_rejected() {
         let url = serve_body(MAX_PLAYLIST_BYTES + 1).await;
         let client = risuko_http::Client::builder().build().unwrap();
-        let error = fetch_playlist_bytes(&url, &client).await.unwrap_err();
+        let headers = RequestHeaders::new(&serde_json::Map::new(), &url);
+        let error = fetch_playlist_bytes(&url, &client, &headers)
+            .await
+            .unwrap_err();
         assert!(error.contains("Failed to read playlist body"), "{error}");
     }
 

@@ -34,18 +34,11 @@ import {
 import logger from "@shared/utils/logger";
 import { invoke } from "@tauri-apps/api/core";
 import { isEmpty } from "lodash";
+import { liveTaskOptions, liveUserOptions } from "@/utils/liveTaskOptions";
 import { fetchAllPages } from "@/utils/taskPages";
 
 const ENGINE_RESTART_USER_KEYS: string[] = ["engine-overrides", "rpc-host"];
 const P2P_RUNTIME_OPTION_KEYS = new Set([
-	"p2p-proxy",
-	"p2p-no-proxy",
-	"p2p-udp-proxy",
-	"p2p-udp-no-proxy",
-]);
-const PROXY_RUNTIME_OPTION_KEYS = new Set([
-	"all-proxy",
-	"no-proxy",
 	"p2p-proxy",
 	"p2p-no-proxy",
 	"p2p-udp-proxy",
@@ -143,17 +136,19 @@ export default class Api {
 		}
 
 		const result = await invoke("save_preference", { config });
-		if (!isEmpty(runtimeSystem)) {
+		const runtimeGlobal = {
+			...runtimeSystem,
+			...liveUserOptions(user as Record<string, unknown>),
+		};
+		if (!isEmpty(runtimeGlobal)) {
 			try {
-				await this.changeGlobalOption(runtimeSystem);
+				await this.changeGlobalOption(runtimeGlobal);
 			} catch (err) {
 				logger.warn("[Risuko] changeGlobalOption failed:", err?.message || err);
 			}
-			const activeTaskOptions = Object.fromEntries(
-				Object.entries(runtimeSystem).filter(
-					([key]) => !PROXY_RUNTIME_OPTION_KEYS.has(key),
-				),
-			);
+		}
+		if (!isEmpty(runtimeSystem)) {
+			const activeTaskOptions = liveTaskOptions(runtimeSystem);
 			if (!isEmpty(activeTaskOptions)) {
 				this.updateActiveTaskOption(activeTaskOptions);
 			}

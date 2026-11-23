@@ -49,6 +49,7 @@ pub(crate) fn check_out_name(out: &str) -> Result<(), String> {
         || [out, out.trim()].into_iter().any(|name| {
             let path = Path::new(name);
             name.starts_with(['/', '\\'])
+                || starts_at_home(name)
                 || path.has_root()
                 || matches!(path.components().next(), Some(Component::Prefix(_)))
         });
@@ -142,6 +143,11 @@ fn absolute_paths(dirs: impl Iterator<Item = String>) -> Vec<PathBuf> {
     dirs.map(|dir| PathBuf::from(dir.trim()))
         .filter(|path| path.is_absolute())
         .collect()
+}
+
+fn starts_at_home(name: &str) -> bool {
+    name.strip_prefix('~')
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
 }
 
 fn has_parent_step(path: &str) -> bool {
@@ -295,8 +301,8 @@ mod tests {
     fn roots_and_folders_compare_after_resolving() {
         let (_tmp, root) = download_root();
         let canonical = std::fs::canonicalize(&root).unwrap();
-        assert!(check_save_dir(&text(&root.join("sub")), &[canonical.clone()]).is_ok());
-        assert!(check_save_dir(&text(&canonical.join("sub")), &[root.clone()]).is_ok());
+        assert!(check_save_dir(&text(&root.join("sub")), std::slice::from_ref(&canonical)).is_ok());
+        assert!(check_save_dir(&text(&canonical.join("sub")), std::slice::from_ref(&root)).is_ok());
     }
 
     #[cfg(unix)]
@@ -319,7 +325,7 @@ mod tests {
     fn a_symlink_inside_a_root_that_stays_inside_passes() {
         let (_tmp, root) = download_root();
         std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).unwrap();
-        assert!(check_save_dir(&text(&root.join("alias")), &[root.clone()]).is_ok());
+        assert!(check_save_dir(&text(&root.join("alias")), std::slice::from_ref(&root)).is_ok());
     }
 
     fn ignores_case(tmp: &Path) -> bool {
@@ -419,7 +425,16 @@ mod tests {
 
     #[test]
     fn out_names_stay_inside_the_save_folder() {
-        for out in ["file.bin", "sub/name.bin", "a..b.bin", ".hidden", ""] {
+        for out in [
+            "file.bin",
+            "sub/name.bin",
+            "a..b.bin",
+            ".hidden",
+            "",
+            "~x.bin",
+            "sub/~/x.bin",
+            "~user/x.bin",
+        ] {
             assert!(check_out_name(out).is_ok(), "{out:?}");
         }
         for out in [
@@ -431,6 +446,11 @@ mod tests {
             "sub/.. ",
             "..\\x.bin",
             "\\x.bin",
+            "~",
+            "~/x.mp4",
+            " ~/x.mp4",
+            "~\\x.mp4",
+            "~/.config/autostart/x.desktop",
         ] {
             let error = check_out_name(out).unwrap_err();
             assert!(error.contains("not allowed for RPC clients"), "{error}");

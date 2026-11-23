@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Manager};
 
 use risuko_engine::engine;
+use risuko_engine::engine::manager::{media_downloads_supported, uri_kind, UriKind};
 use risuko_engine::engine::torrent;
 
 const TEMP_DOWNLOAD_SUFFIX: &str = ".part";
@@ -766,21 +767,14 @@ pub async fn add_uri(
             })
             .unwrap_or_else(|| infer_out_from_uri_inner(uri));
 
+        let kind = uri_kind(uri, &task_options);
         let is_media =
             engine::media::is_media_uri(uri) || engine::media::is_force_ytdlp(&task_options);
         let is_m3u8 = engine::m3u8::is_m3u8_uri(uri);
-        let legacy_kind = if engine::adc::is_adc_uri(uri) {
-            Some(engine::task::TaskKind::Adc)
-        } else if engine::gnutella::is_gnutella_uri(uri) {
-            Some(engine::task::TaskKind::Gnutella)
-        } else if engine::g2::is_g2_uri(uri) {
-            Some(engine::task::TaskKind::G2)
-        } else if engine::gift::is_gift_uri(uri) {
-            Some(engine::task::TaskKind::Gift)
-        } else {
-            None
-        };
-        let is_legacy_p2p = legacy_kind.is_some();
+        let is_legacy_p2p = engine::adc::is_adc_uri(uri)
+            || engine::gnutella::is_gnutella_uri(uri)
+            || engine::g2::is_g2_uri(uri)
+            || engine::gift::is_gift_uri(uri);
         if !is_m3u8 && !is_media && !is_legacy_p2p {
             let temp_out = ensure_temp_download_suffix(&preferred_out);
             if !temp_out.is_empty() {
@@ -790,32 +784,31 @@ pub async fn add_uri(
             task_options.insert("out".to_string(), Value::String(preferred_out));
         }
 
-        let result = if torrent::is_magnet_uri(uri) {
-            manager.add_magnet_task(uri, task_options).await
-        } else if is_nzb_url(uri) {
-            let mut fetch_options = global_options.clone();
-            fetch_options.extend(task_options.clone());
-            match fetch_nzb_url(uri, &fetch_options).await {
-                Ok(bytes) => {
-                    task_options
-                        .entry("usenet-source-name".to_string())
-                        .or_insert_with(|| Value::String(nzb_source_name_from_url(uri)));
-                    manager.add_nzb_task(bytes, task_options).await
+        let result = match kind {
+            UriKind::Magnet => manager.add_magnet_task(uri, task_options).await,
+            _ if is_nzb_url(uri) => {
+                let mut fetch_options = global_options.clone();
+                fetch_options.extend(task_options.clone());
+                match fetch_nzb_url(uri, &fetch_options).await {
+                    Ok(bytes) => {
+                        task_options
+                            .entry("usenet-source-name".to_string())
+                            .or_insert_with(|| Value::String(nzb_source_name_from_url(uri)));
+                        manager.add_nzb_task(bytes, task_options).await
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
             }
-        } else if is_m3u8 {
-            manager.add_m3u8_task(uri, task_options).await
-        } else if engine::ed2k::is_ed2k_uri(uri) {
-            manager.add_ed2k_task(uri, task_options).await
-        } else if engine::ftp::is_ftp_uri(uri) {
-            manager.add_ftp_task(uri, task_options).await
-        } else if is_media {
-            manager.add_media_task(uri, task_options).await
-        } else if let Some(kind) = legacy_kind {
-            manager.add_legacy_p2p_task(kind, uri, task_options).await
-        } else {
-            manager.add_http_task(vec![uri.clone()], task_options).await
+            UriKind::M3u8 => manager.add_m3u8_task(uri, task_options).await,
+            UriKind::Ed2k => manager.add_ed2k_task(uri, task_options).await,
+            UriKind::Ftp => manager.add_ftp_task(uri, task_options).await,
+            UriKind::Media => manager.add_media_task(uri, task_options).await,
+            UriKind::LegacyP2p(task_kind) => {
+                manager
+                    .add_legacy_p2p_task(task_kind, uri, task_options)
+                    .await
+            }
+            UriKind::Http => manager.add_http_task(vec![uri.clone()], task_options).await,
         };
         match result {
             Ok(gid) => results.push(Value::Array(vec![Value::String(gid)])),
@@ -857,6 +850,11 @@ pub async fn get_media_info(
     url: String,
     options: Option<Value>,
 ) -> Result<engine::media::MediaInfo, String> {
+    if !media_downloads_supported() {
+        return Err(
+            "Media-site downloads need yt-dlp, which is not available on Android".to_string(),
+        );
+    }
     let normalized = url.trim().to_string();
     if normalized.is_empty() {
         return Err("URL is required".to_string());

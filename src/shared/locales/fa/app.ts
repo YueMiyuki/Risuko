@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "به‌روزرسانی لغو شد",
 	"update-install": "نصب به‌روزرسانی",
 	"update-relaunch": "برای تکمیل به‌روزرسانی دوباره اجرا کنید",
+	"update-relaunching": "در حال راه‌اندازی دوباره Risuko…",
 	"update-progress": "پیشرفت به‌روزرسانی: {{progress}}%",
 	"update-error": "خطای به‌روزرسانی: {{error}}",
 	"update-unsigned": "به‌روزرسانی در این ساخت ارائه نمی‌شود",

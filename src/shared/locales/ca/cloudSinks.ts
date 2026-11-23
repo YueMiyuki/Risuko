@@ -75,6 +75,8 @@ export default {
 	errSftpAuthRequired:
 		"La contrasenya o la clau privada d'SFTP és obligatòria.",
 	errFtpHostRequired: "L'amfitrió FTP és obligatori.",
+	errSecretForNewServer:
+		"El servidor ha canviat, de manera que la contrasenya o la clau desades no es tornen a utilitzar. Torna-les a introduir.",
 	errMoveTargetRequired:
 		"La carpeta de destí és obligatòria quan l'acció posterior és moure.",
 	saving: "Desant…",

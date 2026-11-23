@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "ยกเลิกการอัปเดตแล้ว",
 	"update-install": "ติดตั้งการอัปเดต",
 	"update-relaunch": "เริ่มใหม่เพื่อเสร็จสิ้นการอัปเดต",
+	"update-relaunching": "กำลังเริ่ม Risuko ใหม่…",
 	"update-progress": "ความคืบหน้าการอัปเดต: {{progress}}%",
 	"update-error": "ข้อผิดพลาดในการอัปเดต: {{error}}",
 	"update-unsigned": "ไม่มีการอัปเดตสำหรับบิลด์นี้",

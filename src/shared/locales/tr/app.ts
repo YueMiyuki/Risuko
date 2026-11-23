@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "Güncelleme iptal edildi",
 	"update-install": "Güncellemeyi yükle",
 	"update-relaunch": "Güncellemeyi tamamlamak için yeniden başlatın",
+	"update-relaunching": "Risuko yeniden başlatılıyor…",
 	"update-progress": "Güncelleme ilerlemesi: {{progress}}%",
 	"update-error": "Güncelleme hatası: {{error}}",
 	"update-unsigned": "Bu derlemede güncellemeler kullanılamıyor",

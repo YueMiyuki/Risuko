@@ -200,6 +200,10 @@ export default {
 	"uri-selector-feedback": "Phản hồi (loại bỏ máy chủ gương chậm/lỗi)",
 	"uri-selector-inorder": "Theo thứ tự (thử máy chủ gương từ trái sang phải)",
 	"uri-selector-adaptive": "Thích ứng (ưu tiên nhanh nhất)",
+	"send-auth-to-all-mirrors":
+		"Gửi thông tin đăng nhập tới mọi máy chủ gương HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Gửi header Authorization của tác vụ tới mọi máy chủ gương HTTPS. Khi tắt, chỉ máy chủ gương có cùng giao thức, host và cổng với liên kết đầu tiên mới nhận được.",
 	"unit-seconds": "giây",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Lưu trữ",

@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Η ενημέρωση ακυρώθηκε",
 	"update-install": "Εγκατάσταση ενημέρωσης",
 	"update-relaunch": "Επανεκκινήστε για να ολοκληρωθεί η ενημέρωση",
+	"update-relaunching": "Επανεκκίνηση του Risuko…",
 	"update-progress": "Πρόοδος ενημέρωσης: {{progress}}%",
 	"update-error": "Σφάλμα ενημέρωσης: {{error}}",
 	"update-unsigned": "Οι ενημερώσεις δεν είναι διαθέσιμες σε αυτή την έκδοση",

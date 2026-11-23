@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Pembaruan dibatalkan",
 	"update-install": "Pasang pembaruan",
 	"update-relaunch": "Mulai ulang untuk menyelesaikan pembaruan",
+	"update-relaunching": "Memulai ulang Risuko…",
 	"update-progress": "Progres pembaruan: {{progress}}%",
 	"update-error": "Kesalahan pembaruan: {{error}}",
 	"update-unsigned": "Pembaruan tidak tersedia pada build ini",

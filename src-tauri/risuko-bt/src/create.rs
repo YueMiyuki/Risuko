@@ -14,7 +14,9 @@ use sha1::{Digest, Sha1};
 use super::bencode::{encode_to_vec, Value};
 use super::core::hash::{sha1, sha256, Id20, Id32};
 use super::core::merkle::{blocks_root, piece_layer_root, piece_root, BLOCK_SIZE};
-use super::core::metainfo::{is_parts_dir_name, is_safe_component, parse_torrent, MetaVersion};
+use super::core::metainfo::{
+    is_parts_dir_name, is_safe_component, parse_torrent, MetaVersion, MAX_PIECES,
+};
 use super::core::peer_id::CLIENT_VERSION;
 use super::tracker::http::QUERY_SAFE;
 
@@ -39,6 +41,8 @@ pub enum CreateError {
     Empty,
     #[error("piece length must be a power of two between 16 KiB and 64 MiB")]
     BadPieceLength,
+    #[error("{pieces} pieces would be needed, more than the {limit} a torrent may have; choose a larger piece size")]
+    TooManyPieces { pieces: u64, limit: u64 },
     #[error("{} changed while it was being hashed", .0.display())]
     Changed(PathBuf),
     #[error("cancelled")]
@@ -119,6 +123,33 @@ pub fn auto_piece_length(total_length: u64) -> u32 {
     length
 }
 
+fn check_piece_count(
+    version: MetaVersion,
+    piece_length: u32,
+    file_lengths: impl Iterator<Item = u64>,
+) -> Result<(), CreateError> {
+    let piece = piece_length as u64;
+    let (total, aligned) = file_lengths.fold((0u64, 0u64), |(total, aligned), length| {
+        (
+            total.saturating_add(length),
+            aligned.saturating_add(length.div_ceil(piece)),
+        )
+    });
+    let by_total = total.div_ceil(piece);
+    let pieces = match version {
+        MetaVersion::V1 => by_total,
+        MetaVersion::V2 => aligned,
+        MetaVersion::Hybrid => by_total.max(aligned),
+    };
+    if pieces > MAX_PIECES {
+        return Err(CreateError::TooManyPieces {
+            pieces,
+            limit: MAX_PIECES,
+        });
+    }
+    Ok(())
+}
+
 pub fn throttled(interval: Duration, mut report: impl FnMut(u64, u64)) -> impl FnMut(u64, u64) {
     let mut last: Option<Instant> = None;
     move |done, total| {
@@ -160,6 +191,7 @@ pub fn plan(root: &Path, opts: &CreateOptions) -> Result<Plan, CreateError> {
         Some(_) => return Err(CreateError::BadPieceLength),
         None => auto_piece_length(total_length),
     };
+    check_piece_count(opts.version, piece_length, files.iter().map(|f| f.length))?;
     Ok(Plan {
         root,
         name,
@@ -1304,5 +1336,28 @@ mod tests {
         assert_eq!(auto_piece_length(1500 * 256 * 1024), 256 * 1024);
         assert_eq!(auto_piece_length(1501 * 256 * 1024), 512 * 1024);
         assert_eq!(auto_piece_length(u64::MAX), AUTO_MAX_PIECE_LENGTH);
+    }
+
+    #[test]
+    fn a_piece_size_too_small_for_the_data_is_refused() {
+        let gib64 = 64u64 * 1024 * 1024 * 1024;
+        assert!(check_piece_count(MetaVersion::V1, MIN_PIECE_LENGTH, [gib64].into_iter()).is_ok());
+        assert!(matches!(
+            check_piece_count(MetaVersion::V1, MIN_PIECE_LENGTH, [gib64 + 1].into_iter()),
+            Err(CreateError::TooManyPieces {
+                pieces: 4_194_305,
+                limit: MAX_PIECES
+            })
+        ));
+        let many = || std::iter::repeat_n(1u64, 4_194_305);
+        assert!(matches!(
+            check_piece_count(MetaVersion::V2, MIN_PIECE_LENGTH, many()),
+            Err(CreateError::TooManyPieces { .. })
+        ));
+        assert!(matches!(
+            check_piece_count(MetaVersion::Hybrid, MIN_PIECE_LENGTH, many()),
+            Err(CreateError::TooManyPieces { .. })
+        ));
+        assert!(check_piece_count(MetaVersion::V1, MIN_PIECE_LENGTH, many()).is_ok());
     }
 }

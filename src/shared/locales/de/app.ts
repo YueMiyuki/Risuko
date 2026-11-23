@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Update abgebrochen",
 	"update-install": "Update installieren",
 	"update-relaunch": "Zum Abschließen des Updates neu starten",
+	"update-relaunching": "Risuko wird neu gestartet…",
 	"update-progress": "Update-Fortschritt: {{progress}}%",
 	"update-error": "Update-Fehler: {{error}}",
 	"update-unsigned": "Updates sind in diesem Build nicht verfügbar",

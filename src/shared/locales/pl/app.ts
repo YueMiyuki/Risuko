@@ -29,6 +29,7 @@ export default {
 	"update-cancelled": "Anulowano aktualizację",
 	"update-install": "Zainstaluj aktualizację",
 	"update-relaunch": "Uruchom ponownie, aby ukończyć aktualizację",
+	"update-relaunching": "Ponowne uruchamianie Risuko…",
 	"update-progress": "Postęp aktualizacji: {{progress}}%",
 	"update-error": "Błąd aktualizacji: {{error}}",
 	"update-unsigned": "Aktualizacje są niedostępne w tej kompilacji",

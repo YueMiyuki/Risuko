@@ -75,6 +75,7 @@ export interface DownloadTask {
 	metaVersion?: "v1" | "v2" | "hybrid";
 	bittorrent?: BitTorrentInfo;
 	seeder?: string;
+	seedingTime?: string;
 	numSeeders?: string;
 	swarmSeeders?: string;
 	swarmLeechers?: string;

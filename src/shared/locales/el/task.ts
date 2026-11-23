@@ -334,6 +334,8 @@ export default {
 	"media-format-hint":
 		"Ανακτήστε τις μορφές για να επιλέξετε συγκεκριμένη ποιότητα.",
 	"media-format-error": "Δεν ήταν δυνατή η φόρτωση των μορφών για αυτό το URL.",
+	"media-unsupported-android":
+		"Οι λήψεις από ιστότοπους πολυμέσων απαιτούν το yt-dlp, το οποίο δεν είναι διαθέσιμο στο Android",
 	"download-complete-message": "Η λήψη του {{taskName}} ολοκληρώθηκε",
 	"download-complete-notify": "Η λήψη ολοκληρώθηκε",
 	"bt-download-complete-message":
@@ -381,6 +383,15 @@ export default {
 	"mirror-placeholder": "URL καθρέφτη (ίδιο αρχείο, άλλος διακομιστής)",
 	"mirror-hint":
 		"Προσθέστε URL καθρεφτών που δείχνουν στο ίδιο αρχείο για λήψη από πολλές πηγές ταυτόχρονα.",
+	"mirror-sources": "{{count}} πηγές",
+	"mirror-failing": "Αποτυγχάνει",
+	"mirror-idle": "Εκτός χρήσης",
+	"add-tab-links": "Σύνδεσμοι",
+	"add-tab-mirrors": "Καθρέφτες",
+	"mirror-list-placeholder": "URL καθρεφτών ενός αρχείου, ένα ανά γραμμή",
+	"mirror-list-hint":
+		"Κάθε σύνδεσμος πρέπει να δείχνει στο ίδιο αρχείο. Τα τμήματά του λαμβάνονται από όλους τους καθρέφτες ταυτόχρονα, και ένας καθρέφτης που αποτυγχάνει ή επιβραδύνεται παραδίδει τα τμήματά του στους άλλους.",
+	"mirror-list-rejected": "Δεν είναι απλός σύνδεσμος αρχείου http(s):",
 	"detail-tab-general": "Γενικά",
 	"detail-tab-activity": "Δραστηριότητα",
 	"detail-tab-trackers": "Trackers",
@@ -411,6 +422,34 @@ export default {
 	"edit-speed-limit-placeholder": "0 ή κενό = χωρίς όριο (π.χ. 500K)",
 	"edit-primary-uri": "URL λήψης",
 	"edit-primary-uri-placeholder": "Κύριο URL λήψης",
+	"edit-tab-seeding": "Διαμοιρασμός",
+	"seeding-rule-global": "Χρήση της καθολικής ρύθμισης",
+	"seeding-rule-forever": "Διαμοιρασμός μέχρι να τον σταματήσω",
+	"seeding-rule-limits": "Διακοπή σε αναλογία ή μετά από χρόνο",
+	"seeding-rule-none": "Χωρίς διαμοιρασμό",
+	"seeding-global-off": "Αυτή τη στιγμή: χωρίς διαμοιρασμό",
+	"seeding-global-forever": "Αυτή τη στιγμή: διαμοιρασμός μέχρι τη διακοπή",
+	"seeding-global-ratio": "Αυτή τη στιγμή: διακοπή στην αναλογία {{ratio}}",
+	"seeding-global-minutes":
+		"Αυτή τη στιγμή: διακοπή μετά από {{minutes}} λεπτά",
+	"seeding-global-both":
+		"Αυτή τη στιγμή: διακοπή στην αναλογία {{ratio}} ή μετά από {{minutes}} λεπτά",
+	"seeding-limits-hint":
+		"Ο διαμοιρασμός σταματά στο πρώτο όριο που θα επιτευχθεί. Το 0 σημαίνει ότι δεν υπάρχει όριο αυτού του είδους.",
+	"seeding-limits-required":
+		"Εισαγάγετε μια αναλογία ή έναν αριθμό λεπτών μεγαλύτερο από 0",
+	"seeding-for": "Διάρκεια διαμοιρασμού",
+	"seeding-applies-after-download": "Αυτό ισχύει όταν ολοκληρωθεί η λήψη.",
+	"seeding-stops-now":
+		"Αυτή η εργασία σταματά τον διαμοιρασμό όταν αποθηκεύσετε.",
+	"seeding-limit-reached":
+		"Αυτή η εργασία έχει ήδη φτάσει σε αυτό το όριο και σταματά τον διαμοιρασμό όταν αποθηκεύσετε.",
+	"seeding-in-place-note":
+		"Τα torrent που δημιουργήσατε διαμοιράζονται μέχρι να τα σταματήσετε.",
+	"seeding-ed2k-sharing-off":
+		"Η κοινή χρήση μέσω eD2K είναι απενεργοποιημένη στις Προτιμήσεις, οπότε αυτή η εργασία δεν θα ανεβάσει τίποτα.",
+	"seeding-leftover-values":
+		"Αυτή η εργασία έχει τιμές διαμοιρασμού από προηγούμενη αλλαγή ρυθμίσεων. Η αποθήκευση τις αντικαθιστά.",
 	"create-torrent": "Δημιουργία Torrent",
 	"create-torrent-menu": "Δημιουργία Torrent...",
 	"create-torrent-source": "Αρχείο ή φάκελος για κοινή χρήση",

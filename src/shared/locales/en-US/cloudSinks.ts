@@ -73,6 +73,8 @@ export default {
 	errSftpUsernameRequired: "SFTP username is required.",
 	errSftpAuthRequired: "SFTP password or private key is required.",
 	errFtpHostRequired: "FTP host is required.",
+	errSecretForNewServer:
+		"The server changed, so the saved password or key is not reused. Enter it again.",
 	errMoveTargetRequired: "Move-to folder is required when post-action is move.",
 	saving: "Saving…",
 	recentJobs: "Recent Uploads",

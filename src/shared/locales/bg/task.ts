@@ -332,6 +332,8 @@ export default {
 	"media-format-hint":
 		"Извлечете форматите, за да изберете конкретно качество.",
 	"media-format-error": "Форматите за този URL не можаха да бъдат заредени.",
+	"media-unsupported-android":
+		"За изтегляне от медийни сайтове е необходим yt-dlp, който не е наличен на Android",
 	"download-complete-message": "Завършено изтегляне {{taskName}}",
 	"download-complete-notify": "изтеглянето Завършено",
 	"bt-download-complete-message": "завършено изтегляне {{taskName}}, раздаване",
@@ -377,6 +379,16 @@ export default {
 	"mirror-placeholder": "URL на огледало (същият файл, друг сървър)",
 	"mirror-hint":
 		"Добавете URL адреси на огледала, които сочат към същия файл, за да изтегляте от няколко източника едновременно.",
+	"mirror-sources": "Източници: {{count}}",
+	"mirror-failing": "Неуспешно",
+	"mirror-idle": "Не се използва",
+	"add-tab-links": "Връзки",
+	"add-tab-mirrors": "Огледала",
+	"mirror-list-placeholder":
+		"URL адреси на огледала за един файл, по един на ред",
+	"mirror-list-hint":
+		"Всички връзки трябва да сочат към един и същ файл. Частите му се изтеглят от всички огледала едновременно, а огледало, което се провали или забави, предава частите си на другите.",
+	"mirror-list-rejected": "Не е обикновена http(s) връзка към файл:",
 	"detail-tab-general": "Общи",
 	"detail-tab-activity": "Активност",
 	"detail-tab-trackers": "Тракери",
@@ -407,6 +419,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 или празно = без ограничение (напр. 500K)",
 	"edit-primary-uri": "URL за изтегляне",
 	"edit-primary-uri-placeholder": "Основен URL за изтегляне",
+	"edit-tab-seeding": "Засяване",
+	"seeding-rule-global": "Използвай глобалната настройка",
+	"seeding-rule-forever": "Засявай, докато не го спра",
+	"seeding-rule-limits": "Спри при съотношение или след време",
+	"seeding-rule-none": "Не засявай",
+	"seeding-global-off": "В момента: без засяване",
+	"seeding-global-forever": "В момента: засяване, докато не бъде спряно",
+	"seeding-global-ratio": "В момента: спиране при съотношение {{ratio}}",
+	"seeding-global-minutes": "В момента: спиране след {{minutes}} минути",
+	"seeding-global-both":
+		"В момента: спиране при съотношение {{ratio}} или след {{minutes}} минути",
+	"seeding-limits-hint":
+		"Засяването спира при първото достигнато ограничение. 0 означава без ограничение от този вид.",
+	"seeding-limits-required": "Въведете съотношение или брой минути над 0",
+	"seeding-for": "Продължителност на засяването",
+	"seeding-applies-after-download":
+		"Това се прилага, когато изтеглянето приключи.",
+	"seeding-stops-now": "Тази задача спира засяването при запазване.",
+	"seeding-limit-reached":
+		"Тази задача вече е достигнала това ограничение и спира засяването при запазване.",
+	"seeding-in-place-note":
+		"Торентите, които сте създали, се засяват, докато не ги спрете.",
+	"seeding-ed2k-sharing-off":
+		"Споделянето през eD2K е изключено в Настройки, затова тази задача няма да качва.",
+	"seeding-leftover-values":
+		"Тази задача има стойности за засяване от по-ранна промяна на настройките. Запазването ги заменя.",
 	"create-torrent": "Създай торент",
 	"create-torrent-menu": "Създай торент...",
 	"create-torrent-source": "Файл или папка за споделяне",

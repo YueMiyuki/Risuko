@@ -32,6 +32,8 @@ src-tauri/gen/*
 !src-tauri/gen/android/**
 
 *.node
+packages/risuko-cli/npm/*/risuko
+packages/risuko-cli/npm/*/risuko.exe
 
 content
 debugging

@@ -930,23 +930,13 @@ async fn check_bittorrent(
     out
 }
 
-async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck {
-    use risuko_http::{ClientBuilder, Method};
-    use tokio::task::JoinSet;
+const PER_TRACKER_TIMEOUT: Duration = Duration::from_secs(3);
 
-    const MAX_CONCURRENCY: usize = 8;
-    const PER_TRACKER_TIMEOUT: Duration = Duration::from_secs(3);
-
-    let proxy = match options.p2p_proxy_connector() {
-        Ok(proxy) => proxy,
-        Err(e) => {
-            return HealthCheck::skipped(
-                "trackers",
-                format!("P2P proxy is misconfigured ({e}) — tracker probe skipped"),
-            );
-        }
-    };
-    let mut builder = ClientBuilder::new()
+fn tracker_probe_client(
+    url: &str,
+    proxy: &risuko_http::ProxyConnector,
+) -> Result<risuko_http::Client, String> {
+    let mut builder = risuko_bt::tracker::http::probe_client_builder(url)
         .timeout(PER_TRACKER_TIMEOUT)
         .connect_timeout(PER_TRACKER_TIMEOUT);
     if let Some(route) = proxy.proxy() {
@@ -955,11 +945,46 @@ async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck
     if let Some(bypass) = proxy.no_proxy() {
         builder = builder.no_proxy(bypass);
     }
+    builder.build().map_err(|e| e.to_string())
+}
 
-    let client = match builder.build() {
-        Ok(c) => c,
+async fn probe_one(url: String, proxy: risuko_http::ProxyConnector) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("udp://") || lower.starts_with("ws://") || lower.starts_with("wss://") {
+        return "skipped";
+    }
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return "skipped";
+    }
+    let Ok(client) = tracker_probe_client(&url, &proxy) else {
+        return "fail";
+    };
+    match client.request(risuko_http::Method::HEAD, &url).send().await {
+        Ok(resp) => {
+            let s = resp.status();
+            if s.is_success() || s.is_redirection() || s.as_u16() == 400 {
+                "ok"
+            } else {
+                "warn"
+            }
+        }
+        Err(_) => "fail",
+    }
+}
+
+async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck {
+    use tokio::task::JoinSet;
+
+    const MAX_CONCURRENCY: usize = 8;
+    const MAX_PROBED_TRACKERS: usize = 50;
+
+    let proxy = match options.p2p_proxy_connector() {
+        Ok(proxy) => proxy,
         Err(e) => {
-            return HealthCheck::fail("trackers", format!("Probe client init failed: {e}"), None);
+            return HealthCheck::skipped(
+                "trackers",
+                format!("P2P proxy is misconfigured ({e}) — tracker probe skipped"),
+            );
         }
     };
 
@@ -971,35 +996,12 @@ async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck
         skipped: usize,
     }
 
-    async fn probe_one(client: risuko_http::Client, url: String) -> &'static str {
-        let lower = url.to_ascii_lowercase();
-        if lower.starts_with("udp://") || lower.starts_with("ws://") || lower.starts_with("wss://")
-        {
-            return "skipped";
-        }
-        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-            return "skipped";
-        }
-        match client.request(Method::HEAD, &url).send().await {
-            Ok(resp) => {
-                let s = resp.status();
-                if s.is_success() || s.is_redirection() || s.as_u16() == 400 {
-                    "ok"
-                } else {
-                    "warn"
-                }
-            }
-            Err(_) => "fail",
-        }
-    }
-
     let mut counts = Counts::default();
-    let mut iter = urls.iter().cloned();
+    let mut iter = urls.iter().take(MAX_PROBED_TRACKERS).cloned();
     let mut set: JoinSet<&'static str> = JoinSet::new();
     for _ in 0..MAX_CONCURRENCY {
         if let Some(url) = iter.next() {
-            let c = client.clone();
-            set.spawn(async move { probe_one(c, url).await });
+            set.spawn(probe_one(url, proxy.clone()));
         } else {
             break;
         }
@@ -1013,8 +1015,7 @@ async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck
             _ => counts.skipped += 1,
         }
         if let Some(url) = iter.next() {
-            let c = client.clone();
-            set.spawn(async move { probe_one(c, url).await });
+            set.spawn(probe_one(url, proxy.clone()));
         }
     }
 
@@ -1025,6 +1026,7 @@ async fn probe_trackers(urls: &[String], options: &EngineOptions) -> HealthCheck
         "warn": counts.warn,
         "fail": counts.fail,
         "skipped": counts.skipped,
+        "notProbed": urls.len().saturating_sub(MAX_PROBED_TRACKERS),
     });
     let msg = format!(
         "Trackers: {} ok, {} warn, {} fail, {} skipped (of {})",
@@ -1685,9 +1687,7 @@ fn cached_tool_facts() -> Option<ToolFacts> {
 }
 
 async fn probe_tool_facts() -> ToolFacts {
-    let yt_dlp = tokio::process::Command::new("yt-dlp")
-        .arg("--version")
-        .output()
+    let yt_dlp = media::probe_output("yt-dlp", "--version")
         .await
         .ok()
         .filter(|o| o.status.success())
@@ -1702,9 +1702,7 @@ async fn probe_tool_facts() -> ToolFacts {
 
     let ffmpeg = match media::find_ffmpeg().await {
         Some(path) => Some(
-            tokio::process::Command::new(&path)
-                .arg("-version")
-                .output()
+            media::probe_output(&path, "-version")
                 .await
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1785,6 +1783,38 @@ fn tail_count_levels(path: &Path) -> std::io::Result<(usize, usize)> {
 mod tests {
     use super::*;
     use serde_json::{json, Map};
+
+    async fn serve_empty_ok() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = stream.read(&mut [0u8; 4096]).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn the_tracker_probe_refuses_local_addresses_off_the_announce_path() {
+        let port = serve_empty_ok().await;
+        let options = EngineOptions::from_config(&Map::new(), &Map::new());
+        let proxy = options.p2p_proxy_connector().unwrap();
+
+        let off_path = format!("http://127.0.0.1:{port}/scrape.php");
+        assert_eq!(probe_one(off_path, proxy.clone()).await, "fail");
+
+        let announce = format!("http://127.0.0.1:{port}/announce");
+        assert_eq!(probe_one(announce, proxy).await, "ok");
+    }
 
     fn kad_options(enabled: bool, port: Value) -> EngineOptions {
         let mut system = Map::new();

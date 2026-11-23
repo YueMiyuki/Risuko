@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Обновление отменено",
 	"update-install": "Установить обновление",
 	"update-relaunch": "Перезапустите приложение для завершения обновления",
+	"update-relaunching": "Перезапуск Risuko…",
 	"update-progress": "Ход обновления: {{progress}}%",
 	"update-error": "Ошибка обновления: {{error}}",
 	"update-unsigned": "Обновления недоступны в этой сборке",

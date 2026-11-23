@@ -327,6 +327,27 @@ fn verify_or_repair_one_set(
     cancel: Option<&CancellationToken>,
     mode: SetMode,
 ) -> Result<Par2RepairResult, Par2Error> {
+    let links_work = hard_links_work(&request.destination);
+    verify_or_repair_one_set_with(
+        request,
+        data_by_name,
+        parity,
+        cancel,
+        mode,
+        links_work,
+        &|path| fs4::available_space(path),
+    )
+}
+
+fn verify_or_repair_one_set_with(
+    request: &Par2RepairRequest,
+    data_by_name: &HashMap<String, &Par2InputFile>,
+    parity: &ValidatedParityFiles,
+    cancel: Option<&CancellationToken>,
+    mode: SetMode,
+    links_work: bool,
+    available_space: &dyn Fn(&Path) -> io::Result<u64>,
+) -> Result<Par2RepairResult, Par2Error> {
     let limits = request.limits;
     let (file_set, source) = parse_index(
         &parity.files,
@@ -336,7 +357,12 @@ fn verify_or_repair_one_set(
     )?;
     validate_task_budget(request, source, parity.total)?;
     validate_verification_resources(&file_set)?;
-    ensure_staging_space(request, 0, parity.total.bytes)?;
+    ensure_staging_space(
+        request,
+        staging_write_bytes(links_work, source.bytes, 0)?,
+        parity.total.bytes,
+        available_space,
+    )?;
     let stage = tempfile::Builder::new()
         .prefix(".risuko-par2-")
         .tempdir_in(&request.destination)
@@ -411,7 +437,17 @@ fn verify_or_repair_one_set(
                 .any(|name| name == &file.filename)
         })
         .fold(0u64, |total, file| total.saturating_add(file.size));
-    ensure_staging_space(request, changed_bytes, parity.total.bytes)?;
+    let intact_bytes = file_set
+        .files
+        .values()
+        .filter(|file| intact.contains(file.filename.as_str()))
+        .fold(0u64, |total, file| total.saturating_add(file.size));
+    ensure_staging_space(
+        request,
+        staging_write_bytes(links_work, intact_bytes, changed_bytes)?,
+        parity.total.bytes,
+        available_space,
+    )?;
     let repair_dir = stage.path().join("repair");
     fs::create_dir(&repair_dir)?;
     stage_parity_files(&repair_dir, &request.parity_files, cancel)?;
@@ -1245,10 +1281,38 @@ fn validate_task_budget(
     Ok(())
 }
 
+fn hard_links_work(dir: &Path) -> bool {
+    let Ok(source) = tempfile::Builder::new()
+        .prefix(".risuko-par2-link-")
+        .tempfile_in(dir)
+        .map(tempfile::NamedTempFile::into_temp_path)
+    else {
+        return false;
+    };
+    tempfile::Builder::new()
+        .prefix(".risuko-par2-link-")
+        .make_in(dir, |path| fs::hard_link(&source, path))
+        .is_ok()
+}
+
+fn staging_write_bytes(
+    links_work: bool,
+    linked_bytes: u64,
+    copied_bytes: u64,
+) -> Result<u64, Par2Error> {
+    if links_work {
+        return Ok(copied_bytes);
+    }
+    copied_bytes
+        .checked_add(linked_bytes)
+        .ok_or_else(|| Par2Error::Limits("PAR2 staging size overflowed".into()))
+}
+
 fn ensure_staging_space(
     request: &Par2RepairRequest,
     source_bytes: u64,
     parity_bytes: u64,
+    available_space: &dyn Fn(&Path) -> io::Result<u64>,
 ) -> Result<(), Par2Error> {
     let staging_bytes = source_bytes
         .checked_add(parity_bytes)
@@ -1256,7 +1320,7 @@ fn ensure_staging_space(
     let required = staging_bytes
         .checked_add(request.limits.free_space_reserve_bytes)
         .ok_or_else(|| Par2Error::Limits("PAR2 staging reserve overflowed".into()))?;
-    let available = fs4::available_space(&request.destination)?;
+    let available = available_space(&request.destination)?;
     if available < required {
         return Err(Par2Error::Limits(
             "insufficient free space for PAR2 staging and reserve".into(),
@@ -2899,5 +2963,342 @@ pub(crate) mod tests {
         assert!(promote_outputs(&stage, &names, &inputs, None).is_err());
         assert!(!dir.path().join("a.bin").exists());
         assert_eq!(fs::read(stage.join("a.bin")).unwrap(), b"a");
+    }
+
+    #[test]
+    fn staging_space_with_hard_links_is_the_same_as_before() {
+        assert_eq!(staging_write_bytes(true, 300, 0).unwrap(), 0);
+        assert_eq!(staging_write_bytes(true, 200, 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn staging_space_without_hard_links_counts_the_linked_files_as_copies() {
+        assert_eq!(staging_write_bytes(false, 300, 0).unwrap(), 300);
+        assert_eq!(staging_write_bytes(false, 200, 100).unwrap(), 300);
+        assert!(matches!(
+            staging_write_bytes(false, u64::MAX, 1),
+            Err(Par2Error::Limits(_))
+        ));
+    }
+
+    #[test]
+    fn hard_links_work_in_a_temp_folder_and_the_probe_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(hard_links_work(dir.path()));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(!hard_links_work(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn staging_without_hard_links_is_refused_before_anything_is_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let parity_dir = tempfile::tempdir().unwrap();
+        let complete = b"ABCDEFGH";
+        let parity_files = write_fixture(parity_dir.path(), "data.bin", complete, true);
+        fs::write(dir.path().join("data.bin.part"), complete).unwrap();
+        let mut request = repair_request(dir.path(), parity_files);
+        request.required_incomplete_names.clear();
+        let data_by_name = validate_input_files(&request.data_files, request.limits).unwrap();
+        let parity = validate_parity_files(&request.parity_files).unwrap();
+        let parity_bytes = parity.total.bytes;
+        let available_space = |_: &Path| Ok(parity_bytes);
+
+        let error = verify_or_repair_one_set_with(
+            &request,
+            &data_by_name,
+            &parity,
+            None,
+            SetMode::Apply,
+            false,
+            &available_space,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Par2Error::Limits(ref message)
+                if message == "insufficient free space for PAR2 staging and reserve"
+        ));
+        let entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("data.bin.part")]);
+
+        let result = verify_or_repair_one_set_with(
+            &request,
+            &data_by_name,
+            &parity,
+            None,
+            SetMode::Apply,
+            true,
+            &available_space,
+        )
+        .unwrap();
+
+        assert_eq!(result.report.outcome, Par2Outcome::Verified);
+        assert_eq!(fs::read(dir.path().join("data.bin")).unwrap(), complete);
+    }
+
+    fn bench_env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn write_bench_data(path: &Path, seed: u64, bytes: u64) {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut chunk = vec![0u8; 1024 * 1024];
+        for word in chunk.as_chunks_mut::<8>().0 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *word = state.to_le_bytes();
+        }
+        let mut file = fs::File::create(path).unwrap();
+        let mut written = 0u64;
+        let mut counter = 0u64;
+        while written < bytes {
+            chunk[..8].copy_from_slice(&counter.to_le_bytes());
+            let take = (bytes - written).min(chunk.len() as u64) as usize;
+            file.write_all(&chunk[..take]).unwrap();
+            written += take as u64;
+            counter += 1;
+        }
+        file.sync_all().unwrap();
+    }
+
+    fn bench_index(
+        set_id: [u8; 16],
+        slice_bytes: usize,
+        files: &[([u8; 16], String, PathBuf)],
+    ) -> Vec<u8> {
+        let mut index = Vec::new();
+        let mut main = Vec::new();
+        main.extend_from_slice(&(slice_bytes as u64).to_le_bytes());
+        main.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (file_id, _, _) in files {
+            main.extend_from_slice(file_id);
+        }
+        index.extend_from_slice(&build_packet(set_id, TYPE_MAIN, &main));
+        for (file_id, name, path) in files {
+            let data = fs::read(path).unwrap();
+            let mut desc = Vec::new();
+            desc.extend_from_slice(file_id);
+            desc.extend_from_slice(&md5(&data));
+            desc.extend_from_slice(&md5(&data[..data.len().min(16_384)]));
+            desc.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            desc.extend_from_slice(name.as_bytes());
+            desc.push(0);
+            while desc.len() % 4 != 0 {
+                desc.push(0);
+            }
+            index.extend_from_slice(&build_packet(set_id, TYPE_FILE_DESC, &desc));
+            let mut ifsc = Vec::new();
+            ifsc.extend_from_slice(file_id);
+            for chunk in data.chunks(slice_bytes) {
+                let mut block = chunk.to_vec();
+                block.resize(slice_bytes, 0);
+                ifsc.extend_from_slice(&md5(&block));
+                ifsc.extend_from_slice(
+                    &crate::engine::usenet_pipeline::crc32(&block).to_le_bytes(),
+                );
+            }
+            index.extend_from_slice(&build_packet(set_id, TYPE_IFSC, &ifsc));
+        }
+        index
+    }
+
+    #[cfg(unix)]
+    fn staged_copy_bytes(dir: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        let mut total = 0u64;
+        let mut pending = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".risuko-par2-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.extend(
+                    fs::read_dir(&path)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path()),
+                );
+            } else if metadata.nlink() == 1 {
+                total += metadata.blocks() * 512;
+            }
+        }
+        total
+    }
+
+    #[cfg(unix)]
+    fn sample_staging(
+        dir: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<(u64, u64)> {
+        std::thread::spawn(move || {
+            let mut lowest = u64::MAX;
+            let mut peak_copies = 0u64;
+            loop {
+                if let Ok(available) = fs4::available_space(&dir) {
+                    lowest = lowest.min(available);
+                }
+                peak_copies = peak_copies.max(staged_copy_bytes(&dir));
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break (lowest, peak_copies);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_verification_staging() {
+        let base = std::env::var_os("RISUKO_PAR2_BENCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let file_count = bench_env_u64("RISUKO_PAR2_BENCH_FILES", 6) as usize;
+        let file_bytes = bench_env_u64("RISUKO_PAR2_BENCH_FILE_MIB", 50) * 1024 * 1024;
+        let slice_bytes = 1024 * 1024;
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let workdir = tempfile::tempdir_in(&base).unwrap();
+        let dir = workdir.path();
+
+        let probe = dir.join("link-probe");
+        fs::write(&probe, b"probe").unwrap();
+        let links_work = fs::hard_link(&probe, dir.join("link-probe-2")).is_ok();
+        let _ = fs::remove_file(dir.join("link-probe-2"));
+        fs::remove_file(&probe).unwrap();
+
+        let names = (0..file_count)
+            .map(|index| format!("data.{index:02}.bin"))
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().enumerate() {
+            write_bench_data(&dir.join(name), index as u64 + 1, file_bytes);
+        }
+        let entries = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ([index as u8 + 1; 16], name.clone(), dir.join(name)))
+            .collect::<Vec<_>>();
+        let half = file_count / 2;
+        let one = dir.join("one.par2");
+        fs::write(&one, bench_index([0x5a; 16], slice_bytes, &entries)).unwrap();
+        let first = dir.join("first.par2");
+        fs::write(
+            &first,
+            bench_index([0x6b; 16], slice_bytes, &entries[..half]),
+        )
+        .unwrap();
+        let second = dir.join("second.par2");
+        fs::write(
+            &second,
+            bench_index([0x7c; 16], slice_bytes, &entries[half..]),
+        )
+        .unwrap();
+
+        let mut limits = platform_limits();
+        let default_reserve = limits.free_space_reserve_bytes;
+        limits.free_space_reserve_bytes = 0;
+        let data_bytes = file_count as u64 * file_bytes;
+        println!(
+            "base={} hard_links={links_work} files={file_count} file_MiB={:.0} data_MiB={:.0} default_reserve_MiB={:.0}",
+            base.display(),
+            mib(file_bytes),
+            mib(data_bytes),
+            mib(default_reserve),
+        );
+        println!(
+            "layout | verify_ms | free_space_drop_MiB | peak_staged_copies_MiB | parity_bytes_counted_by_check | data_bytes_counted_by_check | required_with_default_reserve_MiB | available_before_MiB | bytes_copied_in_total_without_links_MiB"
+        );
+        for (label, passes, parity_files) in [
+            ("one set", 1u64, vec![one.clone()]),
+            ("two sets", 2, vec![first.clone(), second.clone()]),
+        ] {
+            let request = Par2RepairRequest {
+                destination: dir.to_path_buf(),
+                data_files: names
+                    .iter()
+                    .map(|name| Par2InputFile {
+                        manifest_name: name.clone(),
+                        source_path: dir.join(name),
+                        output_path: dir.join(name),
+                        expected_size: Some(file_bytes),
+                    })
+                    .collect(),
+                parity_files: parity_files.clone(),
+                required_incomplete_names: BTreeSet::new(),
+                limits,
+                active_started_at: None,
+                active_elapsed_before_repair: None,
+            };
+            let parity_bytes = validate_parity_files(&parity_files).unwrap().total.bytes;
+            let available_before = fs4::available_space(dir).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sampler = sample_staging(dir.to_path_buf(), stop.clone());
+            let started = Instant::now();
+            let result = verify_or_repair(&request);
+            let elapsed = started.elapsed();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (lowest, peak_copies) = sampler.join().unwrap();
+            let result = result.unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(result.report.outcome, Par2Outcome::Verified);
+            let leftovers = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".risuko-par2-")
+                })
+                .count();
+            assert_eq!(leftovers, 0);
+            println!(
+                "{label} | {:.0} | {:.1} | {:.1} | {parity_bytes} | 0 | {:.1} | {:.0} | {:.1}",
+                elapsed.as_secs_f64() * 1000.0,
+                mib(available_before.saturating_sub(lowest)),
+                mib(peak_copies),
+                mib(parity_bytes + default_reserve),
+                mib(available_before),
+                mib(passes * (data_bytes + parity_bytes)),
+            );
+        }
+
+        let stage_root = dir.join("stage-only");
+        fs::create_dir(&stage_root).unwrap();
+        let started = Instant::now();
+        for name in &names {
+            link_or_copy(&dir.join(name), &stage_root.join(name), None).unwrap();
+        }
+        let staging = started.elapsed();
+        fs::remove_dir_all(&stage_root).unwrap();
+        let started = Instant::now();
+        for name in &names {
+            md5_file_with_cancel(&dir.join(name), None, None).unwrap();
+        }
+        let hashing = started.elapsed();
+        println!(
+            "staging alone (link_or_copy of all data files): {:.0} ms; one MD5 pass over the data: {:.0} ms",
+            staging.as_secs_f64() * 1000.0,
+            hashing.as_secs_f64() * 1000.0,
+        );
     }
 }

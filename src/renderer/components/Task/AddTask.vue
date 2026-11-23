@@ -425,6 +425,7 @@ import {
 } from "@/store/batchQueue";
 import { usePreferenceStore } from "@/store/preference";
 import { useTaskStore } from "@/store/task";
+import { splitBySelection } from "@/utils/fileSelection";
 import {
 	approveCompletionScript,
 	buildOption,
@@ -856,7 +857,12 @@ export default {
 						return;
 					}
 					const items = decoded.map(({ uri, rename }) => {
-						const item = createUriBatchItem(uri);
+						const item = createUriBatchItem(
+							uri,
+							is.android()
+								? this.$t("task.media-unsupported-android")
+								: undefined,
+						);
 						if (rename) {
 							item.out = rename;
 						}
@@ -1160,17 +1166,21 @@ export default {
 				return;
 			}
 
-			const torrentItems = items.filter(
+			const { selectable, empty } = splitBySelection(
+				items.filter((it) => !(it.kind === "torrent" && !it.path)),
+				NONE_SELECTED_FILES,
+			);
+			const torrentItems = selectable.filter(
 				(it) => it.kind === "torrent" && it.path,
 			);
 			const invalidTorrentItems = items.filter(
 				(it) => it.kind === "torrent" && !it.path,
 			);
-			const metalinkItems = items.filter(
+			const metalinkItems = selectable.filter(
 				(it) => it.kind === "metalink" && it.path,
 			);
-			const nzbItems = items.filter((it) => it.kind === "nzb" && it.path);
-			const uriItems = items.filter(
+			const nzbItems = selectable.filter((it) => it.kind === "nzb" && it.path);
+			const uriItems = selectable.filter(
 				(it) => it.kind === "uri" || it.kind === "magnet",
 			);
 
@@ -1188,6 +1198,17 @@ export default {
 					appStore.updateBatchItem(it.id, {
 						status: "failed",
 						error: invalidMsg,
+					});
+					failCount += 1;
+				}
+			}
+
+			if (empty.length > 0) {
+				const emptyMsg = this.$t("task.select-at-least-one");
+				for (const it of empty) {
+					appStore.updateBatchItem(it.id, {
+						status: "failed",
+						error: emptyMsg,
 					});
 					failCount += 1;
 				}

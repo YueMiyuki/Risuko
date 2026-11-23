@@ -74,6 +74,8 @@ export default {
 	errSftpUsernameRequired: "SFTP-brukernavn er påkrevd.",
 	errSftpAuthRequired: "SFTP-passord eller privat nøkkel er påkrevd.",
 	errFtpHostRequired: "FTP-vert er påkrevd.",
+	errSecretForNewServer:
+		"Serveren er endret, så det lagrede passordet eller nøkkelen gjenbrukes ikke. Skriv det inn på nytt.",
 	errMoveTargetRequired:
 		"Målmappe for flytting er påkrevd når handlingen etter opplasting er å flytte.",
 	saving: "Lagrer…",

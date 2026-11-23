@@ -322,6 +322,8 @@ export default {
 	"media-format-auto": "Best available (auto)",
 	"media-format-hint": "Fetch formats to choose a specific quality.",
 	"media-format-error": "Could not load formats for this URL.",
+	"media-unsupported-android":
+		"Media-site downloads need yt-dlp, which is not available on Android",
 	"download-complete-message": "Completed downloading {{taskName}}",
 	"download-complete-notify": "Download Completed",
 	"bt-download-complete-message": "Completed downloading {{taskName}}, seeding",
@@ -406,6 +408,30 @@ export default {
 	"edit-speed-limit-placeholder": "0 or empty = unlimited (e.g. 500K)",
 	"edit-primary-uri": "Download URL",
 	"edit-primary-uri-placeholder": "Primary download URL",
+	"edit-tab-seeding": "Seeding",
+	"seeding-rule-global": "Use the global setting",
+	"seeding-rule-forever": "Seed until I stop it",
+	"seeding-rule-limits": "Stop at a ratio or after a time",
+	"seeding-rule-none": "Don't seed",
+	"seeding-global-off": "Currently: don't seed",
+	"seeding-global-forever": "Currently: seed until stopped",
+	"seeding-global-ratio": "Currently: stop at ratio {{ratio}}",
+	"seeding-global-minutes": "Currently: stop after {{minutes}} minutes",
+	"seeding-global-both":
+		"Currently: stop at ratio {{ratio}} or after {{minutes}} minutes",
+	"seeding-limits-hint":
+		"Seeding stops at whichever limit comes first. 0 means no limit of that kind.",
+	"seeding-limits-required": "Enter a ratio or a number of minutes above 0",
+	"seeding-for": "Seeding for",
+	"seeding-applies-after-download": "This applies when the download finishes.",
+	"seeding-stops-now": "This task stops seeding when you save.",
+	"seeding-limit-reached":
+		"This task has already reached this limit and stops seeding when you save.",
+	"seeding-in-place-note": "Torrents you created seed until you stop them.",
+	"seeding-ed2k-sharing-off":
+		"Sharing over eD2K is off in Preferences, so this task won't upload.",
+	"seeding-leftover-values":
+		"This task has seeding values from an earlier settings change. Saving replaces them.",
 	"create-torrent": "Create Torrent",
 	"create-torrent-menu": "Create Torrent...",
 	"create-torrent-source": "File or folder to share",

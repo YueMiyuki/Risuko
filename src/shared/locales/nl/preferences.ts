@@ -206,6 +206,9 @@ export default {
 	"uri-selector-inorder":
 		"In volgorde (spiegels van links naar rechts proberen)",
 	"uri-selector-adaptive": "Adaptief (snelste bij voorkeur)",
+	"send-auth-to-all-mirrors": "Inloggegevens naar alle HTTPS-spiegels sturen",
+	"send-auth-to-all-mirrors-tips":
+		"Stuurt de autorisatieheader van een taak naar elke HTTPS-spiegel. Indien uit, krijgen alleen spiegels met hetzelfde schema, dezelfde host en poort als de eerste link hem.",
 	"unit-seconds": "seconden",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Opslag",

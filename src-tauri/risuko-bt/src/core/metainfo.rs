@@ -499,7 +499,7 @@ fn check_meta_version(info: &Value) -> Result<(), MetaError> {
     }
 }
 
-const MAX_PIECES: u64 = 1 << 22;
+pub(crate) const MAX_PIECES: u64 = 1 << 22;
 const MAX_PIECE_LENGTH: u32 = 256 * 1024 * 1024;
 
 fn check_piece_count(total_len: u64, piece_length: u32) -> Result<(), MetaError> {
@@ -540,7 +540,10 @@ pub fn sanitize_windows_component(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            if c.is_control()
+                || risuko_util::is_invisible_format_char(c)
+                || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 c
@@ -574,9 +577,25 @@ pub fn sanitize_windows_component(s: &str) -> String {
 pub fn fs_component(s: &str) -> std::borrow::Cow<'_, str> {
     if cfg!(windows) {
         std::borrow::Cow::Owned(sanitize_windows_component(s))
+    } else if s.chars().any(risuko_util::is_invisible_format_char) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| {
+                    if risuko_util::is_invisible_format_char(c) {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
+        )
     } else {
         std::borrow::Cow::Borrowed(s)
     }
+}
+
+fn storage_ignores_case() -> bool {
+    cfg!(any(windows, target_os = "macos", target_os = "android"))
 }
 
 fn disk_path_key(path: &[String]) -> String {
@@ -585,7 +604,7 @@ fn disk_path_key(path: &[String]) -> String {
         .map(|c| fs_component(c).into_owned())
         .collect::<Vec<_>>()
         .join("/");
-    if cfg!(any(windows, target_os = "macos")) {
+    if storage_ignores_case() {
         joined.to_lowercase()
     } else {
         joined
@@ -1631,11 +1650,34 @@ mod tests {
     fn dedupe_folds_case_only_where_the_filesystem_does() {
         let mut paths = vec![vec!["A.txt".to_string()], vec!["a.txt".to_string()]];
         dedupe_paths(&mut paths, &[false, false]);
-        if cfg!(any(windows, target_os = "macos")) {
+        if storage_ignores_case() {
             assert_eq!(paths[1], vec!["a (1).txt".to_string()]);
         } else {
             assert_eq!(paths[1], vec!["a.txt".to_string()]);
         }
+    }
+
+    #[test]
+    fn invisible_format_characters_are_replaced_in_disk_names() {
+        assert_eq!(fs_component("report\u{202E}gpj.exe"), "report_gpj.exe");
+        assert_eq!(fs_component("a\u{200B}b\u{FEFF}c"), "a_b_c");
+        #[cfg(not(windows))]
+        {
+            let plain = fs_component("plain name.txt");
+            assert!(matches!(plain, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(plain, "plain name.txt");
+        }
+    }
+
+    #[test]
+    fn names_that_differ_only_by_an_invisible_character_do_not_collide() {
+        let mut paths = vec![
+            vec!["a\u{202E}.txt".to_string()],
+            vec!["a_.txt".to_string()],
+        ];
+        dedupe_paths(&mut paths, &[false, false]);
+        assert_ne!(disk_path_key(&paths[0]), disk_path_key(&paths[1]));
+        assert_eq!(paths[1], vec!["a_ (1).txt".to_string()]);
     }
 
     #[test]

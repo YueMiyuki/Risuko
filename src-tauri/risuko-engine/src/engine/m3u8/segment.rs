@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::decrypt::{decrypt_segment, fetch_decryption_key, iv_from_sequence};
+use super::download::RequestHeaders;
 use super::parser::Segment;
 use crate::engine::speed_limiter::SpeedLimiter;
 
@@ -87,8 +88,10 @@ impl From<String> for AttemptError {
     }
 }
 
+type KeyCell = Arc<tokio::sync::OnceCell<[u8; 16]>>;
+
 struct KeyCache {
-    entries: std::collections::HashMap<String, [u8; 16]>,
+    entries: std::collections::HashMap<String, KeyCell>,
 }
 
 impl KeyCache {
@@ -98,16 +101,16 @@ impl KeyCache {
         }
     }
 
-    async fn get_or_fetch(&mut self, key_uri: &str, client: &Client) -> Result<[u8; 16], String> {
-        if let Some(key) = self.entries.get(key_uri) {
-            return Ok(*key);
-        }
-        let key = tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch_decryption_key(key_uri, client))
-            .await
-            .map_err(|_| "Decryption key fetch timed out".to_string())??;
-        self.entries.insert(key_uri.to_string(), key);
-        Ok(key)
+    fn cell(&mut self, key_uri: &str) -> KeyCell {
+        self.entries.entry(key_uri.to_string()).or_default().clone()
     }
+}
+
+async fn key_from_cell<F>(cell: &KeyCell, fetch: F) -> Result<[u8; 16], String>
+where
+    F: std::future::Future<Output = Result<[u8; 16], String>>,
+{
+    cell.get_or_try_init(|| fetch).await.copied()
 }
 
 pub type SharedProgress = Arc<StdMutex<ProgressState>>;
@@ -139,6 +142,7 @@ fn estimate_total(done_bytes: u64, done_segments: u64, total_segments: u64) -> u
 
 struct SegmentCtx {
     client: Client,
+    headers: RequestHeaders,
     throttle: Throttle,
     key_cache: tokio::sync::Mutex<KeyCache>,
     total: Arc<AtomicU64>,
@@ -150,11 +154,12 @@ struct SegmentCtx {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn download_segments(
+pub(super) async fn download_segments(
     segments: &[Segment],
     media_sequence: u64,
     temp_dir: &Path,
     client: &Client,
+    headers: &RequestHeaders,
     total: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     connections: Arc<AtomicU32>,
@@ -201,6 +206,7 @@ pub async fn download_segments(
 
     let ctx = Arc::new(SegmentCtx {
         client: client.clone(),
+        headers: headers.clone(),
         throttle: Throttle::new(global_limiter, task_limiter),
         key_cache: tokio::sync::Mutex::new(KeyCache::new()),
         total,
@@ -341,7 +347,9 @@ async fn attempt_segment_download(
     added: &mut u64,
 ) -> Result<u64, AttemptError> {
     let client = &ctx.client;
-    let mut request = client.get(&segment.url);
+    let mut request = client
+        .get(&segment.url)
+        .headers(ctx.headers.for_url(&segment.url));
 
     let mut ranged: Option<(u64, u64)> = None;
     if let Some(ref br) = segment.byte_range {
@@ -433,12 +441,16 @@ async fn attempt_segment_download(
     }
 
     if let Some(enc) = encryption {
-        let key = ctx
-            .key_cache
-            .lock()
+        let cell = ctx.key_cache.lock().await.cell(&enc.key_uri);
+        let key = key_from_cell(&cell, async {
+            tokio::time::timeout(
+                KEY_FETCH_TIMEOUT,
+                fetch_decryption_key(&enc.key_uri, client, &ctx.headers),
+            )
             .await
-            .get_or_fetch(&enc.key_uri, client)
-            .await?;
+            .map_err(|_| "Decryption key fetch timed out".to_string())?
+        })
+        .await?;
         let iv = match &enc.iv {
             Some(iv_bytes) => {
                 let mut iv = [0u8; 16];
@@ -500,6 +512,7 @@ mod tests {
 
     async fn fail_one_segment(segment: Segment) -> String {
         let dir = tempfile::tempdir().unwrap();
+        let headers = RequestHeaders::new(&serde_json::Map::new(), &segment.url);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             download_segments(
@@ -507,6 +520,7 @@ mod tests {
                 0,
                 dir.path(),
                 &Client::builder().build().unwrap(),
+                &headers,
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU32::new(0)),
@@ -556,6 +570,94 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
+    async fn serve_and_record(body: &'static [u8]) -> (u16, Arc<StdMutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads = Arc::new(StdMutex::new(Vec::new()));
+        let seen = heads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        (port, heads)
+    }
+
+    #[tokio::test]
+    async fn segment_and_key_requests_carry_the_credentials_of_their_own_origin() {
+        let (segment_port, segment_heads) = serve_and_record(b"").await;
+        let (key_port, key_heads) = serve_and_record(&[7u8; 16]).await;
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "header".into(),
+            serde_json::json!(["Authorization: Bearer t"]),
+        );
+        options.insert("cookie".into(), "sid=abc".into());
+        options.insert(
+            crate::engine::http::COOKIE_HOST_OPTION.into(),
+            "127.0.0.1".into(),
+        );
+        options.insert("no-netrc".into(), true.into());
+        let headers =
+            RequestHeaders::new(&options, &format!("http://127.0.0.1:{segment_port}/a.m3u8"));
+        let segment = Segment {
+            url: format!("http://127.0.0.1:{segment_port}/seg.ts"),
+            byte_range: None,
+            encryption: Some(super::super::parser::EncryptionInfo {
+                method: "AES-128".into(),
+                key_uri: format!("http://127.0.0.1:{key_port}/key"),
+                iv: None,
+            }),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        download_segments(
+            &[segment],
+            0,
+            dir.path(),
+            &Client::builder().build().unwrap(),
+            &headers,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            CancellationToken::new(),
+            Arc::new(SpeedLimiter::new(0)),
+            Arc::new(SpeedLimiter::new(0)),
+            1,
+        )
+        .await
+        .unwrap();
+
+        let segment_head = segment_heads.lock().unwrap()[0].clone();
+        let key_head = key_heads.lock().unwrap()[0].clone();
+        assert!(
+            segment_head.contains("authorization: bearer t"),
+            "{segment_head}"
+        );
+        assert!(segment_head.contains("cookie: sid=abc"), "{segment_head}");
+        assert!(!key_head.contains("authorization:"), "{key_head}");
+        assert!(key_head.contains("cookie: sid=abc"), "{key_head}");
+    }
+
     #[test]
     fn a_server_that_ignores_range_is_judged_by_the_requested_length() {
         let whole_file = 600 << 20;
@@ -563,6 +665,50 @@ mod tests {
         assert_eq!(expected_body_len(Some(1000), None), 1000);
         assert_eq!(expected_body_len(None, Some(whole_file)), whole_file);
         assert_eq!(expected_body_len(None, None), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_is_fetched_once_for_concurrent_segments() {
+        let cache = Arc::new(tokio::sync::Mutex::new(KeyCache::new()));
+        let calls = Arc::new(AtomicU32::new(0));
+        let ask = |cache: Arc<tokio::sync::Mutex<KeyCache>>, calls: Arc<AtomicU32>| async move {
+            let cell = cache.lock().await.cell("http://keys.test/k");
+            key_from_cell(&cell, async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Ok([3u8; 16])
+            })
+            .await
+        };
+        let (first, second) = tokio::join!(
+            ask(cache.clone(), calls.clone()),
+            ask(cache.clone(), calls.clone())
+        );
+        assert_eq!(first.unwrap(), [3u8; 16]);
+        assert_eq!(second.unwrap(), [3u8; 16]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_key_does_not_block_another_key() {
+        let cache = Arc::new(tokio::sync::Mutex::new(KeyCache::new()));
+        let stuck_cache = cache.clone();
+        let stuck = tokio::spawn(async move {
+            let cell = stuck_cache.lock().await.cell("http://keys.test/slow");
+            key_from_cell(&cell, std::future::pending()).await
+        });
+        tokio::task::yield_now().await;
+
+        let other = async {
+            let cell = cache.lock().await.cell("http://keys.test/fast");
+            key_from_cell(&cell, async { Ok([9u8; 16]) }).await
+        };
+        let key = tokio::time::timeout(std::time::Duration::from_secs(2), other)
+            .await
+            .expect("a key that is already available must not wait for a slow one")
+            .unwrap();
+        assert_eq!(key, [9u8; 16]);
+        stuck.abort();
     }
 
     #[test]

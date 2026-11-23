@@ -189,7 +189,11 @@ async fn discover_and_map(
     active: &Arc<Mutex<Vec<ActiveMapping>>>,
 ) -> std::io::Result<usize> {
     let mut mapped = 0usize;
-    let endpoints = ssdp_discover(DISCOVER_TIMEOUT).await?;
+    let default_gateway = tokio::task::spawn_blocking(crate::natpmp::default_gateway_ipv4)
+        .await
+        .ok()
+        .flatten();
+    let endpoints = ssdp_discover(DISCOVER_TIMEOUT, default_gateway).await?;
     let ifaces = NetworkInterface::show().unwrap_or_default();
     for ep in endpoints {
         let root = match fetch_root_desc(&ep.location).await {
@@ -210,7 +214,9 @@ async fn discover_and_map(
         };
         let external_ip = get_external_ip(&control_url, &service_type).await.ok();
         if let Some(reported) = external_ip {
-            report_external_address(ExternalIp::shared(), gateway, reported);
+            if votes_as_gateway(gateway, default_gateway) {
+                report_external_address(ExternalIp::shared(), gateway, reported);
+            }
         }
         for &(port, proto) in ports {
             match add_port_mapping_compat(
@@ -284,7 +290,28 @@ fn location_belongs_to_responder(location: &Url, responder: Ipv4Addr) -> bool {
     on_lan && location.scheme() == "http" && location.host() == Some(url::Host::Ipv4(responder))
 }
 
-async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverResponse>> {
+fn keeps_response(
+    kept_from_gateway: usize,
+    kept_others: usize,
+    responder: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+) -> bool {
+    let kept = if Some(responder) == gateway {
+        kept_from_gateway
+    } else {
+        kept_others
+    };
+    kept < MAX_DISCOVERED_ENDPOINTS
+}
+
+fn votes_as_gateway(responder: Ipv4Addr, gateway: Option<Ipv4Addr>) -> bool {
+    gateway.is_none_or(|gateway| gateway == responder)
+}
+
+async fn ssdp_discover(
+    timeout: Duration,
+    gateway: Option<Ipv4Addr>,
+) -> std::io::Result<Vec<DiscoverResponse>> {
     let sock = bind_ssdp_socket()?;
     let sock = UdpSocket::from_std(sock.into())?;
 
@@ -295,6 +322,8 @@ async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverRespons
 
     let mut seen = std::collections::HashSet::<String>::new();
     let mut responses = Vec::new();
+    let mut from_gateway = 0usize;
+    let mut others = 0usize;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 2048];
     loop {
@@ -309,12 +338,21 @@ async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverRespons
                 let Ok(parsed) = parse_ssdp_response(&buf[..n], from) else {
                     continue;
                 };
-                if !location_belongs_to_responder(&parsed.location, *from.ip()) {
+                let responder = *from.ip();
+                if !location_belongs_to_responder(&parsed.location, responder)
+                    || !keeps_response(from_gateway, others, responder, gateway)
+                {
                     continue;
                 }
                 if seen.insert(parsed.location.to_string()) {
+                    if Some(responder) == gateway {
+                        from_gateway += 1;
+                    } else {
+                        others += 1;
+                    }
                     responses.push(parsed);
-                    if responses.len() >= MAX_DISCOVERED_ENDPOINTS {
+                    if others >= MAX_DISCOVERED_ENDPOINTS && (from_gateway > 0 || gateway.is_none())
+                    {
                         break;
                     }
                 }
@@ -322,6 +360,7 @@ async fn ssdp_discover(timeout: Duration) -> std::io::Result<Vec<DiscoverRespons
             Ok(Err(_)) | Err(_) => break,
         }
     }
+    responses.sort_by_key(|r| Some(*r.received_from.ip()) != gateway);
     Ok(responses)
 }
 
@@ -817,6 +856,21 @@ mod tests {
             "http://8.8.8.8/rootDesc.xml",
             Ipv4Addr::new(8, 8, 8, 8)
         ));
+    }
+
+    #[test]
+    fn the_default_gateway_is_always_heard_and_only_it_votes() {
+        let router = Ipv4Addr::new(192, 168, 1, 1);
+        let other = Ipv4Addr::new(192, 168, 1, 77);
+        assert!(keeps_response(0, 8, router, Some(router)));
+        assert!(keeps_response(7, 8, router, Some(router)));
+        assert!(!keeps_response(8, 0, router, Some(router)));
+        assert!(!keeps_response(0, 8, other, Some(router)));
+        assert!(keeps_response(8, 7, other, Some(router)));
+        assert!(!keeps_response(0, 8, other, None));
+        assert!(votes_as_gateway(router, Some(router)));
+        assert!(!votes_as_gateway(other, Some(router)));
+        assert!(votes_as_gateway(other, None));
     }
 
     #[test]

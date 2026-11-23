@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
@@ -506,16 +507,21 @@ pub async fn fetch_tracker_sources(
         requests.push((target, configured_proxy.clone()));
     }
 
-    Ok(fetch_tracker_source_requests(requests).await)
+    Ok(fetch_tracker_source_requests(requests, risuko_bt::webseed::is_allowed_destination).await)
 }
 
 async fn fetch_tracker_source_requests(
     requests: Vec<(Url, Option<(String, NoProxy)>)>,
+    destination_filter: fn(IpAddr) -> bool,
 ) -> Vec<String> {
     let mut pending = stream::iter(requests.into_iter().enumerate().map(
         |(index, (target, proxy))| async move {
             let host = target.host_str().unwrap_or("unknown").to_string();
-            (index, host, fetch_one_tracker_source(target, proxy).await)
+            (
+                index,
+                host,
+                fetch_one_tracker_source(target, proxy, destination_filter).await,
+            )
         },
     ))
     .buffer_unordered(MAX_TRACKER_SOURCE_CONCURRENCY);
@@ -534,6 +540,7 @@ async fn fetch_tracker_source_requests(
 async fn fetch_one_tracker_source(
     target: Url,
     configured_proxy: Option<(String, NoProxy)>,
+    destination_filter: fn(IpAddr) -> bool,
 ) -> Result<String, String> {
     let mut builder = risuko_http::Client::builder()
         .user_agent(risuko_engine::engine::USER_AGENT)
@@ -541,7 +548,8 @@ async fn fetch_one_tracker_source(
         .timeout(Duration::from_secs(30))
         .gzip(true)
         .brotli(true)
-        .deflate(true);
+        .deflate(true)
+        .direct_address_filter(destination_filter);
     if let Some((server, bypass)) = configured_proxy {
         let configured = risuko_http::Proxy::all(server)
             .map_err(|e| format!("Invalid configured proxy: {e}"))?;
@@ -1470,7 +1478,9 @@ mod tests {
         });
 
         let target = Url::parse(&format!("http://{address}/trackers.txt")).unwrap();
-        let error = fetch_one_tracker_source(target, None).await.unwrap_err();
+        let error = fetch_one_tracker_source(target, None, |_| true)
+            .await
+            .unwrap_err();
         assert_eq!(error, "Tracker source response is too large");
         server.await.unwrap();
     }
@@ -1500,12 +1510,35 @@ mod tests {
         let second = Url::parse(&format!("http://{address}/second")).unwrap();
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            fetch_tracker_source_requests(vec![(first, None), (second, None)]),
+            fetch_tracker_source_requests(vec![(first, None), (second, None)], |_| true),
         )
         .await
         .expect("tracker fetches should overlap instead of waiting serially");
 
         assert_eq!(results, vec!["ok\n\n", "ok\n\n"]);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tracker_list_on_this_machine_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nok\n\n",
+                )
+                .await;
+        });
+
+        let target = Url::parse(&format!("http://127.0.0.1:{port}/list.txt")).unwrap();
+        let result =
+            fetch_one_tracker_source(target, None, risuko_bt::webseed::is_allowed_destination)
+                .await;
+        assert!(result.is_err());
+        server.abort();
     }
 }

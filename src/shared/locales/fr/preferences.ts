@@ -209,6 +209,10 @@ export default {
 	"uri-selector-inorder":
 		"Dans l’ordre (essayer les miroirs de gauche à droite)",
 	"uri-selector-adaptive": "Adaptatif (préférer le plus rapide)",
+	"send-auth-to-all-mirrors":
+		"Envoyer les identifiants à tous les miroirs HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Envoie l’en-tête d’autorisation d’une tâche à chaque miroir HTTPS. Désactivé, seuls les miroirs ayant le même schéma, hôte et port que le premier lien le reçoivent.",
 	"unit-seconds": "secondes",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Stockage",

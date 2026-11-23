@@ -250,7 +250,7 @@ async function askToInstall(
 
 		if (showFeedback()) {
 			toast.info(
-				translate("app.update-relaunch"),
+				translate("app.update-relaunching"),
 				feedbackToastId === undefined
 					? undefined
 					: { id: feedbackToastId, duration: Number.POSITIVE_INFINITY },

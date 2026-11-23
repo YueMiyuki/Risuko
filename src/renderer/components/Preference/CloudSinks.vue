@@ -951,6 +951,55 @@ function emptyForm(): FormState {
 	};
 }
 
+function sameEndpoint(a: string, b: string): boolean {
+	try {
+		return (
+			new URL(a.trim().replace(/\/+$/, "")).href ===
+			new URL(b.trim().replace(/\/+$/, "")).href
+		);
+	} catch {
+		return false;
+	}
+}
+
+function sameHost(a: string, b: string): boolean {
+	return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+function sameSinkServer(a: SinkConfig, b: SinkConfig): boolean {
+	if (a.kind === "webdav" && b.kind === "webdav") {
+		return sameEndpoint(a.endpoint, b.endpoint);
+	}
+	if (a.kind === "s3" && b.kind === "s3") {
+		return (
+			sameEndpoint(a.endpoint, b.endpoint) &&
+			a.bucket.trim() === b.bucket.trim()
+		);
+	}
+	if (a.kind === "sftp" && b.kind === "sftp") {
+		return sameHost(a.host, b.host) && a.port === b.port;
+	}
+	if (a.kind === "ftp" && b.kind === "ftp") {
+		return (
+			sameHost(a.host, b.host) && a.port === b.port && !!a.secure === !!b.secure
+		);
+	}
+	return false;
+}
+
+function secretMissing(config: SinkConfig): boolean {
+	switch (config.kind) {
+		case "webdav":
+			return !!config.username && !config.password;
+		case "s3":
+			return !config.secretAccessKey;
+		case "sftp":
+			return !config.password && !config.privateKey;
+		case "ftp":
+			return !!config.username && !config.password;
+	}
+}
+
 export default defineComponent({
 	name: "preference-cloud-sinks",
 	components: {
@@ -1194,6 +1243,16 @@ export default defineComponent({
 					};
 			}
 		},
+		secretNeededForNewServer(): boolean {
+			const saved = this.editingId
+				? this.store.sinks.find((s) => s.id === this.editingId)
+				: undefined;
+			if (!saved) {
+				return false;
+			}
+			const config = this.buildConfig();
+			return !sameSinkServer(saved.config, config) && secretMissing(config);
+		},
 		validate(): string | null {
 			if (!this.form.label.trim()) {
 				return this.$t("cloudSinks.errLabelRequired") as string;
@@ -1238,6 +1297,9 @@ export default defineComponent({
 						return this.$t("cloudSinks.errFtpHostRequired") as string;
 					}
 					break;
+			}
+			if (this.secretNeededForNewServer()) {
+				return this.$t("cloudSinks.errSecretForNewServer") as string;
 			}
 			if (this.form.postAction === "move" && !this.form.moveTarget.trim()) {
 				return this.$t("cloudSinks.errMoveTargetRequired") as string;

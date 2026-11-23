@@ -747,6 +747,157 @@ async fn padding_chunks_are_zero_filled_instead_of_requested() {
     assert_eq!(seed_handle.stats().uploaded_bytes, requested_payload);
 }
 
+async fn finished_seed(
+    meta: &TorrentMeta,
+    payload: &[u8],
+) -> (tempfile::TempDir, std::sync::Arc<Session>, SocketAddr) {
+    let dir = tempfile::tempdir().unwrap();
+    write_payload(dir.path(), &meta.info.name, payload);
+    let seed = loopback_session(dir.path(), false).await;
+    let AddTorrentResponse::Added(_, handle) = seed
+        .add_from_meta(meta.clone(), AddTorrentOptions::default())
+        .await
+        .unwrap()
+    else {
+        panic!("expected Added");
+    };
+    wait_until_finished(&handle, Duration::from_secs(30)).await;
+    let addr = format!("127.0.0.1:{}", seed.listen_port()).parse().unwrap();
+    (dir, seed, addr)
+}
+
+fn flip_bytes_in_place(path: &std::path::Path, original: &[u8], at: usize, len: usize) {
+    use std::io::Write;
+    let mut corrupt = original.to_vec();
+    for byte in &mut corrupt[at..at + len] {
+        *byte ^= 0xA5;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all(&corrupt).unwrap();
+    file.sync_all().unwrap();
+}
+
+async fn wait_until_a_piece_from_fails_its_hash(
+    handle: &risuko_bt::ManagedTorrent,
+    from: SocketAddr,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let stats = handle.stats();
+        let delivered = stats
+            .peers
+            .iter()
+            .find(|peer| peer.addr == from)
+            .map_or(0, |peer| peer.downloaded);
+        if delivered > stats.total_bytes {
+            assert!(!stats.finished, "finished from the corrupt seed alone");
+            assert_eq!(
+                stats.progress_bytes,
+                stats.total_bytes - PIECE_LEN as u64,
+                "only the corrupted piece should be missing"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the corrupt piece was never fetched twice: {delivered} bytes delivered, progress={} / {}",
+            stats.progress_bytes,
+            stats.total_bytes
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupt_block_from_one_seed_is_fetched_again_from_another() {
+    let payload = make_payload();
+    let meta = build_meta(&payload);
+    let (bad_dir, _bad_seed, bad_addr) = finished_seed(&meta, &payload).await;
+    let (_good_dir, _good_seed, good_addr) = finished_seed(&meta, &payload).await;
+
+    flip_bytes_in_place(
+        &bad_dir.path().join(&meta.info.name),
+        &payload,
+        TOTAL as usize / 2 + 8 * 1024,
+        4 * 1024,
+    );
+
+    let leech_dir = tempfile::tempdir().unwrap();
+    let leech = loopback_session(leech_dir.path(), false).await;
+    let AddTorrentResponse::Added(_, leech_handle) = leech
+        .add_from_meta(meta.clone(), AddTorrentOptions::default())
+        .await
+        .unwrap()
+    else {
+        panic!("expected Added");
+    };
+    leech.add_peer(meta.info_hash, bad_addr).await.unwrap();
+    wait_until_a_piece_from_fails_its_hash(&leech_handle, bad_addr).await;
+
+    leech.add_peer(meta.info_hash, good_addr).await.unwrap();
+    wait_until_finished(&leech_handle, Duration::from_secs(30)).await;
+
+    let got = std::fs::read(leech_dir.path().join(&meta.info.name)).unwrap();
+    assert_eq!(got.len(), payload.len(), "length mismatch");
+    assert_eq!(got, payload, "payload mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_download_resumes_and_completes() {
+    let payload = make_payload();
+    let meta = build_meta(&payload);
+    let (_seed_dir, _seed, seed_addr) = finished_seed(&meta, &payload).await;
+
+    let leech_dir = tempfile::tempdir().unwrap();
+    let leech = loopback_session(leech_dir.path(), false).await;
+    let AddTorrentResponse::Added(_, leech_handle) = leech
+        .add_from_meta(
+            meta.clone(),
+            AddTorrentOptions {
+                download_limit: 64 * 1024,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected Added");
+    };
+    leech.add_peer(meta.info_hash, seed_addr).await.unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while leech_handle.stats().progress_bytes == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the transfer never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    leech.pause(&leech_handle).await.unwrap();
+    let paused = leech_handle.stats();
+    assert!(
+        !paused.finished && paused.progress_bytes < paused.total_bytes,
+        "finished before the pause: progress={} / {}",
+        paused.progress_bytes,
+        paused.total_bytes
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let still = leech_handle.stats();
+    assert_eq!(
+        still.progress_bytes, paused.progress_bytes,
+        "progress advanced while paused"
+    );
+    assert!(!still.finished, "finished while paused");
+
+    leech.unpause(&leech_handle).await.unwrap();
+    wait_until_finished(&leech_handle, Duration::from_secs(30)).await;
+
+    let got = std::fs::read(leech_dir.path().join(&meta.info.name)).unwrap();
+    assert_eq!(got.len(), payload.len(), "length mismatch");
+    assert_eq!(got, payload, "payload mismatch");
+}
+
 #[test]
 fn sanity_bytes_type_exists() {
     let _ = Bytes::from_static(b"");
@@ -1104,7 +1255,9 @@ mod v2 {
         .await
         .expect("no hashes reply");
         let hashes: Vec<Id32> = hashes
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|c| Id32::from_slice(c).unwrap())
             .collect();
         assert_eq!(hashes.len(), 5);

@@ -28,6 +28,7 @@ export default {
 	"update-cancelled": "تم إلغاء التحديث",
 	"update-install": "تثبيت التحديث",
 	"update-relaunch": "أعد التشغيل لإكمال التحديث",
+	"update-relaunching": "جارٍ إعادة تشغيل Risuko…",
 	"update-progress": "تقدم التحديث: {{progress}}%",
 	"update-error": "خطأ في التحديث: {{error}}",
 	"update-unsigned": "التحديثات غير متاحة في هذا الإصدار",

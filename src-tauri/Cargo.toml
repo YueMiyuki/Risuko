@@ -5,7 +5,7 @@ members = ["risuko-engine", "risuko-bt", "risuko-ed2k", "risuko-util", "risuko-t
 version = "1.3.0"
 authors = ["YueMiyuki"]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 risuko-engine = { path = "risuko-engine" }

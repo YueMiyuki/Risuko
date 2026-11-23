@@ -329,6 +329,8 @@ export default {
 	"media-format-hint":
 		"Получите список форматов, чтобы выбрать конкретное качество.",
 	"media-format-error": "Не удалось загрузить форматы для этого URL.",
+	"media-unsupported-android":
+		"Для загрузок с медиасайтов требуется yt-dlp, который недоступен на Android",
 	"download-complete-message": "Завершена загрузка {{taskName}}",
 	"download-complete-notify": "Загрузка завершена",
 	"bt-download-complete-message": "Завершена загрузка {{taskName}}, раздача",
@@ -375,6 +377,15 @@ export default {
 	"mirror-placeholder": "URL зеркала (тот же файл, другой сервер)",
 	"mirror-hint":
 		"Добавьте URL зеркал, указывающих на тот же файл, чтобы загружать из нескольких источников одновременно.",
+	"mirror-sources": "Источников: {{count}}",
+	"mirror-failing": "Сбой",
+	"mirror-idle": "Не используется",
+	"add-tab-links": "Ссылки",
+	"add-tab-mirrors": "Зеркала",
+	"mirror-list-placeholder": "URL зеркал одного файла, по одному в строке",
+	"mirror-list-hint":
+		"Все ссылки должны указывать на один и тот же файл. Его части загружаются со всех зеркал сразу, а зеркало, которое даёт сбой или замедляется, передаёт свои части остальным.",
+	"mirror-list-rejected": "Не простая http(s)-ссылка на файл:",
 	"detail-tab-general": "Общие",
 	"detail-tab-activity": "Активность",
 	"detail-tab-trackers": "Трекеры",
@@ -405,6 +416,31 @@ export default {
 	"edit-speed-limit-placeholder": "0 или пусто = без ограничения (напр. 500K)",
 	"edit-primary-uri": "URL загрузки",
 	"edit-primary-uri-placeholder": "Основной URL загрузки",
+	"edit-tab-seeding": "Раздача",
+	"seeding-rule-global": "Использовать глобальную настройку",
+	"seeding-rule-forever": "Раздавать, пока я не остановлю",
+	"seeding-rule-limits": "Остановить при коэффициенте или через время",
+	"seeding-rule-none": "Не раздавать",
+	"seeding-global-off": "Сейчас: без раздачи",
+	"seeding-global-forever": "Сейчас: раздача до остановки",
+	"seeding-global-ratio": "Сейчас: остановка при коэффициенте {{ratio}}",
+	"seeding-global-minutes": "Сейчас: остановка через {{minutes}} мин",
+	"seeding-global-both":
+		"Сейчас: остановка при коэффициенте {{ratio}} или через {{minutes}} мин",
+	"seeding-limits-hint":
+		"Раздача прекращается при достижении первого из ограничений. 0 означает отсутствие ограничения этого вида.",
+	"seeding-limits-required": "Укажите коэффициент или число минут больше 0",
+	"seeding-for": "Раздаётся уже",
+	"seeding-applies-after-download": "Это применится после завершения загрузки.",
+	"seeding-stops-now": "Это задание прекратит раздачу после сохранения.",
+	"seeding-limit-reached":
+		"Это задание уже достигло этого ограничения и прекратит раздачу после сохранения.",
+	"seeding-in-place-note":
+		"Созданные вами торренты раздаются, пока вы их не остановите.",
+	"seeding-ed2k-sharing-off":
+		"Раздача через eD2K отключена в Настройках, поэтому это задание ничего не будет отдавать.",
+	"seeding-leftover-values":
+		"У этого задания остались значения раздачи после прошлого изменения настроек. При сохранении они будут заменены.",
 	"create-torrent": "Создать торрент",
 	"create-torrent-menu": "Создать торрент...",
 	"create-torrent-source": "Файл или папка для раздачи",

@@ -77,6 +77,8 @@ export default {
 	errSftpAuthRequired:
 		"Ein SFTP-Passwort oder ein privater Schlüssel ist erforderlich.",
 	errFtpHostRequired: "Ein FTP-Host ist erforderlich.",
+	errSecretForNewServer:
+		"Der Server wurde geändert, daher werden das gespeicherte Passwort oder der gespeicherte Schlüssel nicht wiederverwendet. Geben Sie sie erneut ein.",
 	errMoveTargetRequired:
 		"Ein Zielordner ist erforderlich, wenn die Datei nach dem Upload verschoben wird.",
 	saving: "Wird gespeichert…",

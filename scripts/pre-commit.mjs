@@ -43,9 +43,10 @@ function main() {
 	);
 
 	execFileSync(
-		"pnpx",
+		"pnpm",
 		[
-			"@biomejs/biome",
+			"exec",
+			"biome",
 			"check",
 			"--write",
 			"--staged",

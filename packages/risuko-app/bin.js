@@ -38,6 +38,12 @@ for (let i = 0; i < rawArgs.length; i++) {
 	const arg = rawArgs[i];
 	if ((arg === "--version" || arg === "-v") && rawArgs[i + 1]) {
 		version = rawArgs[++i].replace(/^v/, "");
+		if (!parseVersion(version)) {
+			console.error(
+				`Invalid version "${version}": expected a version such as 1.2.0`,
+			);
+			process.exit(1);
+		}
 	} else if (arg === "--no-cache") {
 		noCache = true;
 	} else if (arg === "--allow-legacy-no-checksum") {
@@ -555,8 +561,14 @@ async function main() {
 		detached: true,
 		stdio: "ignore",
 	});
-	child.unref();
-	process.exit(0);
+	child.once("error", (err) => {
+		console.error(`Failed to start Risuko (${binaryPath}): ${err.message}`);
+		process.exit(1);
+	});
+	child.once("spawn", () => {
+		child.unref();
+		process.exit(0);
+	});
 }
 
 main().catch((err) => {

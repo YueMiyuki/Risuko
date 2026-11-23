@@ -247,6 +247,14 @@ pub(crate) fn spawn_task_list_notifier(
     })
 }
 
+fn upload_trigger(event: &events::EngineEvent) -> Option<bool> {
+    match event {
+        events::EngineEvent::BtDownloadComplete { seeding: true, .. } => Some(true),
+        events::EngineEvent::DownloadComplete { seeded: false, .. } => Some(false),
+        _ => None,
+    }
+}
+
 pub async fn start_engine(
     config: &ConfigManager,
     event_sink: Arc<dyn EventSink>,
@@ -360,7 +368,7 @@ pub async fn start_engine(
                     };
                     sink.emit(name, event.params());
 
-                    if matches!(event, EngineEvent::DownloadComplete { .. }) {
+                    if let Some(seeding) = upload_trigger(&event) {
                         if let Some(uploads) = upload_mgr.clone() {
                             let mgr = mgr_for_uploads.clone();
                             let gid_owned = gid.to_string();
@@ -379,6 +387,7 @@ pub async fn start_engine(
                                             f.category,
                                             &kind,
                                             override_id.clone(),
+                                            seeding,
                                         )
                                         .await;
                                 }
@@ -517,5 +526,46 @@ mod credential_tests {
         assert_eq!(credentials.username.as_deref(), Some("alice"));
         assert_eq!(credentials.password.as_deref(), Some("secret"));
         assert!(resolver.resolve("missing").await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::events::EngineEvent;
+    use super::upload_trigger;
+
+    #[test]
+    fn uploads_start_once_when_the_data_is_complete() {
+        let gid = || "g".to_string();
+        assert_eq!(
+            upload_trigger(&EngineEvent::BtDownloadComplete {
+                gid: gid(),
+                seeding: true
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            upload_trigger(&EngineEvent::DownloadComplete {
+                gid: gid(),
+                seeded: false
+            }),
+            Some(false)
+        );
+        for event in [
+            EngineEvent::DownloadComplete {
+                gid: gid(),
+                seeded: true,
+            },
+            EngineEvent::BtDownloadComplete {
+                gid: gid(),
+                seeding: false,
+            },
+            EngineEvent::DownloadPause { gid: gid() },
+            EngineEvent::DownloadStop { gid: gid() },
+            EngineEvent::DownloadError { gid: gid() },
+            EngineEvent::DownloadStart { gid: gid() },
+        ] {
+            assert_eq!(upload_trigger(&event), None, "{event:?}");
+        }
     }
 }

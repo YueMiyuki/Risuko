@@ -1,15 +1,19 @@
 use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 
+use super::download::RequestHeaders;
+
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 const MAX_KEY_BYTES: usize = 1024;
 
-pub async fn fetch_decryption_key(
+pub(super) async fn fetch_decryption_key(
     key_uri: &str,
     client: &risuko_http::Client,
+    headers: &RequestHeaders,
 ) -> Result<[u8; 16], String> {
     let resp = client
         .get(key_uri)
+        .headers(headers.for_url(key_uri))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch decryption key: {e}"))?;
@@ -89,7 +93,10 @@ mod tests {
     async fn oversized_key_bodies_are_rejected_before_the_length_check() {
         let url = serve_body(2 * MAX_KEY_BYTES).await;
         let client = risuko_http::Client::builder().build().unwrap();
-        let error = fetch_decryption_key(&url, &client).await.unwrap_err();
+        let headers = RequestHeaders::new(&serde_json::Map::new(), &url);
+        let error = fetch_decryption_key(&url, &client, &headers)
+            .await
+            .unwrap_err();
         assert!(error.contains("Failed to read key body"), "{error}");
     }
 

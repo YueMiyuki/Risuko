@@ -2675,7 +2675,7 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
     }
     let mut nodes: Vec<(Id20, SocketAddr)> = Vec::new();
     if let Some(n) = r_val.get(b"nodes").and_then(|v| v.as_bytes()) {
-        for chunk in n.chunks_exact(26) {
+        for chunk in n.as_chunks::<26>().0 {
             let id = Id20::from_slice(&chunk[..20]).ok()?;
             let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
             let port = u16::from_be_bytes([chunk[24], chunk[25]]);
@@ -2686,7 +2686,7 @@ fn parse_get_peers_response(body: &Value) -> Option<GetPeersResponseBody> {
         }
     }
     if let Some(n6) = r_val.get(b"nodes6").and_then(|v| v.as_bytes()) {
-        for chunk in n6.chunks_exact(38) {
+        for chunk in n6.as_chunks::<38>().0 {
             let id = match Id20::from_slice(&chunk[..20]) {
                 Ok(v) => v,
                 Err(_) => continue,

@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "Actualizare anulată",
 	"update-install": "Instalează actualizarea",
 	"update-relaunch": "Repornește pentru a finaliza actualizarea",
+	"update-relaunching": "Se repornește Risuko…",
 	"update-progress": "Progresul actualizării: {{progress}}%",
 	"update-error": "Eroare de actualizare: {{error}}",
 	"update-unsigned": "Actualizările nu sunt disponibile în această versiune",

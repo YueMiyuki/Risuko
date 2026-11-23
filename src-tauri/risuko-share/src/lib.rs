@@ -123,20 +123,35 @@ fn begin_send_transfer(
 
 const PATH_POLL_INTERVAL: Duration = Duration::from_millis(700);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(6);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
-async fn bind_endpoint() -> Result<Endpoint> {
+#[cfg(not(test))]
+fn endpoint_builder() -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Default)
+}
+
+#[cfg(test)]
+fn endpoint_builder() -> iroh::endpoint::Builder {
     Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Default)
+        .relay_mode(RelayMode::Disabled)
+        .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .expect("loopback bind address")
+}
+
+async fn bind_endpoint() -> Result<Endpoint> {
+    endpoint_builder()
         .bind()
         .await
         .context("failed to bind endpoint")
 }
 
-fn spawn_online_warmup(endpoint: Endpoint) {
+fn spawn_online_warmup(endpoint: Endpoint) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        endpoint.online().await;
-    });
+        let _ = tokio::time::timeout(WARMUP_TIMEOUT, endpoint.online()).await;
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,16 +342,12 @@ impl ShareManager {
             format: BlobFormat::Raw,
         };
 
-        let ticket_hash;
-        let ticket_format;
-
-        if entries.len() == 1 && !has_dir {
+        let (ticket_hash, ticket_format) = if entries.len() == 1 && !has_dir {
             let tag = store
                 .blobs()
                 .add_path_with_opts(import_opts(entries[0].1.clone()))
                 .await?;
-            ticket_hash = tag.hash;
-            ticket_format = tag.format;
+            (tag.hash, tag.format)
         } else {
             let limit = std::thread::available_parallelism().map_or(4, |n| n.get());
             let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
@@ -363,9 +374,8 @@ impl ShareManager {
             let collection = Collection::from_iter(items);
             let tt = collection.store(&store).await?;
             store.tags().create(tt.hash_and_format()).await?;
-            ticket_hash = tt.hash();
-            ticket_format = BlobFormat::HashSeq;
-        }
+            (tt.hash(), BlobFormat::HashSeq)
+        };
 
         let endpoint = endpoint_task.await??;
         let addr = endpoint.addr();
@@ -602,13 +612,12 @@ async fn run_receive(
 
     let lookup = MemoryLookup::new();
     lookup.add_endpoint_info(ticket.addr().clone());
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Default)
+    let endpoint = endpoint_builder()
         .address_lookup(lookup)
         .bind()
         .await
         .context("failed to bind endpoint")?;
-    spawn_online_warmup(endpoint.clone());
+    let _warmup = AbortOnDrop(spawn_online_warmup(endpoint.clone()));
 
     let path_handle = AbortOnDrop(spawn_path_poll(
         endpoint.clone(),
@@ -1014,5 +1023,214 @@ mod tests {
         drop(AbortOnDrop(task));
         tokio::task::yield_now().await;
         assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn the_warmup_task_ends_when_its_guard_is_dropped() {
+        let endpoint = endpoint_builder().bind().await.unwrap();
+        let task = spawn_online_warmup(endpoint.clone());
+        let handle = task.abort_handle();
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished());
+
+        drop(AbortOnDrop(task));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("warm-up task outlived its guard");
+    }
+
+    async fn direct_addr(endpoint: &Endpoint) -> iroh::EndpointAddr {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = endpoint.addr();
+                if addr.ip_addrs().next().is_some() {
+                    return addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("endpoint never reported a direct address")
+    }
+
+    #[tokio::test]
+    async fn test_endpoints_connect_over_loopback_without_relays() {
+        const ALPN: &[u8] = b"risuko-share-test";
+        let server = endpoint_builder()
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client = endpoint_builder().bind().await.unwrap();
+
+        let addr = direct_addr(&server).await;
+        assert_eq!(addr.relay_urls().count(), 0);
+        assert!(addr.ip_addrs().all(|a| a.ip().is_loopback()));
+
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                conn.remote_id()
+            }
+        });
+        let conn = tokio::time::timeout(Duration::from_secs(10), client.connect(addr, ALPN))
+            .await
+            .expect("connect timed out")
+            .unwrap();
+        assert_eq!(conn.remote_id(), server.id());
+        assert_eq!(accept.await.unwrap(), client.id());
+    }
+
+    async fn wait_for_outcome(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<ShareEnvelope>,
+        id: &str,
+    ) -> ShareEvent {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let envelope = events.recv().await.expect("event channel closed");
+                if envelope.id == id
+                    && matches!(
+                        envelope.event,
+                        ShareEvent::Completed | ShareEvent::Error { .. }
+                    )
+                {
+                    return envelope.event;
+                }
+            }
+        })
+        .await
+        .expect("receive did not finish")
+    }
+
+    async fn wait_until_gone(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while tokio::fs::try_exists(path).await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{path:?} was not removed"));
+    }
+
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                } else {
+                    files.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn a_received_collection_lands_in_the_destination_with_safe_names() {
+        let sending = tempfile::tempdir().unwrap();
+        let receiving = tempfile::tempdir().unwrap();
+        let src = sending.path().join("src");
+        std::fs::create_dir_all(src.join("album/inner")).unwrap();
+        std::fs::write(src.join("plain.txt"), b"incoming plain").unwrap();
+        std::fs::write(src.join("album/inner/deep.txt"), b"deep").unwrap();
+        std::fs::write(src.join("re\u{200B}port.txt"), b"report").unwrap();
+        let dest = receiving.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("plain.txt"), b"already here").unwrap();
+        let data = receiving.path().join("data");
+
+        let (send_tx, _send_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = ShareManager::new(sending.path().join("data"), send_tx);
+        let info = sender
+            .start_send(
+                "t1".to_string(),
+                vec![
+                    src.join("plain.txt"),
+                    src.join("album"),
+                    src.join("re\u{200B}port.txt"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let (recv_tx, mut recv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = ShareManager::new(data.clone(), recv_tx);
+        receiver
+            .start_receive("t1".to_string(), info.ticket, dest.clone(), info.files)
+            .unwrap();
+
+        let outcome = wait_for_outcome(&mut recv_rx, "t1").await;
+        assert!(matches!(outcome, ShareEvent::Completed), "{outcome:?}");
+        wait_until_gone(&data.join("recv-t1")).await;
+
+        assert_eq!(
+            std::fs::read(dest.join("plain.txt")).unwrap(),
+            b"already here"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("plain (1).txt")).unwrap(),
+            b"incoming plain"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("album/inner/deep.txt")).unwrap(),
+            b"deep"
+        );
+        assert_eq!(std::fs::read(dest.join("re_port.txt")).unwrap(), b"report");
+        assert_eq!(
+            files_under(receiving.path()),
+            [
+                "dest/album/inner/deep.txt",
+                "dest/plain (1).txt",
+                "dest/plain.txt",
+                "dest/re_port.txt",
+            ]
+            .map(PathBuf::from)
+        );
+        sender.cancel("t1").await;
+    }
+
+    #[tokio::test]
+    async fn a_transfer_larger_than_announced_is_aborted() {
+        let sending = tempfile::tempdir().unwrap();
+        let receiving = tempfile::tempdir().unwrap();
+        let big = sending.path().join("big.bin");
+        let sent = 6 * 1024 * 1024;
+        std::fs::write(&big, vec![7u8; sent]).unwrap();
+        let dest = receiving.path().join("dest");
+        let data = receiving.path().join("data");
+
+        let (send_tx, _send_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = ShareManager::new(sending.path().join("data"), send_tx);
+        let info = sender
+            .start_send("t2".to_string(), vec![big])
+            .await
+            .unwrap();
+        let announced: Vec<FileMeta> = info.files.iter().map(|f| meta(&f.name, 1024)).collect();
+        assert!(exceeds_announced(sent as u64, announced_limit(&announced)));
+
+        let (recv_tx, mut recv_rx) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = ShareManager::new(data.clone(), recv_tx);
+        receiver
+            .start_receive("t2".to_string(), info.ticket, dest.clone(), announced)
+            .unwrap();
+
+        match wait_for_outcome(&mut recv_rx, "t2").await {
+            ShareEvent::Error { message } => {
+                assert_eq!(message, "sender sent more data than it announced")
+            }
+            other => panic!("{other:?}"),
+        }
+        wait_until_gone(&data.join("recv-t2")).await;
+        assert_eq!(files_under(receiving.path()), Vec::<PathBuf>::new());
+        sender.cancel("t2").await;
     }
 }

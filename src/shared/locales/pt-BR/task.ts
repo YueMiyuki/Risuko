@@ -329,6 +329,8 @@ export default {
 	"media-format-hint":
 		"Busque os formatos para escolher uma qualidade específica.",
 	"media-format-error": "Não foi possível carregar os formatos desta URL.",
+	"media-unsupported-android":
+		"Downloads de sites de mídia exigem o yt-dlp, que não está disponível no Android",
 	"download-complete-message": "{{taskName}} download completado",
 	"download-complete-notify": "Download Completado",
 	"bt-download-complete-message":
@@ -376,6 +378,15 @@ export default {
 	"mirror-placeholder": "URL do espelho (mesmo arquivo, outro servidor)",
 	"mirror-hint":
 		"Adicione URLs de espelho que apontem para o mesmo arquivo para baixar de várias fontes em paralelo.",
+	"mirror-sources": "{{count}} fontes",
+	"mirror-failing": "Com falha",
+	"mirror-idle": "Sem uso",
+	"add-tab-links": "Links",
+	"add-tab-mirrors": "Espelhos",
+	"mirror-list-placeholder": "URLs de espelhos de um arquivo, uma por linha",
+	"mirror-list-hint":
+		"Todos os links devem apontar para o mesmo arquivo. Suas partes são baixadas de todos os espelhos ao mesmo tempo, e um espelho que falha ou fica lento passa suas partes aos outros.",
+	"mirror-list-rejected": "Não é um link http(s) simples para arquivo:",
 	"detail-tab-general": "Geral",
 	"detail-tab-activity": "Atividade",
 	"detail-tab-trackers": "Trackers",
@@ -406,6 +417,32 @@ export default {
 	"edit-speed-limit-placeholder": "0 ou vazio = ilimitado (ex.: 500K)",
 	"edit-primary-uri": "URL de download",
 	"edit-primary-uri-placeholder": "URL principal de download",
+	"edit-tab-seeding": "Semeadura",
+	"seeding-rule-global": "Usar a configuração global",
+	"seeding-rule-forever": "Semear até eu parar",
+	"seeding-rule-limits": "Parar em uma proporção ou após um tempo",
+	"seeding-rule-none": "Não semear",
+	"seeding-global-off": "Atualmente: não semear",
+	"seeding-global-forever": "Atualmente: semear até parar",
+	"seeding-global-ratio": "Atualmente: parar na proporção {{ratio}}",
+	"seeding-global-minutes": "Atualmente: parar após {{minutes}} minutos",
+	"seeding-global-both":
+		"Atualmente: parar na proporção {{ratio}} ou após {{minutes}} minutos",
+	"seeding-limits-hint":
+		"A semeadura para no primeiro limite atingido. 0 significa sem limite desse tipo.",
+	"seeding-limits-required":
+		"Digite uma proporção ou um número de minutos acima de 0",
+	"seeding-for": "Tempo semeando",
+	"seeding-applies-after-download": "Isso vale quando o download terminar.",
+	"seeding-stops-now": "Esta tarefa para de semear quando você salvar.",
+	"seeding-limit-reached":
+		"Esta tarefa já atingiu esse limite e para de semear quando você salvar.",
+	"seeding-in-place-note":
+		"Os torrents que você criou são semeados até você pará-los.",
+	"seeding-ed2k-sharing-off":
+		"O compartilhamento via eD2K está desativado em Preferências, então esta tarefa não fará upload.",
+	"seeding-leftover-values":
+		"Esta tarefa tem valores de semeadura de uma alteração anterior de configurações. Salvar os substitui.",
 	"create-torrent": "Criar torrent",
 	"create-torrent-menu": "Criar torrent...",
 	"create-torrent-source": "Arquivo ou pasta a compartilhar",

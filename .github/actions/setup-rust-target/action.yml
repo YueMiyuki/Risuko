@@ -22,7 +22,7 @@ runs:
       with:
         arch: ${{ inputs.target == 'aarch64-pc-windows-msvc' && 'amd64_arm64' || 'amd64' }}
 
-    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       with:
         workspaces: src-tauri -> target
         key: ${{ inputs.cache-key }}

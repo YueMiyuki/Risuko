@@ -3761,4 +3761,255 @@ mod tests {
             "{error}"
         );
     }
+
+    async fn spawn_timed_article_server(
+        articles: HashMap<String, Vec<u8>>,
+        delay: Duration,
+    ) -> (u16, Arc<Mutex<Vec<(Instant, Instant)>>>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let log = served.clone();
+        let connections = accepted.clone();
+        let articles = Arc::new(articles);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.fetch_add(1, Ordering::Relaxed);
+                let articles = articles.clone();
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    if reader
+                        .get_mut()
+                        .write_all(b"200 fake NNTP server ready\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let command = line.trim_end();
+                        let Some(id) = command
+                            .strip_prefix("ARTICLE <")
+                            .and_then(|rest| rest.strip_suffix('>'))
+                        else {
+                            if command.starts_with("QUIT") {
+                                let _ = reader.get_mut().write_all(b"205 bye\r\n").await;
+                                break;
+                            }
+                            let _ = reader.get_mut().write_all(b"500 unknown command\r\n").await;
+                            continue;
+                        };
+                        let started = Instant::now();
+                        tokio::time::sleep(delay).await;
+                        let response = match articles.get(id) {
+                            Some(body) => {
+                                let mut response = b"220 article follows\r\n".to_vec();
+                                response.extend_from_slice(body);
+                                response.extend_from_slice(b".\r\n");
+                                response
+                            }
+                            None => b"430 no such article\r\n".to_vec(),
+                        };
+                        if reader.get_mut().write_all(&response).await.is_err() {
+                            break;
+                        }
+                        log.lock().unwrap().push((started, Instant::now()));
+                    }
+                });
+            }
+        });
+        (port, served, accepted)
+    }
+
+    fn throughput_post(
+        files: usize,
+        articles_per_file: usize,
+        article_bytes: usize,
+    ) -> (UsenetTaskData, HashMap<String, Vec<u8>>) {
+        let mut articles = HashMap::new();
+        let mut task_files = Vec::new();
+        for file_index in 0..files {
+            let name = format!("post.{file_index:03}.bin");
+            let total = (articles_per_file * article_bytes) as u64;
+            let mut segments = Vec::new();
+            for part in 0..articles_per_file {
+                let data = (0..article_bytes)
+                    .map(|offset| ((file_index * 7 + part * 13 + offset) % 251) as u8)
+                    .collect::<Vec<_>>();
+                let begin = (part * article_bytes) as u64 + 1;
+                let end = begin + article_bytes as u64 - 1;
+                let message_id = format!("f{file_index}-p{part}@bench");
+                articles.insert(
+                    message_id.clone(),
+                    yenc_article(&name, &data, Some((begin, end, total))),
+                );
+                segments.push(UsenetTaskSegment {
+                    number: part as u32 + 1,
+                    bytes: article_bytes as u64,
+                    message_id,
+                });
+            }
+            task_files.push(UsenetTaskFile {
+                name: name.clone(),
+                subject: name,
+                groups: Vec::new(),
+                segments,
+            });
+        }
+        (
+            UsenetTaskData {
+                files: task_files,
+                ..Default::default()
+            },
+            articles,
+        )
+    }
+
+    struct BusyStats {
+        span: Duration,
+        idle: Duration,
+        idle_gaps: usize,
+        longest_gap: Duration,
+        below_full: Duration,
+        mean_busy: f64,
+    }
+
+    fn busy_stats(intervals: &[(Instant, Instant)], connections: usize) -> BusyStats {
+        let mut events = Vec::with_capacity(intervals.len() * 2);
+        for (start, end) in intervals {
+            events.push((*start, 1i64));
+            events.push((*end, -1i64));
+        }
+        events.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+        let first = events.first().map(|event| event.0).unwrap();
+        let last = events.last().map(|event| event.0).unwrap();
+        let mut busy = 0i64;
+        let mut previous = first;
+        let mut idle = Duration::ZERO;
+        let mut idle_gaps = 0;
+        let mut longest_gap = Duration::ZERO;
+        let mut below_full = Duration::ZERO;
+        let mut busy_seconds = 0f64;
+        for (at, delta) in events {
+            let step = at - previous;
+            if busy == 0 && !step.is_zero() {
+                idle += step;
+                idle_gaps += 1;
+                longest_gap = longest_gap.max(step);
+            }
+            if (busy as usize) < connections {
+                below_full += step;
+            }
+            busy_seconds += busy as f64 * step.as_secs_f64();
+            busy += delta;
+            previous = at;
+        }
+        let span = last - first;
+        BusyStats {
+            span,
+            idle,
+            idle_gaps,
+            longest_gap,
+            below_full,
+            mean_busy: busy_seconds / span.as_secs_f64(),
+        }
+    }
+
+    fn bench_env_list(name: &str, default: &[u64]) -> Vec<u64> {
+        std::env::var(name)
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|item| item.trim().parse().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| default.to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark"]
+    async fn benchmark_idle_time_between_files() {
+        const CONNECTIONS: u32 = 30;
+        const TOTAL_ARTICLES: usize = 2_800;
+        let delays = bench_env_list("RISUKO_USENET_BENCH_DELAYS_MS", &[20, 100]);
+        let runs = bench_env_list("RISUKO_USENET_BENCH_RUNS", &[2])[0];
+        let article_bytes =
+            bench_env_list("RISUKO_USENET_BENCH_ARTICLE_BYTES", &[4096])[0] as usize;
+        let layouts = [(40usize, 70usize), (7, 400), (1, TOTAL_ARTICLES)];
+        let posts = layouts.map(|(files, per_file)| {
+            (
+                files,
+                per_file,
+                throughput_post(files, per_file, article_bytes),
+            )
+        });
+        println!(
+            "connections={CONNECTIONS} pipeline_depth={PIPELINE_DEPTH} article_bytes={article_bytes}"
+        );
+        println!(
+            "delay_ms | layout | run | wall_ms | server_span_ms | ideal_ms | no_request_in_flight_ms | gaps | longest_gap_ms | below_{CONNECTIONS}_busy_ms | mean_busy_connections | connections_opened"
+        );
+        for delay_ms in delays {
+            let delay = Duration::from_millis(delay_ms);
+            let ideal = delay * TOTAL_ARTICLES.div_ceil(CONNECTIONS as usize) as u32;
+            for (files, per_file, (metadata, articles)) in &posts {
+                for run in 1..=runs {
+                    let (port, served, accepted) =
+                        spawn_timed_article_server(articles.clone(), delay).await;
+                    let dir = tempfile::tempdir().unwrap();
+                    let task = DownloadTask {
+                        dir: dir.path().to_string_lossy().into_owned(),
+                        usenet: Some(metadata.clone()),
+                        ..Default::default()
+                    };
+                    let mut bench_profile = profile("bench", port, 0);
+                    bench_profile.max_connections = CONNECTIONS;
+                    let mut options = Map::new();
+                    options.insert(
+                        "usenet-profiles".into(),
+                        serde_json::to_value(vec![bench_profile]).unwrap(),
+                    );
+                    let started = Instant::now();
+                    run_usenet_download_with_resolver_and_capacity(
+                        &task,
+                        &options,
+                        Arc::new(AtomicU64::new(0)),
+                        Arc::new(AtomicU64::new(0)),
+                        CancellationToken::new(),
+                        Arc::new(AnonymousCredentialResolver),
+                        Arc::new(ProviderConnectionCapacityRegistry::default()),
+                        Throttle::unlimited(),
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                    let wall = started.elapsed();
+                    let intervals = served.lock().unwrap().clone();
+                    assert_eq!(intervals.len(), files * per_file);
+                    let stats = busy_stats(&intervals, CONNECTIONS as usize);
+                    let ms = |value: Duration| value.as_secs_f64() * 1000.0;
+                    println!(
+                        "{delay_ms} | {files} x {per_file} | {run} | {:.0} | {:.0} | {:.0} | {:.1} | {} | {:.1} | {:.0} | {:.1} | {}",
+                        ms(wall),
+                        ms(stats.span),
+                        ms(ideal),
+                        ms(stats.idle),
+                        stats.idle_gaps,
+                        ms(stats.longest_gap),
+                        ms(stats.below_full),
+                        stats.mean_busy,
+                        accepted.load(Ordering::Relaxed),
+                    );
+                }
+            }
+        }
+    }
 }

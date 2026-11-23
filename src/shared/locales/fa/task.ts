@@ -324,6 +324,8 @@ export default {
 	"media-format-auto": "بهترین موجود (خودکار)",
 	"media-format-hint": "برای انتخاب کیفیت مشخص، قالب‌ها را دریافت کنید.",
 	"media-format-error": "قالب‌های این URL بارگذاری نشدند.",
+	"media-unsupported-android":
+		"بارگیری از سایت‌های رسانه به yt-dlp نیاز دارد که در Android در دسترس نیست",
 	"download-complete-message": "بارگیری {{taskName}} تکمیل شد",
 	"download-complete-notify": "بارگیری تکمیل شد",
 	"bt-download-complete-message": "بارگیری {{taskName}} تکمیل شد، بذرپاشی",
@@ -370,6 +372,15 @@ export default {
 	"mirror-placeholder": "نشانی آینه (همان فایل، سرور دیگر)",
 	"mirror-hint":
 		"نشانی‌های آینه را که به همان فایل اشاره می‌کنند اضافه کنید تا از چند منبع به‌طور همزمان دانلود کنید.",
+	"mirror-sources": "{{count}} منبع",
+	"mirror-failing": "ناموفق",
+	"mirror-idle": "استفاده نمی‌شود",
+	"add-tab-links": "پیوندها",
+	"add-tab-mirrors": "آینه‌ها",
+	"mirror-list-placeholder": "نشانی‌های آینه یک فایل، هر خط یکی",
+	"mirror-list-hint":
+		"همه پیوندها باید به همان فایل اشاره کنند. بخش‌های آن هم‌زمان از همه آینه‌ها دانلود می‌شود و آینه‌ای که خطا دهد یا کند شود، بخش‌هایش را به آینه‌های دیگر می‌سپارد.",
+	"mirror-list-rejected": "پیوند فایل http(s) ساده نیست:",
 	"detail-tab-general": "عمومی",
 	"detail-tab-activity": "فعالیت",
 	"detail-tab-trackers": "ردیاب‌ها",
@@ -400,6 +411,31 @@ export default {
 	"edit-speed-limit-placeholder": "۰ یا خالی = نامحدود (مثلاً 500K)",
 	"edit-primary-uri": "نشانی بارگیری",
 	"edit-primary-uri-placeholder": "نشانی اصلی بارگیری",
+	"edit-tab-seeding": "بذرپاشی",
+	"seeding-rule-global": "استفاده از تنظیم سراسری",
+	"seeding-rule-forever": "بذرپاشی تا زمانی که متوقفش کنم",
+	"seeding-rule-limits": "توقف در یک نسبت یا پس از مدتی",
+	"seeding-rule-none": "بذرپاشی نکن",
+	"seeding-global-off": "در حال حاضر: بدون بذرپاشی",
+	"seeding-global-forever": "در حال حاضر: بذرپاشی تا زمان توقف",
+	"seeding-global-ratio": "در حال حاضر: توقف در نسبت {{ratio}}",
+	"seeding-global-minutes": "در حال حاضر: توقف پس از {{minutes}} دقیقه",
+	"seeding-global-both":
+		"در حال حاضر: توقف در نسبت {{ratio}} یا پس از {{minutes}} دقیقه",
+	"seeding-limits-hint":
+		"بذرپاشی در هر حدی که زودتر برسد متوقف می‌شود. 0 یعنی بدون محدودیت از آن نوع.",
+	"seeding-limits-required": "نسبتی یا تعداد دقیقه‌ای بزرگ‌تر از 0 وارد کنید",
+	"seeding-for": "مدت بذرپاشی",
+	"seeding-applies-after-download": "این پس از پایان بارگیری اعمال می‌شود.",
+	"seeding-stops-now": "این وظیفه هنگام ذخیره بذرپاشی را متوقف می‌کند.",
+	"seeding-limit-reached":
+		"این وظیفه از قبل به این حد رسیده است و هنگام ذخیره بذرپاشی را متوقف می‌کند.",
+	"seeding-in-place-note":
+		"تورنت‌هایی که ساخته‌اید تا زمانی که متوقفشان کنید بذرپاشی می‌شوند.",
+	"seeding-ed2k-sharing-off":
+		"اشتراک‌گذاری از طریق eD2K در ترجیحات خاموش است، بنابراین این وظیفه چیزی بارگذاری نمی‌کند.",
+	"seeding-leftover-values":
+		"این وظیفه مقادیر بذرپاشی از یک تغییر تنظیمات قبلی دارد. ذخیره کردن آن‌ها را جایگزین می‌کند.",
 	"create-torrent": "ساخت تورنت",
 	"create-torrent-menu": "ساخت تورنت...",
 	"create-torrent-source": "پرونده یا پوشه برای اشتراک‌گذاری",

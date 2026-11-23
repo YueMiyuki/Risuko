@@ -97,6 +97,27 @@ fn ensure_torrent_extension(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn reveals_as_item(path: &Path, is_dir: bool) -> bool {
+    !is_dir
+        || path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn openable_local_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err("Path must be absolute".to_string());
+    }
+    if !path.exists() {
+        return Err("Path does not exist".to_string());
+    }
+    Ok(path)
+}
+
 #[tauri::command]
 pub fn reveal_in_folder(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -117,14 +138,14 @@ pub fn reveal_in_folder(handle: AppHandle, path: String) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             let _ = handle;
-            if is_dir {
+            if reveals_as_item(&p, is_dir) {
                 std::process::Command::new("open")
-                    .arg(&path)
+                    .args(["-R", &path])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             } else {
                 std::process::Command::new("open")
-                    .args(["-R", &path])
+                    .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
@@ -204,7 +225,8 @@ pub fn open_path(handle: AppHandle, path: String) -> Result<(), String> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = handle;
-        open::that(&path).map_err(|e| e.to_string())
+        let local = openable_local_path(&path)?;
+        open::that(local).map_err(|e| e.to_string())
     }
 }
 
@@ -1660,6 +1682,48 @@ mod tests {
             .map(|f| (f.path.as_str(), f.length))
             .collect();
         assert_eq!(listed, [("album/a.bin", 3000), ("album/sub/b.bin", 5000)]);
+    }
+
+    #[test]
+    fn open_path_refuses_urls_relative_and_empty_paths() {
+        for path in [
+            "https://example.com",
+            "file:///etc/hosts",
+            "smb://host/share",
+            "relative/file",
+            "",
+        ] {
+            assert!(openable_local_path(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn open_path_refuses_a_path_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.bin");
+        assert!(openable_local_path(missing.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn open_path_accepts_an_existing_file_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.bin");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(openable_local_path(file.to_str().unwrap()).unwrap(), file);
+        assert_eq!(
+            openable_local_path(dir.path().to_str().unwrap()).unwrap(),
+            dir.path()
+        );
+    }
+
+    #[test]
+    fn reveal_treats_app_folders_as_items_by_extension_ignoring_case() {
+        assert!(reveals_as_item(Path::new("/Applications/X.app"), true));
+        assert!(reveals_as_item(Path::new("/Applications/x.APP"), true));
+        assert!(reveals_as_item(Path::new("/Downloads/file.zip"), false));
+        assert!(reveals_as_item(Path::new("/Downloads/X.app"), false));
+        assert!(!reveals_as_item(Path::new("/Downloads/album"), true));
+        assert!(!reveals_as_item(Path::new("/Downloads/app"), true));
     }
 
     #[test]

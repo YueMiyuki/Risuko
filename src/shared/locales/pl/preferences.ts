@@ -204,6 +204,10 @@ export default {
 		"Ze sprzężeniem zwrotnym (odrzucaj wolne lub zawodne serwery)",
 	"uri-selector-inorder": "Po kolei (próbuj serwerów od lewej do prawej)",
 	"uri-selector-adaptive": "Adaptacyjny (preferuj najszybszy)",
+	"send-auth-to-all-mirrors":
+		"Wysyłaj dane logowania do wszystkich serwerów lustrzanych HTTPS",
+	"send-auth-to-all-mirrors-tips":
+		"Wysyła nagłówek autoryzacji zadania do każdego serwera lustrzanego HTTPS. Gdy wyłączone, otrzymują go tylko serwery lustrzane o tym samym schemacie, hoście i porcie co pierwszy link.",
 	"unit-seconds": "sekundy",
 	"unit-kib-per-sec": "KiB/s",
 	storage: "Pamięć masowa",

@@ -30,6 +30,7 @@ export default {
 	"update-cancelled": "업데이트 취소됨",
 	"update-install": "업데이트 설치",
 	"update-relaunch": "업데이트를 완료하려면 다시 시작하세요",
+	"update-relaunching": "Risuko 다시 시작하는 중…",
 	"update-progress": "업데이트 진행률: {{progress}}%",
 	"update-error": "업데이트 오류: {{error}}",
 	"update-unsigned": "이 빌드에서는 업데이트를 사용할 수 없습니다",
