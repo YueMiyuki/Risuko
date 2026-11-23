@@ -74,7 +74,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out flatpak-builder-tools
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: flatpak/flatpak-builder-tools
           ref: 9d86d336a39b9af38b86f114b6ce5820fe260f91
@@ -92,7 +92,7 @@ jobs:
             --pnpm-store-version v11 -o generated-sources.json
 
       - name: Check out the Flathub repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ env.FLATHUB_REPO }}
           token: ${{ secrets.FLATHUB_TOKEN }}
