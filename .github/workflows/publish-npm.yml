@@ -25,7 +25,7 @@ env:
 jobs:
   meta:
     name: Resolve version
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'release'
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'release' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: read
