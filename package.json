@@ -85,5 +85,5 @@
 		"vue-tsc": "^3.3.14",
 		"vue-virtual-scroller": "3.0.5"
 	},
-	"packageManager": "pnpm@11.3.0"
+	"packageManager": "pnpm@12.21.0"
 }
